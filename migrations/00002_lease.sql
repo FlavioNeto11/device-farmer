@@ -78,6 +78,12 @@ BEGIN
   EXECUTE 'GRANT SELECT, INSERT, UPDATE ON farm.device_runtime TO farm_watchdog';
   EXECUTE 'GRANT SELECT ON farm.devices, farm.slots, farm.hosts TO farm_watchdog';
   EXECUTE 'REVOKE ALL ON farm.leases FROM farm_watchdog';
+
+  -- lease_reclaim carries `SET role = farm_reaper`, which requires its caller
+  -- to be a member of that role. Membership does NOT weaken the firewall:
+  -- SET ROLE replaces the active privilege set, so farm_scheduler's own SELECT
+  -- on device_runtime is not in effect while the function runs.
+  EXECUTE 'GRANT farm_reaper TO farm_scheduler';
 END $$;
 -- +goose StatementEnd
 
@@ -177,6 +183,13 @@ CREATE OR REPLACE FUNCTION farm.lease_acquire(
   reattached     boolean
 )
 LANGUAGE plpgsql AS $fn$
+-- The RETURNS TABLE column names are also OUT variables, and several of them
+-- (device_id, slot_id, fence, expires_at) share a name with a column of
+-- farm.leases. ON CONFLICT's conflict target must be a bare column name and
+-- cannot be qualified, so the ambiguity has to be resolved by policy: inside
+-- queries a bare name means the COLUMN. Assignment targets (INTO ...) are
+-- always variables regardless, so the OUT parameters still work.
+#variable_conflict use_column
 DECLARE
   j          farm.jobs%ROWTYPE;
   existing   farm.leases%ROWTYPE;
@@ -353,8 +366,12 @@ LANGUAGE sql AS $fn$
      AND l.fence = p_fence
      AND l.state IN ('held','suspect')
      AND l.witness_extensions < p_max_extensions
-     -- A witness carrying a fence at or below the device floor is stale.
-     AND l.fence > (SELECT d.fence_floor FROM farm.devices d WHERE d.id = l.device_id)
+     -- A witness carrying a fence BELOW the device floor is stale. The
+     -- comparison is >= and not >: the INSERT trigger raises fence_floor to
+     -- the granting fence, so a live lease always sits exactly AT the floor.
+     -- Release and reclaim push the floor to a fresh nextval above the fence
+     -- they closed, which is what makes the previous holder's fence stale.
+     AND l.fence >= (SELECT d.fence_floor FROM farm.devices d WHERE d.id = l.device_id)
   RETURNING l.reclaimable_at;
 $fn$;
 -- +goose StatementEnd
@@ -497,7 +514,27 @@ CREATE OR REPLACE FUNCTION farm.lease_reclaim(
   old_fence bigint,
   new_floor bigint
 )
-LANGUAGE plpgsql AS $fn$
+LANGUAGE plpgsql
+-- BLOCKER 3 FIX, and the mechanism matters.
+--
+-- A function-level SET is saved on entry and RESTORED ON EXIT, so the role
+-- change is scoped to this function alone. `SET LOCAL ROLE` in the body would
+-- instead leak farm_reaper to the remainder of the caller's transaction, and
+-- the next unrelated statement would fail on a table the reaper cannot see.
+--
+-- Running as farm_reaper is what makes health structurally invisible here:
+-- SELECT on farm.device_runtime is revoked from this role, so no future edit
+-- to this function can make reclamation depend on whether a device is
+-- reachable. That is the STF #663 firewall, enforced by the database rather
+-- than by a code-review convention.
+--
+-- The caller must be a member of farm_reaper to SET ROLE to it; see the
+-- membership grant in this migration.
+SET role = farm_reaper
+AS $fn$
+-- Same name-shadowing hazard as lease_acquire: the OUT names shadow columns
+-- of farm.leases and farm.devices inside the CTE chain.
+#variable_conflict use_column
 DECLARE
   st farm.reaper_state%ROWTYPE;
 BEGIN
@@ -505,9 +542,6 @@ BEGIN
   IF NOT st.enabled OR now() < st.quiesce_until THEN
     RETURN;   -- quiesce gate
   END IF;
-
-  -- BLOCKER 3 FIX: drop to the reaper role for this transaction.
-  SET LOCAL ROLE farm_reaper;
 
   RETURN QUERY
   WITH cand AS (

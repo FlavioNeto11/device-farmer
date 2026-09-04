@@ -1,0 +1,127 @@
+# The whole control plane on one machine.
+#
+#   docker compose up -d
+#   open http://localhost:8420
+#
+# This brings up Postgres, applies the schema, and runs the demo: 56 simulated
+# devices across two in-process fake ADB servers, driven by the REAL scheduler,
+# lease store, reaper and recovery ladder. No phone is attached.
+#
+# For a real farm, drop the `demo` service and use the per-role services at the
+# bottom instead, then run one `farmd node` per host that has devices plugged
+# into it — that one cannot run in this compose file, because it needs
+# /dev/bus/usb on the physical machine.
+
+name: device-farmer
+
+x-farmd: &farmd
+  build:
+    context: .
+    args:
+      VERSION: ${VERSION:-dev}
+  image: device-farmer/farmd:${VERSION:-dev}
+  environment: &farmd-env
+    DATABASE_URL: postgres://farm:farm@postgres:5432/device_farmer?sslmode=disable
+    FARM_LOG_LEVEL: ${FARM_LOG_LEVEL:-info}
+  depends_on:
+    migrate:
+      condition: service_completed_successfully
+  restart: unless-stopped
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: farm
+      POSTGRES_PASSWORD: farm
+      POSTGRES_DB: device_farmer
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      # Exposed for psql and for the assertions in test/assertions.sql. Drop
+      # this line for anything that is not a laptop.
+      - "127.0.0.1:55433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U farm -d device_farmer"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # Schema first, as a one-shot. Everything else waits for it to succeed, so a
+  # failed migration stops the rollout instead of starting a control plane
+  # against a schema it does not understand.
+  migrate:
+    <<: *farmd
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["migrate", "up"]
+    restart: "no"
+
+  # ---------------------------------------------------------------------
+  # Laptop / evaluation: simulated hardware plus the real control plane.
+  # Comment this out and uncomment the per-role services for a real farm.
+  # ---------------------------------------------------------------------
+  demo:
+    <<: *farmd
+    environment:
+      <<: *farmd-env
+      FARM_API_ADDR: "0.0.0.0:8080"
+    command: ["demo", "-hosts", "2", "-devices", "56"]
+    ports:
+      - "${FARM_PORT:-8420}:8080"
+
+  # ---------------------------------------------------------------------
+  # Real farm. Each role scales and fails independently.
+  #
+  #   docker compose --profile farm up -d
+  #
+  # The watchdog and the recovery ladder reach your hosts' ADB servers over
+  # TCP, so farm.hosts.adb_endpoint must be an address this network can route
+  # to. Run `farmd node` on each physical host separately: it needs
+  # /dev/bus/usb, which is exactly why it cannot live in the cluster.
+  # ---------------------------------------------------------------------
+  api:
+    <<: *farmd
+    profiles: ["farm"]
+    environment:
+      <<: *farmd-env
+      FARM_API_ADDR: "0.0.0.0:8080"
+    command: ["api"]
+    ports:
+      - "${FARM_PORT:-8420}:8080"
+
+  scheduler:
+    <<: *farmd
+    profiles: ["farm"]
+    command: ["scheduler"]
+
+  jobrunner:
+    <<: *farmd
+    profiles: ["farm"]
+    command: ["jobrunner"]
+    # Safe to scale: jobs are claimed with SKIP LOCKED and a lease is
+    # re-attached by job_id, so two replicas never fight over one device.
+    deploy:
+      replicas: 2
+
+  reaper:
+    <<: *farmd
+    profiles: ["farm"]
+    # The ONLY automatic release path in the system, and a singleton by
+    # design: it elects itself with a Postgres advisory lock, so a second
+    # replica idles rather than duplicating reclaims.
+    command: ["reaper"]
+
+  watchdog:
+    <<: *farmd
+    profiles: ["farm"]
+    command: ["watchdog"]
+
+  recovery:
+    <<: *farmd
+    profiles: ["farm"]
+    command: ["recovery"]
+
+volumes:
+  pgdata:

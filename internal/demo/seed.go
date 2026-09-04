@@ -188,6 +188,14 @@ func seedTenancy(ctx context.Context, tx pgx.Tx, opts SeedOptions) error {
 		{`INSERT INTO farm.queues (id, tenant_id, priority, max_devices) VALUES ($1,$2,$3,$4)
 		    ON CONFLICT (id) DO NOTHING`,
 			[]any{opts.Queue, opts.Tenant, 100, 0}},
+		// A profile, because a reset tier has no meaning without one: 'medium'
+		// is defined as "uninstall everything this profile does NOT own", so
+		// with no profile there is nothing to reset against and
+		// GET /api/v1/specs/resets can only answer 404.
+		{`INSERT INTO farm.profiles (id, description, packages) VALUES ($1,$2,$3)
+		    ON CONFLICT (id) DO NOTHING`,
+			[]any{opts.Pool, "baseline packages every device in this pool keeps",
+				[]string{"com.android.chrome", "com.acme.harness"}}},
 	}
 	for _, s := range stmts {
 		if _, err := tx.Exec(ctx, s.sql, s.args...); err != nil {

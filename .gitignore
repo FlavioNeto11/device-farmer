@@ -1,4 +1,7 @@
-bin/
+# Build output. The binaries are large and reproducible from source.
+/bin/
 *.exe
-.env
-coverage.out
+*.exe~
+
+# Local artifact blobs, when FARM_ARTIFACT_DIR is left at its default.
+/artifacts/

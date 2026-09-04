@@ -109,6 +109,9 @@ func defaultExecutorFactory(endpoint string, timeout time.Duration, maxOutput in
 // Server is the API. It is safe for concurrent use once constructed, and its
 // zero value is not usable — call New.
 type Server struct {
+	// extraRoutes are mount functions contributed by the parent via WithRoutes.
+	extraRoutes []func(*Server, *http.ServeMux)
+
 	cfg    *config.Config
 	pool   *pgxpool.Pool
 	leases *lease.Store
@@ -175,6 +178,24 @@ func WithRegistry(r *prometheus.Registry) Option {
 	return func(s *Server) {
 		if r != nil {
 			s.reg = r
+		}
+	}
+}
+
+// WithRoutes contributes extra routes to the server's mux at build time.
+//
+// It exists because some subsystems need a dependency the server has no
+// business choosing — the artifact API needs a blob backend, and a control
+// plane should not be deciding for its operator whether that is a directory or
+// a bucket. The parent builds the subsystem and hands over a mount function.
+//
+// Mounts run before the UI's catch-all "/" is installed, and Go's ServeMux
+// prefers the more specific pattern regardless, so a contributed route cannot
+// be shadowed by the dashboard.
+func WithRoutes(mount func(*Server, *http.ServeMux)) Option {
+	return func(s *Server) {
+		if mount != nil {
+			s.extraRoutes = append(s.extraRoutes, mount)
 		}
 	}
 }

@@ -49,6 +49,21 @@ func (s *Server) buildHandler() http.Handler {
 		mux.Handle(pattern, s.requireRole(RoleOperator, h))
 	}
 
+	// Job specs. Reading the vocabulary needs no privilege: a client that
+	// cannot ask what steps this server accepts has to hard-code them, and
+	// then a schema change breaks it silently instead of loudly.
+	tenant("POST /api/v1/specs/validate", s.handleSpecValidate)
+	tenant("GET /api/v1/specs/kinds", s.handleSpecKinds)
+	tenant("GET /api/v1/specs/resets", s.handleSpecResets)
+
+	// Routes contributed by the parent, mounted before the catch-all UI so a
+	// more specific pattern still wins. This is the seam for subsystems the
+	// server does not own — the artifact store, which needs a blob backend the
+	// server has no opinion about.
+	for _, mount := range s.extraRoutes {
+		mount(s, mux)
+	}
+
 	// Fleet and devices.
 	tenant("GET /api/v1/fleet", s.handleFleet)
 	tenant("GET /api/v1/devices/{id}", s.handleDevice)

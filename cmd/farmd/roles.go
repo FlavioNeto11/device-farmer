@@ -6,21 +6,31 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
 
+	"github.com/flaviopadilha/device-farmer/internal/adbwire"
 	"github.com/flaviopadilha/device-farmer/internal/api"
+	"github.com/flaviopadilha/device-farmer/internal/artifacts"
 	"github.com/flaviopadilha/device-farmer/internal/config"
+	"github.com/flaviopadilha/device-farmer/internal/ctl"
 	"github.com/flaviopadilha/device-farmer/internal/demo"
+	"github.com/flaviopadilha/device-farmer/internal/enroll"
+	"github.com/flaviopadilha/device-farmer/internal/jobrunner"
 	"github.com/flaviopadilha/device-farmer/internal/lease"
+	"github.com/flaviopadilha/device-farmer/internal/node"
 	"github.com/flaviopadilha/device-farmer/internal/obs"
 	"github.com/flaviopadilha/device-farmer/internal/reaper"
 	"github.com/flaviopadilha/device-farmer/internal/recovery"
+	"github.com/flaviopadilha/device-farmer/internal/runner"
 	"github.com/flaviopadilha/device-farmer/internal/scheduler"
+	"github.com/flaviopadilha/device-farmer/internal/topo"
 	"github.com/flaviopadilha/device-farmer/internal/ui"
 	"github.com/flaviopadilha/device-farmer/internal/watchdog"
 )
@@ -116,6 +126,22 @@ func runAPI(ctx context.Context, cfg *config.Config, log *slog.Logger, pool *pgx
 		// The dashboard ships inside the binary and is mounted at "/", so a
 		// farm has an operator interface with nothing else deployed.
 		api.WithUI(ui.Handler()),
+	}
+
+	// The artifact API needs a blob backend, which is a deployment choice the
+	// server has no business making, so it is contributed rather than built in.
+	if store, aerr := openArtifacts(cfg, pool); aerr != nil {
+		log.Warn("artifact endpoints are disabled", "err", aerr,
+			"consequence", "jobs with push or install steps will fail at the first artifact")
+	} else {
+		opts = append(opts, api.WithRoutes(func(srv *api.Server, mux *http.ServeMux) {
+			a, aerr := api.NewArtifactAPI(srv, store)
+			if aerr != nil {
+				log.Warn("artifact endpoints are disabled", "err", aerr)
+				return
+			}
+			a.Register(mux)
+		}))
 	}
 	// Authentication is a deployment decision. Absent a token spec the server
 	// runs open and says so loudly rather than quietly.
@@ -261,6 +287,9 @@ func runAll(ctx context.Context, cfg *config.Config, log *slog.Logger, pool *pgx
 		"scheduler": func(c context.Context) error { return runScheduler(c, cfg, log, pool) },
 		"reaper":    func(c context.Context) error { return runReaper(c, cfg, log, pool) },
 		"recovery":  func(c context.Context) error { return runRecovery(c, cfg, log, pool) },
+		// Without this the scheduler allocates devices and nothing ever runs on
+		// them: jobs sit in 'running' forever holding a phone each.
+		"jobrunner": func(c context.Context) error { return runJobRunner(c, cfg, log, pool) },
 	}
 	wds, err := watchdogsForHosts(ctx, cfg, log, pool)
 	if err != nil {
@@ -311,6 +340,7 @@ func runDemo(ctx context.Context, cfg *config.Config, log *slog.Logger, pool *pg
 		"scheduler": func(c context.Context) error { return runScheduler(c, cfg, log, pool) },
 		"reaper":    func(c context.Context) error { return runReaper(c, cfg, log, pool) },
 		"recovery":  func(c context.Context) error { return runRecovery(c, cfg, log, pool) },
+		"jobrunner": func(c context.Context) error { return runJobRunner(c, cfg, log, pool) },
 	}
 
 	// Watchdogs are started after the simulation has registered its hosts, so
@@ -348,6 +378,135 @@ func waitForHosts(ctx context.Context, pool *pgxpool.Pool, want int) error {
 		case <-t.C:
 		}
 	}
+}
+
+// openArtifacts builds the content-addressed artifact store. The blob backend
+// is a local directory here; the Backend interface is the seam for object
+// storage, and nothing above it knows the difference.
+func openArtifacts(cfg *config.Config, pool *pgxpool.Pool) (*artifacts.Store, error) {
+	root := os.Getenv("FARM_ARTIFACT_DIR")
+	if root == "" {
+		root = filepath.Join(os.TempDir(), "device-farmer-artifacts")
+	}
+	backend, err := artifacts.NewDirBackend(root)
+	if err != nil {
+		return nil, fmt.Errorf("artifact backend at %s: %w", root, err)
+	}
+	return artifacts.NewStore(pool, backend)
+}
+
+// runJobRunner executes jobs on the devices the scheduler allocated. It is the
+// component that turns a lease into work actually happening on a phone.
+func runJobRunner(ctx context.Context, cfg *config.Config, log *slog.Logger, pool *pgxpool.Pool) error {
+	inst, err := lease.NewHolderInstance()
+	if err != nil {
+		return fmt.Errorf("mint holder instance: %w", err)
+	}
+
+	store, err := openArtifacts(cfg, pool)
+	if err != nil {
+		return err
+	}
+
+	exec, err := runner.New(runner.Config{
+		Pool:      pool,
+		Logger:    log,
+		Artifacts: store,
+	})
+	if err != nil {
+		return fmt.Errorf("runner: %w", err)
+	}
+
+	jr, err := jobrunner.New(jobrunner.Config{
+		Pool:           pool,
+		Store:          lease.NewStore(pool),
+		Runner:         exec,
+		Component:      "jobrunner",
+		Holder:         hostname(),
+		HolderInstance: inst,
+		// One ADB client per device connection. The client is a dialer rather
+		// than a connection, so this is cheap and keeps each job's transport
+		// failures to itself.
+		Dial: func(endpoint, devpath string) (runner.Conn, error) {
+			return jobrunner.NewDeviceConn(adbwire.New(endpoint), devpath)
+		},
+		SlotRearm: cfg.Lease.SlotRearm,
+		Logger:    log,
+	})
+	if err != nil {
+		return err
+	}
+	return jr.Run(ctx)
+}
+
+// runNode is the agent that lives on a bare-metal device host, beside the USB
+// hubs. It is the only component with access to /dev/bus/usb and to hub power,
+// which is why recovery tiers 3 and 4 are refused when it is absent rather
+// than silently reported as ineffective.
+func runNode(ctx context.Context, cfg *config.Config, log *slog.Logger, pool *pgxpool.Pool) error {
+	hostID := cfg.Node.HostID
+	if hostID == "" {
+		return errors.New("FARM_HOST_ID is required: a node agent speaks for exactly one " +
+			"physical host, and guessing which one would attach a rack of phones to the wrong row")
+	}
+
+	src, err := topo.Sysfs("/sys")
+	if err != nil {
+		return fmt.Errorf("read the USB tree: %w "+
+			"(a node agent must run on the Linux host the devices are plugged into)", err)
+	}
+	disco, err := topo.New(topo.Config{
+		Pool:   pool,
+		HostID: hostID,
+		Source: src,
+		Actor:  "farmd-node",
+		Logger: log.With("component", "topo"),
+	})
+	if err != nil {
+		return fmt.Errorf("topology discovery: %w", err)
+	}
+
+	enr, err := enroll.New(enroll.Config{
+		Pool:        pool,
+		Component:   "enroll",
+		HostID:      hostID,
+		ADBEndpoint: cfg.Node.ADBEndpoint,
+		Connect: func(endpoint string) (enroll.Host, error) {
+			return adbwire.New(endpoint), nil
+		},
+		Logger: log.With("component", "enroll"),
+	})
+	if err != nil {
+		return fmt.Errorf("enrollment: %w", err)
+	}
+
+	agent, err := node.New(node.Config{
+		Pool:         pool,
+		HostID:       hostID,
+		ADBEndpoint:  cfg.Node.ADBEndpoint,
+		Component:    "node",
+		AgentVersion: version,
+		// Discovery must run before enrollment: a device at a USB position with
+		// no registered slot cannot be resolved, only recorded as pending.
+		Discover: func(c context.Context) error {
+			_, derr := disco.Once(c)
+			return derr
+		},
+		Enroll: func(c context.Context) error {
+			_, err := enr.EnrollOnce(c)
+			return err
+		},
+		Addr:   cfg.NodeAddr,
+		Logger: log,
+	})
+	if err != nil {
+		return err
+	}
+	return agent.Run(ctx)
+}
+
+func runCtl(ctx context.Context, cfg *config.Config, args []string, stdout, stderr io.Writer) int {
+	return ctl.Main(ctx, cfg, args, stdout, stderr)
 }
 
 func hostname() string {

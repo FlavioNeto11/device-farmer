@@ -516,7 +516,7 @@ type Step struct {
 // payload has no kind, and reports the empty string rather than panicking, so
 // that [Validate] can report it as a problem instead of crashing on it.
 func (s Step) Kind() Kind {
-	if s.Payload == nil {
+	if nilPayload(s.Payload) {
 		return ""
 	}
 	return s.Payload.Kind()
@@ -589,7 +589,12 @@ func (e *stepEnvelope) present() []Payload {
 
 // set stores p in the field named by its kind.
 func (e *stepEnvelope) set(p Payload) error {
-	switch v := p.(type) {
+	// Both Shell and *Shell satisfy Payload, because every Kind() has a value
+	// receiver and a pointer's method set includes it. Go offers no way to
+	// exclude the pointer form, so the package accepts both rather than
+	// failing at marshal time on a spec that compiled cleanly. Validation
+	// normalises the same way; see derefPayload.
+	switch v := derefPayload(p).(type) {
 	case Push:
 		e.Push = &v
 	case Install:
@@ -625,7 +630,7 @@ func (e *stepEnvelope) set(p Payload) error {
 // kind-less step to farm.jobs.spec would produce a row that fails to unmarshal
 // on resume, which is a defect discovered at the worst possible moment.
 func (s Step) MarshalJSON() ([]byte, error) {
-	if s.Payload == nil {
+	if nilPayload(s.Payload) {
 		return nil, fmt.Errorf("jobspec: step %q has no payload", s.ID)
 	}
 	env := stepEnvelope{

@@ -182,7 +182,7 @@ func checkStep(v *validator, path string, st Step, checkInherited bool) {
 		}
 	}
 
-	if st.Payload == nil {
+	if nilPayload(st.Payload) {
 		v.add(path, "has no payload, so it has no kind")
 		return
 	}
@@ -228,7 +228,17 @@ func checkStep(v *validator, path string, st Step, checkInherited bool) {
 	}
 
 	p := path + "." + string(kind)
-	switch pl := st.Payload.(type) {
+
+	// Normalise a pointer payload to its value before dispatching.
+	//
+	// Every payload's Kind() has a VALUE receiver, which is idiomatic Go and
+	// means both Shell and *Shell satisfy Payload. MarshalJSON accepts either.
+	// If validation dispatched on the value form alone, &Shell{...} would
+	// marshal, store and RUN while silently skipping every rule written for
+	// it — a spec accepted unchecked, which is the one outcome this function
+	// exists to prevent. Accepting both here is cheaper than a rule nobody
+	// can see they broke.
+	switch pl := derefPayload(st.Payload).(type) {
 	case Push:
 		checkDevicePath(v, p+".dest", pl.Dest)
 		if pl.Mode != "" && !modeRe.MatchString(pl.Mode) {
@@ -707,4 +717,87 @@ func uninstallUnknownCommand(profilePackages []string) string {
 		"case \"$keep\" in *\" $p \"*) continue;; esac; " +
 		"pm uninstall --user 0 \"$p\" | grep -q Success || rc=1; " +
 		"done; exit $rc"
+}
+
+// derefPayload returns the value form of a payload, so validation dispatches
+// identically whether a caller wrote Shell{...} or &Shell{...}.
+func derefPayload(pl Payload) Payload {
+	switch v := pl.(type) {
+	case *Push:
+		if v != nil {
+			return *v
+		}
+	case *Install:
+		if v != nil {
+			return *v
+		}
+	case *Uninstall:
+		if v != nil {
+			return *v
+		}
+	case *Shell:
+		if v != nil {
+			return *v
+		}
+	case *ShellDetached:
+		if v != nil {
+			return *v
+		}
+	case *WaitFor:
+		if v != nil {
+			return *v
+		}
+	case *Pull:
+		if v != nil {
+			return *v
+		}
+	case *Assert:
+		if v != nil {
+			return *v
+		}
+	case *Reset:
+		if v != nil {
+			return *v
+		}
+	case *Sleep:
+		if v != nil {
+			return *v
+		}
+	}
+	return pl
+}
+
+// nilPayload reports whether pl is a typed nil pointer.
+//
+// A typed nil is not == nil, and every payload's Kind() has a value receiver,
+// so calling Kind() on a nil *Shell PANICS by dereferencing it. That panic
+// would land in whatever is holding the spec — an API handler validating a
+// submission, or the runner about to start a step — so the nil is detected
+// before any method is called on it.
+func nilPayload(pl Payload) bool {
+	switch v := pl.(type) {
+	case nil:
+		return true
+	case *Push:
+		return v == nil
+	case *Install:
+		return v == nil
+	case *Uninstall:
+		return v == nil
+	case *Shell:
+		return v == nil
+	case *ShellDetached:
+		return v == nil
+	case *WaitFor:
+		return v == nil
+	case *Pull:
+		return v == nil
+	case *Assert:
+		return v == nil
+	case *Reset:
+		return v == nil
+	case *Sleep:
+		return v == nil
+	}
+	return false
 }

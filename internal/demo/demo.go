@@ -72,6 +72,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/flaviopadilha/device-farmer/internal/adbwire"
+	"github.com/flaviopadilha/device-farmer/internal/jobspec"
 	"github.com/flaviopadilha/device-farmer/internal/lease"
 	"github.com/flaviopadilha/device-farmer/internal/obs"
 	"github.com/flaviopadilha/device-farmer/test/fakeadb"
@@ -897,12 +898,87 @@ func (r *Runner) submitJob(ctx context.Context) error {
 		maxRuntime = iv(limit)
 	}
 
-	spec, err := json.Marshal(map[string]any{
-		"suite":  kind,
-		"apk":    "acme-app-debug.apk",
-		"steps":  steps,
-		"shards": 1,
-	})
+	// A REAL jobspec document, not a hand-rolled shape. internal/runner
+	// executes exactly this, so a spec the demo cannot express is a spec the
+	// product cannot run — which is the point of generating it here rather
+	// than stubbing the execution.
+	//
+	// The steps are deliberately cheap shell probes: the simulated hardware
+	// answers them, and the demo is about the LEASE surviving a partition, not
+	// about what the phone computed.
+	js := jobspec.New()
+	js.DefaultTimeout = jobspec.Duration(30 * time.Second)
+
+	// A soak is hours of work, and expressing it as thousands of ADB round
+	// trips is the wrong shape: every one of them is a socket that can die.
+	// The right shape — the one that makes a six-hour job survive a ten-minute
+	// partition — is to start the work DETACHED on the device and poll a
+	// result file, so no socket is the source of truth for anything.
+	if kind == "soak" {
+		const result = "/data/local/tmp/.farm/soak.result"
+		js.Steps = []jobspec.Step{
+			{ID: "soak/start", Payload: jobspec.ShellDetached{
+				Command:    fmt.Sprintf("for i in $(seq 1 %d); do getprop sys.boot_completed >/dev/null; sleep 1; done", steps),
+				ResultPath: result,
+				Handle:     "soak",
+			}},
+			{ID: "soak/await", Timeout: jobspec.Duration(6 * time.Hour),
+				Payload: jobspec.WaitFor{
+					Probe:    "test -f " + result,
+					Interval: jobspec.Duration(r.scale(5 * time.Second)),
+					Timeout:  jobspec.Duration(6 * time.Hour),
+				}},
+			{ID: "soak/collect", Payload: jobspec.Shell{Command: "cat " + result}},
+		}
+		return r.insertJob(ctx, js, kind, steps, expected, maxRuntime, policy)
+	}
+
+	for i := 0; i < steps; i++ {
+		id := fmt.Sprintf("%s/%03d", kind, i)
+		switch i % 4 {
+		case 0:
+			js.Steps = append(js.Steps, jobspec.Step{
+				ID:      id,
+				Payload: jobspec.Shell{Command: "getprop sys.boot_completed"},
+			})
+		case 1:
+			js.Steps = append(js.Steps, jobspec.Step{
+				ID:      id,
+				Payload: jobspec.Shell{Command: "dumpsys battery | head -20"},
+			})
+		case 2:
+			js.Steps = append(js.Steps, jobspec.Step{
+				ID: id,
+				Payload: jobspec.WaitFor{
+					Probe:    "getprop sys.boot_completed",
+					Interval: jobspec.Duration(time.Second),
+					Timeout:  jobspec.Duration(15 * time.Second),
+				},
+			})
+		default:
+			js.Steps = append(js.Steps, jobspec.Step{
+				ID:      id,
+				Payload: jobspec.Sleep{Duration: jobspec.Duration(r.scale(2 * time.Second))},
+			})
+		}
+	}
+
+	return r.insertJob(ctx, js, kind, steps, expected, maxRuntime, policy)
+}
+
+// insertJob validates and queues one generated spec.
+//
+// Validation happens here rather than at the call sites so that no path can
+// queue a job the runner will refuse: a demo that does that teaches the reader
+// the runner is broken when the fault is in the document.
+func (r *Runner) insertJob(ctx context.Context, js jobspec.Spec, kind string, steps int,
+	expected time.Duration, maxRuntime any, policy string) error {
+
+	if verr := jobspec.Validate(js); verr != nil {
+		return fmt.Errorf("demo: generated an invalid job spec: %w", verr)
+	}
+
+	spec, err := json.Marshal(js)
 	if err != nil {
 		return fmt.Errorf("demo: encode job spec: %w", err)
 	}
@@ -919,8 +995,8 @@ RETURNING id::text`
 	).Scan(&id); err != nil {
 		return fmt.Errorf("demo: insert job: %w", err)
 	}
-	r.log.Info("job queued", "job_id", short(id), "suite", kind, "steps", steps,
-		"disruption_policy", policy, "max_runtime", maxRuntime)
+	r.log.Info("job queued", "job_id", short(id), "suite", kind, "steps", len(js.Steps),
+		"work_units", steps, "disruption_policy", policy, "max_runtime", maxRuntime)
 	return nil
 }
 
@@ -960,7 +1036,11 @@ func (r *Runner) schedulerLoop(ctx context.Context) {
 
 func (r *Runner) schedulableJobs(ctx context.Context) ([]jobRow, error) {
 	const q = `
-SELECT j.id::text, j.state, COALESCE((j.spec->>'steps')::int, 8)
+-- steps is a jobspec array, not a count. It was an integer in the demo's
+-- own ad-hoc shape before internal/jobspec existed; reading it as one
+-- now fails every scheduling poll with SQLSTATE 22P02.
+SELECT j.id::text, j.state,
+       COALESCE(jsonb_array_length(j.spec->'steps'), 8)
   FROM farm.jobs j
  WHERE j.pool_id = $1
    AND (j.state = 'queued'

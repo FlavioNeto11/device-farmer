@@ -122,14 +122,19 @@ func run(args []string, stdout, stderr io.Writer) int {
 	switch role {
 	case "migrate":
 		err = runMigrate(ctx, rest, stdout, stderr)
-	case "api", "scheduler", "reaper", "watchdog", "recovery", "all", "demo":
+	case "api", "scheduler", "reaper", "watchdog", "recovery",
+		"jobrunner", "node", "all", "demo":
 		err = runRole(ctx, role, rest, stderr)
-	case "node":
-		err = notImplemented(role, stderr, config.Load)
 	case "ctl":
-		err = notImplemented(role, stderr, func(c string, o ...config.Option) (*config.Config, error) {
-			return config.Load(c, append(o, config.WithoutDatabase())...)
-		})
+		// ctl talks to the API over HTTP and never to the database, so it needs
+		// no DSN and must keep working when the control plane is the thing
+		// being investigated.
+		cfg, cerr := config.Load("ctl", config.WithoutDatabase())
+		if cerr != nil {
+			fmt.Fprintln(stderr, "Configuration preflight FAILED.")
+			return exitFailure
+		}
+		return runCtl(ctx, cfg, rest, stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "farmd: unknown role %q\n\n", role)
 		usage(stderr)
@@ -198,6 +203,10 @@ func runRole(ctx context.Context, role string, args []string, stderr io.Writer) 
 		return runRecovery(ctx, cfg, log, pool)
 	case "watchdog":
 		return runWatchdog(ctx, cfg, log, pool)
+	case "jobrunner":
+		return runJobRunner(ctx, cfg, log, pool)
+	case "node":
+		return runNode(ctx, cfg, log, pool)
 	case "all":
 		return runAll(ctx, cfg, log, pool, reg)
 	case "demo":
@@ -282,10 +291,11 @@ Roles:
   scheduler   matches queued jobs to free devices via farm.lease_acquire
   reaper      suspect sweep and the single automatic release path
   watchdog    device health only; it can never touch a lease
+  jobrunner   runs job specs on leased devices; re-attaches after an eviction
   recovery    the recovery ladder; acts for a holder that keeps its device
   all         every control-plane role in one process (laptop / single node)
   demo        simulated hardware plus the real control plane; needs no phones
-  node        per-host ADB proxy; enforces the fence at the resource
+  node        host agent: USB discovery, enrollment, and the hardware rungs
   ctl         operator CLI against the API
   version     build information
 

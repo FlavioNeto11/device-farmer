@@ -77,13 +77,43 @@ func openPool(ctx context.Context, cfg *config.Config) (*pgxpool.Pool, error) {
 }
 
 // newRegistry builds a metrics registry with the farm collectors installed.
+//
+// Every package that measures something is listed here. obs cannot fetch these
+// itself — six of the ten import it, so it has to stay a leaf (see
+// obs.RegisterAll) — which means this call site is the only thing standing
+// between a package's counters and /metrics. It was called with no groups at
+// all for long enough that nine of the ten sets were incremented at runtime and
+// reachable from no registry: every lease, scheduling and recovery counter
+// outside obs read as a loop that had never run. obs.TestEveryCollectorGroupIsRegistered
+// fails if a new package's Collectors() is ever left off this list.
+//
+// The list is not conditioned on the role, and one consequence is worth
+// knowing before reading a graph. /metrics is served by the api role alone
+// (internal/api/router.go), so in the split deployment in docker-compose.yml
+// the api process now publishes the loop counters at a permanent 0 while the
+// processes that increment them still expose no endpoint. Inside 'all' and
+// 'demo' — one process running every loop, which is what this binary is for —
+// the numbers are real. Making them real in the split shape needs a metrics
+// listener in the loop roles, not a shorter list here: trimming the list would
+// only put those packages back where they were, measured by nobody.
 func newRegistry(log *slog.Logger) (*prometheus.Registry, error) {
 	reg := prometheus.NewRegistry()
 
 	// A metric naming collision must not take down a control plane. Every
 	// counter this fails to register is a graph an operator loses; every
 	// lease it would have protected is one it does not. Log it and carry on.
-	if err := obs.RegisterAll(reg, log); err != nil {
+	if err := obs.RegisterAll(reg, log,
+		adbwire.Collectors(),
+		enroll.Collectors(),
+		janitor.Collectors(),
+		jobrunner.Collectors(),
+		node.Collectors(),
+		reaper.Collectors(),
+		recovery.Collectors(),
+		scheduler.Collectors(),
+		topo.Collectors(),
+		watchdog.Collectors(),
+	); err != nil {
 		log.Error("some metrics could not be registered; the control plane is "+
 			"running but /metrics is incomplete", "err", err)
 	}

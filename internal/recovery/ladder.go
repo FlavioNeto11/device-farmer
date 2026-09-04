@@ -757,9 +757,10 @@ VALUES ('hub_quarantined', $1::text, $2::jsonb)`,
 		return false, fmt.Errorf("recovery: commit hub quarantine: %w", err)
 	}
 
-	// The outcome is 'no_change' and not 'recovered' because nothing was
-	// repaired: scheduling stopped and a human was told.
-	attemptsTotal.WithLabelValues(t.Name, string(OutcomeNoChange)).Inc()
+	// The recorded outcome is 'no_change' and not 'recovered' because nothing
+	// was repaired: scheduling stopped and a human was told. obs folds that to
+	// failed, which is the same statement in its coarser vocabulary — never
+	// claim a recovery that cannot be proven.
 	obs.RecoveryAttempt(obs.Slot{Host: st.HostID, Hub: st.HubPath},
 		obsTier(t), obs.OutcomeFailed)
 	return true, nil
@@ -858,7 +859,6 @@ func (l *Ladder) attempt(ctx context.Context, c candidate, tiers []tier) {
 	out, detail := l.perform(ctx, c, t, log)
 	l.finish(ctx, attemptID, out, detail, log)
 
-	attemptsTotal.WithLabelValues(t.Name, string(out)).Inc()
 	obs.RecoveryAttempt(c.slot(), obsTier(t), obsOutcome(out))
 }
 
@@ -956,7 +956,6 @@ VALUES ($1::uuid, $2::bigint, $3::bigint, $4::text, $5::int, now(), 'refused', $
 		}
 		return
 	}
-	attemptsTotal.WithLabelValues(t.Name, string(OutcomeRefused)).Inc()
 	refusalsTotal.WithLabelValues(t.Name, string(kind)).Inc()
 	obs.RecoveryAttempt(c.slot(), obsTier(t), kind)
 }
@@ -1417,14 +1416,28 @@ var (
 		Help: "Recovery ladder cycles.",
 	})
 
-	// attemptsTotal keeps the database's exact vocabulary — nine tiers, five
-	// outcomes — without the physical-position labels obs carries, so the
-	// cardinality stays at tiers x outcomes.
-	attemptsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: "farm", Subsystem: "recovery", Name: "attempts_total",
-		Help: "Recovery attempts by tier name and farm.recovery_attempts.outcome. " +
-			"outcome=refused means a live lease's disruption_policy forbade the tier.",
-	}, []string{"tier", "outcome"})
+	// There is deliberately NO attempts counter here. Namespace "farm" +
+	// Subsystem "recovery" + Name "attempts_total" renders the same
+	// fully-qualified name as obs's farm_recovery_attempts_total, which carries
+	// {tier, outcome, host, hub, rack_slot} where this one carried only
+	// {tier, outcome}. Prometheus refuses the second registration of a name
+	// whose descriptors differ, and it refuses it for whichever collector
+	// arrives second — so registering this package's metrics alongside obs's
+	// cost one of the two sets its entire registration, and this package's
+	// counters went unregistered for as long as that stood.
+	//
+	// obs's declaration is the survivor because the documented alert
+	//
+	//	sum by (host, hub) (rate(farm_recovery_attempts_total{outcome="failed"}[15m]))
+	//
+	// needs the physical-position labels this one did not have, and correlating
+	// failures by hub — one page instead of twelve — is the whole point of that
+	// rule. Nothing is lost by the removal: every increment here already sat on
+	// the same line as an obs.RecoveryAttempt call recording the same event, so
+	// the pair was double-counting one attempt under one name. The exact rung
+	// and the exact outcome word, including 'no_change' which obs folds to
+	// failed, stay in farm.recovery_attempts where forensics belong; obsTier
+	// and obsOutcome document the folding.
 
 	refusalsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "farm", Subsystem: "recovery", Name: "refusals_total",
@@ -1463,7 +1476,7 @@ var (
 // Collectors returns this package's metrics for registration by the binary.
 func Collectors() []prometheus.Collector {
 	return []prometheus.Collector{
-		cyclesTotal, attemptsTotal, refusalsTotal, budgetSkips,
+		cyclesTotal, refusalsTotal, budgetSkips,
 		hubQuarantines, quarantinesCleared, candidatesGauge, beatFailures,
 	}
 }

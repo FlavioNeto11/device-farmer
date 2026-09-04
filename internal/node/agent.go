@@ -42,7 +42,9 @@
 // clocks would fuse the hardware plane into lease liveness, which is the exact
 // fusion this system exists to prevent. The component name defaults to
 // "node:<host id>" because farm.component_heartbeat is keyed by component: one
-// shared "node" key would let a healthy host's beat hide a dead host.
+// shared "node" key would let a healthy host's beat hide a dead host. A
+// component that does not name this host is refused by [New] for that reason,
+// rather than honoured into a farm that misreports which agents are alive.
 //
 // # host_epoch
 //
@@ -96,6 +98,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
@@ -190,6 +194,12 @@ type DiscoverFunc func(ctx context.Context) error
 // is supplied by internal/enroll. Returning early is treated as a fault and
 // the agent restarts it with backoff, because an agent that stops enrolling
 // silently stops adopting every device plugged in from then on.
+//
+// It is enroll.Enroller.Run, NOT EnrollOnce. Run owns enrollment's own cadence
+// and reports each cycle's summary; EnrollOnce performs a single pass and
+// returns, which means it reaches the fault path above on every healthy cycle
+// and the backoff that follows makes a farm adopt new devices more and more
+// slowly while warning that something is wrong. See [Agent.enrollLoop].
 type EnrollFunc func(ctx context.Context) error
 
 // Config is the agent's wiring. Pool and HostID are required.
@@ -320,6 +330,30 @@ func New(cfg Config) (*Agent, error) {
 			"not know which host it runs on would interpret every devpath against " +
 			"the wrong rack")
 	}
+	// Trimmed before anything is checked, so that the value validated here is
+	// the value stored below. Otherwise " node:h01 " passes a check on one
+	// string and writes another to farm.component_heartbeat, where the
+	// dashboard's prefix match no longer recognises it, and a whitespace-only
+	// name slips past the check below and then past applyDefaults, which only
+	// substitutes the per-host default for a name that is exactly empty.
+	cfg.HostID = strings.TrimSpace(cfg.HostID)
+	cfg.Component = strings.TrimSpace(cfg.Component)
+
+	// A heartbeat name that does not name this host is refused rather than
+	// honoured, because the damage it does is invisible.
+	// farm.component_heartbeat is keyed by component, so two hosts beating
+	// under one name write the SAME row and each keeps it fresh for the other:
+	// an operator then reads one healthy "node" while a rack sits dark, and if
+	// such a name ever reached FARM_REAPER_COMPONENTS a live host would be
+	// refunding lease time for a dead host's outage. This process cannot see
+	// the names its siblings on other hosts chose, so naming this host is the
+	// only property it can check on its own.
+	if cfg.Component != "" && !namesHost(cfg.Component, cfg.HostID) {
+		return nil, fmt.Errorf("node: Config.Component %q does not name host %q; "+
+			"farm.component_heartbeat is keyed by component, so a name shared between "+
+			"hosts lets one host's beat stand in for another's silence. Use %q",
+			cfg.Component, cfg.HostID, DefaultComponentPrefix+cfg.HostID)
+	}
 	if cfg.Addr != "" && cfg.Token == "" {
 		return nil, errors.New("node: Config.Token is required whenever Config.Addr " +
 			"is set; the node endpoint can cut power to ports holding live leases " +
@@ -342,6 +376,26 @@ func New(cfg Config) (*Agent, error) {
 		discoverNow:    make(chan struct{}, 1),
 		lastTransports: make(map[string]int64),
 	}, nil
+}
+
+// namesHost reports whether a farm.component_heartbeat key belongs to exactly
+// one host: the host id itself, or a name ending in a separator followed by it
+// — "node:h01" names h01, and so does "farmd-node/h01".
+//
+// The separator is what makes the test exact. A containment or bare suffix
+// test would accept "node:h01-spare" for host "h01", so two hosts whose ids
+// nest that way would beat under one name and keep each other's row fresh:
+// precisely the collision the caller is checking for.
+func namesHost(component, hostID string) bool {
+	if component == hostID {
+		return true
+	}
+	prefix, ok := strings.CutSuffix(component, hostID)
+	if !ok || prefix == "" {
+		return false
+	}
+	last, _ := utf8.DecodeLastRuneInString(prefix)
+	return !unicode.IsLetter(last) && !unicode.IsDigit(last)
 }
 
 // ---------------------------------------------------------------------------
@@ -758,10 +812,20 @@ func (a *Agent) enrollLoop(ctx context.Context) error {
 		}
 		if err != nil {
 			a.log.Warn("enrollment stopped with an error; restarting it",
-				"err", err, "in", backoff)
+				"err", err, "ran_for", time.Since(started), "in", backoff)
 		} else {
+			// This line must never appear on a healthy farm, so it names the
+			// mistake that produces it: Config.Enroll is required to run until
+			// its context ends (enroll.Run). A single-pass function
+			// (enroll.EnrollOnce) returns cleanly every cycle and reaches here
+			// every cycle, and the doubling below then makes a newly plugged
+			// handset wait longer and longer to be adopted — while an operator
+			// is trained to ignore the warning that says so.
 			a.log.Warn("enrollment returned without an error before the agent was asked "+
-				"to stop; restarting it", "in", backoff)
+				"to stop; restarting it. Config.Enroll must run until its context ends, "+
+				"the way enroll.Run does; a function that performs one pass and returns, "+
+				"the way enroll.EnrollOnce does, reaches this line on every healthy cycle",
+				"ran_for", time.Since(started), "in", backoff)
 		}
 
 		select {

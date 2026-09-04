@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/flaviopadilha/device-farmer/internal/adbwire"
 	"github.com/flaviopadilha/device-farmer/internal/api"
@@ -75,12 +77,146 @@ func openPool(ctx context.Context, cfg *config.Config) (*pgxpool.Pool, error) {
 }
 
 // newRegistry builds a metrics registry with the farm collectors installed.
-func newRegistry() (*prometheus.Registry, error) {
+//
+// Every package's collectors are registered in every role, not just the ones
+// this role will run. Prometheus counters exist from registration, so a series
+// that is registered and never touched exports a zero — and an alert written
+// over a series that does not exist yields no result and therefore never
+// fires. farm_jobrunner_release_errors_total must be armed from the first
+// scrape of a fresh process, not from the first casualty. The unused ones cost
+// one zero-valued line each.
+//
+// internal/api registers its own request series into whatever registry it is
+// handed, so they are absent here.
+//
+// A collector the registry refuses is skipped with a WARN rather than being
+// fatal. Two packages currently declare farm_recovery_attempts_total with
+// different label sets — internal/obs with the physical position, internal
+// /recovery without — and only one of them can win a registry. That
+// disagreement is worth fixing where it lives; it is not worth refusing to
+// start a scheduler over.
+func newRegistry(log *slog.Logger) (*prometheus.Registry, error) {
 	reg := prometheus.NewRegistry()
 	if err := obs.Register(reg); err != nil {
 		return nil, fmt.Errorf("register metrics: %w", err)
 	}
+	collectors := [][]prometheus.Collector{
+		adbwire.Collectors(),
+		enroll.Collectors(),
+		jobrunner.Collectors(),
+		node.Collectors(),
+		reaper.Collectors(),
+		recovery.Collectors(),
+		scheduler.Collectors(),
+		topo.Collectors(),
+		watchdog.Collectors(),
+	}
+	for _, set := range collectors {
+		for _, c := range set {
+			err := reg.Register(c)
+			if err == nil {
+				continue
+			}
+			var dup prometheus.AlreadyRegisteredError
+			if errors.As(err, &dup) {
+				continue
+			}
+			log.Warn("a metric could not be registered and will not be exported",
+				"err", err,
+				"consequence", "an alert written over that series will never fire")
+		}
+	}
 	return reg, nil
+}
+
+// withMetrics runs a role with a /metrics listener beside it on
+// FARM_METRICS_ADDR.
+//
+// Only the api role served metrics before this, off its own listener, so every
+// other role — the scheduler that allocates, the reaper that is the sole
+// automatic release path, the jobrunner that holds the leases — exported
+// nothing at all. farm_lease_reaped_total{reason="holder_expired"} and
+// farm_lease_renew_failures_total{kind="fenced"} are the two series that mean
+// work was destroyed, and they are incremented by exactly those roles.
+//
+// The API keeps /metrics on its own listener too. Serving the same registry on
+// two addresses costs nothing and lets one scrape configuration name one port
+// for every role in the farm.
+//
+// The listener is bound BEFORE the role starts, so a port that is already
+// taken is a startup failure naming FARM_METRICS_ADDR rather than a role that
+// comes up healthy and exports nothing. A listener that dies later is only
+// logged: an already-running control plane must not be torn down because a
+// scrape endpoint went away, since tearing it down is what stops leases being
+// renewed.
+func withMetrics(ctx context.Context, cfg *config.Config, log *slog.Logger, reg *prometheus.Registry, role func(context.Context) error) error {
+	addr, want := cfg.MetricsListenAddr()
+	if !want {
+		// Either metrics are switched off, or this role's API server is
+		// already publishing the same registry at the same address. Which of
+		// the two it is belongs in the startup summary, not in a second line
+		// here.
+		return role(ctx)
+	}
+
+	srv, ln, err := newMetricsServer(addr, reg)
+	if err != nil {
+		return err
+	}
+	log.Info("metrics listening", "addr", ln.Addr().String(), "path", "/metrics")
+
+	served := make(chan struct{})
+	go func() {
+		defer close(served)
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Error("the metrics listener stopped; this process is still doing its work "+
+				"but is now invisible to scrapes", "err", err, "addr", addr)
+		}
+	}()
+	defer func() {
+		// The parent context is already cancelled by the time this runs, so the
+		// shutdown deadline is taken from the process's grace rather than from
+		// a context that has none left.
+		stop, cancel := context.WithTimeout(context.WithoutCancel(ctx), cfg.ShutdownGrace)
+		defer cancel()
+		_ = srv.Shutdown(stop)
+		<-served
+	}()
+
+	return role(ctx)
+}
+
+// newMetricsServer builds the metrics listener. Split out of withMetrics so a
+// test can bind it without running a role.
+func newMetricsServer(addr string, reg *prometheus.Registry) (*http.Server, net.Listener, error) {
+	mux := http.NewServeMux()
+	mux.Handle("GET /metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{
+		Registry:          reg,
+		ErrorHandling:     promhttp.ContinueOnError,
+		EnableOpenMetrics: true,
+	}))
+	// A liveness endpoint that answers without touching Postgres. A role whose
+	// database is unreachable is unhealthy, but it is NOT a role that should be
+	// restarted: restarting it is how a control-plane outage becomes a
+	// mass-reclaim once the gap refund stops being written.
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		_, _ = io.WriteString(w, "ok\n")
+	})
+
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, nil, fmt.Errorf("%s=%s: listen: %w (set it to a free port, "+
+			"or to %q to serve no metrics endpoint)",
+			config.EnvMetricsAddr, addr, err, config.MetricsOff)
+	}
+	return &http.Server{
+		Handler: mux,
+		// This listener is exposed in the same sense the API's is, and a
+		// half-open connection that never sends a header must not hold a slot
+		// forever.
+		ReadHeaderTimeout: 10 * time.Second,
+	}, ln, nil
 }
 
 // runGroup runs every function until the context ends, and returns the first
@@ -120,6 +256,18 @@ func runGroup(ctx context.Context, fns map[string]func(context.Context) error) e
 // ---------------------------------------------------------------------------
 
 func runAPI(ctx context.Context, cfg *config.Config, log *slog.Logger, pool *pgxpool.Pool, reg *prometheus.Registry) error {
+	// The server reads cfg.Component for its heartbeat. Inside `all` and `demo`
+	// that field names the PROCESS ("all", "demo"), so the API was beating
+	// under a key farm.reaper_arm does not watch: its outage was invisible to
+	// gap accounting while every other component's was refunded. A copy is
+	// taken rather than mutating the shared config, because five other roles in
+	// this process are reading the same struct.
+	if name := cfg.ComponentFor("api"); name != cfg.Component {
+		dup := *cfg
+		dup.Component = name
+		cfg = &dup
+	}
+
 	opts := []api.Option{
 		api.WithLogger(log),
 		api.WithRegistry(reg),
@@ -168,7 +316,7 @@ func runScheduler(ctx context.Context, cfg *config.Config, log *slog.Logger, poo
 	s, err := scheduler.New(scheduler.Config{
 		Pool:           pool,
 		Store:          lease.NewStore(pool),
-		Component:      "scheduler",
+		Component:      cfg.ComponentFor("scheduler"),
 		Holder:         hostname(),
 		HolderInstance: inst,
 		SlotRearm:      cfg.Lease.SlotRearm,
@@ -184,7 +332,7 @@ func runReaper(ctx context.Context, cfg *config.Config, log *slog.Logger, pool *
 	r, err := reaper.New(reaper.Config{
 		Pool:       pool,
 		Store:      lease.NewStore(pool),
-		Component:  "reaper",
+		Component:  cfg.ComponentFor("reaper"),
 		Interval:   cfg.Reaper.Interval,
 		Batch:      cfg.Reaper.Batch,
 		GapFloor:   cfg.Reaper.GapFloor,
@@ -204,7 +352,7 @@ func runRecovery(ctx context.Context, cfg *config.Config, log *slog.Logger, pool
 	l, err := recovery.New(recovery.Config{
 		Pool:      pool,
 		Actuator:  recovery.NewADBActuator(log, nil),
-		Component: "recovery",
+		Component: cfg.ComponentFor("recovery"),
 		Logger:    log,
 	})
 	if err != nil {
@@ -232,7 +380,7 @@ func watchdogsForHosts(ctx context.Context, cfg *config.Config, log *slog.Logger
 		}
 		cfgCopy := watchdog.Config{
 			Pool:        pool,
-			Component:   "watchdog:" + id,
+			Component:   cfg.ComponentFor("watchdog") + ":" + id,
 			HostID:      id,
 			ADBEndpoint: endpoint,
 			Interval:    cfg.WatchdogInterval,
@@ -255,7 +403,7 @@ func runWatchdog(ctx context.Context, cfg *config.Config, log *slog.Logger, pool
 	if cfg.Node.HostID != "" {
 		w, err := watchdog.New(watchdog.Config{
 			Pool:        pool,
-			Component:   "watchdog:" + cfg.Node.HostID,
+			Component:   cfg.ComponentFor("watchdog") + ":" + cfg.Node.HostID,
 			HostID:      cfg.Node.HostID,
 			ADBEndpoint: cfg.Node.ADBEndpoint,
 			Interval:    cfg.WatchdogInterval,
@@ -421,7 +569,7 @@ func runJobRunner(ctx context.Context, cfg *config.Config, log *slog.Logger, poo
 		Pool:           pool,
 		Store:          lease.NewStore(pool),
 		Runner:         exec,
-		Component:      "jobrunner",
+		Component:      cfg.ComponentFor("jobrunner"),
 		Holder:         hostname(),
 		HolderInstance: inst,
 		// One ADB client per device connection. The client is a dialer rather
@@ -429,6 +577,23 @@ func runJobRunner(ctx context.Context, cfg *config.Config, log *slog.Logger, poo
 		// failures to itself.
 		Dial: func(endpoint, devpath string) (runner.Conn, error) {
 			return jobrunner.NewDeviceConn(adbwire.New(endpoint), devpath)
+		},
+		// The renewal cadence is how a holder proves it is alive, so it is the
+		// one timing knob that is load bearing on the invariant. Without this
+		// field the loop fell back to lease.DefaultRenewInterval and
+		// FARM_LEASE_RENEW_INTERVAL changed nothing — including in the
+		// direction that matters: an operator who raised the lease TTL and
+		// slowed renewal to match got the old fast cadence, and one who
+		// LOWERED the TTL toward the floor got a cadence config had checked
+		// against a TTL the holder was not using. The startup assertion that
+		// three renewals must fit inside one TTL was being made about a number
+		// with no destination.
+		HolderConfig: lease.HolderConfig{
+			Interval: cfg.Lease.RenewInterval,
+			// Caps consecutive witness-only extensions. It reaches
+			// farm.lease_witness as p_max_extensions — for whenever something
+			// in this build starts producing a witness; nothing does yet.
+			WitnessMaxExtensions: cfg.Lease.MaxWitnessExtensions,
 		},
 		SlotRearm: cfg.Lease.SlotRearm,
 		Logger:    log,

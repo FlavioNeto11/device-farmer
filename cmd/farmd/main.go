@@ -46,6 +46,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/signal"
 	"runtime"
@@ -63,13 +64,19 @@ var (
 )
 
 // Exit codes. They are distinct so a supervisor, a CI step, or a human reading
-// a CrashLoopBackOff can tell "you typed it wrong" from "it broke" from "that
-// role does not exist yet".
+// a CrashLoopBackOff can tell "you typed it wrong" from "it broke".
+//
+// There is no code 3 here. There used to be one meaning "not implemented", for
+// roles that existed in this usage text and nowhere else; every role now
+// dispatches, so nothing could return it. Code 3 is not free, either: `farmd
+// ctl` exits with ctl.ExitCode, where 3 means the remote REFUSED an action —
+// a 409, which is an answer rather than a failure. A second meaning for the
+// same number in the same binary is how a rollout script comes to treat a
+// refusal as a missing feature.
 const (
-	exitOK             = 0
-	exitFailure        = 1
-	exitUsage          = 2
-	exitNotImplemented = 3
+	exitOK      = 0
+	exitFailure = 1
+	exitUsage   = 2
 )
 
 func main() {
@@ -146,8 +153,6 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return exitOK
 	case errors.Is(err, errUsage):
 		return exitUsage
-	case errors.Is(err, errNotImplemented):
-		return exitNotImplemented
 	case errors.Is(err, context.Canceled):
 		// A signal during a long operation is an orderly stop, but it did not
 		// finish, so it is not a success either.
@@ -187,67 +192,46 @@ func runRole(ctx context.Context, role string, args []string, stderr io.Writer) 
 	// grace band, a control-plane gap refund and a quiesce gate.
 	defer pool.Close()
 
-	reg, err := newRegistry()
+	reg, err := newRegistry(log)
 	if err != nil {
 		return err
 	}
 
+	var fn func(context.Context) error
 	switch role {
 	case "api":
-		return runAPI(ctx, cfg, log, pool, reg)
+		fn = func(c context.Context) error { return runAPI(c, cfg, log, pool, reg) }
 	case "scheduler":
-		return runScheduler(ctx, cfg, log, pool)
+		fn = func(c context.Context) error { return runScheduler(c, cfg, log, pool) }
 	case "reaper":
-		return runReaper(ctx, cfg, log, pool)
+		fn = func(c context.Context) error { return runReaper(c, cfg, log, pool) }
 	case "recovery":
-		return runRecovery(ctx, cfg, log, pool)
+		fn = func(c context.Context) error { return runRecovery(c, cfg, log, pool) }
 	case "watchdog":
-		return runWatchdog(ctx, cfg, log, pool)
+		fn = func(c context.Context) error { return runWatchdog(c, cfg, log, pool) }
 	case "jobrunner":
-		return runJobRunner(ctx, cfg, log, pool)
+		fn = func(c context.Context) error { return runJobRunner(c, cfg, log, pool) }
 	case "node":
-		return runNode(ctx, cfg, log, pool)
+		fn = func(c context.Context) error { return runNode(c, cfg, log, pool) }
 	case "all":
-		return runAll(ctx, cfg, log, pool, reg)
+		fn = func(c context.Context) error { return runAll(c, cfg, log, pool, reg) }
 	case "demo":
-		return runDemo(ctx, cfg, log, pool, reg, *hosts, *devices)
+		fn = func(c context.Context) error { return runDemo(c, cfg, log, pool, reg, *hosts, *devices) }
+	default:
+		return fmt.Errorf("unreachable role %q", role)
 	}
-	return fmt.Errorf("unreachable role %q", role)
-}
 
-// errNotImplemented marks a role that exists in the CLI surface but has no
-// implementation compiled in yet.
-var errNotImplemented = errors.New("not yet implemented")
-
-// notImplemented refuses loudly. A role that silently no-ops is worse than a
-// missing binary: the pod goes Ready, the readiness probe passes, and the farm
-// looks healthy while nothing renews a lease.
-//
-// It still runs the configuration preflight first, so that a manifest with a
-// bad lease/fence relationship is rejected the day it is written rather than
-// the day the role starts working.
-//
-// A failed preflight is reported as a FAILURE (exit 1), not as
-// not-implemented (exit 3). The two codes exist to be told apart: a CI gate or
-// a rollout script that tolerates "this role is not built yet" must not also
-// tolerate "your slot rearm is shorter than the node's self-fence timeout",
-// which is a manifest that will hand one phone to two jobs the moment the role
-// does ship.
-func notImplemented(role string, stderr io.Writer, load func(string, ...config.Option) (*config.Config, error)) error {
-	fmt.Fprintf(stderr, "farmd %s: %s in this build.\n\n", role, errNotImplemented)
-	fmt.Fprintf(stderr,
-		"The %q role is part of farmd's committed surface, but its implementation is\n"+
-			"not wired into this binary. Exiting %d so a supervisor restarts and a deploy\n"+
-			"fails visibly, instead of leaving a process that looks alive and does nothing.\n\n",
-		role, exitNotImplemented)
-
-	cfg, err := load(role)
-	if err != nil {
-		fmt.Fprintln(stderr, "Configuration preflight FAILED; that is the more urgent problem.")
-		return err
+	// Say what this process actually decided, before it starts deciding with
+	// it. The alternative is an operator reading a manifest and inferring the
+	// resolved values — which is how a farm gets debugged against a lease TTL
+	// it is not running, and how a variable that reaches nothing goes years
+	// without anyone noticing. Suppressed below info level, because an
+	// operator who asked for warnings only has asked for this too.
+	if log.Enabled(ctx, slog.LevelInfo) {
+		fmt.Fprintf(stderr, "farmd %s: resolved configuration\n%s\n", role, indent(cfg.Summary()))
 	}
-	fmt.Fprintf(stderr, "Configuration preflight passed:\n%s\n", indent(cfg.Summary()))
-	return errNotImplemented
+
+	return withMetrics(ctx, cfg, log, reg, fn)
 }
 
 func indent(s string) string {
@@ -301,6 +285,10 @@ Roles:
 
 Every role reads its configuration from the environment; DATABASE_URL is
 required by all of them except ctl. Run "farmd migrate -h" for its flags.
+
+Each role prints its resolved configuration at startup and serves /metrics on
+FARM_METRICS_ADDR (default :9090; set it to "off" for no metrics listener).
+The api role also serves /metrics on its own listener.
 
 SIGTERM and SIGINT drain in-flight work. They do not release leases: a pod
 eviction is not evidence that the job on the phone died, and the replacement

@@ -23,6 +23,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"strconv"
@@ -115,13 +116,60 @@ const (
 	DefaultDBConnectTimeout = 10 * time.Second
 
 	DefaultMigrationsTable = "public.goose_db_version"
+
+	// MetricsOff is the value of FARM_METRICS_ADDR that means "serve no
+	// metrics listener". An empty string cannot mean it: an empty environment
+	// variable is indistinguishable from an unset one here (see loader.raw),
+	// so opting out needs a word.
+	MetricsOff = "off"
 )
 
-// DefaultReaperComponents matches farm.reaper_arm's own default. Every
-// component on the renewal path must appear here or a control-plane outage in
-// the missing component is invisible to gap accounting — the failure mode
+// DefaultReaperComponents lists every component whose downtime must be
+// refunded to live leases. A component on the renewal path that is missing
+// from this list is a blind spot: farm.reaper_arm takes min(beat_at) over the
+// components it is given, a component with no row is simply absent from that
+// minimum, and so its outage is invisible to gap accounting — the failure mode
 // called out as BLOCKER 8 in migrations/00002_lease.sql.
-var DefaultReaperComponents = []string{"reaper", "api", "scheduler"}
+//
+// It deliberately carries one name more than farm.reaper_arm's own SQL default
+// of ('reaper','api','scheduler'): the jobrunner holds the leases whose
+// deadlines the reaper enforces, so a jobrunner outage is precisely the outage
+// the refund exists for. The SQL default is only reachable by a hand-typed
+// psql call; every farmd process passes this list explicitly.
+//
+// The list is what a farm RUNS, not what it could run. farm.reaper_arm refunds
+// now()-min(beat_at) across the rows that exist, so a component that beat once
+// and was then scaled to zero leaves a stale row that refunds every second
+// since it left to every live lease, on every arm. Remove a component from
+// this list when you remove it from the farm — and delete its heartbeat row.
+var DefaultReaperComponents = []string{"reaper", "api", "scheduler", "jobrunner"}
+
+// roleComponents is what each farmd role actually writes to
+// farm.component_heartbeat. It is the difference between a knob that renames a
+// process and a knob that renames one row, and it is what lets the BLOCKER 8
+// assertion below cover a process that runs six components rather than one.
+//
+// An empty list means the role beats for nothing at all: migrate exits, and
+// ctl talks to the API over HTTP and never touches Postgres.
+//
+// The watchdog's real key carries a ":<host id>" suffix, because health is
+// per-host and one shared "watchdog" row would let a healthy host's beat hide
+// a dead one. The suffix is not known until farm.hosts is read, so the base
+// name stands for it here. internal/node documents the same intent for the
+// node agent, though cmd/farmd does not yet pass a per-host name through.
+var roleComponents = map[string][]string{
+	"api":       {"api"},
+	"scheduler": {"scheduler"},
+	"reaper":    {"reaper"},
+	"recovery":  {"recovery"},
+	"jobrunner": {"jobrunner"},
+	"watchdog":  {"watchdog"},
+	"node":      {"node", "enroll"},
+	"all":       {"api", "scheduler", "reaper", "recovery", "jobrunner", "watchdog"},
+	"demo":      {"api", "scheduler", "reaper", "recovery", "jobrunner", "watchdog"},
+	"ctl":       {},
+	"migrate":   {},
+}
 
 // Lease holds the only clock that may end a lease on a timer: lease liveness.
 // Job progress and device health have their own clocks elsewhere and are never
@@ -140,6 +188,13 @@ type Lease struct {
 	RenewInterval time.Duration
 	// WitnessInterval is the period of farm.lease_witness, the on-device
 	// proof that the holder is alive.
+	//
+	// NOTHING IN THIS BUILD PRODUCES A WITNESS. No caller of
+	// lease.Store.Witness exists outside its own tests, so this value has no
+	// loop to pace. It is still validated against Grace, because the check is
+	// what makes a witness producer safe to add, and Summary states the gap out
+	// loud so that an operator who sets it is not left believing a witness is
+	// being written.
 	WitnessInterval time.Duration
 	// MaxWitnessExtensions caps consecutive witness-only extensions so a
 	// wedged holder cannot hold a device forever on device-side evidence.
@@ -174,6 +229,10 @@ type Node struct {
 type Config struct {
 	// Component is the name written by farm.component_beat. It must match the
 	// name the reaper looks for, or this process's downtime is not refunded.
+	//
+	// Wire it through ComponentFor rather than reading it directly: a process
+	// that runs several components writes several rows, and this field names
+	// none of them.
 	Component string
 	LogLevel  string
 	// ShutdownGrace bounds in-flight request draining ONLY. It must never be
@@ -184,7 +243,12 @@ type Config struct {
 	DBMaxConns       int32
 	DBConnectTimeout time.Duration
 
-	APIAddr     string
+	APIAddr string
+	// MetricsAddr is where a role that is not the API binds its own /metrics
+	// listener. The API serves /metrics off its own listener, so for that role
+	// this is a second address carrying the same registry — which is what lets
+	// one scrape config point at one port for every role in the farm.
+	// MetricsOff disables it.
 	MetricsAddr string
 	NodeAddr    string
 	APIBaseURL  string
@@ -284,6 +348,104 @@ func Load(component string, opts ...Option) (*Config, error) {
 		return nil, fmt.Errorf("invalid configuration:\n%w", errors.Join(errs...))
 	}
 	return cfg, nil
+}
+
+// Role returns the subcommand this configuration was loaded for. It is what
+// the process does; Component is what it is called.
+func (c *Config) Role() string { return c.role }
+
+// multiplexed reports whether this process runs several components at once.
+//
+// Such a process cannot be renamed by FARM_COMPONENT: each component it runs
+// writes its own farm.component_heartbeat row, and one name cannot stand for
+// all of them without one component's beat hiding another's silence. The node
+// role is deliberately not here — its enroll loop is subordinate to the agent
+// that runs it, on one host, and the two are named together.
+func (c *Config) multiplexed() bool {
+	switch c.role {
+	case "all", "demo":
+		return true
+	}
+	return false
+}
+
+// beats returns the canonical names of the components this process runs.
+func (c *Config) beats() []string {
+	if names, ok := roleComponents[c.role]; ok {
+		return names
+	}
+	// A role this package has not been told about is assumed to beat under its
+	// own name. Guessing wrong here costs an unnecessary assertion; guessing
+	// the other way would silently drop the BLOCKER 8 check for it.
+	return []string{c.role}
+}
+
+// ComponentFor returns the farm.component_heartbeat key this process must use
+// for the named component.
+//
+// FARM_COMPONENT renames the component a process IS: `farmd scheduler` with
+// FARM_COMPONENT=scheduler-a beats as "scheduler-a", which is how two
+// schedulers, or a canary and its fleet, are told apart in gap accounting. It
+// does not rename the components a process merely CONTAINS: inside `all` and
+// `demo` each component keeps its canonical name, and Load refuses an override
+// there rather than accepting one and discarding it.
+func (c *Config) ComponentFor(component string) string {
+	if !c.multiplexed() && component == c.role {
+		return c.Component
+	}
+	return component
+}
+
+// HeartbeatComponents returns every farm.component_heartbeat key this process
+// writes, in the order the role runs them. The watchdog and node entries are
+// base names; their real keys carry a ":<host id>" suffix.
+func (c *Config) HeartbeatComponents() []string {
+	canon := c.beats()
+	out := make([]string, 0, len(canon))
+	for _, name := range canon {
+		out = append(out, c.ComponentFor(name))
+	}
+	return out
+}
+
+// MetricsDisabled reports whether the operator asked for no metrics listener.
+func (c *Config) MetricsDisabled() bool {
+	return strings.EqualFold(strings.TrimSpace(c.MetricsAddr), MetricsOff)
+}
+
+// bindsMetrics reports whether this role has a process to hang a metrics
+// listener off at all. ctl is a one-shot command against the API and migrate
+// exits; neither has a scrape interval to be visible across, and validating an
+// address they will never bind would make a stray variable in a shared
+// environment break the one command an operator reaches for when the control
+// plane is the thing being investigated.
+func (c *Config) bindsMetrics() bool {
+	switch c.role {
+	case "ctl", "migrate":
+		return false
+	}
+	return !c.MetricsDisabled()
+}
+
+// MetricsListenAddr returns the address this process must bind its own
+// /metrics listener on, and whether it must bind one at all.
+//
+// It answers false when metrics are switched off, when the role is not a
+// long-running one, and when this role's API server already publishes the same
+// registry at the same address — for `api`, `all` and `demo` a second bind
+// there would fail on a port that is already serving exactly what was asked
+// for.
+func (c *Config) MetricsListenAddr() (string, bool) {
+	if !c.bindsMetrics() {
+		return "", false
+	}
+	switch c.role {
+	case "api", "all", "demo":
+		if sameListenAddr(c.MetricsAddr, c.APIAddr) {
+			return "", false
+		}
+	}
+	return c.MetricsAddr, true
 }
 
 // Validate checks every invariant except the presence of DATABASE_URL, which
@@ -404,17 +566,45 @@ Fix by raising %s above %s + %s, or by lowering the proxy's self-fence timeout.`
 	// BLOCKER 8: a component on the renewal path that is not watched is a
 	// blind spot big enough to mass-reclaim the farm.
 	//
-	// The role is consulted as well as the name. Testing only the name would
-	// let FARM_COMPONENT=api-canary switch the guard off for a process that is
-	// still very much on the renewal path: farm.component_beat would write
-	// "api-canary", farm.reaper_arm would not be watching it, and the canary's
-	// downtime would be invisible to gap accounting.
-	if (onRenewalPath(c.role) || onRenewalPath(c.Component)) &&
-		!contains(c.Reaper.Components, c.Component) {
-		fail("component %q is on the lease renewal path but is missing from %s (%s). "+
-			"If this component is down while the reaper is healthy, no gap is recorded "+
-			"and every unprotected lease is reclaimed once TTL+grace elapses",
-			c.Component, EnvReaperComponent, strings.Join(c.Reaper.Components, ","))
+	// The assertion walks every component this PROCESS runs, not just the one
+	// it is named after. A role that multiplexes — `all`, `demo` — puts an API,
+	// a scheduler, a reaper and a jobrunner on the renewal path under one
+	// process name, and asking only about that name let all four through.
+	//
+	// The resolved key is what is checked, not the canonical one. Testing only
+	// the canonical name would let FARM_COMPONENT=api-canary switch the guard
+	// off for a process that is still very much on the renewal path:
+	// farm.component_beat would write "api-canary", farm.reaper_arm would not
+	// be watching it, and the canary's downtime would be invisible.
+	for _, canon := range c.beats() {
+		name := c.ComponentFor(canon)
+		switch {
+		case onRenewalPath(canon) && !contains(c.Reaper.Components, name):
+			fail("component %q is on the lease renewal path but is missing from %s (%s). "+
+				"If this component is down while the reaper is healthy, no gap is recorded "+
+				"and every unprotected lease is reclaimed once TTL+grace elapses",
+				name, EnvReaperComponent, strings.Join(c.Reaper.Components, ","))
+		case !onRenewalPath(canon) && onRenewalPath(name):
+			// The mirror-image blind spot. A watchdog renamed "api" writes the
+			// API's heartbeat row, so farm.reaper_arm reads a fresh beat for a
+			// component that may have been dead for an hour and refunds
+			// nothing. The masquerade is worse than the silence it replaces.
+			fail("%s renames the %q component of this process to %q, which is the heartbeat "+
+				"key of a component ON the lease renewal path. Its beat would stand in for "+
+				"that component's, so a real outage there would be refunded to no lease",
+				EnvComponent, canon, name)
+		}
+	}
+	// FARM_COMPONENT on a role that runs several components at once was read,
+	// validated, and then applied to nothing. Refusing is the only honest
+	// answer: silently ignoring it is how an operator ends up believing a
+	// canary is named apart when it is not.
+	if c.multiplexed() && c.Component != c.role {
+		fail("%s=%q cannot be honoured by the %q role: it runs %s in one process, each "+
+			"writing its own farm.component_heartbeat row, so one name cannot stand for "+
+			"all of them. Run the component as its own process to rename it, or unset %s",
+			EnvComponent, c.Component, c.role,
+			strings.Join(roleComponents[c.role], ", "), EnvComponent)
 	}
 
 	// ---- identity and addresses --------------------------------------
@@ -437,6 +627,14 @@ Fix by raising %s above %s + %s, or by lowering the proxy's self-fence timeout.`
 	}
 	if c.WatchdogInterval <= 0 {
 		fail("%s must be positive", EnvWatchdogInterval)
+	}
+	// The metrics address is a listener now, so a malformed one is a bind
+	// failure at startup rather than a string nobody reads.
+	if c.bindsMetrics() {
+		if err := checkListenAddr(c.MetricsAddr); err != nil {
+			fail("%s (%q): %v — or %q to serve no metrics endpoint at all",
+				EnvMetricsAddr, c.MetricsAddr, err, MetricsOff)
+		}
 	}
 	// ctl reaches the API through this, and a base URL without a scheme joins
 	// into a request path instead of a host. Catch it at boot rather than as a
@@ -488,21 +686,48 @@ func (c *Config) RedactedDatabaseURL() string {
 }
 
 // Summary is a one-line-per-field dump for startup logs.
+//
+// It is printed by every role that starts, because the alternative — an
+// operator reading a manifest and inferring what the process decided — is how
+// a farm ends up being debugged against values it is not running. Where a
+// value has no destination in this build, the line says so rather than
+// implying one.
 func (c *Config) Summary() string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "component        = %s\n", c.Component)
-	fmt.Fprintf(&b, "database         = %s\n", c.RedactedDatabaseURL())
+	fmt.Fprintf(&b, "role             = %s\n", c.role)
+	fmt.Fprintf(&b, "heartbeats as    = %s (every %s)\n",
+		strings.Join(c.HeartbeatComponents(), ", "), c.Reaper.HeartbeatInterval)
+	fmt.Fprintf(&b, "database         = %s (max %d conns, connect timeout %s)\n",
+		c.RedactedDatabaseURL(), c.DBMaxConns, c.DBConnectTimeout)
 	fmt.Fprintf(&b, "api addr         = %s\n", c.APIAddr)
-	fmt.Fprintf(&b, "metrics addr     = %s\n", c.MetricsAddr)
+	if c.MetricsDisabled() {
+		fmt.Fprintf(&b, "metrics addr     = %s (no /metrics listener)\n", MetricsOff)
+	} else {
+		fmt.Fprintf(&b, "metrics addr     = %s\n", c.MetricsAddr)
+	}
 	fmt.Fprintf(&b, "node addr        = %s\n", c.NodeAddr)
 	fmt.Fprintf(&b, "lease ttl/grace  = %s / %s\n", c.Lease.TTL, c.Lease.Grace)
-	fmt.Fprintf(&b, "renew / witness  = %s / %s\n", c.Lease.RenewInterval, c.Lease.WitnessInterval)
+	fmt.Fprintf(&b, "renew interval   = %s (%d renewal attempts inside one ttl)\n",
+		c.Lease.RenewInterval, c.renewAttempts())
+	fmt.Fprintf(&b, "witness          = every %s, at most %d extensions — NOT PRODUCED: "+
+		"nothing in this build calls farm.lease_witness\n",
+		c.Lease.WitnessInterval, c.Lease.MaxWitnessExtensions)
 	fmt.Fprintf(&b, "slot rearm       = %s (node self-fence %s + margin %s)\n",
 		c.Lease.SlotRearm, c.Node.SelfFenceTimeout, c.Node.FenceSafetyMargin)
 	fmt.Fprintf(&b, "reaper           = every %s, batch %d, gap floor %s, watching %s\n",
 		c.Reaper.Interval, c.Reaper.Batch, c.Reaper.GapFloor,
 		strings.Join(c.Reaper.Components, ","))
+	fmt.Fprintf(&b, "shutdown grace   = %s (drains requests; releases nothing)\n", c.ShutdownGrace)
 	return b.String()
+}
+
+// renewAttempts is how many renewals fit inside one TTL, which is the number
+// the MinRenewAttempts assertion is really about.
+func (c *Config) renewAttempts() int {
+	if c.Lease.RenewInterval <= 0 {
+		return 0
+	}
+	return int(c.Lease.TTL / c.Lease.RenewInterval)
 }
 
 // ---------------------------------------------------------------------
@@ -591,13 +816,23 @@ func (l *loader) list(key string, def []string) []string {
 	return out
 }
 
-// onRenewalPath reports whether a role's downtime can stop leases from being
-// renewed, and therefore must be covered by gap accounting. It is asked about
-// both the role and the configured component name, because either one being on
-// the path is enough to require a heartbeat the reaper watches.
+// onRenewalPath reports whether a component's downtime can stop leases from
+// being renewed, and therefore must be covered by gap accounting.
+//
+// The jobrunner belongs here and was missing: it is the process that HOLDS the
+// leases the reaper enforces deadlines against, so its outage is the one the
+// refund exists for. Its own package says as much (jobrunner.DefaultComponent),
+// and the guard was letting it be omitted from FARM_REAPER_COMPONENTS without
+// a word.
+//
+// The list is deliberately short. The watchdog, the recovery ladder, the node
+// agent and enrollment must NOT be on it: they are on the health side of the
+// firewall, and letting their downtime move a lease deadline would fuse the
+// hardware plane into lease liveness — the exact fusion this system exists to
+// prevent.
 func onRenewalPath(component string) bool {
 	switch component {
-	case "api", "scheduler", "reaper":
+	case "api", "scheduler", "reaper", "jobrunner":
 		return true
 	}
 	return false
@@ -633,6 +868,56 @@ func validComponentName(s string) error {
 		}
 	}
 	return nil
+}
+
+// checkListenAddr rejects anything net.Listen would reject for a reason we can
+// name now rather than at bind time. A bare port ("9090") is the mistake this
+// catches: it is not a listen address, and the process would otherwise die
+// several seconds into startup with a message about a missing port.
+func checkListenAddr(addr string) error {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("must be a listen address such as \":9090\" or \"127.0.0.1:9090\": %w", err)
+	}
+	if port == "" {
+		return errors.New("has no port")
+	}
+	if _, err := strconv.Atoi(port); err != nil {
+		if _, lerr := net.LookupPort("tcp", port); lerr != nil {
+			return fmt.Errorf("port %q is neither a number nor a known service name", port)
+		}
+	}
+	if host != "" {
+		if ip := net.ParseIP(host); ip == nil && strings.ContainsAny(host, "/\\ ") {
+			return fmt.Errorf("host %q is not an address", host)
+		}
+	}
+	return nil
+}
+
+// sameListenAddr reports whether two listen addresses would contend for the
+// same socket. A string comparison is not enough: ":9090", "0.0.0.0:9090" and
+// "[::]:9090" are three spellings of the same bind, and treating them as
+// different is how a role comes to refuse to start on a port conflict it
+// created with itself.
+func sameListenAddr(a, b string) bool {
+	if a == b {
+		return true
+	}
+	ah, ap, aerr := net.SplitHostPort(a)
+	bh, bp, berr := net.SplitHostPort(b)
+	if aerr != nil || berr != nil || ap != bp {
+		return false
+	}
+	return ah == bh || isWildcardHost(ah) && isWildcardHost(bh)
+}
+
+func isWildcardHost(host string) bool {
+	switch host {
+	case "", "0.0.0.0", "::", "[::]":
+		return true
+	}
+	return false
 }
 
 // checkDSN accepts both libpq URL form and keyword/value form, which are both

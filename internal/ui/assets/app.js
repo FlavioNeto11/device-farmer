@@ -492,7 +492,7 @@ function normEvent(raw, source) {
  * State
  * ------------------------------------------------------------------ */
 
-const VIEWS = ['fleet', 'leases', 'jobs', 'recovery', 'bulk', 'events'];
+const VIEWS = ['fleet', 'leases', 'jobs', 'recovery', 'bulk', 'events', 'docs'];
 
 const state = {
   view: 'fleet',
@@ -501,7 +501,8 @@ const state = {
   data: {
     fleet: null, counts: null, hosts: null, hubs: null, topology: null,
     leases: null, leaseCounts: null, protectedSuspect: 0, jobs: null,
-    tiers: null, attempts: null, quarantines: null, bulk: null, bulkRun: null, events: null
+    tiers: null, attempts: null, quarantines: null, bulk: null, bulkRun: null, events: null,
+    capabilities: null, kinds: null
   },
   /* Per-resource "the server capped this response". A capped list that does
    * not say so is the worst thing this page can show: it looks like the whole
@@ -521,7 +522,11 @@ const VIEW_NEEDS = {
   jobs: ['jobs', 'fleet'],
   recovery: ['recovery', 'fleet'],
   bulk: ['bulk', 'bulkRun', 'fleet'],
-  events: ['events']
+  events: ['events'],
+  // Docs reads what this deployment can actually do rather than describing
+  // what the project can do. The two diverge the moment somebody deploys
+  // without a host agent or forgets to set a token list.
+  docs: ['capabilities', 'kinds', 'recovery']
 };
 
 const deviceIndex = new Map();   // device id -> normalised fleet row
@@ -759,6 +764,31 @@ const loaders = {
       state.data.quarantines = listOf(resp, 'quarantines', 'open_quarantines').map(normQuarantine);
       mark('recovery');
     } catch (e) { if (!current()) return; mark('recovery', e); }
+    render();
+  },
+
+  // What this deployment can actually do, observed rather than declared.
+  async capabilities() {
+    const current = beginLoad('capabilities');
+    try {
+      const resp = await api.get('capabilities');
+      if (!current()) return;
+      state.data.capabilities = resp;
+      mark('capabilities');
+    } catch (e) { if (!current()) return; mark('capabilities', e); }
+    render();
+  },
+
+  // The step vocabulary, read from farm.step_kinds rather than hard-coded, so
+  // the docs cannot drift from what this server will accept.
+  async kinds() {
+    const current = beginLoad('kinds');
+    try {
+      const resp = await api.get('specs/kinds');
+      if (!current()) return;
+      state.data.kinds = listOf(resp, 'kinds', 'step_kinds');
+      mark('kinds');
+    } catch (e) { if (!current()) return; mark('kinds', e); }
     render();
   },
 
@@ -2288,6 +2318,7 @@ function render() {
         case 'recovery': renderRecovery(); break;
         case 'bulk': renderBulk(); break;
         case 'events': renderEvents(); break;
+        case 'docs': renderDocs(); break;
       }
       renderTabPips();
     } catch (e) {

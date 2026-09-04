@@ -49,6 +49,11 @@ func (s *Server) buildHandler() http.Handler {
 		mux.Handle(pattern, s.requireRole(RoleOperator, h))
 	}
 
+	// What this deployment can actually do, observed rather than declared.
+	// Unauthenticated for the same reason as healthz: an operator debugging a
+	// farm whose auth is the broken thing still needs to see its state.
+	mux.HandleFunc("GET /api/v1/capabilities", s.handleCapabilities)
+
 	// Job specs. Reading the vocabulary needs no privilege: a client that
 	// cannot ask what steps this server accepts has to hard-code them, and
 	// then a schema change breaks it silently instead of loudly.

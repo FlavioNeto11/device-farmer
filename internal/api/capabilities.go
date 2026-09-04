@@ -1,0 +1,382 @@
+package api
+
+import (
+	"context"
+	"net/http"
+	"runtime"
+	"runtime/debug"
+	"time"
+)
+
+// Capabilities reports what this deployment can actually do, read from the
+// running system rather than written down beside it.
+//
+// The distinction matters. A feature list in a README describes what the
+// project can do; an operator needs to know what THIS process, against THIS
+// database, with THIS configuration, will do at 3am. Those diverge the moment
+// somebody deploys without a host agent, or forgets FARM_API_TOKENS, or runs a
+// binary older than the schema.
+//
+// Every field here is therefore observed: the schema version comes from the
+// migration table, the roles come from their own heartbeats, the host agents
+// come from farm.hosts, and the authentication mode comes from the
+// Authenticator this server was actually built with.
+type Capabilities struct {
+	Build    BuildInfo         `json:"build"`
+	Schema   SchemaInfo        `json:"schema"`
+	Auth     AuthInfo          `json:"auth"`
+	Roles    []RoleStatus      `json:"roles"`
+	Features []FeatureStatus   `json:"features"`
+	Fleet    map[string]int    `json:"fleet"`
+	Limits   map[string]string `json:"limits"`
+}
+
+type BuildInfo struct {
+	Version   string `json:"version"`
+	Revision  string `json:"revision,omitempty"`
+	Go        string `json:"go"`
+	Platform  string `json:"platform"`
+	StartedAt string `json:"started_at"`
+	UptimeS   int64  `json:"uptime_s"`
+}
+
+type SchemaInfo struct {
+	Version int    `json:"version"`
+	Applied string `json:"applied_at,omitempty"`
+	// Migrations are embedded in the binary, so a version the binary does not
+	// carry means somebody deployed an old image against a newer database.
+	Note string `json:"note,omitempty"`
+}
+
+type AuthInfo struct {
+	Mode string `json:"mode"`
+	Open bool   `json:"open"`
+	// Consequence is spelled out rather than left to the reader, because
+	// "allow-all" reads as a configuration value and not as a warning.
+	Consequence string `json:"consequence,omitempty"`
+	Fix         string `json:"fix,omitempty"`
+}
+
+// RoleStatus is one control-plane component and whether it is beating.
+//
+// A role that has stopped beating is not merely absent from a list: the
+// reaper's gap detection reads these same heartbeats, so a dead component is
+// also the thing that stops leases being reclaimed while it is gone.
+type RoleStatus struct {
+	Component string `json:"component"`
+	Running   bool   `json:"running"`
+	LastBeatS *int64 `json:"last_beat_s,omitempty"`
+	Meaning   string `json:"meaning"`
+}
+
+// FeatureStatus is one capability and the honest state of it.
+type FeatureStatus struct {
+	Name   string `json:"name"`
+	State  string `json:"state"` // enabled | degraded | unavailable | not_built
+	How    string `json:"how"`
+	Detail string `json:"detail,omitempty"`
+}
+
+// knownRoles is the set the dashboard expects to see beating, with what each
+// one's absence actually costs. The reaper's own gap detection reads
+// farm.component_heartbeat for the renewal path, so this list and that one
+// describe the same thing from two directions.
+var knownRoles = []struct{ component, meaning string }{
+	{"api", "serves this page and the HTTP API"},
+	{"scheduler", "matches queued jobs to free devices; without it nothing is ever placed"},
+	{"jobrunner", "runs job specs on leased devices; without it jobs sit in running, holding a device each"},
+	{"reaper", "the only automatic release path; without it an abandoned lease is never reclaimed"},
+	{"recovery", "the recovery ladder; without it a stuck device stays stuck until a human acts"},
+	{"watchdog", "device health; without it the fleet view goes stale and quarantine never fires"},
+	{"node", "host agent on a USB host; without it recovery tiers 3 and 4 are refused"},
+	{"enroll", "adopts newly plugged devices; without it a new handset never joins the fleet"},
+}
+
+func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	caps := Capabilities{
+		Build:    s.buildInfo(),
+		Schema:   s.schemaInfo(ctx),
+		Auth:     s.authInfo(),
+		Roles:    s.roleStatuses(ctx),
+		Fleet:    s.fleetCounts(ctx),
+		Limits:   s.limits(),
+		Features: nil,
+	}
+	caps.Features = s.featureStatuses(ctx, caps.Roles)
+	writeJSON(w, http.StatusOK, caps)
+}
+
+func (s *Server) buildInfo() BuildInfo {
+	b := BuildInfo{
+		Go:        runtime.Version(),
+		Platform:  runtime.GOOS + "/" + runtime.GOARCH,
+		StartedAt: s.startedAt.UTC().Format(time.RFC3339),
+		UptimeS:   int64(time.Since(s.startedAt).Seconds()),
+		Version:   "dev",
+	}
+	if bi, ok := debug.ReadBuildInfo(); ok {
+		if bi.Main.Version != "" && bi.Main.Version != "(devel)" {
+			b.Version = bi.Main.Version
+		}
+		for _, st := range bi.Settings {
+			if st.Key == "vcs.revision" {
+				b.Revision = st.Value
+			}
+		}
+	}
+	return b
+}
+
+func (s *Server) schemaInfo(ctx context.Context) SchemaInfo {
+	var (
+		v  *int
+		at *time.Time
+	)
+	// goose owns this table; reading it is how the API learns which schema it
+	// is actually talking to rather than which one it shipped with.
+	_ = s.pool.QueryRow(ctx,
+		`SELECT version_id, tstamp FROM goose_db_version
+		  WHERE is_applied ORDER BY id DESC LIMIT 1`).Scan(&v, &at)
+
+	out := SchemaInfo{}
+	if v != nil {
+		out.Version = *v
+	}
+	if at != nil {
+		out.Applied = at.UTC().Format(time.RFC3339)
+	}
+	if out.Version == 0 {
+		out.Note = "no migrations applied; run farmd migrate up"
+	}
+	return out
+}
+
+func (s *Server) authInfo() AuthInfo {
+	name := "none"
+	if s.auth != nil {
+		name = s.auth.Name()
+	}
+	info := AuthInfo{Mode: name}
+	if name == "allow-all" || name == "none" {
+		info.Open = true
+		info.Consequence = "every request is granted the operator role: anyone who can reach " +
+			"this port can revoke leases, drain hosts and power-cycle slots"
+		info.Fix = "set FARM_API_TOKENS to a token list, or supply an Authenticator"
+	}
+	return info
+}
+
+func (s *Server) roleStatuses(ctx context.Context) []RoleStatus {
+	// One row per component that has ever beaten, with how long ago. A
+	// watchdog is per-host and beats as "watchdog:h01", so prefixes match.
+	beats := map[string]int64{}
+	rows, err := s.pool.Query(ctx,
+		`SELECT component, GREATEST(0, round(extract(epoch FROM now() - beat_at)))::bigint
+		   FROM farm.component_heartbeat`)
+	if err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var c string
+			var ago int64
+			if rows.Scan(&c, &ago) == nil {
+				beats[c] = ago
+			}
+		}
+	}
+
+	// A component is "running" if it beat recently. The window is generous
+	// because these loops have different periods, and a role reported dead
+	// because it is merely slow sends an operator chasing nothing.
+	const staleAfter = 120
+
+	out := make([]RoleStatus, 0, len(knownRoles))
+	for _, kr := range knownRoles {
+		st := RoleStatus{Component: kr.component, Meaning: kr.meaning}
+		var best *int64
+		for c, ago := range beats {
+			if c == kr.component || len(c) > len(kr.component) &&
+				c[:len(kr.component)] == kr.component && c[len(kr.component)] == ':' {
+				a := ago
+				if best == nil || a < *best {
+					best = &a
+				}
+			}
+		}
+		if best != nil {
+			st.LastBeatS = best
+			st.Running = *best <= staleAfter
+		}
+		out = append(out, st)
+	}
+	return out
+}
+
+func (s *Server) fleetCounts(ctx context.Context) map[string]int {
+	out := map[string]int{}
+	var devices, hosts, healthy, leased, quarantined, jobs, artifacts int
+	_ = s.pool.QueryRow(ctx, `
+SELECT (SELECT count(*) FROM farm.devices),
+       (SELECT count(*) FROM farm.hosts),
+       (SELECT count(*) FROM farm.device_runtime WHERE health = 'healthy'),
+       (SELECT count(*) FROM farm.leases WHERE state IN ('held','suspect')),
+       (SELECT count(*) FROM farm.quarantines WHERE closed_at IS NULL),
+       (SELECT count(*) FROM farm.jobs WHERE state IN ('queued','running')),
+       (SELECT count(*) FROM farm.artifacts)`).
+		Scan(&devices, &hosts, &healthy, &leased, &quarantined, &jobs, &artifacts)
+
+	out["devices"] = devices
+	out["hosts"] = hosts
+	out["healthy"] = healthy
+	out["live_leases"] = leased
+	out["open_quarantines"] = quarantined
+	out["active_jobs"] = jobs
+	out["artifacts"] = artifacts
+	return out
+}
+
+func (s *Server) limits() map[string]string {
+	l := map[string]string{}
+	if s.cfg != nil {
+		l["lease_ttl"] = s.cfg.Lease.TTL.String()
+		l["lease_grace"] = s.cfg.Lease.Grace.String()
+		l["renew_interval"] = s.cfg.Lease.RenewInterval.String()
+		l["slot_rearm"] = s.cfg.Lease.SlotRearm.String()
+		l["reaper_gap_floor"] = s.cfg.Reaper.GapFloor.String()
+	}
+	l["device_exec_max_output"] = byteSize(s.execMaxOutput)
+	return l
+}
+
+func (s *Server) featureStatuses(ctx context.Context, roles []RoleStatus) []FeatureStatus {
+	running := map[string]bool{}
+	for _, r := range roles {
+		running[r.Component] = r.Running
+	}
+
+	out := []FeatureStatus{
+		{
+			Name: "Device leasing", State: "enabled",
+			How: "farm.lease_acquire / lease_renew / lease_release, fenced in PostgreSQL",
+			Detail: "A connectivity failure cannot end a lease: farm.leases.release_reason " +
+				"is CHECK-constrained to a domain with no connectivity value.",
+		},
+		{
+			Name: "Job execution", State: stateIf(running["jobrunner"], "enabled", "unavailable"),
+			How: "internal/runner over the step vocabulary in farm.step_kinds",
+			Detail: ifElse(running["jobrunner"],
+				"Steps run against leased devices; a transport failure is retried inside the lease.",
+				"No jobrunner is beating, so allocated jobs will sit in 'running' holding a device each."),
+		},
+		{
+			Name: "Automatic reclamation", State: stateIf(running["reaper"], "enabled", "unavailable"),
+			How: "farm.lease_reclaim behind a grace band, a control-plane gap refund and a quiesce gate",
+			Detail: ifElse(running["reaper"],
+				"The only automatic release path in the system.",
+				"No reaper is beating: an abandoned lease will never be reclaimed and its device stays out of the pool."),
+		},
+		{
+			Name: "Health monitoring", State: stateIf(running["watchdog"], "enabled", "unavailable"),
+			How: "track-devices streams per host, reconciled into farm.device_runtime",
+			Detail: ifElse(running["watchdog"],
+				"Health is a separate clock and can never touch a lease.",
+				"No watchdog is beating: the fleet view is stale and quarantine will not fire."),
+		},
+		{
+			Name: "Recovery ladder", State: stateIf(running["recovery"], "enabled", "unavailable"),
+			How: "tiers stored in farm.recovery_tiers, refused when blast radius exceeds a live lease's policy",
+			Detail: ifElse(running["node"],
+				"A host agent is present, so tiers 3 and 4 (USB reset, port power) can act.",
+				"No host agent is beating: tiers 3 and 4 are REFUSED with a reason, not silently skipped."),
+		},
+		{
+			Name: "Dynamic enrollment", State: stateIf(running["enroll"] || running["node"], "enabled", "unavailable"),
+			How: "farm.resolve_device: branded farm_uid, then hardware fingerprint, then serial AND slot, then adopt",
+			Detail: ifElse(running["enroll"] || running["node"],
+				"A newly plugged device is observed, resolved and branded automatically.",
+				"No enroller is beating: a handset plugged in now will not join the fleet until one runs."),
+		},
+		{
+			Name: "File transfer", State: "enabled",
+			How: "the ADB sync protocol implemented natively in internal/adbwire",
+			Detail: "push, pull and install stream in both directions; a 200MB artifact is never " +
+				"buffered in memory.",
+		},
+		{
+			Name: "Artifacts", State: "enabled",
+			How: "content-addressed by sha256, with EnsureOnDevice skipping a push the device already has",
+		},
+		{
+			Name: "Live updates", State: "enabled",
+			How: "server-sent events on /api/v1/stream, polled and diffed server-side",
+		},
+		{
+			Name: "Authentication", State: "not_built",
+			How: "a stub that grants every caller the operator role",
+			Detail: "Do not expose this port to a network you do not control. The seam for OIDC " +
+				"is documented in internal/api/auth.go.",
+		},
+		{
+			Name: "Fence enforcement at the resource", State: "not_built",
+			How: "the fence is enforced in PostgreSQL and honoured by the client",
+			Detail: "The mTLS proxy that would refuse a fenced connection at the ADB socket is not " +
+				"written, so a misbehaving client could still reach a device it has been fenced out of.",
+		},
+		{
+			Name: "Helm chart", State: "not_built",
+			How: "docker-compose only; the compose file's 'farm' profile carries the per-role services",
+		},
+	}
+
+	if s.auth != nil && !s.authInfo().Open {
+		for i := range out {
+			if out[i].Name == "Authentication" {
+				out[i].State = "enabled"
+				out[i].How = "static bearer tokens (" + s.auth.Name() + ")"
+				out[i].Detail = ""
+			}
+		}
+	}
+	return out
+}
+
+func stateIf(cond bool, yes, no string) string {
+	if cond {
+		return yes
+	}
+	return no
+}
+
+func ifElse(cond bool, yes, no string) string {
+	if cond {
+		return yes
+	}
+	return no
+}
+
+func byteSize(n int) string {
+	switch {
+	case n <= 0:
+		return "unbounded"
+	case n >= 1<<20:
+		return itoa(n/(1<<20)) + " MiB"
+	case n >= 1<<10:
+		return itoa(n/(1<<10)) + " KiB"
+	default:
+		return itoa(n) + " B"
+	}
+}
+
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	var b [20]byte
+	i := len(b)
+	for n > 0 {
+		i--
+		b[i] = byte('0' + n%10)
+		n /= 10
+	}
+	return string(b[i:])
+}

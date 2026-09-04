@@ -54,7 +54,8 @@ const EnvDevDir = "FARM_UI_DEV_DIR"
 // The embed patterns are explicit rather than a directory glob so that a stray
 // editor swap file or a .DS_Store in assets/ cannot become a served asset.
 //
-//go:embed assets/index.html assets/app.js assets/style.css
+//go:embed assets/index.html assets/app.js assets/docs.js assets/style.css
+//go:embed assets/docs
 var embedded embed.FS
 
 // Option configures Handler.
@@ -133,7 +134,7 @@ func newEmbeddedHandler(fsys fs.FS) (*embeddedHandler, error) {
 	// binary that serves a blank dashboard during an incident is worse than one
 	// that refuses to start: the first is discovered by an operator at 3am, the
 	// second at build time. Handler turns this into a panic for that reason.
-	for _, required := range [...]string{"index.html", "app.js", "style.css"} {
+	for _, required := range [...]string{"index.html", "app.js", "docs.js", "style.css", "docs/index.json"} {
 		if _, ok := h.assets[required]; !ok {
 			return nil, fmt.Errorf("%s missing from the embedded assets", required)
 		}

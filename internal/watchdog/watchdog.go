@@ -234,6 +234,20 @@ func (w *Watchdog) Run(ctx context.Context) error {
 		w.wg.Wait()
 	}()
 
+	// Battery level and temperature are LEVEL-triggered facts: they drift
+	// while the wire says nothing, so they cannot ride the connection-state
+	// cache below, which deliberately writes nothing for a device whose state
+	// is unchanged. The reader gets its own, much slower ticker; battery.go
+	// carries the cadence argument. Cancelled before the readers are, because
+	// this defer is registered later and defers unwind in reverse.
+	bctx, bcancel := context.WithCancel(ctx)
+	defer bcancel()
+	w.wg.Add(1)
+	go func() {
+		defer w.wg.Done()
+		w.newBatteryPoller().run(bctx)
+	}()
+
 	ticker := time.NewTicker(w.cfg.Interval)
 	defer ticker.Stop()
 
@@ -974,8 +988,8 @@ func Collectors() []prometheus.Collector {
 	for _, reason := range []string{"hysteresis", "no_credits", "suppressed", "sticky"} {
 		dampedTotal.WithLabelValues(reason)
 	}
-	return []prometheus.Collector{
+	return append([]prometheus.Collector{
 		cyclesTotal, snapshotsTotal, devicesGauge, unmappedGauge, ambiguousGauge,
 		transitionsTotal, dampedTotal, resyncsTotal, reconcileErrors, hostsGauge, beatFailures,
-	}
+	}, batteryCollectors()...)
 }

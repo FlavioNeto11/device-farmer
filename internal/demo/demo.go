@@ -75,6 +75,7 @@ import (
 	"github.com/flaviopadilha/device-farmer/internal/jobspec"
 	"github.com/flaviopadilha/device-farmer/internal/lease"
 	"github.com/flaviopadilha/device-farmer/internal/obs"
+	"github.com/flaviopadilha/device-farmer/internal/watchdog"
 	"github.com/flaviopadilha/device-farmer/test/fakeadb"
 )
 
@@ -449,7 +450,6 @@ func (r *Runner) startHosts(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("demo: start fake adb for %s: %w", hostID, err)
 		}
-		installShellScripts(srv)
 		for _, d := range devs {
 			srv.Add(fakeadb.Device{
 				Serial:   d.serial,
@@ -460,6 +460,9 @@ func (r *Runner) startHosts(ctx context.Context) error {
 				State:    wireState(d.initial),
 			})
 		}
+		// After the devices, because the battery answers are per position and
+		// the script list is consulted newest-first — see installShellScripts.
+		installShellScripts(srv, devs)
 		r.servers[hostID] = srv
 
 		// host_epoch increments on every adb server restart: a transport_id is
@@ -814,16 +817,57 @@ var shellSteps = []shellStep{
 	{"logcat -d -t 5", "01-01 00:00:00.000  1000  1000 I acme: step complete\n"},
 }
 
-// installShellScripts teaches one fake server to answer the harness. The
-// payloads are genuine shell v2 frames built with the shipping encoder, so
-// adbwire's demultiplexer is exercised rather than bypassed.
-func installShellScripts(srv *fakeadb.Server) {
+// installShellScripts teaches one fake server to answer the harness and the
+// watchdog's battery reader. The payloads are genuine shell v2 frames built
+// with the shipping encoder, so adbwire's demultiplexer is exercised rather
+// than bypassed.
+func installShellScripts(srv *fakeadb.Server, devs []*simDevice) {
 	// Registered first so the specific commands below win: fakeadb consults
 	// scripts newest-first.
 	srv.Respond("", "shell", shellV2("\n", 0))
+
+	// The battery reader, per position. Registered BEFORE the harness steps
+	// because matching is by service PREFIX and one of those steps is
+	// "dumpsys battery | grep level": registering this after it would make
+	// the longer command match this shorter prefix first and return the whole
+	// dump where the step asked for one line.
+	for _, d := range devs {
+		srv.Respond(d.devpath, adbwire.ShellService(watchdog.BatteryCommand),
+			shellV2(batteryDump(d.devpath), 0))
+	}
+
 	for _, s := range shellSteps {
 		srv.Respond("", adbwire.ShellService(s.cmd), shellV2(s.out, 0))
 	}
+}
+
+// batteryDump renders one handset's answer to the watchdog's battery probe.
+//
+// Shaped like the real thing, header and all, because the point is to exercise
+// the shipping parser rather than a convenient subset of it: the level is a
+// fraction of the scale below it, and the temperature is in decidegrees.
+//
+// The values are a pure function of the position, as everything in the seed
+// is, so a re-run converges instead of drifting and the fleet shows a spread
+// rather than one number sixty times. They deliberately do NOT match the
+// numbers the seeder wrote: the seeded value is a cold-start placeholder, and
+// seeing the column move off it is how you know the reader — not the seeder —
+// is what is filling it in.
+func batteryDump(devpath string) string {
+	h := hash64("battery/" + devpath)
+	return fmt.Sprintf(`Current Battery Service state:
+  AC powered: false
+  USB powered: true
+  Wireless powered: false
+  status: 2
+  health: 2
+  present: true
+  level: %d
+  scale: 100
+  voltage: %d
+  temperature: %d
+  technology: Li-ion
+`, 35+int(h%62), 3700+int(h%500), 240+int(h%140))
 }
 
 func shellV2(stdout string, exit byte) string {

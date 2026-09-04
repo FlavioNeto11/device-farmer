@@ -123,7 +123,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	case "migrate":
 		err = runMigrate(ctx, rest, stdout, stderr)
 	case "api", "scheduler", "reaper", "watchdog", "recovery",
-		"jobrunner", "node", "all", "demo":
+		"jobrunner", "janitor", "node", "all", "demo":
 		err = runRole(ctx, role, rest, stderr)
 	case "ctl":
 		// ctl talks to the API over HTTP and never to the database, so it needs
@@ -205,6 +205,8 @@ func runRole(ctx context.Context, role string, args []string, stderr io.Writer) 
 		return runWatchdog(ctx, cfg, log, pool)
 	case "jobrunner":
 		return runJobRunner(ctx, cfg, log, pool)
+	case "janitor":
+		return runJanitor(ctx, cfg, log, pool)
 	case "node":
 		return runNode(ctx, cfg, log, pool)
 	case "all":
@@ -292,6 +294,7 @@ Roles:
   reaper      suspect sweep and the single automatic release path
   watchdog    device health only; it can never touch a lease
   jobrunner   runs job specs on leased devices; re-attaches after an eviction
+  janitor     closes rows whose process died; it can never end a lease
   recovery    the recovery ladder; acts for a holder that keeps its device
   all         every control-plane role in one process (laptop / single node)
   demo        simulated hardware plus the real control plane; needs no phones

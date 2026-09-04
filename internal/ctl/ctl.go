@@ -693,9 +693,15 @@ var commands = []command{
 	{"hosts", "", "the hosts, with what a drain would have to wait for", cmdHosts},
 	{"host", "drain|undrain <id> --reason r", "stop or resume placement on a host", cmdHost},
 	{"jobs", "[--state s] [--pool p] [--queue q]", "the work", cmdJobs},
-	{"job", "<id> | cancel <id> --reason r", "one job, or end one", cmdJob},
-	{"submit", "-f spec.json --pool p --queue q --tenant t", "validate a spec and file it as a job", cmdSubmit},
-	{"validate", "-f spec.json", "check a spec without submitting it", cmdValidate},
+	{"job", "<id> | cancel <id> | steps <id> | attempts <id>", "one job, end one, or watch it run", cmdJob},
+	// submit and validate now ask the SERVER. The previous pair parsed with a
+	// private copy of internal/jobspec and never called POST
+	// /api/v1/specs/validate, so the CLI could accept a spec the server would
+	// refuse — or refuse one it would have taken.
+	{"submit", "-f spec.json --pool p --queue q --tenant t [--profile p] [--reset-tier t] [--max-attempts n] [--selector k=v]", "validate against the server, then file it", cmdSpecSubmit},
+	{"validate", "-f spec.json", "ask the server whether this spec can run", cmdSpecValidate},
+	{"kinds", "", "the step vocabulary this server accepts", cmdSpecKinds},
+	{"resets", "--profile p [--tier t]", "exactly what a reset tier will run, before it runs", cmdSpecResets},
 	{"leases", "[--state s] [--host h] [--device d]", "who holds what", cmdLeases},
 	{"lease", "revoke <id> --reason r", "take a device back from its holder", cmdLease},
 	{"recovery", "", "the ladder, recent attempts, open quarantines", cmdRecovery},

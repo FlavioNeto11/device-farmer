@@ -1145,16 +1145,24 @@ func (l *Ladder) perform(ctx context.Context, c candidate, t tier, log *slog.Log
 	if detail == nil {
 		detail = map[string]any{}
 	}
-	switch res.Outcome {
-	case OutcomeRecovered, OutcomeNoChange, OutcomeFailed:
-		// The actuator's verdict is provisional either way: the authority on
-		// whether a device is healthy is the watchdog's next observation, which
-		// arrives on the track-devices stream after the suppression lapses.
-		return res.Outcome, detail
-	default:
-		detail["actuator_outcome"] = string(res.Outcome)
-		return OutcomeFailed, detail
+	// Record is the one place that knows how a Result becomes the two columns
+	// farm.recovery_attempts keeps. The switch this replaced folded anything
+	// it did not recognise into OutcomeFailed, which erased the distinction
+	// the actuator works hardest to preserve: a REFUSAL (this rung is not
+	// permitted here — the device is fine) and an UNREACHABLE host (no rung
+	// will help until somebody fixes the host) both became "the hardware
+	// failed". A dead host then looked like a dead phone, and the ladder
+	// quarantined handsets that were never broken while spending cooldown
+	// budget on a machine that had simply gone away.
+	//
+	// The verdict is still provisional: the authority on whether a device is
+	// healthy is the watchdog's next observation on the track-devices stream.
+	out, refusal := Record(res)
+	if refusal != "" {
+		detail["refusal"] = refusal
 	}
+	detail["disposition"] = string(DispositionOf(res))
+	return out, detail
 }
 
 // quarantineDevice opens a device-scoped quarantine and marks the device so the
@@ -1270,10 +1278,21 @@ func (l *Ladder) finish(ctx context.Context, id int64, out Outcome, detail map[s
 	cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), l.cfg.CallTimeout)
 	defer cancel()
 
+	// farm.recovery_attempts.refusal is the column an operator reads to learn
+	// why the ladder stopped climbing, and until now nothing on the actuator
+	// path ever wrote it: every refusal left it NULL and the row said only
+	// "failed". COALESCE keeps a refusal recorded earlier — the blast-radius
+	// check writes one before the action runs — rather than overwriting it.
+	var refusal any
+	if r, ok := detail["refusal"].(string); ok && r != "" {
+		refusal = r
+	}
+
 	if _, err := l.cfg.Pool.Exec(cctx, `
 UPDATE farm.recovery_attempts
-   SET finished_at = now(), outcome = $2::text, detail = detail || $3::jsonb
- WHERE id = $1::bigint AND finished_at IS NULL`, id, string(out), blob); err != nil {
+   SET finished_at = now(), outcome = $2::text, detail = detail || $3::jsonb,
+       refusal = COALESCE(refusal, $4::text)
+ WHERE id = $1::bigint AND finished_at IS NULL`, id, string(out), blob, refusal); err != nil {
 		l.log.Error("could not record the end of a recovery attempt",
 			"attempt", id, "outcome", string(out), "err", err)
 		return

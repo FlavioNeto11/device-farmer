@@ -1615,29 +1615,20 @@ SELECT t.device_id::text, d.farm_uid, s.rack_slot, d.host_id, t.hub_id, t.state,
 // bad" — and answering it from two lists means an operator manually zipping
 // timestamps at 3am.
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
-	limit := queryInt(r, "limit", 200, 1, 2000)
+	// This endpoint was farm-wide with no tenant scoping while tenantScope was
+	// applied in eight other places: any tenant could read every other
+	// tenant's job and device history. EventScope carries that scoping plus
+	// the filters (kind, since, subject) the handler never had.
+	scope, err := EventScopeFromRequest(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, CodeBadRequest, err.Error(), nil)
+		return
+	}
+	scope.Tenant = tenantScope(r.Context())
+	limit := scope.PageSize()
 
-	const q = `
-SELECT * FROM (
-  (SELECT e.at, 'event'::text AS source, e.kind AS action, coalesce(e.actor,'') AS actor,
-          coalesce(e.device_id::text,'') AS device_id, e.slot_id,
-          coalesce(e.lease_id::text,'') AS lease_id, coalesce(e.job_id::text,'') AS job_id,
-          ''::text AS subject, ''::text AS reason, e.detail
-     FROM farm.events e
-    ORDER BY e.at DESC
-    LIMIT $1)
-  UNION ALL
-  (SELECT a.at, 'audit'::text, a.action, a.actor,
-          ''::text, NULL::bigint, ''::text, ''::text,
-          a.subject, coalesce(a.reason,''), a.detail
-     FROM farm.audit_log a
-    ORDER BY a.at DESC
-    LIMIT $1)
-) m
-ORDER BY m.at DESC
-LIMIT $1`
-
-	rows, err := s.pool.Query(r.Context(), q, limit)
+	q, args := scope.Query()
+	rows, err := s.pool.Query(r.Context(), q, args...)
 	if err != nil {
 		s.fail(w, r, "list events", err)
 		return
@@ -1677,5 +1668,11 @@ LIMIT $1`
 		s.fail(w, r, "read events", err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"events": out, "truncated": len(out) == limit})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"events":    out,
+		"truncated": len(out) == limit,
+		// What the reader is actually looking at. A scoped list that does not
+		// say it is scoped reads as the whole farm.
+		"scope": scope.Describe(),
+	})
 }

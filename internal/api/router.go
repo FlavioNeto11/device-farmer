@@ -109,7 +109,12 @@ func (s *Server) buildHandler() http.Handler {
 	// dashboard's HTML, so a client with a typo in a URL reads an error it can
 	// parse. It is authenticated for the same reason the rest of the API is:
 	// an unauthenticated 404 map is a free inventory of the control plane.
-	mux.Handle("/api/v1/", s.requireRole(RoleTenant, http.HandlerFunc(s.handleAPINotFound)))
+	// A catch-all under /api/v1/ matches every path in the prefix, so Go's own
+	// method-mismatch handling never ran and DELETE /api/v1/fleet answered 404
+	// — telling a client the resource does not exist when the resource is fine
+	// and the verb is wrong. apiFallback answers 405 with an Allow header for a
+	// known path and leaves a genuinely unknown path at 404.
+	mux.Handle("/api/v1/", s.apiFallback(mux))
 
 	// The dashboard. The parent supplies it; this package only holds the hook.
 	mux.HandleFunc("/", s.serveUI)

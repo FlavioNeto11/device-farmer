@@ -1038,8 +1038,18 @@ func (e *env) racksByJob(ctx context.Context, jobs []job) map[string]string {
 }
 
 func cmdJob(ctx context.Context, s *session, args []string) error {
-	if len(args) > 0 && args[0] == "cancel" {
-		return cmdJobCancel(ctx, s, args[1:])
+	if len(args) > 0 {
+		switch args[0] {
+		case "cancel":
+			return cmdJobCancel(ctx, s, args[1:])
+		// A job that failed on four devices is a job problem; the same failure
+		// four times on one device is a device problem. These two subcommands
+		// are how an operator tells them apart.
+		case "steps":
+			return cmdJobSteps(ctx, s, args[1:])
+		case "attempts":
+			return cmdJobAttempts(ctx, s, args[1:])
+		}
 	}
 	fs := newFlags("job", s.err)
 	var g globals
@@ -1049,7 +1059,7 @@ func cmdJob(ctx context.Context, s *session, args []string) error {
 		return err
 	}
 	if len(rest) != 1 {
-		return usageErrf("usage: ctl job <id>  |  ctl job cancel <id> --reason r")
+		return usageErrf("usage: ctl job <id>  |  ctl job cancel <id> --reason r  |  ctl job steps <id> [--attempt n]  |  ctl job attempts <id>")
 	}
 	e, err := s.open(&g)
 	if err != nil {

@@ -1,0 +1,20 @@
+# Go, SQL and shell tooling all assume LF, and gofmt treats a CRLF file as
+# unformatted — so on Windows, `gofmt -l .` reported files nobody had touched
+# and a CI formatting gate would fail on a clean checkout.
+#
+# Normalising in the repository rather than relying on each developer's
+# core.autocrlf keeps the working tree the same shape on every machine.
+* text=auto eol=lf
+
+# Binary, byte-for-byte.
+*.png    binary
+*.jpg    binary
+*.gif    binary
+*.apk    binary
+*.zip    binary
+*.gz     binary
+
+# Windows-native files that genuinely want CRLF: PowerShell is fine with LF,
+# but a .bat read by cmd.exe is not.
+*.bat    text eol=crlf
+*.cmd    text eol=crlf

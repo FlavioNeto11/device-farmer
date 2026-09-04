@@ -23,6 +23,7 @@ import (
 	"github.com/flaviopadilha/device-farmer/internal/ctl"
 	"github.com/flaviopadilha/device-farmer/internal/demo"
 	"github.com/flaviopadilha/device-farmer/internal/enroll"
+	"github.com/flaviopadilha/device-farmer/internal/janitor"
 	"github.com/flaviopadilha/device-farmer/internal/jobrunner"
 	"github.com/flaviopadilha/device-farmer/internal/lease"
 	"github.com/flaviopadilha/device-farmer/internal/node"
@@ -166,6 +167,9 @@ func runAPI(ctx context.Context, cfg *config.Config, log *slog.Logger, pool *pgx
 				return
 			}
 			a.Register(mux)
+			// Artifact bytes. Without this a farm can store a 200MB APK it
+			// cannot hand back, and the blob store is the only copy.
+			a.RegisterBlobRoutes(mux)
 		}))
 	}
 	// Authentication is a deployment decision, and it is decided by
@@ -235,6 +239,26 @@ func runReaper(ctx context.Context, cfg *config.Config, log *slog.Logger, pool *
 		return err
 	}
 	return r.Run(ctx)
+}
+
+// runJanitor closes rows whose process died: a step left "running" by an
+// evicted jobrunner, its attempt, a bulk target from a dead run.
+//
+// It closes ORPHANS ONLY, and that distinction is the whole difficulty. A step
+// is an orphan when its lease is no longer live — never merely because it has
+// been running a long time. A six-hour shell_detached step is exactly what
+// this system is for, and sweeping it for looking stale would be #663 wearing
+// a different hat.
+func runJanitor(ctx context.Context, cfg *config.Config, log *slog.Logger, pool *pgxpool.Pool) error {
+	j, err := janitor.New(janitor.Config{
+		Pool:      pool,
+		Component: "janitor",
+		Logger:    log,
+	})
+	if err != nil {
+		return err
+	}
+	return j.Run(ctx)
 }
 
 func runRecovery(ctx context.Context, cfg *config.Config, log *slog.Logger, pool *pgxpool.Pool) error {
@@ -359,6 +383,7 @@ func runAll(ctx context.Context, cfg *config.Config, log *slog.Logger, pool *pgx
 		// Without this the scheduler allocates devices and nothing ever runs on
 		// them: jobs sit in 'running' forever holding a phone each.
 		"jobrunner": func(c context.Context) error { return runJobRunner(c, cfg, log, pool) },
+		"janitor":   func(c context.Context) error { return runJanitor(c, cfg, log, pool) },
 	}
 	wds, err := watchdogsForHosts(ctx, cfg, log, pool)
 	if err != nil {
@@ -410,6 +435,7 @@ func runDemo(ctx context.Context, cfg *config.Config, log *slog.Logger, pool *pg
 		"reaper":    func(c context.Context) error { return runReaper(c, cfg, log, pool) },
 		"recovery":  func(c context.Context) error { return runRecovery(c, cfg, log, pool) },
 		"jobrunner": func(c context.Context) error { return runJobRunner(c, cfg, log, pool) },
+		"janitor":   func(c context.Context) error { return runJanitor(c, cfg, log, pool) },
 	}
 
 	// Watchdogs are started after the simulation has registered its hosts, so

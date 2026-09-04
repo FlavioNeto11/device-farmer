@@ -187,7 +187,7 @@ func runRole(ctx context.Context, role string, args []string, stderr io.Writer) 
 	// grace band, a control-plane gap refund and a quiesce gate.
 	defer pool.Close()
 
-	reg, err := newRegistry()
+	reg, err := newRegistry(log)
 	if err != nil {
 		return err
 	}

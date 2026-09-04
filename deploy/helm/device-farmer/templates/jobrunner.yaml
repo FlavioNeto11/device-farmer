@@ -1,0 +1,115 @@
+{{/*
+jobrunner — turns a lease into work actually happening on a phone.
+
+THIS IS THE ROLE THAT SCALES. A job is claimed with
+SELECT ... FOR UPDATE SKIP LOCKED plus a session advisory lock per job_id, so
+two replicas never fight over one device: the loser simply does not see the
+row. Raise replicaCount with concurrency, not with device count.
+
+Why an eviction here is cheap: a jobrunner does not own its lease, it
+re-attaches to one. The replacement calls farm.lease_acquire with the SAME
+job_id and gets the same lease, the same device and the same fence back —
+Phase 1 of lease_acquire, which does not bump the fence precisely because the
+evicted process's own work may still be attached to the phone. Nothing is
+released and nothing is fenced out.
+
+Transport failures are retried INSIDE the lease the job still holds. An
+ECONNRESET on the ADB wire is a reason to reconnect, never a reason to give
+the device up; that conflation is DeviceFarmer/STF issue #663.
+*/}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "device-farmer.componentName" (dict "ctx" $ "component" "jobrunner") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "device-farmer.labels" (dict "ctx" $ "component" "jobrunner") | nindent 4 }}
+spec:
+  replicas: {{ .Values.jobrunner.replicaCount }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # Surge before terminating: the replacement is already claiming work
+      # when the outgoing pod stops, so a deploy costs a job seconds of
+      # progress rather than a step.
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      {{- include "device-farmer.selectorLabels" (dict "ctx" $ "component" "jobrunner") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "device-farmer.labels" (dict "ctx" $ "component" "jobrunner") | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        {{- include "device-farmer.configChecksums" . | nindent 8 }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- include "device-farmer.podPreamble" . | nindent 6 }}
+      # Longer than the control-plane roles on purpose: this pod is driving
+      # phones, and its in-flight step should get a chance to report its
+      # outcome before the process goes away. It still releases NOTHING on the
+      # way out — a pod eviction is not evidence the job on the phone died,
+      # and the replacement re-attaches by job_id at the same fence.
+      terminationGracePeriodSeconds: {{ .Values.jobrunner.terminationGracePeriodSeconds }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- with .Values.jobrunner.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.jobrunner.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.jobrunner.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.jobrunner.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml .Values.jobrunner.topologySpreadConstraints | nindent 8 }}
+      {{- else if .Values.jobrunner.spreadAcrossNodes }}
+      # Spread the runners: losing one node should cost a fraction of the
+      # in-flight jobs a re-attach, not all of them at once.
+      topologySpreadConstraints:
+        {{- include "device-farmer.spread" (dict "ctx" $ "component" "jobrunner") | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: jobrunner
+          image: {{ include "device-farmer.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["jobrunner"]
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          # No probes: this role serves no HTTP, and a probe that failed while
+          # a job was mid-step would restart a process that is holding real
+          # work. Liveness is farm.component_heartbeat.
+          envFrom:
+            {{- include "device-farmer.envFrom" . | nindent 12 }}
+          env:
+            {{- include "device-farmer.databaseEnv" (dict "ctx" $) | nindent 12 }}
+            {{- with .Values.jobrunner.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          resources:
+            {{- toYaml .Values.jobrunner.resources | nindent 12 }}
+          volumeMounts:
+            # Push and install steps read their APKs from the artifact store.
+            # With artifacts.persistence disabled this is a per-pod emptyDir,
+            # so a blob uploaded to the api is invisible here — see the
+            # comment on artifacts.persistence in values.yaml.
+            {{- include "device-farmer.artifactVolumeMount" . | nindent 12 }}
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      volumes:
+        {{- include "device-farmer.artifactVolume" . | nindent 8 }}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}

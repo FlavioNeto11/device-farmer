@@ -1,0 +1,92 @@
+{{- if .Values.migrate.enabled }}
+{{/*
+Schema first, as a hook, so a failed migration stops the rollout.
+
+Helm runs pre-install/pre-upgrade hooks to completion before it applies the
+rest of the release. If this Job fails, Helm aborts: no Deployment is created
+or updated, and no control plane is ever pointed at a schema it does not
+understand. That ordering is the whole reason this is a hook and not a plain
+Job or an initContainer — an initContainer would fail per-pod, one replica at
+a time, while the previous ReplicaSet kept serving against the old schema.
+
+Weights: -10 is the Secret carrying the DSN (templates/secret.yaml), -5 is
+this Job. Ordinary release resources — the ConfigMap, the Deployments — do not
+exist yet at hook time, which is why the environment below is materialised
+from the ConfigMap's own template rather than referenced with envFrom.
+
+hook-delete-policy is before-hook-creation ONLY. A failed migration leaves its
+Job and its pod behind so `kubectl logs job/<release>-migrate` still has the
+goose output that explains what went wrong; the next attempt deletes them.
+*/}}
+{{- $cfg := include (print .Template.BasePath "/configmap.yaml") . | fromYaml -}}
+{{- if not $cfg.data -}}
+{{- fail "device-farmer: could not render the configuration for the migrate hook" -}}
+{{- end -}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ printf "%s-migrate" (include "device-farmer.fullname" .) }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "device-farmer.labels" (dict "ctx" $ "component" "migrate") | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": {{ .Values.migrate.hookWeight | quote }}
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  backoffLimit: {{ .Values.migrate.backoffLimit }}
+  activeDeadlineSeconds: {{ .Values.migrate.activeDeadlineSeconds }}
+  template:
+    metadata:
+      labels:
+        {{- include "device-farmer.labels" (dict "ctx" $ "component" "migrate") | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      restartPolicy: Never
+      {{- include "device-farmer.podPreamble" . | nindent 6 }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: migrate
+          image: {{ include "device-farmer.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          # The migrations are embedded in the binary, so this image carries
+          # its own schema: there is no COPY line to forget and no way for the
+          # SQL to drift from the code that reads it.
+          #
+          # A session-scoped advisory lock serialises concurrent migrators, so
+          # two releases racing in one cluster queue instead of both trying to
+          # CREATE SCHEMA farm.
+          args:
+            - migrate
+            - up
+            - -timeout
+            - {{ .Values.migrate.timeout | quote }}
+            - -lock-timeout
+            - {{ .Values.migrate.lockTimeout | quote }}
+          env:
+            {{- $hookSecret := ternary "" (printf "%s-migrate" (include "device-farmer.fullname" .)) (ne .Values.database.existingSecret "") -}}
+            {{- include "device-farmer.databaseEnv" (dict "ctx" $ "secretName" $hookSecret) | nindent 12 }}
+            {{- range $k, $v := $cfg.data }}
+            - name: {{ $k }}
+              value: {{ $v | quote }}
+            {{- end }}
+          resources:
+            {{- toYaml .Values.migrate.resources | nindent 12 }}
+          {{- with .Values.extraVolumeMounts }}
+          volumeMounts:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      {{- with .Values.extraVolumes }}
+      volumes:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

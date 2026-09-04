@@ -1,0 +1,22 @@
+# Patterns to ignore when packaging the chart.
+.DS_Store
+.git/
+.gitignore
+.idea/
+.vscode/
+*.swp
+*.bak
+*.tmp
+*.orig
+*~
+
+# Never package a values file that someone filled in with a real DSN or a real
+# API token. Those belong in a secret manager, not in a chart tarball that
+# gets copied into a CI cache.
+values-*.yaml
+values.local.yaml
+secrets.yaml
+*.dec.yaml
+
+# Rendered output and packaged charts.
+*.tgz

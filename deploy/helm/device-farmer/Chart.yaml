@@ -1,0 +1,41 @@
+apiVersion: v2
+name: device-farmer
+description: >-
+  Control plane for a self-hosted Android device farm. Leases survive pod
+  eviction, node drain and rolling deploys, because a SIGTERM is not evidence
+  that the job on the phone died.
+type: application
+
+# version is the chart's own version. appVersion is the farmd build this chart
+# was written against; image.tag falls back to it.
+version: 0.1.0
+appVersion: "0.1.0"
+
+# Server-side apply of a hook Job, policy/v1 PodDisruptionBudget and
+# discovery.k8s.io/v1 EndpointSlice are all that is assumed of the cluster.
+kubeVersion: ">=1.25.0-0"
+
+home: https://github.com/flaviopadilha/device-farmer
+sources:
+  - https://github.com/flaviopadilha/device-farmer
+
+keywords:
+  - android
+  - adb
+  - device-farm
+  - continuous-integration
+
+maintainers:
+  - name: Flavio Padilha
+    url: https://github.com/flaviopadilha
+
+# There is deliberately no Postgres dependency.
+#
+# Every lease, every fence and every job in this system lives in one database,
+# and farm.lease_reclaim is the only automatic release path there is. A farm
+# that ran its Postgres as a convenience subchart would be one PVC deletion
+# away from losing the record of which phone belongs to whom — and the failure
+# would look exactly like the thing this project exists to prevent. Point
+# database.dsn at a Postgres somebody is responsible for.
+annotations:
+  category: Infrastructure

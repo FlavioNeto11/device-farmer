@@ -1,0 +1,100 @@
+{{/*
+Stable in-cluster names for the bare-metal ADB servers.
+
+The hosts with phones on them are NOT in this cluster — `farmd node` needs
+/dev/bus/usb and uhubctl on the physical machine, so it runs there as a
+systemd unit (see deploy/helm/README.md). The watchdog and the recovery ladder
+still have to reach each host's ADB server over TCP, and a raw IP in
+farm.hosts.adb_endpoint is a value that changes when a machine is re-imaged
+and that nothing in the cluster can redirect.
+
+So for each host with service.enabled the chart renders the standard escape
+hatch for an off-cluster endpoint: a selector-less Service plus a hand-written
+EndpointSlice pointing at the machine's address. `h01-adb.<namespace>.svc`
+then means "whatever address that host has today", and moving a host is a
+values change instead of an UPDATE on farm.hosts.
+
+Two things these objects do NOT do:
+
+  - They do not create rows in farm.hosts. The node agent upserts its own row
+    on every heartbeat, with the FARM_ADB_ENDPOINT it was configured with.
+    Point that variable at the Service name below, or set the endpoint here to
+    match whatever the agent registers.
+  - They do not make an ADB server reachable. adb binds 127.0.0.1 by default;
+    the host must run `adb -a -P 5037 nodaemon server` (or the equivalent
+    systemd unit) and allow the cluster's egress to that port.
+*/}}
+{{/*
+Every id and address below has already been through device-farmer.checkHosts,
+which templates/configmap.yaml runs unconditionally — so an id that is not a
+DNS-1123 label, a duplicate id, or an address carrying a port or a scheme has
+been refused before this file builds a name out of it.
+*/}}
+{{- $ := . }}
+{{- range $host := .Values.hosts }}
+{{- if and $host.service $host.service.enabled }}
+{{- $svc := printf "%s-%s-adb" (include "device-farmer.fullname" $) $host.id | trunc 63 | trimSuffix "-" }}
+{{- $port := default 5037 $host.service.port }}
+{{- $addr := $host.service.address }}
+{{/* The same classifier the guard used, so the object and the check cannot disagree. */}}
+{{- $kind := include "device-farmer.hostAddressKind" $addr }}
+{{- $isIPv4 := eq $kind "ipv4" }}
+{{- $isIPv6 := eq $kind "ipv6" }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $svc }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "device-farmer.labels" (dict "ctx" $ "component" "adb-host") | nindent 4 }}
+    device-farmer.io/host: {{ $host.id | quote }}
+  {{- with $host.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+{{- if or $isIPv4 $isIPv6 }}
+  # No selector: the endpoint below is a machine, not a pod. kube-proxy
+  # forwards to it like any other backend, so nothing in the control plane
+  # needs to know it is off-cluster.
+  type: ClusterIP
+  ports:
+    - name: adb
+      port: {{ $port }}
+      targetPort: {{ $port }}
+      protocol: TCP
+{{- else }}
+  # A name rather than an address: DNS does the indirection, and the port
+  # stays in farm.hosts.adb_endpoint.
+  type: ExternalName
+  externalName: {{ $addr | quote }}
+{{- end }}
+{{- if or $isIPv4 $isIPv6 }}
+---
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata:
+  name: {{ $svc }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "device-farmer.labels" (dict "ctx" $ "component" "adb-host") | nindent 4 }}
+    device-farmer.io/host: {{ $host.id | quote }}
+    kubernetes.io/service-name: {{ $svc }}
+addressType: {{ if $isIPv4 }}IPv4{{ else }}IPv6{{ end }}
+ports:
+  - name: adb
+    port: {{ $port }}
+    protocol: TCP
+endpoints:
+  - addresses:
+      - {{ $addr | quote }}
+    conditions:
+      # Hand-written and always ready: nothing in the cluster probes a
+      # bare-metal ADB server, and marking it not-ready here would only hide
+      # the host from the one component whose job is to notice it is sick.
+      # Host liveness is farm.hosts.last_seen_at, written by the node agent.
+      ready: true
+{{- end }}
+{{- end }}
+{{- end }}

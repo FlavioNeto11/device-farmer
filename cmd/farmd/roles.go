@@ -14,6 +14,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
 
 	"github.com/flaviopadilha/device-farmer/internal/adbwire"
 	"github.com/flaviopadilha/device-farmer/internal/api"
@@ -75,11 +76,22 @@ func openPool(ctx context.Context, cfg *config.Config) (*pgxpool.Pool, error) {
 }
 
 // newRegistry builds a metrics registry with the farm collectors installed.
-func newRegistry() (*prometheus.Registry, error) {
+func newRegistry(log *slog.Logger) (*prometheus.Registry, error) {
 	reg := prometheus.NewRegistry()
-	if err := obs.Register(reg); err != nil {
-		return nil, fmt.Errorf("register metrics: %w", err)
+
+	// A metric naming collision must not take down a control plane. Every
+	// counter this fails to register is a graph an operator loses; every
+	// lease it would have protected is one it does not. Log it and carry on.
+	if err := obs.RegisterAll(reg, log); err != nil {
+		log.Error("some metrics could not be registered; the control plane is "+
+			"running but /metrics is incomplete", "err", err)
 	}
+
+	// The process and Go runtime collectors are the binary's decision, not
+	// obs's: a library that registers them makes two roles in one process
+	// collide over them.
+	reg.MustRegister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
+	reg.MustRegister(collectors.NewGoCollector())
 	return reg, nil
 }
 
@@ -128,6 +140,19 @@ func runAPI(ctx context.Context, cfg *config.Config, log *slog.Logger, pool *pgx
 		api.WithUI(ui.Handler()),
 	}
 
+	// Job step and attempt visibility. Without these an operator cannot see
+	// which step a job is on, what it printed, or which devices it has already
+	// failed on — and that last one is how a job problem is told apart from a
+	// device problem.
+	opts = append(opts, api.WithRoutes(func(srv *api.Server, mux *http.ServeMux) {
+		js, jerr := api.NewJobStepsAPI(srv)
+		if jerr != nil {
+			log.Error("job step endpoints are disabled", "err", jerr)
+			return
+		}
+		js.Register(mux)
+	}))
+
 	// The artifact API needs a blob backend, which is a deployment choice the
 	// server has no business making, so it is contributed rather than built in.
 	if store, aerr := openArtifacts(cfg, pool); aerr != nil {
@@ -143,9 +168,23 @@ func runAPI(ctx context.Context, cfg *config.Config, log *slog.Logger, pool *pgx
 			a.Register(mux)
 		}))
 	}
-	// Authentication is a deployment decision. Absent a token spec the server
-	// runs open and says so loudly rather than quietly.
-	opts = append(opts, api.WithAuthenticator(api.NewAllowAll(log, "anonymous")))
+	// Authentication is a deployment decision, and it is decided by
+	// configuration rather than by this line.
+	//
+	// This used to hardcode AllowAll, so FARM_API_TOKENS was read by
+	// internal/config and then discarded: every deployment was open and no
+	// setting could close it. AuthenticatorFor now refuses to start an
+	// exposed listener with no credentials, which is safe with respect to
+	// the invariant in a way that booting open is not — an api that will not
+	// start goes stale in farm.component_heartbeat, farm.reaper_arm records
+	// that as a control-plane gap, and the gap is REFUNDED onto every live
+	// lease. Refusing to boot costs a tenant nothing; booting open costs
+	// them whatever the first stranger who finds the port decides to revoke.
+	auth, err := api.AuthenticatorFor(cfg, log)
+	if err != nil {
+		return err
+	}
+	opts = append(opts, api.WithAuthenticator(auth))
 
 	srv, err := api.New(cfg, pool, opts...)
 	if err != nil {
@@ -199,11 +238,41 @@ func runReaper(ctx context.Context, cfg *config.Config, log *slog.Logger, pool *
 }
 
 func runRecovery(ctx context.Context, cfg *config.Config, log *slog.Logger, pool *pgxpool.Pool) error {
-	// No host agent is configured here, so tiers 3 and 4 are refused with a
-	// reason naming what is missing rather than silently skipped.
+	// The two rungs ADB cannot perform — a USB device reset and a VBUS power
+	// cycle — happen on the physical machine, so the ladder drives them
+	// through each host's farmd-node agent.
+	//
+	// This used to pass a nil HostRunner, which meant tiers 3 and 4 were
+	// refused on every deployment forever with "no host agent is configured
+	// for this farm". That refusal was honest and unfixable: nothing in the
+	// tree spoke to a node agent, and farm.hosts had no column saying where
+	// one listens.
+	//
+	// A farm with no agents still works. The client resolves each host's
+	// endpoint per call, and a host with node_endpoint NULL produces the same
+	// honest refusal as before — for that host only, rather than fleet-wide.
+	var runner recovery.HostRunner
+	token := os.Getenv("FARM_NODE_TOKEN")
+	if token == "" {
+		log.Warn("no FARM_NODE_TOKEN set, so recovery tiers 3 and 4 stay refused",
+			"consequence", "a device that needs a USB reset or a port power cycle "+
+				"will climb to quarantine instead of being recovered",
+			"fix", "set FARM_NODE_TOKEN to the same value the farmd node agents use")
+	} else {
+		c, cerr := node.NewClient(node.ClientConfig{
+			Resolver: node.NewDBResolver(pool),
+			Token:    token,
+			Logger:   log.With("component", "node-client"),
+		})
+		if cerr != nil {
+			return fmt.Errorf("node client: %w", cerr)
+		}
+		runner = c
+	}
+
 	l, err := recovery.New(recovery.Config{
 		Pool:      pool,
-		Actuator:  recovery.NewADBActuator(log, nil),
+		Actuator:  recovery.NewADBActuator(log, runner),
 		Component: "recovery",
 		Logger:    log,
 	})
@@ -496,7 +565,13 @@ func runNode(ctx context.Context, cfg *config.Config, log *slog.Logger, pool *pg
 			_, err := enr.EnrollOnce(c)
 			return err
 		},
-		Addr:   cfg.NodeAddr,
+		Addr: cfg.NodeAddr,
+		// node.New refuses an HTTP surface with no credential, which is
+		// right: an unauthenticated endpoint that power-cycles USB ports is
+		// worse than no endpoint. Serving nothing is a legitimate deployment
+		// — discovery and enrollment still run — so an empty Addr needs no
+		// token, and a non-empty one needs this.
+		Token:  os.Getenv("FARM_NODE_TOKEN"),
 		Logger: log,
 	})
 	if err != nil {

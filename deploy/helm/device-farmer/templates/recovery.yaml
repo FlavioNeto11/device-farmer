@@ -1,0 +1,95 @@
+{{/*
+recovery — the recovery ladder.
+
+It acts FOR a holder that keeps its device: an unresponsive phone gets an adb
+reconnect, then a USB reset, then a VBUS cycle, while the lease and the fence
+stay exactly where they are. Recovery is not a release path and does not
+import the lease package at all.
+
+Concurrency is serialised per device by a TRANSACTION-scoped advisory lock
+(pg_advisory_xact_lock over the device key), not by a single-writer election,
+so a second replica is harmless — attempts on the same device queue rather
+than overlap. One replica is still the right number: the ladder is paced by
+per-tier cooldowns and blast-radius checks, not by throughput.
+
+Tiers 3 and 4 need `farmd node` on the physical host, because they are an
+ioctl on /dev/bus/usb and a uhubctl power cycle. Without a host agent they are
+REFUSED with a reason naming what is missing, rather than reported as
+ineffective. See deploy/helm/README.md.
+*/}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "device-farmer.componentName" (dict "ctx" $ "component" "recovery") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "device-farmer.labels" (dict "ctx" $ "component" "recovery") | nindent 4 }}
+spec:
+  replicas: {{ .Values.recovery.replicaCount }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      {{- include "device-farmer.selectorLabels" (dict "ctx" $ "component" "recovery") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "device-farmer.labels" (dict "ctx" $ "component" "recovery") | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        {{- include "device-farmer.configChecksums" . | nindent 8 }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- include "device-farmer.podPreamble" . | nindent 6 }}
+      # SIGTERM drains; it never releases. A recovery attempt interrupted by an
+      # eviction leaves the device with its holder, which is the whole point:
+      # the ladder exists to give a job its phone back, not to take it away.
+      terminationGracePeriodSeconds: {{ .Values.recovery.terminationGracePeriodSeconds }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- with .Values.recovery.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.recovery.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.recovery.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: recovery
+          image: {{ include "device-farmer.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["recovery"]
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          # No probes: this role serves no HTTP. It beats as "recovery", and
+          # that name is deliberately NOT in FARM_REAPER_COMPONENTS — a
+          # recovery outage must not move any lease deadline.
+          envFrom:
+            {{- include "device-farmer.envFrom" . | nindent 12 }}
+          env:
+            {{- include "device-farmer.databaseEnv" (dict "ctx" $) | nindent 12 }}
+            {{- with .Values.recovery.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          resources:
+            {{- toYaml .Values.recovery.resources | nindent 12 }}
+          {{- with .Values.extraVolumeMounts }}
+          volumeMounts:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      {{- with .Values.extraVolumes }}
+      volumes:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

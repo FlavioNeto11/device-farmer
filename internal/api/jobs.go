@@ -213,6 +213,11 @@ type jobCreateRequest struct {
 	GraceS            int64 `json:"grace_s,omitempty"`
 
 	CreatedBy string `json:"created_by,omitempty"`
+
+	// The four farm.jobs columns internal/runner reads and no caller could
+	// set. profile_id in particular was written by nothing in the tree, so a
+	// reset tier had no package list to reset against.
+	JobSubmissionOptions
 }
 
 // handleJobCreate serves POST /api/v1/jobs.
@@ -318,15 +323,33 @@ SELECT (SELECT count(*) FROM farm.tenants WHERE id = $1),
 		createdBy = actor(r.Context())
 	}
 
+	// THE GATE. specSubmissionError has existed and been documented as "the
+	// gate POST /api/v1/jobs uses" since it was written, and nothing called
+	// it: a spec that could never run was accepted, allocated a device, and
+	// failed at the runner — having occupied a handset to do it. Validating
+	// here costs one request; validating at the runner costs a device.
+	opts, apiErr, verr := s.ValidateJobSubmission(r.Context(), spec, selector, req.JobSubmissionOptions)
+	if verr != nil {
+		s.fail(w, r, "validate job submission", verr)
+		return
+	}
+	if apiErr != nil {
+		RejectSubmission(w, apiErr)
+		return
+	}
+	selector = opts.Selector
+
 	const insert = `
 INSERT INTO farm.jobs (
   tenant_id, queue_id, pool_id, spec, selector, pin_device, protected, disruption_policy,
-  expected_duration, max_runtime, ttl, grace, created_by)
+  expected_duration, max_runtime, ttl, grace, created_by,
+  profile_id, reset_tier, max_attempts, resumable)
 VALUES (
   $1, $2, $3, $4::jsonb, $5::jsonb, nullif($6,'')::uuid, $7, $8,
   CASE WHEN $9::bigint  IS NULL THEN NULL ELSE make_interval(secs => $9::bigint)  END,
   CASE WHEN $10::bigint IS NULL THEN NULL ELSE make_interval(secs => $10::bigint) END,
-  make_interval(secs => $11::bigint), make_interval(secs => $12::bigint), $13)
+  make_interval(secs => $11::bigint), make_interval(secs => $12::bigint), $13,
+  nullif($14,''), $15, $16::int, $17::boolean)
 RETURNING id::text`
 
 	var jobID string
@@ -334,7 +357,8 @@ RETURNING id::text`
 		req.Tenant, req.Queue, req.Pool, []byte(spec), []byte(selector), req.PinDevice,
 		req.Protected, policy,
 		secondsPtr(req.ExpectedDurationS), secondsPtr(req.MaxRuntimeS),
-		ttl, grace, createdBy).Scan(&jobID)
+		ttl, grace, createdBy,
+		opts.ProfileID, opts.ResetTier, opts.MaxAttempts, opts.Resumable).Scan(&jobID)
 	if err != nil {
 		s.fail(w, r, "create job", err)
 		return

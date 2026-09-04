@@ -374,6 +374,18 @@ END $fn$;
 -- +goose StatementEnd
 
 -- +goose StatementBegin
+-- CREATE OR REPLACE matches on the ARGUMENT LIST, so adding p_rearm creates
+-- an OVERLOAD rather than replacing the original. Both would then exist, and
+-- the one-argument call in internal/lease/store.go:460 becomes ambiguous:
+--
+--   ERROR: function farm.lease_expire_max_runtime(integer) is not unique
+--
+-- which is the reaper failing in production on a path no SQL assertion here
+-- exercises, because these assertions call the two-argument form. The Go test
+-- added alongside this migration is what caught it. Drop the old signature
+-- explicitly so exactly one function answers that name.
+DROP FUNCTION IF EXISTS farm.lease_expire_max_runtime(int);
+
 CREATE OR REPLACE FUNCTION farm.lease_expire_max_runtime(
   p_limit int DEFAULT 100,
   p_rearm interval DEFAULT interval '35 seconds'

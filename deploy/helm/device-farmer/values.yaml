@@ -1,0 +1,527 @@
+# device-farmer — the control plane, in Kubernetes.
+#
+# THE INVARIANT THIS DEPLOYMENT MUST NOT BREAK
+#
+#   A lease ends when the job says so, when a deadline the user wrote down
+#   elapses, or when a human takes it back. Nothing else. Not a socket error,
+#   not a probe timeout, not a device going offline, not a pod dying.
+#
+# Kubernetes is where that invariant is hardest to keep, because eviction,
+# drain, preemption and rolling updates are ordinary here. Every knob below
+# that looks like a timeout has been chosen so that ordinary cluster churn
+# costs a job nothing: farmd never releases a lease on SIGTERM, and the
+# replacement pod re-attaches to the same lease at the same fence.
+#
+# What is NOT in this chart:
+#   - Postgres. Bring your own; see Chart.yaml.
+#   - `farmd node`. It needs /dev/bus/usb and uhubctl on the physical host the
+#     phones are plugged into, so it cannot be a workload here. See README.md.
+#   - RBAC and a ServiceAccount. Nothing in this control plane talks to the
+#     Kubernetes API; it talks to Postgres. Tokens are not mounted.
+
+# -----------------------------------------------------------------------------
+# Image
+# -----------------------------------------------------------------------------
+image:
+  # One image, every role. The roles disagree about exactly one thing — the
+  # lease — and shipping them from one binary makes it impossible to run a
+  # reaper built from a different commit than the scheduler it races with.
+  repository: ghcr.io/flaviopadilha/device-farmer/farmd
+  # Empty means .Chart.AppVersion. Pin a digest or an immutable tag in
+  # production: "latest" would let a node restart change the lease semantics
+  # of a running farm.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  # This chart creates no ServiceAccount and no RBAC, on purpose: farmd never
+  # calls the Kubernetes API. Name an existing one only if your cluster policy
+  # demands it (image pull secrets, workload identity for a cloud database).
+  name: ""
+  # Nothing here reads the API server, so no token is projected into any pod.
+  automountToken: false
+
+# Applied to every pod in the chart. A control plane that gets preempted
+# before the workloads it supervises is a control plane that stops renewing.
+priorityClassName: ""
+
+podAnnotations: {}
+podLabels: {}
+
+# -----------------------------------------------------------------------------
+# Database — the DSN NEVER goes in a ConfigMap.
+# -----------------------------------------------------------------------------
+database:
+  # Set exactly one of dsn or existingSecret. SETTING BOTH IS REFUSED at render
+  # time, because existingSecret would win and dsn would be dropped without a
+  # word — a control plane pointed at a database nobody chose.
+  #
+  #   dsn: postgres://farm:secret@postgres.db.svc:5432/device_farmer?sslmode=require
+  #
+  # With dsn set, the chart writes a Secret. With existingSecret set, the chart
+  # writes nothing and reads DATABASE_URL out of the Secret you already have —
+  # which is what you want if the DSN is minted by an external-secrets
+  # controller or a cloud IAM helper.
+  dsn: ""
+  existingSecret: ""
+  existingSecretKey: DATABASE_URL
+
+# -----------------------------------------------------------------------------
+# API authentication
+# -----------------------------------------------------------------------------
+auth:
+  # FARM_API_TOKENS is a comma-separated list of "<token>:<role>[:<subject>[:<tenant>]]",
+  # where role is tenant, operator or admin.
+  #
+  #   tokens: "s3cr3t:operator:ci,readonly:tenant:dash"
+  #
+  # WITHOUT THIS, THE CONTROL PLANE IS OPEN: every caller is granted the
+  # operator role, which can revoke leases, drain hosts and cut power to a USB
+  # port that is holding a live job. NOTES.txt says so again, louder, and
+  # deploy/helm/README.md explains how to ask the server which authenticator
+  # it actually installed — a build that has the token wiring in place refuses
+  # to start on a network listener instead of serving open.
+  #
+  # SETTING THIS *AND* existingSecret IS REFUSED at render time. existingSecret
+  # would win and this value would reach no pod, so editing it to revoke a
+  # leaked credential would look like a clean upgrade and change nothing.
+  tokens: ""
+  # Or keep them out of your values file entirely: a Secret with a
+  # FARM_API_TOKENS key (override the key with existingSecretKey).
+  existingSecret: ""
+  existingSecretKey: FARM_API_TOKENS
+
+# -----------------------------------------------------------------------------
+# Configuration — everything that is not a credential.
+#
+# These are the real environment variables from internal/config/config.go and
+# the defaults here are that package's defaults. farmd validates them against
+# each other at startup and REFUSES to boot on a bad combination, so a typo
+# here fails the rollout rather than a tenant's job.
+# -----------------------------------------------------------------------------
+config:
+  # FARM_LOG_LEVEL: debug | info | warn | error
+  logLevel: info
+  # FARM_SHUTDOWN_GRACE bounds draining of in-flight HTTP requests. It is NOT a
+  # deadline to release leases; nothing in farmd releases on shutdown.
+  shutdownGrace: 30s
+
+  db:
+    # FARM_DB_MAX_CONNS, per pod. Two floors, and the chart treats them
+    # differently because their failure modes differ:
+    #
+    #   2  REFUSED BELOW THIS. The scheduler and the reaper each pin one
+    #      connection for the life of the process — the session holding their
+    #      leader-election advisory lock. With a pool of one, the elected
+    #      leader has nothing left to work with: it logs that it took
+    #      leadership and then places no job and reclaims no lease, forever,
+    #      with no error anywhere. farmd accepts 1 because internal/config
+    #      cannot know which role it is configuring. This chart can.
+    #
+    #   7  WARNED BELOW THIS, in NOTES.txt. A jobrunner replica runs 4 jobs at
+    #      once (jobrunner.DefaultConcurrency), holds one connection
+    #      permanently for its claim session, and renews one lease per running
+    #      job. Below 7 it warns at startup and then quietly stops picking work
+    #      up once the farm is busy. Raise it with jobrunner concurrency.
+    maxConns: 8
+    # FARM_DB_CONNECT_TIMEOUT
+    connectTimeout: 10s
+
+  lease:
+    # FARM_LEASE_TTL — how long a lease survives without a renewal before the
+    # suspect sweep marks it. Marking a lease suspect RELEASES NOTHING.
+    # farm.jobs.ttl is CHECK-constrained to >= 10 minutes.
+    ttl: 15m
+    # FARM_LEASE_GRACE — the band after TTL before a suspect lease becomes
+    # reclaimable. TTL+grace is the only automatic release deadline in the
+    # system that a user did not write down. CHECK-constrained to >= 5 minutes.
+    grace: 30m
+    # FARM_LEASE_RENEW_INTERVAL — at least three renewal attempts must fit
+    # inside one TTL, so a holder survives losing two in a row to a rolling
+    # deploy or a Postgres failover.
+    renewInterval: 90s
+    # FARM_LEASE_WITNESS_INTERVAL — on-device proof that the holder is alive.
+    # Must land at least twice per grace band or it protects nothing.
+    witnessInterval: 2m
+    # FARM_LEASE_WITNESS_MAX_EXTENSIONS — caps consecutive witness-only
+    # extensions, so a wedged holder cannot keep a phone forever.
+    maxWitnessExtensions: 12
+    # FARM_SLOT_REARM — how long a slot stays parked after a release or a
+    # reclaim. THIS ONE IS LOAD BEARING: it must exceed
+    # node.selfFenceTimeout + node.fenceSafetyMargin, or a reclaimed device can
+    # be handed to a new job while the previous holder's ADB sockets are still
+    # open on the host. farmd refuses to start if you get this wrong.
+    slotRearm: 35s
+
+  reaper:
+    # FARM_REAPER_INTERVAL — sweep period.
+    interval: 10s
+    # FARM_REAPER_BATCH — leases considered per sweep.
+    batch: 100
+    # FARM_REAPER_GAP_FLOOR — a heartbeat older than this counts as a
+    # control-plane outage and refunds the lease time it cost.
+    gapFloor: 60s
+    # FARM_HEARTBEAT_INTERVAL — must be less than half of gapFloor, or
+    # ordinary scheduling jitter is recorded as an outage.
+    heartbeatInterval: 5s
+    # FARM_REAPER_COMPONENTS — the components whose downtime is refunded.
+    #
+    # Add every role that is ON THE LEASE RENEWAL PATH and nothing else. api,
+    # scheduler and reaper belong here: if one of them is down, holders cannot
+    # renew and the outage must not be charged to the tenant.
+    #
+    # watchdog, recovery, jobrunner and node beat too, and are deliberately
+    # ABSENT. Listing watchdog here would let device health move a lease
+    # deadline, which fuses two clocks this system keeps apart on purpose.
+    components: "reaper,api,scheduler"
+
+  node:
+    # FARM_NODE_SELF_FENCE_TIMEOUT — how long the host-side proxy may go
+    # without a successful fence check before it tears down its ADB sockets.
+    # This is a property of the agent on the bare-metal host; set it to the
+    # same value there and here, because lease.slotRearm is validated against it.
+    selfFenceTimeout: 20s
+    # FARM_FENCE_SAFETY_MARGIN — required slack between the two.
+    fenceSafetyMargin: 5s
+
+  # FARM_WATCHDOG_INTERVAL — device health probe period. Health never ends a
+  # lease; this clock only writes to the health tables.
+  watchdogInterval: 5s
+
+  # FARM_MIGRATIONS_TABLE — goose's version table.
+  migrationsTable: public.goose_db_version
+
+  # FARM_API_URL — how `farmd ctl` and in-cluster clients reach the API.
+  # Empty means the api Service of this release.
+  apiBaseURL: ""
+
+  # Anything else you need in every pod's environment. FARM_COMPONENT is
+  # rejected here on purpose: each role must beat under its own name, and a
+  # shared FARM_COMPONENT would make the reaper's gap accounting blind to the
+  # role that is actually down.
+  extra: {}
+
+# -----------------------------------------------------------------------------
+# Artifacts — APKs, pushed files, captured output.
+# -----------------------------------------------------------------------------
+artifacts:
+  # FARM_ARTIFACT_DIR. The distroless image runs with a read-only root
+  # filesystem, so this path is always a mounted volume.
+  dir: /var/lib/device-farmer/artifacts
+  persistence:
+    # WITHOUT A SHARED VOLUME, the store is per-pod: the api accepts an upload
+    # into its own emptyDir and a jobrunner on another node cannot find the
+    # blob when the job's install step asks for it. Fine for a single-replica
+    # evaluation; give it a ReadWriteMany claim for anything real.
+    enabled: false
+    existingClaim: ""
+
+# -----------------------------------------------------------------------------
+# Schema migration — a pre-install/pre-upgrade hook.
+# -----------------------------------------------------------------------------
+migrate:
+  enabled: true
+  # Hook weights. The hook Secret carrying the DSN is -10, the Job is -5, so
+  # the credential exists before the Job that needs it.
+  hookWeight: -5
+  # A failed migration must stop the rollout: Helm aborts the release and no
+  # workload is ever pointed at a schema it does not understand. The failed
+  # Job and its pod are kept so `kubectl logs` still has something to show;
+  # the next attempt deletes them before creating its own.
+  backoffLimit: 1
+  # Overall deadline for the run, passed to `farmd migrate -timeout`.
+  timeout: 10m
+  # How long to wait for the migration advisory lock. Two farmd migrate Jobs
+  # racing in one cluster serialise on it rather than both trying to
+  # CREATE SCHEMA farm.
+  lockTimeout: 2m
+  activeDeadlineSeconds: 900
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      memory: 256Mi
+
+# -----------------------------------------------------------------------------
+# api — the tenant HTTP surface, the dashboard, and /metrics.
+# -----------------------------------------------------------------------------
+api:
+  replicaCount: 2
+  # Spread replicas over nodes so one node's failure does not take the whole
+  # renewal path with it. Set false and use topologySpreadConstraints for
+  # anything more specific (zones, racks).
+  spreadAcrossNodes: true
+  topologySpreadConstraints: []
+
+  service:
+    type: ClusterIP
+    port: 8080
+    # nodePort: 30080
+    annotations: {}
+    labels: {}
+
+  ingress:
+    enabled: false
+    className: ""
+    annotations: {}
+    hosts:
+      - host: device-farmer.example.com
+        paths:
+          - path: /
+            pathType: Prefix
+    tls: []
+
+  podDisruptionBudget:
+    # The API serves POST /api/v1/leases/{id}/renew, the only request in this
+    # system whose failure costs a device. A node drain must not be able to
+    # take every replica at once.
+    enabled: true
+    # With replicaCount 1 this allows ZERO voluntary disruptions and blocks
+    # every node drain forever. NOTES.txt says so when that is what you asked
+    # for. Leases survive an API outage, so prefer maxUnavailable: 1 over
+    # blocking the drain if you really want a single replica.
+    minAvailable: 1
+    # maxUnavailable: 1
+
+  # SIGTERM DRAINS; IT DOES NOT RELEASE. This window only has to outlast
+  # config.shutdownGrace so in-flight requests — including a renewal one round
+  # trip from succeeding — finish before the kernel kills the process.
+  #
+  # The chart REFUSES to render if it does not exceed config.shutdownGrace:
+  # the kubelet would SIGKILL the api mid-drain, and the request most likely to
+  # be in flight during a rolling deploy is a renewal. It costs the holder TTL
+  # rather than the device — no lease ends from a failed renewal — but it is a
+  # cost nobody chose.
+  terminationGracePeriodSeconds: 60
+
+  probes:
+    liveness:
+      # /healthz answers from process state and NEVER touches the database.
+      # That is the point: a Postgres outage must not restart the API. A
+      # restart loses in-flight renewals and resets the heartbeat that the
+      # reaper's gap accounting depends on — which is how a database blip
+      # would turn into mass reclamation.
+      enabled: true
+      initialDelaySeconds: 5
+      periodSeconds: 10
+      timeoutSeconds: 3
+      failureThreshold: 6
+    readiness:
+      # /readyz pings the database. An instance that cannot reach Postgres
+      # cannot serve a renewal, so it should leave the Service — and come back
+      # by itself when the database does.
+      enabled: true
+      initialDelaySeconds: 3
+      periodSeconds: 5
+      timeoutSeconds: 3
+      failureThreshold: 3
+    startup:
+      enabled: true
+      periodSeconds: 2
+      failureThreshold: 30
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      memory: 512Mi
+
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  extraEnv: []
+
+# -----------------------------------------------------------------------------
+# scheduler — matches queued jobs to free devices via farm.lease_acquire.
+# -----------------------------------------------------------------------------
+scheduler:
+  # One is enough. Every replica takes a Postgres session advisory lock and
+  # only the winner allocates; the rest idle and keep beating. Raise this for
+  # a warm standby that takes over in milliseconds instead of on a pod
+  # reschedule — allocation is never duplicated, only the lock holder acts.
+  replicaCount: 1
+  terminationGracePeriodSeconds: 60
+  resources:
+    requests:
+      cpu: 50m
+      memory: 96Mi
+    limits:
+      memory: 256Mi
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  extraEnv: []
+
+# -----------------------------------------------------------------------------
+# reaper — the suspect sweep and the ONLY automatic release path.
+# -----------------------------------------------------------------------------
+reaper:
+  # Same advisory-lock election as the scheduler. A second replica idles
+  # rather than duplicating reclaims, and on every gain of leadership the
+  # winner calls farm.reaper_arm BEFORE its first sweep, so a reaper that was
+  # just blind refunds the outage instead of mass-revoking at the moment of
+  # restoration.
+  replicaCount: 1
+  terminationGracePeriodSeconds: 60
+  resources:
+    requests:
+      cpu: 50m
+      memory: 96Mi
+    limits:
+      memory: 256Mi
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  extraEnv: []
+
+# -----------------------------------------------------------------------------
+# recovery — the recovery ladder. Acts FOR a holder that keeps its device.
+# -----------------------------------------------------------------------------
+recovery:
+  # Serialised per device by a transaction-scoped advisory lock rather than by
+  # a single-writer election, so a second replica is harmless; one is still
+  # the right number, because the ladder is rate limited by cooldowns and not
+  # by throughput.
+  replicaCount: 1
+  terminationGracePeriodSeconds: 60
+  resources:
+    requests:
+      cpu: 50m
+      memory: 96Mi
+    limits:
+      memory: 256Mi
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  extraEnv: []
+
+# -----------------------------------------------------------------------------
+# jobrunner — turns a lease into work actually happening on a phone.
+# -----------------------------------------------------------------------------
+jobrunner:
+  # This one scales. Jobs are claimed with SELECT ... FOR UPDATE SKIP LOCKED
+  # plus a session advisory lock per job, and a lease is re-attached by
+  # job_id, so two replicas never fight over one device: the loser simply does
+  # not see the row.
+  replicaCount: 2
+  spreadAcrossNodes: true
+  topologySpreadConstraints: []
+  # Longer than the others on purpose. A jobrunner pod is holding leases and
+  # driving phones; give its in-flight step time to finish reporting before
+  # the process goes away. It still releases nothing on the way out — the
+  # replacement re-attaches by job_id at the same fence.
+  terminationGracePeriodSeconds: 120
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      memory: 512Mi
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  extraEnv: []
+
+# -----------------------------------------------------------------------------
+# watchdog — device health, one Deployment per host.
+# -----------------------------------------------------------------------------
+watchdog:
+  enabled: true
+  # Only used when hosts[] is empty: one pod that supervises every row in
+  # farm.hosts instead of one pod per host. It is the laptop shape — every
+  # host's probes share one process, and hosts enrolled after it started are
+  # not watched until it restarts. Fine while bringing a farm up; move the
+  # hosts into hosts[] before it matters.
+  superviseAllHosts: false
+  terminationGracePeriodSeconds: 30
+  resources:
+    requests:
+      cpu: 50m
+      memory: 96Mi
+    limits:
+      memory: 256Mi
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  extraEnv: []
+
+# The hosts that have phones plugged into them.
+#
+# Health is per-host because the ADB server is per-host: one stream, one epoch,
+# one blast radius. So there is one watchdog per entry below, each pinned to
+# its host with FARM_HOST_ID and FARM_ADB_ENDPOINT.
+#
+# id must match farm.hosts.id — the value `farmd node` registers on that
+# machine — and must be a DNS-1123 label, because it becomes part of a resource
+# name. farm.hosts.id is unconstrained text in the schema, so an id that is
+# perfectly legal in the database and illegal in Kubernetes is ordinary. Ids
+# are checked, and checked for uniqueness, whatever watchdog.enabled says: the
+# Services in templates/hosts.yaml are built from the same value.
+#
+# adbEndpoint must be routable FROM THE CLUSTER. The ADB server binds
+# 127.0.0.1 by default; start it with `adb -a nodaemon server` on the host.
+#
+# service.enabled renders a selector-less Service plus an EndpointSlice for the
+# bare-metal address, so the endpoint has a stable in-cluster name instead of
+# an IP that changes when the machine is re-imaged. service.address is the bare
+# address of the machine, with no port and no scheme — the port goes in
+# service.port, and anything else is refused, because this value becomes an
+# EndpointSlice address or an ExternalName and neither accepts one.
+#
+# hosts:
+#   - id: h01
+#     adbEndpoint: device-farmer-h01-adb:5037
+#     service:
+#       enabled: true
+#       address: 10.20.0.11
+#       port: 5037
+#   - id: h02
+#     adbEndpoint: 10.20.0.12:5037
+hosts: []
+
+# -----------------------------------------------------------------------------
+# Metrics
+# -----------------------------------------------------------------------------
+serviceMonitor:
+  # Requires the Prometheus Operator CRDs. Scrapes the api Service; see the
+  # comment in templates/servicemonitor.yaml for what that does and does not
+  # cover.
+  enabled: false
+  namespace: ""
+  interval: 30s
+  scrapeTimeout: 10s
+  labels: {}
+  annotations: {}
+  relabelings: []
+  metricRelabelings: []
+
+# -----------------------------------------------------------------------------
+# Pod hardening. The image is distroless/static:nonroot — no shell, no package
+# manager, nothing to exec into at 3am instead of fixing the image.
+# -----------------------------------------------------------------------------
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+# Extra volumes and mounts for every farmd pod, e.g. a CA bundle for a
+# sslmode=verify-full DSN.
+extraVolumes: []
+extraVolumeMounts: []

@@ -1,0 +1,97 @@
+{{/*
+scheduler — matches queued jobs to free devices through farm.lease_acquire.
+
+SINGLE WRITER BY ELECTION, NOT BY REPLICA COUNT.
+
+Every replica takes a Postgres SESSION advisory lock on a dedicated
+connection; only the holder allocates, and the rest idle while still writing
+farm.component_beat. So scheduler.replicaCount may be raised for a warm
+standby that takes over in milliseconds — allocation is never duplicated,
+because the losers never get past the lock.
+
+Two consequences for this manifest:
+
+  - FARM_DB_MAX_CONNS must be at least 2. One connection is pinned for the
+    leadership lock; a pool of one would deadlock against its own work.
+  - maxSurge 1 / maxUnavailable 0 is safe and desirable. The new pod starts,
+    idles until the old one's session ends, and picks the lock up immediately
+    — instead of the farm allocating nothing for a scheduling round trip.
+*/}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "device-farmer.componentName" (dict "ctx" $ "component" "scheduler") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "device-farmer.labels" (dict "ctx" $ "component" "scheduler") | nindent 4 }}
+spec:
+  replicas: {{ .Values.scheduler.replicaCount }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      {{- include "device-farmer.selectorLabels" (dict "ctx" $ "component" "scheduler") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "device-farmer.labels" (dict "ctx" $ "component" "scheduler") | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        {{- include "device-farmer.configChecksums" . | nindent 8 }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- include "device-farmer.podPreamble" . | nindent 6 }}
+      # SIGTERM drains; it never releases. A scheduler that "cleaned up" the
+      # leases it minted on its way out would destroy the work of every job it
+      # had just placed.
+      terminationGracePeriodSeconds: {{ .Values.scheduler.terminationGracePeriodSeconds }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- with .Values.scheduler.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.scheduler.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.scheduler.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: scheduler
+          image: {{ include "device-farmer.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["scheduler"]
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          # No probes: this role serves no HTTP, and the image has no shell to
+          # exec into. Its liveness is farm.component_heartbeat — visible on
+          # the dashboard, and the same signal the reaper uses for gap
+          # accounting. A probe invented for it here would be a second opinion
+          # about liveness that nothing else in the system shares.
+          envFrom:
+            {{- include "device-farmer.envFrom" . | nindent 12 }}
+          env:
+            {{- include "device-farmer.databaseEnv" (dict "ctx" $) | nindent 12 }}
+            {{- with .Values.scheduler.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          resources:
+            {{- toYaml .Values.scheduler.resources | nindent 12 }}
+          {{- with .Values.extraVolumeMounts }}
+          volumeMounts:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      {{- with .Values.extraVolumes }}
+      volumes:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

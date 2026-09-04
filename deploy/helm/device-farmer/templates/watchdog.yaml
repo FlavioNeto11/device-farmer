@@ -1,0 +1,197 @@
+{{- if .Values.watchdog.enabled }}
+{{/*
+watchdog — device health, and NOTHING ELSE.
+
+One Deployment per host, because health is per-host: the ADB server is
+per-host, one stream, one epoch, one blast radius. A watchdog pinned with
+FARM_HOST_ID supervises exactly the phones plugged into that machine, and its
+failure blinds that machine only.
+
+What a watchdog can do: write the health tables, and beat as
+"watchdog:<host id>". What it can NEVER do: end a lease. It does not import
+the lease package, "watchdog" is deliberately absent from
+FARM_REAPER_COMPONENTS, and a device reading unhealthy is not a release
+reason — farm.leases.release_reason has no connectivity value in its domain.
+
+Replicas are pinned at 1 and not exposed as a value: there is no leader
+election here and none is wanted. A second replica would simply double the
+probe rate against that host's single ADB server, which is the one thing on
+the machine that everything else has to share.
+*/}}
+{{/*
+hosts[] is validated by device-farmer.checkHosts, which templates/configmap.yaml
+runs unconditionally. It lives there rather than here because this file can be
+switched off with watchdog.enabled while templates/hosts.yaml still builds
+resource names out of the very same ids.
+*/}}
+{{- $ := . }}
+{{- if .Values.hosts }}
+{{- range $i, $host := .Values.hosts }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ printf "%s-watchdog-%s" (include "device-farmer.fullname" $) $host.id | trunc 63 | trimSuffix "-" }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "device-farmer.labels" (dict "ctx" $ "component" "watchdog") | nindent 4 }}
+    device-farmer.io/host: {{ $host.id | quote }}
+spec:
+  replicas: 1
+  strategy:
+    # Recreate, not RollingUpdate: two watchdogs on one host would double the
+    # probe load on its ADB server for the length of a deploy, and a few
+    # seconds without health data costs nothing — health is not a lease clock.
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "device-farmer.selectorLabels" (dict "ctx" $ "component" "watchdog") | nindent 6 }}
+      device-farmer.io/host: {{ $host.id | quote }}
+  template:
+    metadata:
+      labels:
+        {{- include "device-farmer.labels" (dict "ctx" $ "component" "watchdog") | nindent 8 }}
+        device-farmer.io/host: {{ $host.id | quote }}
+        {{- with $.Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        {{- include "device-farmer.configChecksums" $ | nindent 8 }}
+        {{- with $.Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- include "device-farmer.podPreamble" $ | nindent 6 }}
+      # Short, because there is nothing to drain: a half-finished health probe
+      # is discarded and re-run. A watchdog holds no lease and can lose none.
+      terminationGracePeriodSeconds: {{ $.Values.watchdog.terminationGracePeriodSeconds }}
+      securityContext:
+        {{- toYaml $.Values.podSecurityContext | nindent 8 }}
+      {{- with $.Values.watchdog.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $.Values.watchdog.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $.Values.watchdog.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: watchdog
+          image: {{ include "device-farmer.image" $ }}
+          imagePullPolicy: {{ $.Values.image.pullPolicy }}
+          args: ["watchdog"]
+          securityContext:
+            {{- toYaml $.Values.containerSecurityContext | nindent 12 }}
+          envFrom:
+            {{- include "device-farmer.envFrom" $ | nindent 12 }}
+          env:
+            {{- include "device-farmer.databaseEnv" (dict "ctx" $) | nindent 12 }}
+            # FARM_HOST_ID is what makes this the single-host production shape.
+            # Without it, farmd supervises every registered host in one
+            # process, which is the laptop shape.
+            - name: FARM_HOST_ID
+              value: {{ $host.id | quote }}
+            # Reached over TCP from inside the cluster. On the host, the ADB
+            # server must be listening on a routable interface:
+            #   adb -a -P 5037 nodaemon server
+            - name: FARM_ADB_ENDPOINT
+              value: {{ $host.adbEndpoint | quote }}
+            {{- with $.Values.watchdog.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          resources:
+            {{- toYaml $.Values.watchdog.resources | nindent 12 }}
+          {{- with $.Values.extraVolumeMounts }}
+          volumeMounts:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      {{- with $.Values.extraVolumes }}
+      volumes:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}
+{{- else if .Values.watchdog.superviseAllHosts }}
+---
+{{/*
+The fallback shape: one pod that supervises every row in farm.hosts, started
+without FARM_HOST_ID.
+
+It is the laptop shape, not the production one. Every host's probes share one
+process and one failure domain, so a pod restart blinds the whole farm at
+once, and the pod discovers its hosts only at startup — a host enrolled later
+is not watched until this Deployment is restarted. Use it while you are
+bringing a farm up, then move the hosts into hosts[] and get one pod each.
+*/}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "device-farmer.componentName" (dict "ctx" $ "component" "watchdog") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "device-farmer.labels" (dict "ctx" $ "component" "watchdog") | nindent 4 }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "device-farmer.selectorLabels" (dict "ctx" $ "component" "watchdog") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "device-farmer.labels" (dict "ctx" $ "component" "watchdog") | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        {{- include "device-farmer.configChecksums" . | nindent 8 }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- include "device-farmer.podPreamble" . | nindent 6 }}
+      terminationGracePeriodSeconds: {{ .Values.watchdog.terminationGracePeriodSeconds }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- with .Values.watchdog.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.watchdog.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.watchdog.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: watchdog
+          image: {{ include "device-farmer.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["watchdog"]
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          envFrom:
+            {{- include "device-farmer.envFrom" . | nindent 12 }}
+          env:
+            {{- include "device-farmer.databaseEnv" (dict "ctx" $) | nindent 12 }}
+            {{- with .Values.watchdog.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          resources:
+            {{- toYaml .Values.watchdog.resources | nindent 12 }}
+          {{- with .Values.extraVolumeMounts }}
+          volumeMounts:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      {{- with .Values.extraVolumes }}
+      volumes:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}
+{{- end }}

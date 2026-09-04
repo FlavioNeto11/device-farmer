@@ -1,0 +1,203 @@
+device-farmer {{ .Chart.AppVersion }} — release {{ .Release.Name }} in namespace {{ .Release.Namespace }}
+
+The schema migration ran as a pre-install/pre-upgrade hook. If you are reading
+this, it succeeded: `farmd migrate up` exited 0 before any workload was
+created or updated.
+
+REACH THE DASHBOARD
+{{- $svc := printf "%s-api" (include "device-farmer.fullname" .) }}
+{{- if .Values.api.ingress.enabled }}
+{{- $scheme := "http" }}
+{{- if .Values.api.ingress.tls }}{{ $scheme = "https" }}{{ end }}
+{{- range $h := .Values.api.ingress.hosts }}
+{{- range $p := $h.paths }}
+
+  {{ $scheme }}://{{ $h.host }}{{ $p.path }}
+{{- end }}
+{{- end }}
+{{- else if eq .Values.api.service.type "LoadBalancer" }}
+
+  kubectl -n {{ .Release.Namespace }} get svc {{ $svc }} -w
+
+  and open http://<EXTERNAL-IP>:{{ .Values.api.service.port }}/
+{{- else if eq .Values.api.service.type "NodePort" }}
+
+  kubectl -n {{ .Release.Namespace }} get svc {{ $svc }} \
+    -o jsonpath='{.spec.ports[0].nodePort}'
+
+  and open http://<any node>:<that port>/
+{{- else }}
+
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ $svc }} 8420:{{ .Values.api.service.port }}
+
+  and open http://127.0.0.1:8420/
+{{- end }}
+
+  In-cluster, the API is at {{ include "device-farmer.apiURL" . }}
+  Health: /healthz (no database) and /readyz (pings Postgres).
+  What this deployment can actually do, observed rather than declared:
+    curl {{ include "device-farmer.apiURL" . }}/api/v1/capabilities
+
+{{- if not (or .Values.auth.tokens .Values.auth.existingSecret) }}
+
+
+  ############################################################################
+  ############################################################################
+  ##                                                                        ##
+  ##   THIS CONTROL PLANE IS OPEN. NO API TOKENS WERE CONFIGURED.           ##
+  ##                                                                        ##
+  ############################################################################
+  ############################################################################
+
+  Every caller that can reach port {{ .Values.api.service.port }} is granted the OPERATOR role.
+  That is not a read-only dashboard. An operator can:
+
+    * revoke a live lease           — POST /api/v1/leases/{id}/revoke
+    * cancel somebody's job         — POST /api/v1/jobs/{id}/cancel
+    * drain a host                  — POST /api/v1/hosts/{id}/drain
+    * cut power to a USB port that is holding a running job
+                                    — POST /api/v1/slots/{id}/power
+    * run arbitrary adb commands on any device
+                                    — POST /api/v1/devices/{id}/exec
+
+  In a farm running multi-hour jobs, one unauthenticated request destroys
+  hours of work on a phone somebody else is using.
+
+  Fix it now:
+
+    helm upgrade {{ .Release.Name }} <chart> --reuse-values \
+      --set auth.tokens='<token>:operator:ci,<token>:tenant:dashboard'
+
+  or, keeping the tokens out of your values and your shell history:
+
+    kubectl -n {{ .Release.Namespace }} create secret generic farm-api-tokens \
+      --from-literal=FARM_API_TOKENS='<token>:operator:ci'
+    helm upgrade {{ .Release.Name }} <chart> --reuse-values \
+      --set auth.existingSecret=farm-api-tokens
+
+  Until then, treat port {{ .Values.api.service.port }} as privileged: keep the Service ClusterIP
+  and put a NetworkPolicy in front of it.
+
+{{- else }}
+
+  FARM_API_TOKENS IS MOUNTED. THAT IS NOT THE SAME AS AUTHENTICATION BEING ON.
+
+  This chart put the tokens in the api's environment. Whether the binary reads
+  them is a property of the image you deployed, not of these values: builds
+  exist in which `runAPI` installs the allow-all authenticator unconditionally
+  and every caller is an operator no matter what is mounted. Do not take this
+  paragraph's word for it. Ask the server, which reports the authenticator it
+  actually installed:
+
+    curl -s {{ include "device-farmer.apiURL" . }}/api/v1/capabilities
+
+  Look at ".auth": mode "bearer-token" with "open": false is authenticated.
+  "open": true means every caller that can reach port {{ .Values.api.service.port }} can revoke a
+  lease, cancel a job, drain a host and cut power to a port holding live work
+  — treat the port as privileged until it says otherwise.
+
+  Once it does, callers authenticate with:
+
+    curl -H "Authorization: Bearer <token>" {{ include "device-farmer.apiURL" . }}/api/v1/fleet
+{{- end }}
+
+{{- if and .Values.api.podDisruptionBudget.enabled (not .Values.api.podDisruptionBudget.maxUnavailable) (le (int .Values.api.replicaCount) (int .Values.api.podDisruptionBudget.minAvailable)) }}
+
+
+  THE API PDB WILL BLOCK EVERY NODE DRAIN.
+
+  api.replicaCount is {{ .Values.api.replicaCount }} and the PDB demands minAvailable {{ .Values.api.podDisruptionBudget.minAvailable }}, so
+  Kubernetes allows zero voluntary disruptions: `kubectl drain` on the node
+  holding that pod waits forever, and so does a cluster upgrade behind it.
+
+  Leases survive an API outage — they go suspect, and farm.reaper_arm refunds
+  the gap when it comes back — so the drain does not need to be blocked to
+  protect them. Raise api.replicaCount, or set
+  api.podDisruptionBudget.maxUnavailable: 1 instead of minAvailable.
+{{- end }}
+
+{{- if lt (int .Values.config.db.maxConns) 7 }}
+
+
+  config.db.maxConns IS {{ .Values.config.db.maxConns }}, AND THE JOBRUNNER WANTS 7.
+
+  Each jobrunner replica runs 4 jobs at once by default, holds one connection
+  permanently for its claim session, and uses one per running job to renew that
+  job's lease. Below 7 it logs a warning at startup and then, once the farm is
+  busy, quietly stops picking work up: the claim session cannot be built, the
+  poll times out, and no error is reported anywhere.
+
+  Jobs already running keep their devices — nothing here ends a lease — but the
+  queue stops moving with every component reporting itself healthy.
+{{- end }}
+
+{{- if and .Values.watchdog.enabled (not .Values.hosts) (not .Values.watchdog.superviseAllHosts) }}
+
+
+  NO WATCHDOGS WERE CREATED — hosts[] is empty.
+
+  Nothing is probing device health, so an offline phone will not be marked
+  unhealthy and the recovery ladder has nothing to act on. Leases are
+  unaffected (health has never been allowed to end one), but the fleet grid
+  will show stale state.
+
+  Add the machines your phones are plugged into:
+
+    hosts:
+      - id: h01                        # must match farm.hosts.id
+        adbEndpoint: 10.20.0.11:5037   # routable FROM THE CLUSTER
+{{- end }}
+
+{{- if .Values.hosts }}
+
+
+  CHECK ONE NUMBER ON EACH OF YOUR {{ len .Values.hosts }} HOST{{ if gt (len .Values.hosts) 1 }}S{{ end }}: FARM_NODE_SELF_FENCE_TIMEOUT.
+
+  This release asserts config.lease.slotRearm ({{ .Values.config.lease.slotRearm }}) >
+  config.node.selfFenceTimeout ({{ .Values.config.node.selfFenceTimeout }}) + config.node.fenceSafetyMargin ({{ .Values.config.node.fenceSafetyMargin }}),
+  and farmd refuses to start if that does not hold. But the self-fence timeout
+  it checks is the COPY in this cluster. The real one lives in
+  /etc/device-farmer/node.env on each machine with phones in it, and no
+  assertion in Kubernetes can see it.
+
+  If the agent's value is larger than this one, the assertion passes here and
+  is false in the world: a reclaimed slot becomes schedulable while the
+  previous holder's ADB sockets are still open on the host, and two jobs drive
+  one phone — interleaved shell, installs in the wrong session, no error on
+  either side.
+
+    for h in {{ range $i, $host := .Values.hosts }}{{ if $i }} {{ end }}{{ $host.id }}{{ end }}; do
+      ssh $h grep FARM_NODE_SELF_FENCE_TIMEOUT /etc/device-farmer/node.env
+    done
+
+  Every one of them must read {{ .Values.config.node.selfFenceTimeout }}.
+{{- end }}
+
+{{- if and (not .Values.artifacts.persistence.enabled) (or (gt (int .Values.api.replicaCount) 1) (gt (int .Values.jobrunner.replicaCount) 1)) }}
+
+
+  ARTIFACT STORE IS PER-POD, AND YOU HAVE MORE THAN ONE REPLICA.
+
+  An APK uploaded to one api pod lives in that pod's emptyDir. A jobrunner
+  scheduled elsewhere will fail its install step with a missing blob. Give
+  artifacts.persistence a ReadWriteMany claim before running jobs that push
+  or install anything.
+{{- end }}
+
+
+WHAT THIS DEPLOYMENT PROMISES
+
+  A lease ends when the job says so, when a deadline the user wrote down
+  elapses, or when a human takes it back. Nothing else.
+
+  Rolling this release, draining a node, or losing a pod does NOT release a
+  lease. farmd drains in-flight work on SIGTERM and leaves the lease alone;
+  the replacement re-attaches with the same job_id and gets the same lease,
+  the same device and the same fence back. Watch it happen:
+
+    kubectl -n {{ .Release.Namespace }} rollout restart deploy/{{ include "device-farmer.fullname" . }}-jobrunner
+    kubectl -n {{ .Release.Namespace }} logs -l app.kubernetes.io/component=jobrunner --tail=50
+
+  `farmd node` is NOT part of this release. It runs on the bare-metal hosts
+  because it needs /dev/bus/usb and uhubctl; without it, recovery tiers 3 and
+  4 are refused rather than silently skipped. See deploy/helm/README.md.

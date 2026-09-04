@@ -43,6 +43,7 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -121,7 +122,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 	switch role {
 	case "migrate":
 		err = runMigrate(ctx, rest, stdout, stderr)
-	case "api", "scheduler", "reaper", "watchdog", "node":
+	case "api", "scheduler", "reaper", "watchdog", "recovery", "all", "demo":
+		err = runRole(ctx, role, rest, stderr)
+	case "node":
 		err = notImplemented(role, stderr, config.Load)
 	case "ctl":
 		err = notImplemented(role, stderr, func(c string, o ...config.Option) (*config.Config, error) {
@@ -149,6 +152,58 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "farmd %s: %v\n", role, err)
 		return exitFailure
 	}
+}
+
+// runRole loads configuration, opens the database, and dispatches to the
+// role's runner. Configuration and connectivity are verified BEFORE the role
+// starts, so a bad manifest fails at rollout rather than at the first request.
+func runRole(ctx context.Context, role string, args []string, stderr io.Writer) error {
+	fs := flag.NewFlagSet(role, flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	hosts := fs.Int("hosts", 2, "demo only: simulated ADB hosts")
+	devices := fs.Int("devices", 56, "demo only: simulated devices across those hosts")
+	if err := fs.Parse(args); err != nil {
+		return errUsage
+	}
+
+	cfg, err := config.Load(role)
+	if err != nil {
+		fmt.Fprintln(stderr, "Configuration preflight FAILED.")
+		return err
+	}
+	log := newLogger(cfg, stderr)
+
+	pool, err := openPool(ctx, cfg)
+	if err != nil {
+		return fmt.Errorf("database: %w", err)
+	}
+	// Closing the pool ends our connections. It does NOT end any lease: the
+	// only automatic release path is farm.lease_reclaim, which lives behind a
+	// grace band, a control-plane gap refund and a quiesce gate.
+	defer pool.Close()
+
+	reg, err := newRegistry()
+	if err != nil {
+		return err
+	}
+
+	switch role {
+	case "api":
+		return runAPI(ctx, cfg, log, pool, reg)
+	case "scheduler":
+		return runScheduler(ctx, cfg, log, pool)
+	case "reaper":
+		return runReaper(ctx, cfg, log, pool)
+	case "recovery":
+		return runRecovery(ctx, cfg, log, pool)
+	case "watchdog":
+		return runWatchdog(ctx, cfg, log, pool)
+	case "all":
+		return runAll(ctx, cfg, log, pool, reg)
+	case "demo":
+		return runDemo(ctx, cfg, log, pool, reg, *hosts, *devices)
+	}
+	return fmt.Errorf("unreachable role %q", role)
 }
 
 // errNotImplemented marks a role that exists in the CLI surface but has no
@@ -227,6 +282,9 @@ Roles:
   scheduler   matches queued jobs to free devices via farm.lease_acquire
   reaper      suspect sweep and the single automatic release path
   watchdog    device health only; it can never touch a lease
+  recovery    the recovery ladder; acts for a holder that keeps its device
+  all         every control-plane role in one process (laptop / single node)
+  demo        simulated hardware plus the real control plane; needs no phones
   node        per-host ADB proxy; enforces the fence at the resource
   ctl         operator CLI against the API
   version     build information

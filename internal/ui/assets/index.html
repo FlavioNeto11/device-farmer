@@ -1,0 +1,313 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>device-farmer</title>
+<!-- Relative hrefs so the dashboard survives being mounted under a prefix. -->
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%23167a4a'/%3E%3Crect x='5' y='3' width='6' height='10' rx='1' fill='%23fff'/%3E%3C/svg%3E">
+<script src="app.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to fleet</a>
+
+<header class="top">
+  <div class="brand">
+    <span class="brand-mark" aria-hidden="true">▚</span>
+    <span class="brand-name">device-farmer</span>
+  </div>
+
+  <nav class="tabs" role="tablist" aria-label="Views">
+    <button class="tab" role="tab" id="tab-fleet"    data-view="fleet"    aria-controls="view-fleet"    aria-selected="true"><span class="key" aria-hidden="true">1</span>Fleet</button>
+    <button class="tab" role="tab" id="tab-leases"   data-view="leases"   aria-controls="view-leases"   aria-selected="false"><span class="key" aria-hidden="true">2</span>Leases</button>
+    <button class="tab" role="tab" id="tab-jobs"     data-view="jobs"     aria-controls="view-jobs"     aria-selected="false"><span class="key" aria-hidden="true">3</span>Jobs</button>
+    <button class="tab" role="tab" id="tab-recovery" data-view="recovery" aria-controls="view-recovery" aria-selected="false"><span class="key" aria-hidden="true">4</span>Recovery</button>
+    <button class="tab" role="tab" id="tab-bulk"     data-view="bulk"     aria-controls="view-bulk"     aria-selected="false"><span class="key" aria-hidden="true">5</span>Bulk</button>
+    <button class="tab" role="tab" id="tab-events"   data-view="events"   aria-controls="view-events"   aria-selected="false"><span class="key" aria-hidden="true">6</span>Events</button>
+  </nav>
+
+  <div class="search">
+    <label class="sr-only" for="q">Search devices, hosts, jobs and holders</label>
+    <input id="q" type="search" placeholder="Search  ( / )" autocomplete="off" spellcheck="false">
+  </div>
+
+  <button id="refresh" class="ghost" title="Refetch every view now">Refresh</button>
+  <button id="token-btn" class="ghost" title="Set the bearer token this browser sends to the API">Token</button>
+
+  <div id="conn" class="conn conn-connecting" role="status" aria-live="polite">
+    <span class="dot" aria-hidden="true"></span>
+    <span id="conn-text">connecting</span>
+  </div>
+</header>
+
+<div id="banners" class="banners" role="status" aria-live="polite" aria-atomic="false"></div>
+
+<main id="main" tabindex="-1">
+
+  <!-- ================= FLEET ================= -->
+  <section id="view-fleet" class="view" role="tabpanel" aria-labelledby="tab-fleet" tabindex="-1">
+    <div class="toolbar">
+      <label>Host
+        <select id="f-host"><option value="">all hosts</option></select>
+      </label>
+      <label>Hub
+        <select id="f-hub"><option value="">all hubs</option></select>
+      </label>
+      <label>Health
+        <select id="f-health">
+          <option value="">any health</option>
+          <!-- The API reads "unhealthy" as every state except healthy and
+               retired. It is the set the Fleet tab's pip counts, so it needs a
+               way to be clicked. -->
+          <option value="unhealthy">not healthy (any fault)</option>
+          <option value="healthy">healthy</option>
+          <option value="degraded">degraded</option>
+          <option value="offline">offline</option>
+          <option value="unauthorized">unauthorized</option>
+          <option value="missing">missing</option>
+          <option value="recovering">recovering</option>
+          <option value="booting">booting</option>
+          <option value="quarantined">quarantined</option>
+          <option value="unknown">unknown</option>
+          <option value="retired">retired</option>
+        </select>
+      </label>
+      <label>Pool
+        <select id="f-pool"><option value="">all pools</option></select>
+      </label>
+      <label>Lease
+        <select id="f-lease">
+          <option value="">any lease state</option>
+          <option value="held">held</option>
+          <option value="suspect">suspect</option>
+          <option value="protected">protected</option>
+          <option value="free">free</option>
+        </select>
+      </label>
+      <button id="f-clear" class="ghost">Clear</button>
+      <span class="grow"></span>
+      <span id="fleet-counts" class="counts"></span>
+    </div>
+    <div id="fleet-alerts" class="alerts"></div>
+    <div id="fleet-body" class="fleet-body" aria-busy="true"></div>
+  </section>
+
+  <!-- ================= LEASES ================= -->
+  <section id="view-leases" class="view" role="tabpanel" aria-labelledby="tab-leases" tabindex="-1" hidden>
+    <div class="toolbar">
+      <label>State
+        <select id="l-state">
+          <option value="">live (held and suspect)</option>
+          <option value="held">held</option>
+          <option value="suspect">suspect</option>
+          <option value="expired">expired</option>
+          <option value="released">released</option>
+        </select>
+      </label>
+      <span class="grow"></span>
+      <span id="leases-counts" class="counts"></span>
+    </div>
+    <p class="axiom">
+      <strong>A lease ends when the job says so, when a deadline the user wrote down elapses, or when a human takes it back.</strong>
+      Nothing on this page ends one on its own. A <span class="chip chip-suspect"><span aria-hidden="true">◐</span> suspect</span>
+      lease means the control plane has not heard a heartbeat from the holder — it does <em>not</em> mean the device is broken,
+      the device has not been released, and a heartbeat that arrives later heals the lease at the same fence.
+    </p>
+    <div id="leases-body" class="panel-body" aria-busy="true"></div>
+  </section>
+
+  <!-- ================= JOBS ================= -->
+  <section id="view-jobs" class="view" role="tabpanel" aria-labelledby="tab-jobs" tabindex="-1" hidden>
+    <div class="split">
+      <div class="col-main">
+        <div class="toolbar">
+          <label>State
+            <select id="j-state">
+              <option value="">all states</option>
+              <option value="queued">queued</option>
+              <option value="allocating">allocating</option>
+              <option value="running">running</option>
+              <option value="succeeded">succeeded</option>
+              <option value="failed">failed</option>
+              <option value="cancelled">cancelled</option>
+            </select>
+          </label>
+          <span class="grow"></span>
+          <span id="jobs-counts" class="counts"></span>
+        </div>
+        <div id="jobs-body" class="panel-body" aria-busy="true"></div>
+      </div>
+
+      <form class="col-side card" id="job-form" autocomplete="off">
+        <h2>Submit a job</h2>
+        <label for="job-pool">Pool</label>
+        <input id="job-pool" name="pool" required placeholder="pixel-6">
+        <label for="job-queue">Queue</label>
+        <input id="job-queue" name="queue" required placeholder="ci-main">
+        <label for="job-tenant">Tenant</label>
+        <input id="job-tenant" name="tenant" required placeholder="platform">
+        <label for="job-spec">Spec (JSON)</label>
+        <textarea id="job-spec" name="spec" rows="4" spellcheck="false">{}</textarea>
+        <label for="job-selector">Selector (JSON)</label>
+        <textarea id="job-selector" name="selector" rows="2" spellcheck="false">{}</textarea>
+        <div class="row2">
+          <div>
+            <label for="job-expected">Expected duration (s)</label>
+            <input id="job-expected" name="expected_duration_s" type="number" min="0" step="1" placeholder="3600">
+          </div>
+          <div>
+            <label for="job-maxrt">Max runtime (s)</label>
+            <input id="job-maxrt" name="max_runtime_s" type="number" min="0" step="1" placeholder="21600">
+          </div>
+        </div>
+        <p class="hint">Max runtime is the only user-supplied clock allowed to end a lease automatically. Leave it empty and only the job or a human ends this lease.</p>
+        <div class="row2">
+          <div>
+            <label for="job-ttl">TTL (s, min 600)</label>
+            <input id="job-ttl" name="ttl_s" type="number" min="600" step="1" placeholder="900">
+          </div>
+          <div>
+            <label for="job-grace">Grace (s, min 300)</label>
+            <input id="job-grace" name="grace_s" type="number" min="300" step="1" placeholder="1800">
+          </div>
+        </div>
+        <label for="job-policy">Disruption policy</label>
+        <select id="job-policy" name="disruption_policy">
+          <option value="allow_port_power_cycle">allow_port_power_cycle</option>
+          <option value="allow_soft_reset">allow_soft_reset</option>
+          <option value="no_disruption">no_disruption</option>
+        </select>
+        <label class="chk"><input id="job-protected" name="protected" type="checkbox"> Protected — the reaper will never reclaim this lease; a human is paged instead</label>
+        <label for="job-by">Created by</label>
+        <input id="job-by" name="created_by" placeholder="your name">
+        <div id="job-form-error" class="form-error" hidden></div>
+        <button type="submit" class="primary">Submit job</button>
+      </form>
+    </div>
+  </section>
+
+  <!-- ================= RECOVERY ================= -->
+  <section id="view-recovery" class="view" role="tabpanel" aria-labelledby="tab-recovery" tabindex="-1" hidden>
+    <h2 class="section-h">The ladder</h2>
+    <p class="hint">
+      Recovery climbs from the cheapest rung upward and acts <em>on behalf of</em> the holder: the lease keeps its device,
+      the lease clock keeps ticking and the fence never moves. A rung whose blast radius exceeds the live lease's
+      disruption policy is refused, not quietly downgraded.
+    </p>
+    <div id="tiers-body" class="ladder" aria-busy="true"></div>
+
+    <h2 class="section-h">Recent attempts</h2>
+    <div id="attempts-body" class="panel-body" aria-busy="true"></div>
+
+    <h2 class="section-h">Open quarantines</h2>
+    <div id="quarantines-body" class="panel-body" aria-busy="true"></div>
+  </section>
+
+  <!-- ================= BULK ================= -->
+  <section id="view-bulk" class="view" role="tabpanel" aria-labelledby="tab-bulk" tabindex="-1" hidden>
+    <div class="split">
+      <div class="col-main">
+        <h2 class="section-h">Runs</h2>
+        <div id="bulk-runs" class="panel-body" aria-busy="true"></div>
+        <h2 class="section-h">Selected run</h2>
+        <div id="bulk-detail" class="panel-body"></div>
+      </div>
+      <form class="col-side card" id="bulk-form" autocomplete="off">
+        <h2>Run a command</h2>
+        <label for="bulk-selector">Selector (JSON)</label>
+        <textarea id="bulk-selector" name="selector" rows="3" spellcheck="false">{"pool":""}</textarea>
+        <label for="bulk-command">Command</label>
+        <input id="bulk-command" name="command" required placeholder="shell getprop ro.build.fingerprint">
+        <div class="row2">
+          <div>
+            <label for="bulk-max">Max per hub</label>
+            <input id="bulk-max" name="max_per_hub" type="number" min="1" step="1" value="4">
+          </div>
+          <div>
+            <label for="bulk-timeout">Timeout (ms)</label>
+            <input id="bulk-timeout" name="timeout_ms" type="number" min="1000" step="500" value="60000">
+          </div>
+        </div>
+        <p class="hint">Max per hub keeps a fleet-wide command from browning out one power domain.</p>
+        <div id="bulk-form-error" class="form-error" hidden></div>
+        <button type="submit" class="primary">Start run</button>
+      </form>
+    </div>
+  </section>
+
+  <!-- ================= EVENTS ================= -->
+  <section id="view-events" class="view" role="tabpanel" aria-labelledby="tab-events" tabindex="-1" hidden>
+    <div class="toolbar">
+      <label>Show
+        <select id="e-limit">
+          <option value="100">100</option>
+          <option value="250" selected>250</option>
+          <option value="1000">1000</option>
+        </select>
+      </label>
+      <label>Kind contains
+        <input id="e-kind" type="search" placeholder="lease_, drain, recovery" autocomplete="off">
+      </label>
+      <span class="grow"></span>
+      <span id="events-counts" class="counts"></span>
+    </div>
+    <div id="events-body" class="panel-body" aria-busy="true"></div>
+  </section>
+
+</main>
+
+<!-- Confirm-with-reason. Every destructive operator action goes through here:
+     it names exactly what will be disturbed, demands a typed reason for the
+     audit log, and renders the server's own refusal in place when refused. -->
+<dialog id="dlg-confirm" aria-labelledby="confirm-title">
+  <form id="confirm-form" method="dialog">
+    <h2 id="confirm-title">Confirm</h2>
+    <div id="confirm-impact" class="impact"></div>
+    <label for="confirm-reason">Reason — recorded in the audit log (required)</label>
+    <input id="confirm-reason" maxlength="240" autocomplete="off" required>
+    <div id="confirm-error" class="form-error" hidden></div>
+    <menu>
+      <button type="button" id="confirm-cancel" class="ghost">Cancel</button>
+      <button type="submit" id="confirm-ok" class="danger">Confirm</button>
+    </menu>
+  </form>
+</dialog>
+
+<!-- The API authenticates with "Authorization: Bearer <token>". A browser has
+     no way to know that token, so the operator pastes it here once per tab. It
+     is kept in sessionStorage — never in the URL, never in a cookie, gone when
+     the tab closes — and it is attached only to requests to this same origin's
+     API. EventSource cannot carry a header, so on a token-protected deployment
+     the live stream will not open and the page falls back to polling, which
+     can. -->
+<dialog id="dlg-token" aria-labelledby="token-title">
+  <form id="token-form" method="dialog">
+    <h2 id="token-title">API bearer token</h2>
+    <p class="hint">
+      Held in this browser tab only (sessionStorage), sent as an Authorization header to this origin's API and nowhere else.
+      Leave it empty if your control plane runs without authentication.
+    </p>
+    <label for="token-input">Token</label>
+    <input id="token-input" type="password" autocomplete="off" spellcheck="false">
+    <p class="hint" id="token-note"></p>
+    <menu>
+      <button type="button" id="token-clear" class="ghost">Clear</button>
+      <button type="button" id="token-cancel" class="ghost">Cancel</button>
+      <button type="submit" id="token-save" class="primary">Save</button>
+    </menu>
+  </form>
+</dialog>
+
+<!-- Device detail: identity, physical position, health, lease, and the
+     ad-hoc exec box. -->
+<dialog id="dlg-device" aria-labelledby="device-title">
+  <div class="dlg-head">
+    <h2 id="device-title">Device</h2>
+    <button type="button" id="device-close" class="ghost" aria-label="Close">Close</button>
+  </div>
+  <div id="device-body" class="dlg-body"></div>
+</dialog>
+
+</body>
+</html>

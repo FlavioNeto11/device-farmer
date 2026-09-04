@@ -181,6 +181,48 @@ func (c *Client) targetMessage(ctx context.Context, op, devpath, cmd string) (st
 	return c.hostMessage(ctx, op, c.devpathService(devpath, cmd), devpath, false)
 }
 
+// ControlCmd is a position-addressed maintenance verb: a host service that
+// acts on one transport rather than reading from it.
+//
+// Every one of them is addressed by devpath, never by serial. Duplicate OEM
+// serials are real, so a serial-addressed reset can land on a device that was
+// working perfectly and is hours into somebody's work — a worse outcome than
+// the fault being recovered from. See doc.go for why this package refuses to
+// know anything more than that about who is using a device.
+type ControlCmd string
+
+const (
+	// ControlReconnect re-handshakes one transport in place. The device node
+	// is untouched, so this is the least disruptive thing that can be done.
+	ControlReconnect ControlCmd = "reconnect"
+
+	// ControlReconnectOffline asks the server to re-handshake transports it
+	// has already given up on. Scoped to the addressed position.
+	ControlReconnectOffline ControlCmd = "reconnect-offline"
+
+	// ControlDetach drops the server's claim on the device without touching
+	// the USB device node. Pair it with ControlAttach.
+	ControlDetach ControlCmd = "detach"
+
+	// ControlAttach re-claims a previously detached device.
+	ControlAttach ControlCmd = "attach"
+)
+
+// Control runs a maintenance verb against one physical position and returns
+// whatever the server replied.
+//
+// It reports a *ProtocolError when the server refuses (an older server may not
+// implement the verb at all, which is a refusal and not a fault) and a
+// *TransportError when the socket fails. A caller driving a recovery ladder
+// needs that distinction: a refusal means "try the next rung", a transport
+// failure means "the host itself is unreachable and no rung will help".
+func (c *Client) Control(ctx context.Context, devpath string, cmd ControlCmd) (string, error) {
+	if cmd == "" {
+		return "", fmt.Errorf("adbwire: empty control command for %q", devpath)
+	}
+	return c.targetMessage(ctx, "control:"+string(cmd), devpath, string(cmd))
+}
+
 // ---------------------------------------------------------------------------
 // Host services
 // ---------------------------------------------------------------------------

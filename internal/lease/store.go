@@ -88,13 +88,84 @@ var (
 	// ErrJobNotFound means farm.lease_acquire was handed a job id that does not
 	// exist (SQLSTATE P0002).
 	ErrJobNotFound = errors.New("lease: job not found")
+
+	// ErrNotPermitted means farm.lease_acquire refused the call because the
+	// caller is not authorised for this job or for this lease.
+	//
+	// Three refusals, all of them a 403 and none of them a scheduling outcome:
+	// a caller confined to one tenant asking for another tenant's job (DF001),
+	// a re-attach presenting a principal other than the one the lease is bound
+	// to (DF002), and a caller presenting the reserved control-plane principal
+	// (DF003). The wrapped error carries the database's own message, which
+	// names which gate closed. See migrations/00010_reattach_auth.sql.
+	//
+	// THE LEASE IS UNTOUCHED. The refusal is raised before anything is written,
+	// so the rightful holder keeps its fence, its holder_instance and its
+	// deadlines, and its next Renew succeeds. A refusal is not an ending: a
+	// lease ends when the job says so, when a user-written deadline elapses, or
+	// when a human takes it back, and nothing else.
+	//
+	// It is deliberately NOT ErrNoCapacity. Zero rows means "the farm is busy,
+	// re-queue"; a caller that read a permission failure as capacity pressure
+	// would retry forever and never say why.
+	ErrNotPermitted = errors.New("lease: not permitted")
 )
+
+// Caller is the AUTHENTICATED identity an acquire is made on behalf of.
+//
+// Both fields must be derived from a verified credential — the bearer token,
+// the OIDC claim, whatever the deployment's Authenticator produced — and never
+// from a request body. They are what farm.lease_acquire matches on to tell a
+// legitimate re-attach from a takeover, so a value the caller chose for itself
+// would authorise nothing.
+//
+// The zero Caller means "no end-user identity": the call originated inside the
+// control plane, where the only thing that can reach farm.lease_acquire is a
+// process holding a database connection as a control-plane role. The scheduler
+// and the jobrunner acquire this way. It is the honest limit of the mechanism
+// and is documented at length in migrations/00010_reattach_auth.sql.
+type Caller struct {
+	// Tenant confines the caller to one tenant's jobs. Empty means unconfined —
+	// an operator, or a control-plane loop. Matches api.tenantScope's contract
+	// exactly, which is where the API's value comes from.
+	Tenant string
+
+	// Principal is the authenticated subject (api.Identity.Subject).
+	//
+	// It survives a pod eviction, which is the whole reason it and not
+	// holder is the thing a re-attach is checked against: a replacement pod
+	// mounts the same service-account token and authenticates as the same
+	// principal, while its pod name and its holder_instance are both new.
+	Principal string
+}
+
+// ControlPlanePrincipal is the owner farm.lease_acquire writes when no caller
+// identity is presented, so that a lease the scheduler or the jobrunner placed
+// still has an owner on the row and an authenticated caller cannot re-attach
+// it. Presenting it as Caller.Principal is REFUSED with ErrNotPermitted — a
+// token whose subject were this string would otherwise be the control plane as
+// far as every check is concerned.
+//
+// Declared here for readers and tests. The enforcement is in SQL, where it
+// cannot be skipped by a caller that never goes through this package.
+const ControlPlanePrincipal = "system:control-plane"
 
 // SQLSTATEs we interpret. Spelled out rather than pulled from a dependency so
 // that go.mod stays at three third-party modules.
 const (
 	sqlStateCheckViolation = "23514" // CHECK constraint, incl. release_reason
 	sqlStateNoDataFound    = "P0002" // PL/pgSQL RAISE ... ERRCODE = no_data_found
+
+	// The refusals farm.lease_acquire raises, in a private SQLSTATE class.
+	//
+	// NOT 42501. That is Postgres' own insufficient_privilege, raised when a
+	// ROLE lacks a grant, and the two must not share a code: a missing grant is
+	// a deployment misconfiguration the caller should retry through, while
+	// these three are terminal and must not be retried. Sharing 42501 would let
+	// a privilege gap abort a job.
+	sqlStateWrongTenant       = "DF001" // the caller's tenant does not own the job
+	sqlStateWrongPrincipal    = "DF002" // the lease is bound to a different principal
+	sqlStateReservedPrincipal = "DF003" // the caller presented system:control-plane
 )
 
 // Defaults mirroring the SQL function defaults, applied when a caller passes a
@@ -191,14 +262,40 @@ func NewStore(pool *pgxpool.Pool) *Store { return &Store{pool: pool} }
 //
 // Returns ErrNoCapacity (zero rows) when nothing schedulable matched — an
 // ordinary outcome; re-queue. Returns ErrJobNotFound when the job id is unknown.
+//
+// Acquire presents NO caller identity, which marks the call as originating
+// inside the control plane. Anything fronting an untrusted caller must use
+// AcquireAs instead, or a known job id is once again enough to take a live
+// lease away from its holder.
 func (s *Store) Acquire(ctx context.Context, jobID, holder, holderInstance string) (AcquireResult, error) {
+	return s.AcquireAs(ctx, jobID, holder, holderInstance, Caller{})
+}
+
+// AcquireAs is Acquire on behalf of an authenticated caller.
+//
+// The identity is what separates a pod eviction from a theft. Both present the
+// same job id, both present a new pod name and a new holder_instance, and
+// neither is distinguishable from the other by anything already on the row — so
+// the lease binds to the principal that acquired it, and a re-attach must
+// present that principal again. The replacement pod does, because the
+// credential belongs to the workload and not to the process that died.
+//
+// Returns ErrNotPermitted (SQLSTATE 42501) when the caller is confined to
+// another tenant, or when the lease is bound to a different principal. That
+// refusal writes nothing: the lease keeps its fence, its holder_instance and
+// its deadlines, and its rightful holder's next Renew still succeeds.
+//
+// See migrations/00010_reattach_auth.sql for what this closes and — stated
+// there rather than glossed over — what it cannot.
+func (s *Store) AcquireAs(ctx context.Context, jobID, holder, holderInstance string, as Caller) (AcquireResult, error) {
 	const q = `
 SELECT a.lease_id::text, a.device_id::text, a.slot_id, a.fence,
        a.expires_at, a.reclaimable_at, a.reattached
-  FROM farm.lease_acquire($1::uuid, $2::text, $3::uuid) AS a`
+  FROM farm.lease_acquire($1::uuid, $2::text, $3::uuid,
+                          nullif($4::text, ''), nullif($5::text, '')) AS a`
 
 	var out AcquireResult
-	err := s.pool.QueryRow(ctx, q, jobID, holder, holderInstance).Scan(
+	err := s.pool.QueryRow(ctx, q, jobID, holder, holderInstance, as.Tenant, as.Principal).Scan(
 		&out.Lease.ID,
 		&out.Lease.DeviceID,
 		&out.Lease.SlotID,
@@ -212,6 +309,15 @@ SELECT a.lease_id::text, a.device_id::text, a.slot_id, a.fence,
 		return AcquireResult{}, fmt.Errorf("lease: acquire job %s: %w", jobID, ErrNoCapacity)
 	case isSQLState(err, sqlStateNoDataFound):
 		return AcquireResult{}, fmt.Errorf("lease: acquire job %s: %w", jobID, ErrJobNotFound)
+	case isSQLState(err, sqlStateWrongTenant),
+		isSQLState(err, sqlStateWrongPrincipal),
+		isSQLState(err, sqlStateReservedPrincipal):
+		// Kept apart from ErrNoCapacity on purpose. A refusal answered as
+		// "no capacity" would be retried by every caller in this tree until
+		// the job's deadline, with nothing anywhere saying why. The database's
+		// message is preserved because it names which of the three gates
+		// closed, which is the first thing anyone reading a 403 wants.
+		return AcquireResult{}, fmt.Errorf("lease: acquire job %s: %w: %v", jobID, ErrNotPermitted, err)
 	case err != nil:
 		return AcquireResult{}, fmt.Errorf("lease: acquire job %s: %w", jobID, err)
 	}

@@ -516,6 +516,289 @@ func TestAcquireReattachesAtTheSameFence(t *testing.T) {
 	}
 }
 
+// holderPrincipal reads the principal a lease is bound to, straight from the
+// table, so an assertion about the binding is never made from the return value
+// of the call that claimed to make it.
+func (f *fixture) holderPrincipal(t *testing.T, leaseID string) *string {
+	t.Helper()
+	var p *string
+	err := f.pool.QueryRow(t.Context(),
+		`SELECT holder_principal FROM farm.leases WHERE id = $1::uuid`, leaseID).Scan(&p)
+	if err != nil {
+		t.Fatalf("read holder_principal of %s: %v", leaseID, err)
+	}
+	return p
+}
+
+// TestAcquireAsAdmitsTheEvictionAndRefusesTheTakeover is the pair of properties
+// migration 00010 has to hold at once.
+//
+// Re-attach is idempotent on job_id, and a job id is not a secret: the lease
+// list, the fleet grid and the event stream all publish it. So before 00010 any
+// caller holding a job id became that lease's holder and received the fence that
+// authorises writes to the handset, while the rightful holder's next Renew
+// matched nothing and reported ErrFenced — terminal — so it aborted a multi-hour
+// run believing the system had done it correctly.
+//
+// The two callers are indistinguishable from what they present: both bring a new
+// pod name and a freshly minted holder_instance. What separates them is the
+// credential, which belongs to the WORKLOAD and not to the process that died —
+// the replacement pod authenticates as the same principal, the thief does not.
+func TestAcquireAsAdmitsTheEvictionAndRefusesTheTakeover(t *testing.T) {
+	f := newFixture(t, 2)
+	ctx := t.Context()
+	owner := Caller{Tenant: f.tenantID, Principal: "ci-bot@" + f.tenantID}
+
+	jobID := f.newJob(t)
+	first, err := f.store.AcquireAs(ctx, jobID, "pod-a", mustInstance(t), owner)
+	if err != nil {
+		t.Fatalf("first acquire: %v", err)
+	}
+	if got := f.holderPrincipal(t, first.Lease.ID); got == nil || *got != owner.Principal {
+		t.Fatalf("allocation did not bind the lease to its principal: %v", got)
+	}
+
+	// The eviction. New pod, new instance, same workload — and it must land on
+	// the same lease at the SAME fence, because the job's own work may still be
+	// running detached on the phone.
+	second, err := f.store.AcquireAs(ctx, jobID, "pod-b", mustInstance(t), owner)
+	if err != nil {
+		t.Fatalf("the eviction re-attach was refused: %v", err)
+	}
+	if !second.Reattached || second.Lease.ID != first.Lease.ID {
+		t.Fatalf("the replacement pod was handed a new allocation (reattached=%v, %s -> %s)",
+			second.Reattached, first.Lease.ID, second.Lease.ID)
+	}
+	if second.Lease.Fence != first.Lease.Fence {
+		t.Fatalf("re-attach bumped the fence %d -> %d; that fences the job out of its own detached work",
+			first.Lease.Fence, second.Lease.Fence)
+	}
+
+	// The takeover. Same job id, same tenant, a different credential.
+	_, err = f.store.AcquireAs(ctx, jobID, "thief-pod", mustInstance(t),
+		Caller{Tenant: f.tenantID, Principal: "someone-else@" + f.tenantID})
+	if !errors.Is(err, ErrNotPermitted) {
+		t.Fatalf("a stranger presenting only the job id: err = %v, want ErrNotPermitted", err)
+	}
+	if errors.Is(err, ErrNoCapacity) {
+		t.Error("a permission failure was reported as a busy farm; the caller would retry forever and never say why")
+	}
+	if errors.Is(err, ErrFenced) {
+		t.Error("a refused acquire was reported as fencing")
+	}
+
+	// THE INVARIANT. A lease ends when the job says so, when a user-written
+	// deadline elapses, or when a human takes it back. A failed authorisation
+	// check is none of the three, so the holder that was NOT displaced must
+	// still be able to renew — at the same fence, with the instance it
+	// re-attached with.
+	state, reason := f.leaseState(t, first.Lease.ID)
+	if state != "held" || reason != nil {
+		t.Fatalf("the refusal ended the lease: state=%s reason=%v", state, reason)
+	}
+	if _, err := f.store.Renew(ctx, second.Lease.ID, second.Lease.Fence, second.Lease.HolderInstance); err != nil {
+		t.Fatalf("the rightful holder was fenced by somebody else's refused acquire: %v", err)
+	}
+	if got := f.holderPrincipal(t, first.Lease.ID); got == nil || *got != owner.Principal {
+		t.Errorf("the refusal rebound the lease: %v", got)
+	}
+}
+
+// TestAcquireAsRefusesAnotherTenantsJob covers the gate that runs ahead of both
+// phases: tenantScope() from the API, moved inside the transaction so it also
+// covers callers that never pass through the HTTP handler.
+func TestAcquireAsRefusesAnotherTenantsJob(t *testing.T) {
+	f := newFixture(t, 1)
+	ctx := t.Context()
+
+	jobID := f.newJob(t)
+	stranger := Caller{Tenant: "some-other-tenant", Principal: "ci-bot@elsewhere"}
+
+	// Allocation, not just re-attach: a confined caller has no business
+	// allocating a device for a job it does not own either.
+	_, err := f.store.AcquireAs(ctx, jobID, "pod-x", mustInstance(t), stranger)
+	if !errors.Is(err, ErrNotPermitted) {
+		t.Fatalf("allocate for another tenant's job: err = %v, want ErrNotPermitted", err)
+	}
+	var n int
+	if err := f.pool.QueryRow(ctx,
+		`SELECT count(*) FROM farm.leases WHERE job_id = $1::uuid`, jobID).Scan(&n); err != nil {
+		t.Fatalf("count leases: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("the refused allocation still created %d lease(s)", n)
+	}
+
+	// And the re-attach half, against a live lease.
+	live, err := f.store.AcquireAs(ctx, jobID, "pod-own", mustInstance(t),
+		Caller{Tenant: f.tenantID, Principal: "ci-bot@" + f.tenantID})
+	if err != nil {
+		t.Fatalf("acquire as the owning tenant: %v", err)
+	}
+	if _, err := f.store.AcquireAs(ctx, jobID, "pod-x", mustInstance(t), stranger); !errors.Is(err, ErrNotPermitted) {
+		t.Fatalf("re-attach from another tenant: err = %v, want ErrNotPermitted", err)
+	}
+	if _, err := f.store.Renew(ctx, live.Lease.ID, live.Lease.Fence, live.Lease.HolderInstance); err != nil {
+		t.Fatalf("the holder was fenced by a cross-tenant refusal: %v", err)
+	}
+}
+
+// TestControlPlaneLeasesHaveAnOwnerAndItIsNotTheCaller covers the attack that
+// survives every other check if a lease may exist with no owner on the row.
+//
+// In the topology this repo ships, the scheduler places jobs and the jobrunner
+// runs them, and neither holds an end-user credential. If those allocations left
+// holder_principal NULL, every lease in a normal farm would be unowned and any
+// authenticated caller who had read a job id off GET /api/v1/leases could
+// re-attach it, install its own holder_instance, and fence the running jobrunner
+// out with ErrFenced — the whole attack, still open. So an allocation with no
+// caller binds the reserved ControlPlanePrincipal instead, and that name is
+// refused if a caller tries to present it.
+func TestControlPlaneLeasesHaveAnOwnerAndItIsNotTheCaller(t *testing.T) {
+	f := newFixture(t, 2)
+	ctx := t.Context()
+
+	jobID := f.newJob(t)
+	placed, err := f.store.Acquire(ctx, jobID, "scheduler-1", mustInstance(t))
+	if err != nil {
+		t.Fatalf("control-plane allocation: %v", err)
+	}
+	if got := f.holderPrincipal(t, placed.Lease.ID); got == nil || *got != ControlPlanePrincipal {
+		t.Fatalf("a control-plane allocation left the lease unowned: %v", got)
+	}
+
+	// An authenticated caller may not re-attach it. This is the attack in one
+	// line: the thief has the job id and a valid tenant token.
+	_, err = f.store.AcquireAs(ctx, jobID, "thief-pod", mustInstance(t),
+		Caller{Tenant: f.tenantID, Principal: "ci-bot@" + f.tenantID})
+	if !errors.Is(err, ErrNotPermitted) {
+		t.Fatalf("an identified caller re-attached a lease the scheduler placed: err = %v, want ErrNotPermitted", err)
+	}
+
+	// Nor may it claim to BE the control plane.
+	_, err = f.store.AcquireAs(ctx, jobID, "thief-pod", mustInstance(t),
+		Caller{Tenant: f.tenantID, Principal: ControlPlanePrincipal})
+	if !errors.Is(err, ErrNotPermitted) {
+		t.Fatalf("a caller impersonated the control plane: err = %v, want ErrNotPermitted", err)
+	}
+
+	// The control plane itself still re-attaches, at the same fence: this is
+	// the jobrunner picking up after the scheduler, and the jobrunner picking
+	// up after its own eviction.
+	again, err := f.store.Acquire(ctx, jobID, "jobrunner-1", mustInstance(t))
+	if err != nil {
+		t.Fatalf("the control plane could not re-attach its own lease: %v", err)
+	}
+	if !again.Reattached || again.Lease.ID != placed.Lease.ID || again.Lease.Fence != placed.Lease.Fence {
+		t.Fatal("the control-plane re-attach did not land on the same lease at the same fence")
+	}
+
+	// And the refusals ended nothing: the holder of record can still renew.
+	if _, err := f.store.Renew(ctx, again.Lease.ID, again.Lease.Fence, again.Lease.HolderInstance); err != nil {
+		t.Fatalf("a refused acquire fenced the rightful holder: %v", err)
+	}
+}
+
+// TestUnattributedReattachIsAdmittedButRecorded pins the limit this mechanism
+// does not close, so that tightening it is a deliberate act rather than an
+// accident.
+//
+// Store.Acquire presents no identity. SQL cannot tell an in-process loop from a
+// caller that simply omitted the argument, and the scheduler and jobrunner both
+// re-attach legitimately while holding no end-user credential — so an
+// unattributed re-attach is admitted against any lease. What it may NOT do is
+// take the lease away from the principal it belongs to, and it does not happen
+// quietly: the handover ledger names it.
+func TestUnattributedReattachIsAdmittedButRecorded(t *testing.T) {
+	f := newFixture(t, 2)
+	ctx := t.Context()
+	owner := Caller{Tenant: f.tenantID, Principal: "ci-bot@" + f.tenantID}
+
+	jobID := f.newJob(t)
+	first, err := f.store.AcquireAs(ctx, jobID, "pod-a", mustInstance(t), owner)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+
+	// The scheduler's re-attach of a job still marked queued.
+	sched, err := f.store.Acquire(ctx, jobID, "scheduler-1", mustInstance(t))
+	if err != nil {
+		t.Fatalf("an unattributed control-plane re-attach was refused: %v", err)
+	}
+	if !sched.Reattached || sched.Lease.Fence != first.Lease.Fence {
+		t.Fatal("the control-plane re-attach did not land on the same lease at the same fence")
+	}
+	if got := f.holderPrincipal(t, first.Lease.ID); got == nil || *got != owner.Principal {
+		t.Fatalf("an unattributed re-attach rebound the lease: %v", got)
+	}
+
+	var class string
+	err = f.pool.QueryRow(ctx, `
+SELECT detail->>'authorised' FROM farm.events
+ WHERE kind = 'lease_reattached' AND lease_id = $1::uuid
+ ORDER BY at DESC, id DESC LIMIT 1`, first.Lease.ID).Scan(&class)
+	if err != nil {
+		t.Fatalf("read the handover ledger: %v", err)
+	}
+	if class != "unattributed" {
+		t.Errorf("an unattributed re-attach was logged as %q", class)
+	}
+}
+
+// TestPreMigrationLeaseIsAdoptedOnce covers the one population that carries no
+// principal: leases that were already live when the column was added.
+//
+// Nothing recorded the acquiring identity before holder_principal existed, so
+// there is nothing to backfill from, and refusing these would cost a running job
+// its device the moment the upgrade landed. They are adoptable by the first
+// identified caller and locked afterwards. Such a lease can no longer be
+// produced by farm.lease_acquire, so this seeds one directly — which is exactly
+// what the upgrade leaves behind.
+func TestPreMigrationLeaseIsAdoptedOnce(t *testing.T) {
+	f := newFixture(t, 2)
+	ctx := t.Context()
+
+	jobID := f.newJob(t)
+	var (
+		leaseID string
+		fence   int64
+	)
+	err := f.pool.QueryRow(ctx, `
+INSERT INTO farm.leases (device_id, slot_id, job_id, tenant_id, queue_id,
+                         holder, holder_instance, ttl, grace, expires_at, reclaimable_at)
+SELECT d.id, d.current_slot_id, $1::uuid, $2, $3, 'pre-upgrade-pod', gen_random_uuid(),
+       interval '15 minutes', interval '30 minutes',
+       now() + interval '15 minutes', now() + interval '45 minutes'
+  FROM farm.devices d
+ WHERE d.host_id = $4 AND d.current_lease_id IS NULL
+ LIMIT 1
+RETURNING id::text, fence`, jobID, f.tenantID, f.queueID, f.hostID).Scan(&leaseID, &fence)
+	if err != nil {
+		t.Fatalf("seed a pre-migration lease: %v", err)
+	}
+	if got := f.holderPrincipal(t, leaseID); got != nil {
+		t.Fatalf("the seeded lease was not unbound: %q", *got)
+	}
+
+	owner := Caller{Tenant: f.tenantID, Principal: "ci-bot@" + f.tenantID}
+	adopted, err := f.store.AcquireAs(ctx, jobID, "pod-adopt", mustInstance(t), owner)
+	if err != nil {
+		t.Fatalf("adoption of a pre-migration lease: %v", err)
+	}
+	if adopted.Lease.ID != leaseID || adopted.Lease.Fence != fence {
+		t.Fatal("adoption did not land on the same lease at the same fence")
+	}
+	if got := f.holderPrincipal(t, leaseID); got == nil || *got != owner.Principal {
+		t.Fatalf("the first identified holder did not adopt the lease: %v", got)
+	}
+
+	_, err = f.store.AcquireAs(ctx, jobID, "pod-second", mustInstance(t),
+		Caller{Tenant: f.tenantID, Principal: "other@" + f.tenantID})
+	if !errors.Is(err, ErrNotPermitted) {
+		t.Fatalf("a second principal took an adopted lease: err = %v, want ErrNotPermitted", err)
+	}
+}
+
 // TestAcquireWithoutCapacityIsAnOrdinaryOutcome pins ErrNoCapacity as a
 // scheduling result rather than a failure. Nothing is broken when the farm is
 // busy, and nothing about it may look like fencing.

@@ -260,8 +260,60 @@ func (s *Server) handleLeaseAcquire(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	res, err := s.leases.Acquire(r.Context(), req.JobID, req.Holder, req.HolderInstance)
+	// The AUTHENTICATED identity, not anything from the body, is what
+	// farm.lease_acquire matches a re-attach against.
+	//
+	// Re-attach is idempotent on job_id and a job id is not a secret — this
+	// endpoint's own list route, GET /api/v1/fleet and the event stream all
+	// publish it — so without this, any caller who read a job id could take a
+	// live lease, become its holder, and receive the fence that authorises
+	// writes to the handset. The displaced holder's next renew would match
+	// nothing and be reported to it as an ordinary fencing, so it would abort a
+	// six-hour run believing the system had done it correctly.
+	//
+	// Subject rather than Holder, because Holder is a pod name and a pod name
+	// is exactly what changes when a pod is evicted. The credential belongs to
+	// the workload: the replacement pod mounts the same token and authenticates
+	// as the same subject, so the eviction case still re-attaches at the same
+	// fence while a stranger is refused. See migrations/00010_reattach_auth.sql.
+	caller := lease.Caller{Tenant: tenantScope(r.Context())}
+	if id, ok := IdentityFrom(r.Context()); ok {
+		// An empty subject would be sent as SQL NULL and read by
+		// farm.lease_acquire as "this call came from inside the control
+		// plane", switching the gate off for every request. Authenticator is
+		// the OIDC seam and a deployment-supplied verifier that maps no
+		// subject claim is a real possibility, so refuse rather than
+		// silently downgrade: an authenticated request with no subject is a
+		// broken authenticator, not an anonymous one.
+		if strings.TrimSpace(id.Subject) == "" {
+			s.log.ErrorContext(r.Context(), "authenticator returned an identity with no subject",
+				"authenticator", s.auth.Name(), "path", r.URL.Path)
+			writeError(w, http.StatusInternalServerError, CodeInternal,
+				"this deployment's authenticator produced no subject, so a lease cannot be "+
+					"bound to a caller. Acquire is refused rather than granted unattributed.", nil)
+			return
+		}
+		caller.Principal = id.Subject
+	}
+
+	res, err := s.leases.AcquireAs(r.Context(), req.JobID, req.Holder, req.HolderInstance, caller)
 	if err != nil {
+		if errors.Is(err, lease.ErrNotPermitted) {
+			// 403 and not 409: this is "I know who you are and you may not have
+			// this lease", which a client must never retry. Logged with the
+			// actor because an attempted takeover is worth as much to an
+			// incident review as a successful one — and the database cannot
+			// record the attempt itself, since the refusal rolls back with the
+			// transaction that would have written the ledger row.
+			s.log.WarnContext(r.Context(), "refused a lease re-attach",
+				"job_id", req.JobID, "actor", actor(r.Context()), "holder", req.Holder)
+			writeError(w, http.StatusForbidden, CodeForbidden,
+				"you are not authorised for this job's lease. A re-attach must come from the "+
+					"principal that acquired it; taking a device from a live holder is the "+
+					"operator revoke, which is audited.",
+				map[string]any{"job_id": req.JobID, "terminal": true})
+			return
+		}
 		s.fail(w, r, "acquire lease", err)
 		return
 	}

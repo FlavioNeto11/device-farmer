@@ -41,10 +41,23 @@ test:
 	@test -z "$$(gofmt -l . | grep -v '^$$')" || { echo "gofmt:"; gofmt -l .; exit 1; }
 	go test -count=1 ./...
 
-## assertions: run the lease-protocol assertions against DATABASE_URL
+## assertions: run every SQL assertion file against DATABASE_URL
+#
+# Every test/assertions*.sql, not just the first one. Each new migration
+# ships its proof as another file here, and a proof that no target runs is
+# a proof nobody checks.
+#
+# The exit status is the psql one, not grep's. The previous form piped into
+# grep and ended in `|| true`, so a failed assertion — the whole point of
+# ON_ERROR_STOP — still exited 0 and a gate built on this target would have
+# been green through a broken lease protocol.
 assertions:
-	@psql "$(DATABASE_URL)" -v ON_ERROR_STOP=1 -f test/assertions.sql \
-		| grep -E 'P[0-9]+|PASSED|ERROR' || true
+	@set -e; for f in test/assertions*.sql; do \
+		echo "== $$f"; \
+		out=$$(psql "$(DATABASE_URL)" -v ON_ERROR_STOP=1 -f "$$f" 2>&1) || \
+			{ echo "$$out" | grep -E 'ERROR|FATAL' || echo "$$out"; exit 1; }; \
+		echo "$$out" | grep -E 'ok |PASSED' || true; \
+	done
 
 ## migrate: apply the schema to DATABASE_URL
 migrate: build

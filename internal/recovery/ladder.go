@@ -120,6 +120,36 @@ const (
 	// retired and healthy ones only makes quorum harder, which is the safe
 	// direction for an action whose blast radius is a whole hub.
 	unhealthyPredicate = `r.health IN ('offline','unauthorized','missing','degraded')`
+
+	// coveredByQuarantine is the one definition of "an open quarantine covers
+	// this device", shared by the two places that ask. It expects a device `d`
+	// and its slot `s` in scope, and the whole of farm.quarantines as `q`.
+	//
+	// Scope decides which subject column counts, and that is the load-bearing
+	// part. A scope='device' row carries host_id as well — quarantineDevice
+	// fills it in so the row can be reported without a slot lookup — and a
+	// predicate that reads host_id without checking scope therefore reads one
+	// broken phone as a quarantine over its whole host. In the candidate query
+	// that silently makes every device on the host ineligible for recovery: a
+	// single stuck phone stops the ladder for sixty of its neighbours, and the
+	// symptom is devices that stay broken with no refusal recorded, because no
+	// attempt was ever considered. In reconcileQuarantines it means the same
+	// host's devices are never released.
+	//
+	// 'power_domain' is in the table's CHECK constraint but has no column here,
+	// so it cannot be expressed; the last arm falls back to whatever subject
+	// columns such a row does carry. That can only over-cover, which for a test
+	// that decides whether the ladder may touch a device is the safe direction.
+	coveredByQuarantine = `
+     SELECT 1 FROM farm.quarantines q
+      WHERE q.closed_at IS NULL
+        AND ( (q.scope = 'device' AND q.device_id = d.id)
+           OR (q.scope = 'slot'   AND q.slot_id   = s.id)
+           OR (q.scope = 'hub'    AND q.hub_id    = s.hub_id)
+           OR (q.scope = 'host'   AND q.host_id   = s.host_id)
+           OR (q.scope NOT IN ('device','slot','hub','host')
+               AND (q.device_id = d.id OR q.slot_id = s.id
+                    OR q.hub_id = s.hub_id OR q.host_id = s.host_id)) )`
 )
 
 // Outcome mirrors the CHECK constraint on farm.recovery_attempts.outcome.
@@ -166,6 +196,26 @@ type Action struct {
 	// PowerDomainID is nil when the slot's power topology is unknown, which the
 	// ladder treats as "assume the worst" rather than "assume per-port".
 	PowerDomainID *int64
+
+	// Acknowledged are the OTHER positions in this power domain that the ladder
+	// has checked and is willing to see go dark: every slot the blast-radius
+	// check just covered, minus the target itself. It is populated only for a
+	// power_domain rung on a slot whose power topology is actually known, and
+	// only after checkBlastRadius has returned no refusal for that radius —
+	// which is precisely the statement "no live lease in this domain forbids
+	// this tier".
+	//
+	// Empty means "this call authorises the target and nothing else", which is
+	// the default and the safe reading. It is never a way to widen a radius the
+	// check did not clear: the list is built from the same domain the check ran
+	// against, and it is written into farm.recovery_attempts.detail, so what was
+	// authorised is a record rather than an inference.
+	//
+	// There is a window between the check and the cycle in which somebody could
+	// acquire a lease on a neighbour. It is the same window the single-device
+	// path has always had — the check has always preceded the action — and it is
+	// why the agent re-checks the hub itself before switching anything.
+	Acknowledged []string
 
 	// Timeout is the budget for this action.
 	Timeout time.Duration
@@ -423,19 +473,50 @@ SELECT t.tier, t.name, t.blast_radius, t.requires_policy,
 	return out, nil
 }
 
-// next returns the rung to try for a device currently at ladder_tier cur.
+// next returns the rung to try for a device whose ladder_tier is cur.
+//
+// # farm.device_runtime.ladder_tier is the lowest rung NOT YET SPENT
+//
+// It is not "the rung last attempted", and the difference is the whole reason
+// tier 0 is reachable at all. The column DEFAULTs to 0 for a fresh device_runtime
+// row and is only ever RESET to 0 — by reconcileQuarantines, when a quarantine
+// closes or a device goes healthy. So a predicate of `t.Tier > cur` can never be
+// satisfied by tier 0, and "observe: do nothing for one debounce window; most
+// blips self-heal" — the cheapest, least disruptive rung, the one the tier table
+// puts first precisely so the expensive ones are not reached by accident — would
+// never run. Every incident would open with an adb reconnect against a blip that
+// was going to clear itself.
+//
+// Hence `>=` here, and hence rungAfter in begin: spending a rung moves the column
+// PAST it rather than onto it. The two must stay in step; ladderIsMonotonic in
+// ladder_fidelity_test.go is what says so.
 //
 // A device that has exhausted the ladder repeats its top rung, bounded by that
 // rung's own cooldown and max_per_hour. Repeating a six-hourly host_drain is
 // the ladder's way of saying "still broken, still needs a human".
+//
+// Upgrade note: rows written by the previous reading carry the rung last spent,
+// so on the first cycle after deploying this each mid-climb device repeats one
+// rung before resuming. That costs one rung under its own cooldown, which is the
+// safe direction to be wrong in; the alternative — a migration that guesses which
+// rung a device was on — could skip one instead.
 func next(tiers []tier, cur int) tier {
 	for _, t := range tiers {
-		if t.Tier > cur {
+		if t.Tier >= cur {
 			return t
 		}
 	}
 	return tiers[len(tiers)-1]
 }
+
+// rungAfter is the ladder_tier a device carries once rung t has been spent.
+//
+// It is t.Tier+1 and not "the next row in tiers" on purpose: the tier table is
+// an operator-editable table with an enabled flag, so the rung after 2 may be 4
+// today and 3 tomorrow. Storing the first integer ABOVE the rung just spent lets
+// next() resolve the gap against whatever the table says on the cycle that reads
+// it, instead of freezing yesterday's ordering into a device's row.
+func rungAfter(t tier) int { return t.Tier + 1 }
 
 // ---------------------------------------------------------------------------
 // Candidates
@@ -518,11 +599,7 @@ SELECT r.device_id::text, r.health, r.ladder_tier,
    AND d.admin_state = 'enabled'
    AND s.state = 'active'
    AND ho.admin_state <> 'disabled'
-   AND NOT EXISTS (
-         SELECT 1 FROM farm.quarantines q
-          WHERE q.closed_at IS NULL
-            AND (q.device_id = d.id OR q.slot_id = s.id
-                 OR q.hub_id = hb.id OR q.host_id = ho.id))
+   AND NOT EXISTS (` + coveredByQuarantine + `)
  ORDER BY r.health_since
  LIMIT $2`
 
@@ -792,13 +869,7 @@ UPDATE farm.device_runtime r
   LEFT JOIN farm.slots s ON s.id = d.current_slot_id
  WHERE r.device_id = d.id
    AND r.health = 'quarantined'
-   AND NOT EXISTS (
-     SELECT 1 FROM farm.quarantines q
-      WHERE q.closed_at IS NULL
-        AND (q.device_id = d.id
-             OR q.slot_id = s.id
-             OR q.hub_id = s.hub_id
-             OR q.host_id = s.host_id))`)
+   AND NOT EXISTS (`+coveredByQuarantine+`)`)
 	if err != nil {
 		if ctx.Err() == nil {
 			l.log.Debug("quarantine reconciliation failed", "err", err)
@@ -849,13 +920,31 @@ func (l *Ladder) attempt(ctx context.Context, c candidate, tiers []tier) {
 		return
 	}
 
+	// The check has just said that every live lease in `radius` permits this
+	// tier. For a power_domain rung that is exactly the sentence the agent needs
+	// to hear before it will let the target's neighbours go dark, so name them —
+	// once, here, after the check and nowhere else. A list gathered before the
+	// check would be an assumption; a list gathered for a widened radius would
+	// cover a domain nobody enumerated.
+	var acknowledged []string
+	if radius == "power_domain" && c.PowerDomain != nil {
+		acknowledged, err = l.powerDomainSiblings(ctx, c)
+		if err != nil {
+			if ctx.Err() == nil {
+				log.Warn("could not enumerate the power domain; "+
+					"proceeding without an acknowledgement, which the agent may refuse", "err", err)
+			}
+			acknowledged = nil
+		}
+	}
+
 	// Budgets, and the per-device serialisation, in one short transaction.
-	attemptID, ok := l.begin(ctx, c, t, radius, log)
+	attemptID, ok := l.begin(ctx, c, t, radius, acknowledged, log)
 	if !ok {
 		return
 	}
 
-	out, detail := l.perform(ctx, c, t, log)
+	out, detail := l.perform(ctx, c, t, acknowledged, log)
 	l.finish(ctx, attemptID, out, detail, log)
 
 	attemptsTotal.WithLabelValues(t.Name, string(out)).Inc()
@@ -930,6 +1019,55 @@ SELECT l.id::text AS lease_id, l.job_id::text, d.id::text AS device_id,
 	return "", "", nil
 }
 
+// powerDomainSiblings lists the other positions in c's power domain, as
+// devpaths, for Action.Acknowledged.
+//
+// It selects the SAME set checkBlastRadius just cleared — every slot with this
+// power_domain_id — and only drops the target. That correspondence is the whole
+// warrant for the acknowledgement: a slot this query returned but the check did
+// not cover would be a position going dark on nobody's authority, and a slot the
+// check covered but this query missed would be one the agent then refuses over,
+// after the ladder has already spent the rung.
+//
+// It deliberately does not filter on farm.slots.state or on whether the slot
+// holds a device. The agent compares against what is PHYSICALLY plugged in right
+// now, and a slot the control plane calls inactive can still have a phone in it;
+// checkBlastRadius does not filter on state either, so an inactive slot holding a
+// live lease is checked like any other. Filtering here would produce a list that
+// looks narrower and is not.
+func (l *Ladder) powerDomainSiblings(ctx context.Context, c candidate) ([]string, error) {
+	// adb_devpath is GENERATED ALWAYS AS ('usb:' || usb_path) over a NOT NULL
+	// column, so every row has one and there is nothing to filter out.
+	const q = `
+SELECT s.adb_devpath
+  FROM farm.slots s
+ WHERE s.power_domain_id = $1::bigint
+   AND s.id <> $2::bigint
+ ORDER BY s.adb_devpath`
+
+	cctx, cancel := context.WithTimeout(ctx, l.cfg.CallTimeout)
+	defer cancel()
+
+	rows, err := l.cfg.Pool.Query(cctx, q, c.PowerDomain, c.SlotID)
+	if err != nil {
+		return nil, fmt.Errorf("recovery: power domain siblings: %w", err)
+	}
+	defer rows.Close()
+
+	var out []string
+	for rows.Next() {
+		var devpath string
+		if err := rows.Scan(&devpath); err != nil {
+			return nil, fmt.Errorf("recovery: power domain siblings scan: %w", err)
+		}
+		out = append(out, devpath)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("recovery: power domain siblings: %w", err)
+	}
+	return out, nil
+}
+
 // recordRefusal writes the refusal to farm.recovery_attempts.refusal.
 //
 // It is recorded rather than skipped so the UI can explain a gap instead of
@@ -967,7 +1105,7 @@ VALUES ($1::uuid, $2::bigint, $3::bigint, $4::text, $5::int, now(), 'refused', $
 // The transaction deliberately does NOT wrap the action itself: a uhubctl power
 // cycle can take a minute, and holding a database transaction open across it
 // would pin a connection and a lock for the duration.
-func (l *Ladder) begin(ctx context.Context, c candidate, t tier, radius string, log *slog.Logger) (int64, bool) {
+func (l *Ladder) begin(ctx context.Context, c candidate, t tier, radius string, acknowledged []string, log *slog.Logger) (int64, bool) {
 	cctx, cancel := context.WithTimeout(ctx, l.cfg.CallTimeout)
 	defer cancel()
 
@@ -1042,12 +1180,21 @@ SELECT EXISTS (SELECT 1 FROM att WHERE started_at > now() - $2::interval),
 		return 0, false
 	}
 
-	detail := jsonDetail(map[string]any{
+	// from_tier is the lowest rung this device had NOT yet spent when the
+	// attempt opened; the attempt's own tier column says which rung it then
+	// spent. acknowledged records exactly which neighbouring positions this
+	// attempt was willing to darken, so a cycle that took a rack row down has a
+	// list with somebody's reasoning attached rather than a shrug.
+	entry := map[string]any{
 		"blast_radius": radius,
 		"health":       c.Health,
 		"from_tier":    c.LadderTier,
 		"devpath":      c.Devpath,
-	})
+	}
+	if len(acknowledged) > 0 {
+		entry["acknowledged"] = acknowledged
+	}
+	detail := jsonDetail(entry)
 
 	var id int64
 	if err := tx.QueryRow(cctx, `
@@ -1064,6 +1211,11 @@ RETURNING id`,
 	// Climb the ladder and hold health steady for the settle window. The
 	// suppression is what stops the watchdog from recording an INDUCED
 	// transport drop as a fresh fault and re-arming the whole ladder.
+	//
+	// ladder_tier moves PAST the rung just spent, not onto it: the column names
+	// the lowest rung still unspent, which is what makes 0 — the column default,
+	// and the value every reset writes — mean "observe first" rather than
+	// "observe already happened". See next and rungAfter.
 	if _, err := tx.Exec(cctx, `
 UPDATE farm.device_runtime
    SET ladder_tier    = $2::int,
@@ -1072,7 +1224,7 @@ UPDATE farm.device_runtime
        health_since   = CASE WHEN health IN ('quarantined','retired','recovering') THEN health_since ELSE now() END,
        updated_at     = now()
  WHERE device_id = $1::uuid`,
-		c.DeviceID, t.Tier, pgInterval(t.Cooldown), pgInterval(l.cfg.MaxSuppress)); err != nil {
+		c.DeviceID, rungAfter(t), pgInterval(t.Cooldown), pgInterval(l.cfg.MaxSuppress)); err != nil {
 		if ctx.Err() == nil {
 			log.Warn("could not mark the device recovering", "err", err)
 		}
@@ -1090,7 +1242,7 @@ UPDATE farm.device_runtime
 
 // perform runs the rung. The control-plane rungs are done here; everything that
 // touches hardware or the host's ADB server goes to the Actuator.
-func (l *Ladder) perform(ctx context.Context, c candidate, t tier, log *slog.Logger) (Outcome, map[string]any) {
+func (l *Ladder) perform(ctx context.Context, c candidate, t tier, acknowledged []string, log *slog.Logger) (Outcome, map[string]any) {
 	switch t.Name {
 	case "observe":
 		// Not a no-op with extra steps: the attempt row and the suppression
@@ -1131,7 +1283,8 @@ func (l *Ladder) perform(ctx context.Context, c candidate, t tier, log *slog.Log
 		Tier: t.Tier, TierName: t.Name,
 		DeviceID: c.DeviceID, SlotID: c.SlotID, Devpath: c.Devpath, RackSlot: c.RackSlot,
 		HubID: c.HubID, HubPath: c.HubPath, HostID: c.HostID, ADBEndpoint: c.ADBEndpoint,
-		PowerDomainID: c.PowerDomain, Timeout: l.cfg.ActionTimeout,
+		PowerDomainID: c.PowerDomain, Acknowledged: acknowledged,
+		Timeout: l.cfg.ActionTimeout,
 	})
 	switch {
 	case err != nil && ctx.Err() != nil:

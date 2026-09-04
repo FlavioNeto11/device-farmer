@@ -44,9 +44,31 @@ type ADBActuator struct {
 type HostRunner interface {
 	// USBReset re-enumerates one port via USBDEVFS_RESET.
 	USBReset(ctx context.Context, hostID, devpath string) error
-	// PortPower cycles VBUS for one port. The power domain decides how many
-	// devices that actually disturbs; the caller has already checked policy.
+	// PortPower cycles VBUS for one port, authorising the disturbance of THAT
+	// device only. On a ganged hub, where cutting one port cuts the whole power
+	// domain, the agent refuses rather than taking the neighbours down as a
+	// side effect. See DomainPowerRunner for the way to say otherwise.
 	PortPower(ctx context.Context, hostID, devpath string) error
+}
+
+// DomainPowerRunner is the optional half of HostRunner that accepts a power
+// domain acknowledgement: the positions, other than the target, that the
+// control plane has checked lease policy for and is willing to see go dark.
+//
+// It is a SEPARATE interface rather than a third method on HostRunner so that
+// adding it cannot break an existing implementation, and so that the default —
+// a runner that only has PortPower — stays exactly as safe as it was. An
+// acknowledgement is a widening of what the agent will permit, and a widening
+// must be opted into on both sides: the control plane by populating
+// Action.Acknowledged, the host by implementing this method.
+//
+// Nothing here is a promise that the neighbours are free. The agent still
+// checks, against what is physically plugged into the hub at that instant, that
+// every disturbed position is either the target or named here; anything else is
+// a device nobody authorised and the cycle is refused. Being the last line is
+// the point.
+type DomainPowerRunner interface {
+	PortPowerWithDomain(ctx context.Context, hostID, devpath string, acknowledged []string) error
 }
 
 // NewADBActuator returns an actuator that dials each host's ADB server lazily
@@ -104,12 +126,11 @@ func (a *ADBActuator) Recover(ctx context.Context, act Action) (Result, error) {
 		return a.control(ctx, log, act, adbwire.ControlAttach)
 
 	case 3:
-		return a.hostLocal(ctx, log, act, "USBDEVFS_RESET",
+		return a.hostLocal(ctx, log, act, "USBDEVFS_RESET", nil,
 			func() error { return a.HostRunner.USBReset(ctx, act.HostID, act.Devpath) })
 
 	case 4:
-		return a.hostLocal(ctx, log, act, "VBUS power cycle",
-			func() error { return a.HostRunner.PortPower(ctx, act.HostID, act.Devpath) })
+		return a.portPower(ctx, log, act)
 
 	case 5:
 		return a.reboot(ctx, log, act)
@@ -179,9 +200,80 @@ func (a *ADBActuator) control(ctx context.Context, log *slog.Logger, act Action,
 	return Result{Outcome: OutcomeNoChange, Detail: detail}, nil
 }
 
+// portPower performs tier 4, delivering the ladder's power-domain
+// acknowledgement to the agent when there is one and the agent can take it.
+//
+// Three shapes, and the difference between them is recorded rather than
+// inferred, because "the port was not cycled" and "the port was cycled and the
+// device stayed dark" send an operator to opposite ends of the rack:
+//
+//   - no acknowledgement: plain PortPower. Unchanged, and the agent still
+//     refuses a cycle that would darken a neighbour.
+//   - acknowledgement, and the runner implements DomainPowerRunner: the list
+//     goes to the agent, which re-checks it against the hub as it is right now.
+//   - acknowledgement, and the runner does not: the acknowledgement is DROPPED
+//     rather than smuggled through, so a runner that predates this seam cannot
+//     be tricked into a wider blast radius than its own signature admits. That
+//     is the safe direction — the agent will very likely refuse — but a refusal
+//     with no explanation is the failure mode this package exists to avoid, so
+//     the detail says the acknowledgement could not be delivered and names the
+//     positions it covered.
+func (a *ADBActuator) portPower(ctx context.Context, log *slog.Logger, act Action) (Result, error) {
+	const what = "VBUS power cycle"
+
+	run := func() error { return a.HostRunner.PortPower(ctx, act.HostID, act.Devpath) }
+	var extra map[string]any
+
+	if len(act.Acknowledged) > 0 {
+		// Copy: the caller's slice outlives this call in the attempt detail,
+		// and an actuator must not hand the agent an alias of it.
+		ack := append([]string(nil), act.Acknowledged...)
+		// Recorded whatever happens next, including the no-host-agent refusal
+		// below. "Which neighbours had already been cleared" is the first thing
+		// asked of a rung that did not run.
+		extra = map[string]any{"acknowledged": ack}
+
+		// A nil HostRunner type-asserts to ok=false. That is not the same
+		// situation as a runner that simply predates this seam, so only the
+		// second gets the undeliverable note; the first is refused by hostLocal
+		// with a reason of its own.
+		switch dr, ok := a.HostRunner.(DomainPowerRunner); {
+		case ok:
+			run = func() error { return dr.PortPowerWithDomain(ctx, act.HostID, act.Devpath, ack) }
+			log.Info("cycling VBUS with an acknowledged power domain", "acknowledged", ack)
+		case a.HostRunner != nil:
+			extra["acknowledgement_undeliverable"] = fmt.Sprintf(
+				"the control plane checked lease policy for %d other position(s) in this "+
+					"power domain, but this host runner does not implement "+
+					"recovery.DomainPowerRunner, so the agent was asked to cycle the target "+
+					"alone and will refuse if the domain is ganged", len(ack))
+			log.Warn("power domain acknowledgement cannot be delivered to this host runner",
+				"acknowledged", ack)
+		}
+	}
+
+	return a.hostLocal(ctx, log, act, what, extra, run)
+}
+
 // hostLocal performs a rung that needs an agent on the device host, or refuses
 // it with a reason that names what is missing.
-func (a *ADBActuator) hostLocal(ctx context.Context, log *slog.Logger, act Action, what string, run func() error) (Result, error) {
+//
+// extra is merged into every Detail this call can produce, so a fact about the
+// ATTEMPT — which neighbours were acknowledged — survives into
+// farm.recovery_attempts.detail whatever the rung then did.
+func (a *ADBActuator) hostLocal(ctx context.Context, log *slog.Logger, act Action, what string, extra map[string]any, run func() error) (Result, error) {
+	detail := func(kv map[string]any) map[string]any {
+		out := make(map[string]any, len(kv)+len(extra))
+		for k, v := range extra {
+			out[k] = v
+		}
+		// The rung's own facts win: extra describes the request, kv the result.
+		for k, v := range kv {
+			out[k] = v
+		}
+		return out
+	}
+
 	if a.HostRunner == nil {
 		refusal := fmt.Sprintf(
 			"tier %d (%s) needs %s on host %s, which only a farmd-node agent can do; "+
@@ -189,16 +281,16 @@ func (a *ADBActuator) hostLocal(ctx context.Context, log *slog.Logger, act Actio
 			act.Tier, act.TierName, what, act.HostID)
 		log.Warn("recovery rung refused: no host agent", "what", what)
 		return Result{Outcome: OutcomeRefused,
-			Detail: map[string]any{"refusal": refusal}}, nil
+			Detail: detail(map[string]any{"refusal": refusal})}, nil
 	}
 
 	if err := run(); err != nil {
 		if ctx.Err() != nil {
 			return Result{Outcome: OutcomeAborted,
-				Detail: map[string]any{"error": err.Error()}}, nil
+				Detail: detail(map[string]any{"error": err.Error()})}, nil
 		}
 		return Result{Outcome: OutcomeFailed,
-			Detail: map[string]any{"what": what, "error": err.Error()}}, nil
+			Detail: detail(map[string]any{"what": what, "error": err.Error()})}, nil
 	}
 
 	// Re-enumeration is not instant. Poll for the device rather than declaring
@@ -207,10 +299,10 @@ func (a *ADBActuator) hostLocal(ctx context.Context, log *slog.Logger, act Actio
 		if a.waitForDevice(ctx, c, act.Devpath) {
 			log.Info("recovery rung restored the device", "what", what)
 			return Result{Outcome: OutcomeRecovered,
-				Detail: map[string]any{"what": what}}, nil
+				Detail: detail(map[string]any{"what": what})}, nil
 		}
 	}
-	return Result{Outcome: OutcomeNoChange, Detail: map[string]any{"what": what}}, nil
+	return Result{Outcome: OutcomeNoChange, Detail: detail(map[string]any{"what": what})}, nil
 }
 
 // reboot asks the device to reboot and waits for it to come back.

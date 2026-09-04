@@ -937,11 +937,43 @@ SELECT q.id, q.scope, q.device_id::text, d.farm_uid, q.slot_id, s.rack_slot, q.h
 	return out, rows.Err()
 }
 
+// quarantineCloseLockKey serialises POST /api/v1/quarantines/{id}/close against
+// itself. It spells "farmQClo", following the convention of the reaper's and the
+// scheduler's own keys, so a stray lock in pg_locks can be traced to a caller.
+// See handleQuarantineClose for why closing overlapping quarantines concurrently
+// is not safe without it.
+const quarantineCloseLockKey int64 = 0x6661726d51436c6f
+
 // handleQuarantineClose serves POST /api/v1/quarantines/{id}/close.
 //
 // Closing a quarantine makes a device schedulable again, which is a claim that
 // somebody fixed something. It is audited with the human's name and reason for
 // exactly that reason.
+//
+// # The close finishes here, not on the next recovery tick
+//
+// Closing the farm.quarantines row is not what returns a device to service. Two
+// other columns decide that, and neither is in this table:
+//
+//	farm.device_runtime.health   what farm.lease_acquire actually consults
+//	farm.devices.admin_state     what the hot allocation index is built on
+//
+// Writing only closed_at leaves an operator looking at a quarantine that says
+// "closed" and a device that is still out of the fleet, with nothing anywhere
+// naming the reason. Recovery's reconcileQuarantines repairs the health half,
+// but only while the recovery loop is running — a farm deployed without that
+// role, or with it stopped for an upgrade, never repairs it at all — and nothing
+// has ever restored admin_state, so a device that some path took out of
+// allocation stayed out permanently.
+//
+// So the release happens here, in the SAME transaction as the close: the
+// operator's action lands whole or it does not land. reconcileQuarantines is
+// unchanged and remains the backstop for rows closed by other means; both use
+// the same coverage test, so running either, or both, converges on one answer.
+//
+// It does not touch farm.leases. A device released here may be three hours into
+// somebody's job — quarantine only ever stopped NEW allocation — and it keeps
+// its lease, its fence and its deadline across this call.
 func (s *Server) handleQuarantineClose(w http.ResponseWriter, r *http.Request) {
 	id, ok := pathInt64(r, "id")
 	if !ok {
@@ -968,8 +1000,40 @@ func (s *Server) handleQuarantineClose(w http.ResponseWriter, r *http.Request) {
 		hostID    *string
 		openedFor string
 		openedAt  time.Time
+		released  int64 // devices whose health left 'quarantined'
+		reenabled int64 // devices whose admin_state left 'quarantined'
 	)
-	err := s.pool.QueryRow(r.Context(), `
+
+	tx, err := s.pool.Begin(r.Context())
+	if err != nil {
+		s.fail(w, r, "close quarantine: begin", err)
+		return
+	}
+	defer func() { _ = tx.Rollback(r.Context()) }()
+
+	// One close at a time, farm-wide, and taken BEFORE the row is touched.
+	//
+	// Two quarantines can cover the same device — an auto device quarantine
+	// inside a hub quarantine is the ordinary case. Under READ COMMITTED, two
+	// operators closing them at the same instant each evaluate "is this device
+	// still covered by something else?" against a snapshot in which the other
+	// row is still open, so NEITHER releases the device: both commit, both
+	// report zero released, and the device is stranded out of service with no
+	// open quarantine left to explain it. Recovery's reconcileQuarantines would
+	// eventually repair that, but a farm without the recovery role running is
+	// exactly the case this handler exists for.
+	//
+	// A whole-endpoint lock rather than per-row locking because the overlap is
+	// what has to be serialised, not any one row, and because two closes that
+	// each locked the other's row would deadlock. Quarantine closes happen at
+	// human rate; the contention is nil.
+	if _, err := tx.Exec(r.Context(),
+		`SELECT pg_advisory_xact_lock($1::bigint)`, quarantineCloseLockKey); err != nil {
+		s.fail(w, r, "close quarantine: serialise", err)
+		return
+	}
+
+	err = tx.QueryRow(r.Context(), `
 UPDATE farm.quarantines
    SET closed_at = now(), closed_by = $2
  WHERE id = $1 AND closed_at IS NULL
@@ -977,6 +1041,9 @@ RETURNING scope, device_id::text, slot_id, hub_id, host_id, reason, opened_at`, 
 		Scan(&scope, &deviceID, &slotID, &hubID, &hostID, &openedFor, &openedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
+			// Roll back before reading, so the follow-up query is not answered
+			// from inside a transaction the caller will never commit.
+			_ = tx.Rollback(r.Context())
 			var closedAt *time.Time
 			readErr := s.pool.QueryRow(r.Context(),
 				`SELECT closed_at FROM farm.quarantines WHERE id = $1`, id).Scan(&closedAt)
@@ -997,17 +1064,98 @@ RETURNING scope, device_id::text, slot_id, hub_id, host_id, reason, opened_at`, 
 		return
 	}
 
-	detail := map[string]any{
-		"quarantine_id": id,
-		"scope":         scope,
-		"opened_for":    openedFor,
-		"opened_at":     openedAt,
-		"device_id":     deviceID,
-		"slot_id":       slotID,
-		"hub_id":        hubID,
-		"host_id":       hostID,
+	// The devices the row just closed covered, minus any that some OTHER open
+	// quarantine still covers.
+	//
+	// Both halves are driven by SCOPE, not by which subject columns happen to be
+	// populated, and that distinction is load-bearing rather than tidy. A
+	// scope='device' row carries host_id too — the ladder's quarantineDevice
+	// fills it in so the row can be joined without a slot lookup — so a predicate
+	// that reads host_id without checking scope treats one broken phone as a
+	// quarantine over its entire host. In the NOT EXISTS that means a single
+	// stuck device anywhere on a host makes every close on that host a no-op; in
+	// the covered set it means closing one phone's quarantine resets health and
+	// admin_state for every quarantined device on the host. The two errors mask
+	// each other, which is exactly how a predicate like this survives.
+	//
+	// 'power_domain' is in the table's CHECK but has no column, so it cannot be
+	// expressed; the final arm falls back to whatever subject columns such a row
+	// does carry, which can only ever over-cover — the safe direction for a test
+	// whose answer decides whether a device stays out of service.
+	//
+	// health goes to 'unknown' and not 'healthy'. Closing a quarantine is a
+	// human saying "look again", not an observation: the allocator will not
+	// choose an 'unknown' device, so the watchdog's next probe decides, which is
+	// the only party entitled to. ladder_tier goes back to 0 so the next incident
+	// starts at 'observe' instead of answering the operator's repair with
+	// whatever rung the ladder had climbed to.
+	//
+	// admin_state moves only out of 'quarantined'. 'disabled' and 'retired' are
+	// somebody else's decision and closing a quarantine does not overrule them.
+	const release = `
+WITH covered AS (
+  SELECT d.id AS device_id, d.current_slot_id, s.hub_id, s.host_id
+    FROM farm.devices d
+    LEFT JOIN farm.slots s ON s.id = d.current_slot_id
+   WHERE ($1::text = 'device' AND d.id = $2::uuid)
+      OR ($1::text = 'slot'   AND d.current_slot_id = $3::bigint)
+      OR ($1::text = 'hub'    AND s.hub_id = $4::bigint)
+      OR ($1::text = 'host'   AND s.host_id = $5::text)
+      OR ($1::text NOT IN ('device','slot','hub','host')
+          AND (d.id = $2::uuid OR d.current_slot_id = $3::bigint
+               OR s.hub_id = $4::bigint OR s.host_id = $5::text))
+), freed AS (
+  SELECT c.device_id
+    FROM covered c
+   WHERE NOT EXISTS (
+     SELECT 1 FROM farm.quarantines q
+      WHERE q.closed_at IS NULL
+        AND ( (q.scope = 'device' AND q.device_id = c.device_id)
+           OR (q.scope = 'slot'   AND q.slot_id   = c.current_slot_id)
+           OR (q.scope = 'hub'    AND q.hub_id    = c.hub_id)
+           OR (q.scope = 'host'   AND q.host_id   = c.host_id)
+           OR (q.scope NOT IN ('device','slot','hub','host')
+               AND (q.device_id = c.device_id OR q.slot_id = c.current_slot_id
+                    OR q.hub_id = c.hub_id OR q.host_id = c.host_id)) ))
+), health AS (
+  UPDATE farm.device_runtime r
+     SET health = 'unknown', health_since = now(), ladder_tier = 0, updated_at = now()
+   WHERE r.device_id IN (SELECT device_id FROM freed)
+     AND r.health = 'quarantined'
+  RETURNING 1
+), admin AS (
+  UPDATE farm.devices d
+     SET admin_state = 'enabled', updated_at = now()
+   WHERE d.id IN (SELECT device_id FROM freed)
+     AND d.admin_state = 'quarantined'
+  RETURNING 1
+)
+SELECT (SELECT count(*) FROM health), (SELECT count(*) FROM admin)`
+
+	if err := tx.QueryRow(r.Context(), release, scope, deviceID, slotID, hubID, hostID).
+		Scan(&released, &reenabled); err != nil {
+		s.fail(w, r, "close quarantine: return the devices to service", err)
+		return
 	}
-	// The quarantine is already closed and the device is already schedulable
+
+	if err := tx.Commit(r.Context()); err != nil {
+		s.fail(w, r, "close quarantine: commit", err)
+		return
+	}
+
+	detail := map[string]any{
+		"quarantine_id":     id,
+		"scope":             scope,
+		"opened_for":        openedFor,
+		"opened_at":         openedAt,
+		"device_id":         deviceID,
+		"slot_id":           slotID,
+		"hub_id":            hubID,
+		"host_id":           hostID,
+		"devices_released":  released,
+		"devices_reenabled": reenabled,
+	}
+	// The quarantine is already closed and the devices are already schedulable
 	// again; the claim that somebody fixed it must be recorded regardless of
 	// what the caller's connection does next.
 	bookCtx, bookCancel := detachedCtx(r.Context())
@@ -1023,6 +1171,12 @@ RETURNING scope, device_id::text, slot_id, hub_id, host_id, reason, opened_at`, 
 		"closed":        true,
 		"scope":         scope,
 		"opened_for":    openedFor,
+		// Counts, not a bare "closed": an operator who closes a quarantine and
+		// sees zero devices released has learned something — either another
+		// open quarantine still covers them, or the health they were waiting on
+		// was never 'quarantined' to begin with.
+		"devices_released":  released,
+		"devices_reenabled": reenabled,
 	})
 }
 

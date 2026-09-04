@@ -159,16 +159,25 @@ const (
 	HealthUnauthorized HealthState = "unauthorized"
 	HealthMissing      HealthState = "missing"
 	HealthRecovering   HealthState = "recovering"
-	HealthQuarantined  HealthState = "quarantined"
-	HealthRetired      HealthState = "retired"
+	// HealthParked is out of service ON PURPOSE — a charge limiter holding a
+	// handset off VBUS, or an operator who took it out and said why. It is a
+	// health state and not an absence of one precisely so that the census can
+	// tell "this hub lost four devices" apart from "somebody is looking after
+	// four batteries". See migration 00008_parked.sql.
+	HealthParked      HealthState = "parked"
+	HealthQuarantined HealthState = "quarantined"
+	HealthRetired     HealthState = "retired"
 )
 
 var healthStates = []HealthState{
 	HealthUnknown, HealthBooting, HealthHealthy, HealthDegraded, HealthOffline,
-	HealthUnauthorized, HealthMissing, HealthRecovering, HealthQuarantined, HealthRetired,
+	HealthUnauthorized, HealthMissing, HealthRecovering, HealthParked,
+	HealthQuarantined, HealthRetired,
 }
 
-// Valid reports whether h is one of the ten health states.
+// Valid reports whether h is one of the health states above. The count is
+// deliberately not written down here: it was "ten" until 00008_parked.sql,
+// and a comment that has to be edited to stay true eventually is not.
 func (h HealthState) Valid() bool { return containsKind(healthStates, h) }
 
 // ParseHealthState converts a health column read back from
@@ -594,8 +603,8 @@ func SetLeaseSuspect(counts []SuspectCount) {
 
 // SetDeviceHealth publishes the complete device health census.
 //
-// Every hub that appears in counts is published for ALL ten health
-// states, zero-filling the ones with no devices. That zero-fill is the
+// Every hub that appears in counts is published for EVERY health state,
+// zero-filling the ones with no devices. That zero-fill is the
 // whole point of the metric: when a hub dies, its healthy count must fall
 // to a visible 0 rather than have the series simply vanish, because
 // `sum by (hub) (farm_device_health{state="healthy"}) == 0` matches a

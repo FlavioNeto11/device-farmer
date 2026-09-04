@@ -645,9 +645,22 @@ WITH o AS (
 ), n AS (
   SELECT c.*,
          CASE
-           -- Retirement is an administrative fact and quarantine belongs to the
-           -- recovery ladder. Neither is an observation this loop may overwrite.
-           WHEN c.cur_health IN ('retired','quarantined') THEN c.cur_health
+           -- Retirement is an administrative fact, quarantine belongs to the
+           -- recovery ladder, and 'parked' is a human (or a charge limiter)
+           -- saying "out of service ON PURPOSE". None of the three is an
+           -- observation this loop may overwrite.
+           --
+           -- 'parked' is the one that changes what this loop MEANS. A parked
+           -- device usually has no VBUS, so the ADB tracker reports it absent
+           -- and healthFor() calls that 'missing' — which is true about the
+           -- wire and false about the device. Writing it would put a perfectly
+           -- good handset in front of the recovery ladder, which would climb
+           -- to a port power cycle and then quarantine it. The authority for
+           -- the state is farm.devices.admin_state='parked', which this role
+           -- can read and cannot write; the value here is its mirror, and
+           -- migration 00008 carries a trigger that holds it even if this CASE
+           -- is ever edited away.
+           WHEN c.cur_health IN ('retired','quarantined','parked') THEN c.cur_health
            -- An induced reset is in flight: the transport is EXPECTED to drop,
            -- so a drop proves nothing.
            WHEN c.suppressed THEN c.cur_health
@@ -790,7 +803,13 @@ func (w *Watchdog) report(host string, pos slotRow, state adbwire.ConnState, res
 	switch {
 	case res.Suppressed:
 		reason = "suppressed"
-	case res.Previous == "quarantined" || res.Previous == "retired":
+	// 'parked' belongs with the other two, and leaving it out was not merely
+	// a mislabel: a parked device is damped on EVERY tick for as long as the
+	// hold lasts (the observation says 'missing', the row says 'parked'), so
+	// hours of a routine charge hold would land in the "hysteresis" bucket and
+	// drown the signal that bucket exists to carry.
+	case res.Previous == "quarantined" || res.Previous == "retired" ||
+		res.Previous == string(obs.HealthParked):
 		reason = "sticky"
 	case res.Candidate == string(obs.HealthHealthy) && res.ConsecGood >= w.cfg.MinGood && res.Credits < 1:
 		reason = "no_credits"

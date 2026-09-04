@@ -300,7 +300,11 @@ SELECT h.id, h.rack_id, h.rack_unit, h.host_epoch, h.adb_endpoint, h.admin_state
        h.kernel_release, h.agent_version, h.last_seen_at,
        count(d.id) AS devices,
        count(*) FILTER (WHERE r.health = 'healthy') AS healthy,
-       count(*) FILTER (WHERE r.health IS NOT NULL AND r.health NOT IN ('healthy','retired')) AS unhealthy,
+       -- 'parked' is excluded with 'retired': both are decisions, not faults.
+       -- This is the number an operator reads before draining a host, and a
+       -- shelf of charge-limited handsets must not look like a host falling
+       -- apart. Same exclusion as farm.v_hub_health and the fleet counts.
+       count(*) FILTER (WHERE r.health IS NOT NULL AND r.health NOT IN ('healthy','retired','parked')) AS unhealthy,
        count(*) FILTER (WHERE l.state IN ('held','suspect')) AS live_leases,
        count(*) FILTER (WHERE l.state IN ('held','suspect') AND l.protected) AS protected_leases
   FROM farm.hosts h

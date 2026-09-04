@@ -41,10 +41,20 @@ test:
 	@test -z "$$(gofmt -l . | grep -v '^$$')" || { echo "gofmt:"; gofmt -l .; exit 1; }
 	go test -count=1 ./...
 
-## assertions: run the lease-protocol assertions against DATABASE_URL
+## assertions: run every SQL assertion suite against DATABASE_URL
+#
+# All of them, not just the first. Each suite is one migration's proof and each
+# runs in its own transaction and rolls back, so they are independent — but a
+# suite nobody invokes protects nothing, and test/assertions_v5.sql sat here
+# unrun for exactly that reason. New suite, new line.
+#
+# No `|| true` and no swallowed exit status: ON_ERROR_STOP means a failed
+# assertion exits non-zero, and this target has to fail with it.
 assertions:
-	@psql "$(DATABASE_URL)" -v ON_ERROR_STOP=1 -f test/assertions.sql \
-		| grep -E 'P[0-9]+|PASSED|ERROR' || true
+	@for f in test/assertions.sql test/assertions_v5.sql test/assertions_v8.sql; do \
+		echo "== $$f"; \
+		psql "$(DATABASE_URL)" -q -v ON_ERROR_STOP=1 -f $$f || exit 1; \
+	done
 
 ## migrate: apply the schema to DATABASE_URL
 migrate: build

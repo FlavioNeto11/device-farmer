@@ -170,8 +170,27 @@ function fmtSecs(s) {
 
 const HEALTH_GLYPH = {
   healthy: '✓', booting: '↑', recovering: '↻', degraded: '▲', unauthorized: '⚠',
-  offline: '✕', missing: '⊘', quarantined: '■', retired: '–', unknown: '?'
+  offline: '✕', missing: '⊘', quarantined: '■', retired: '–', unknown: '?',
+  // Out of service on purpose — a charge limiter holding a battery, or an
+  // operator who said why. A pause glyph rather than a fault glyph, because
+  // the entire point of the state is that this device is not broken.
+  parked: '❙❙'
 };
+
+/* NOT_A_FAULT holds the health values that mean somebody DECIDED this device
+ * is out of service, as opposed to something having broken: 'retired', and
+ * 'parked' — a charge limiter holding a battery between 40% and 80%, or an
+ * operator who took a handset out and recorded why.
+ *
+ * Every "how many are bad" number on this page goes through isFault, because
+ * this page renders four of them — the fleet tab pip, the host header, the hub
+ * card and the health filter — and they used to carry four copies of the same
+ * predicate. They must also agree with farm.v_hub_health and with the API's
+ * "unhealthy" pseudo-value in internal/api/fleet.go, or one panel reports four
+ * failing devices while the panel beside it reports none. */
+const NOT_A_FAULT = new Set(['healthy', 'retired', 'parked']);
+
+function isFault(h) { return !!h && !NOT_A_FAULT.has(h); }
 
 const OUTCOME_CLASS = {
   recovered: 'chip-healthy', no_change: 'chip-plain', failed: 'chip-offline',
@@ -1013,13 +1032,14 @@ function fleetRows() {
 /* healthMatches applies the ?health= filter the same way the API does.
  *
  * "unhealthy" is not a health value: the API reads it as "every state except
- * healthy and retired" (retired is a decision, not a fault). Comparing it
- * literally against a device's health matched nothing, so a request that the
- * server answered with rows — a shared #/fleet?health=unhealthy link, or the
- * filter below — painted an empty grid over a full response. */
+ * healthy and the ones that are decisions rather than faults" — see
+ * NOT_A_FAULT. Comparing it literally against a device's health matched
+ * nothing, so a request that the server answered with rows — a shared
+ * #/fleet?health=unhealthy link, or the filter below — painted an empty grid
+ * over a full response. */
 function healthMatches(d, want) {
   const h = d.health || 'unknown';
-  if (want === 'unhealthy') return h !== 'healthy' && h !== 'retired';
+  if (want === 'unhealthy') return isFault(h);
   return h === want;
 }
 
@@ -1088,7 +1108,7 @@ function renderFleet() {
     const meta = hostMeta.get(String(host));
     const adminState = (meta && meta.adminState) || (hostDevices[0] && hostDevices[0].hostAdminState) || 'enabled';
     const live = hostDevices.filter((d) => d.leaseState === 'held' || d.leaseState === 'suspect');
-    const bad = hostDevices.filter((d) => d.health && d.health !== 'healthy' && d.health !== 'retired');
+    const bad = hostDevices.filter((d) => isFault(d.health));
 
     const head = el('div', { class: 'host-head' },
       el('span', { class: 'host-name' }, host),
@@ -1120,7 +1140,7 @@ function renderFleet() {
       // Prefer the server's v_hub_health numbers (they count every device on
       // the hub, not just the ones passing the current filter).
       const total = meta2 && meta2.devices !== undefined ? Number(meta2.devices) : devices.length;
-      const unhealthyList = devices.filter((d) => d.health && d.health !== 'healthy' && d.health !== 'retired');
+      const unhealthyList = devices.filter((d) => isFault(d.health));
       const unhealthy = meta2 && meta2.unhealthy !== undefined ? Number(meta2.unhealthy) : unhealthyList.length;
       let since = meta2 && meta2.worstSince ? meta2.worstSince : null;
       if (!since) {
@@ -2331,7 +2351,7 @@ function render() {
  * not healthy, and leases we cannot see the holder of. */
 function renderTabPips() {
   const fleet = state.data.fleet || [];
-  const bad = fleet.filter((d) => d.health && d.health !== 'healthy' && d.health !== 'retired').length;
+  const bad = fleet.filter((d) => isFault(d.health)).length;
   setPip('#tab-fleet', bad, bad ? 'chip-degraded' : null, bad + ' devices not healthy');
   const leases = state.data.leases || [];
   const suspect = leases.filter((l) => l.state === 'suspect').length;

@@ -2,11 +2,15 @@ package config
 
 import (
 	"os"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/flaviopadilha/device-farmer/internal/node"
+	"github.com/flaviopadilha/device-farmer/internal/topo"
 )
 
 // A note on why every test here sets the whole environment.
@@ -32,6 +36,10 @@ var allEnv = []string{
 	EnvNodeSelfFence, EnvFenceMargin, EnvNodeADBEndpoint, EnvNodeHostID,
 	EnvWatchdogInterval, EnvMigrationsTable, EnvMigrationsDir,
 	EnvArtifactGCGrace,
+	EnvNodeToken, EnvSysfsRoot, EnvTopoOverrides,
+	EnvTopoRetireVanished, EnvTopoMaxRetireFraction, EnvTopoDryRun,
+	EnvTopoMinPorts, EnvTopoAdoptEmpty, EnvTopoIncludeRootHubs,
+	EnvTopoInclude, EnvTopoExclude, EnvTopoInterval, EnvTopoCallTimeout,
 }
 
 const testDSN = "postgres://farm@127.0.0.1:5432/farm?sslmode=disable"
@@ -131,11 +139,27 @@ func TestDefaultValues(t *testing.T) {
 		{EnvWatchdogInterval, cfg.WatchdogInterval, DefaultWatchdogEvery},
 		{EnvMigrationsTable, cfg.MigrationsTable, DefaultMigrationsTable},
 		{EnvArtifactGCGrace, cfg.ArtifactGCGrace, DefaultArtifactGCGrace},
+		{EnvNodeToken, cfg.Node.Token, ""},
+		{EnvSysfsRoot, cfg.Topo.SysfsRoot, DefaultSysfsRoot},
+		{EnvTopoOverrides, cfg.Topo.OverridesPath, ""},
+		// Off, and it must stay off: see Topo.RetireVanished.
+		{EnvTopoRetireVanished, cfg.Topo.RetireVanished, false},
+		{EnvTopoMaxRetireFraction, cfg.Topo.MaxRetireFraction, DefaultTopoMaxRetireFraction},
+		{EnvTopoDryRun, cfg.Topo.DryRun, false},
+		{EnvTopoMinPorts, cfg.Topo.MinPorts, DefaultTopoMinPorts},
+		{EnvTopoAdoptEmpty, cfg.Topo.AdoptEmpty, false},
+		{EnvTopoIncludeRootHubs, cfg.Topo.IncludeRootHubs, false},
+		{EnvTopoInterval, cfg.Topo.Interval, DefaultTopoInterval},
+		{EnvTopoCallTimeout, cfg.Topo.CallTimeout, DefaultTopoCallTimeout},
 	}
 	for _, c := range checks {
 		if c.got != c.want {
 			t.Errorf("%s: got %v, want %v", c.name, c.got, c.want)
 		}
+	}
+	if len(cfg.Topo.Include) != 0 || len(cfg.Topo.Exclude) != 0 {
+		t.Errorf("default hub filter lists are not empty: include %v, exclude %v",
+			cfg.Topo.Include, cfg.Topo.Exclude)
 	}
 	if !slices.Equal(cfg.Reaper.Components, DefaultReaperComponents) {
 		t.Errorf("%s: got %v, want %v", EnvReaperComponent, cfg.Reaper.Components, DefaultReaperComponents)
@@ -145,6 +169,34 @@ func TestDefaultValues(t *testing.T) {
 	cfg.Reaper.Components[0] = "clobbered"
 	if DefaultReaperComponents[0] == "clobbered" {
 		t.Fatal("Reaper.Components aliases DefaultReaperComponents")
+	}
+}
+
+// TestTopoDefaultsMatchTheirPackages holds this package's restated defaults
+// to the constants the consuming packages apply for a zero value. If the two
+// drift, Summary prints a number the node is not running with — which is the
+// exact failure the summary exists to prevent.
+//
+// The sysfs root is the one that has already been wrong once: the node role
+// used to open "/sys", a directory with no USB device in it, and would have
+// reported every host as empty.
+func TestTopoDefaultsMatchTheirPackages(t *testing.T) {
+	checks := []struct {
+		name string
+		got  any
+		want any
+	}{
+		{"sysfs root", DefaultSysfsRoot, topo.DefaultSysfsRoot},
+		{"max retire fraction", DefaultTopoMaxRetireFraction, topo.DefaultMaxRetireFraction},
+		{"min hub ports", DefaultTopoMinPorts, topo.DefaultMinHubPorts},
+		{"interval (topo)", DefaultTopoInterval, topo.DefaultInterval},
+		{"interval (node)", DefaultTopoInterval, node.DefaultDiscoverInterval},
+		{"call timeout", DefaultTopoCallTimeout, topo.DefaultCallTimeout},
+	}
+	for _, c := range checks {
+		if c.got != c.want {
+			t.Errorf("%s: config says %v, the package applies %v", c.name, c.got, c.want)
+		}
 	}
 }
 
@@ -378,6 +430,89 @@ func TestPreflightRefusals(t *testing.T) {
 		role: "watchdog",
 		envs: map[string]string{EnvWatchdogInterval: "-1s"},
 		want: []string{EnvWatchdogInterval},
+	}, {
+		// U12. Above 1 is "retire everything the scan says is gone", which is
+		// what a lost /sys bind mount produces.
+		name: "retire fraction above one",
+		role: "node",
+		envs: map[string]string{EnvTopoMaxRetireFraction: "1.5"},
+		want: []string{EnvTopoMaxRetireFraction, "at most 1"},
+	}, {
+		name: "retire fraction of zero",
+		role: "node",
+		envs: map[string]string{EnvTopoMaxRetireFraction: "0"},
+		want: []string{EnvTopoMaxRetireFraction, "greater than 0"},
+	}, {
+		// strconv.ParseFloat accepts NaN, and NaN passes both a <= 0 and a
+		// > 1 test.
+		name: "retire fraction that is not a number at all",
+		role: "node",
+		envs: map[string]string{EnvTopoMaxRetireFraction: "NaN"},
+		want: []string{EnvTopoMaxRetireFraction},
+	}, {
+		name: "retire fraction that does not parse",
+		role: "node",
+		envs: map[string]string{EnvTopoMaxRetireFraction: "a quarter"},
+		want: []string{EnvTopoMaxRetireFraction, "is not a number"},
+	}, {
+		name: "hub port floor of zero",
+		role: "node",
+		envs: map[string]string{EnvTopoMinPorts: "0"},
+		want: []string{EnvTopoMinPorts, "between 1 and 32"},
+	}, {
+		name: "hub port floor above the schema ceiling",
+		role: "node",
+		envs: map[string]string{EnvTopoMinPorts: "33"},
+		want: []string{EnvTopoMinPorts, "no hub"},
+	}, {
+		name: "discovery interval not positive",
+		role: "node",
+		envs: map[string]string{EnvTopoInterval: "0s", EnvTopoCallTimeout: "1s"},
+		want: []string{EnvTopoInterval, "must be positive"},
+	}, {
+		name: "discovery call timeout not positive",
+		role: "node",
+		envs: map[string]string{EnvTopoCallTimeout: "0s"},
+		want: []string{EnvTopoCallTimeout, "must be positive"},
+	}, {
+		name: "discovery call timeout outlasts the pass",
+		role: "node",
+		envs: map[string]string{EnvTopoInterval: "1m", EnvTopoCallTimeout: "2m"},
+		want: []string{EnvTopoCallTimeout, EnvTopoInterval, "never fire"},
+	}, {
+		name: "relative sysfs root",
+		role: "node",
+		envs: map[string]string{EnvSysfsRoot: "sys/bus/usb/devices"},
+		want: []string{EnvSysfsRoot, "absolute path"},
+	}, {
+		// "usb3" is the directory name; the scan reports the hub as "3-0", so
+		// an include spelled this way matches nothing and says nothing.
+		name: "include that is not a usb path",
+		role: "node",
+		envs: map[string]string{EnvTopoInclude: "3-1.4,usb3"},
+		want: []string{EnvTopoInclude, `"usb3"`, "3-1.4"},
+	}, {
+		name: "exclude that is not a usb path",
+		role: "node",
+		envs: map[string]string{EnvTopoExclude: "/sys/bus/usb/devices/3-1"},
+		want: []string{EnvTopoExclude, "not a hub USB path"},
+	}, {
+		name: "hub both included and excluded",
+		role: "node",
+		envs: map[string]string{EnvTopoInclude: "3-1.4", EnvTopoExclude: "3-1.4"},
+		want: []string{EnvTopoInclude, EnvTopoExclude, `"3-1.4"`, "silently do nothing"},
+	}, {
+		// "yes" must not be read as false: a switch that turns removal
+		// reconciliation on cannot be left off by a spelling.
+		name: "boolean that is not a boolean",
+		role: "node",
+		envs: map[string]string{EnvTopoRetireVanished: "yes"},
+		want: []string{EnvTopoRetireVanished, "not a boolean"},
+	}, {
+		name: "overrides file that does not exist",
+		role: "node",
+		envs: map[string]string{EnvTopoOverrides: "/nonexistent/overrides.json"},
+		want: []string{EnvTopoOverrides, "overrides.json"},
 	}}
 
 	for _, tc := range cases {
@@ -459,35 +594,48 @@ func TestWithoutDatabase(t *testing.T) {
 // carried anywhere.
 func TestEveryVariableIsRead(t *testing.T) {
 	env(t, map[string]string{
-		EnvDatabaseURL:          "postgres://farm:hunter2@db.internal:6432/farm",
-		EnvDBMaxConns:           "17",
-		EnvDBConnectTimeout:     "11s",
-		EnvComponent:            "scheduler-a",
-		EnvLogLevel:             "debug",
-		EnvShutdownGrace:        "45s",
-		EnvAPIAddr:              "127.0.0.1:8517",
-		EnvMetricsAddr:          "127.0.0.1:9517",
-		EnvNodeAddr:             "127.0.0.1:8518",
-		EnvAPIBaseURL:           "https://farm.example:8443",
-		EnvLeaseTTL:             "30m",
-		EnvLeaseGrace:           "40m",
-		EnvLeaseRenewInterval:   "45s",
-		EnvLeaseWitnessInterval: "3m",
-		EnvLeaseWitnessMaxExt:   "7",
-		EnvSlotRearm:            "40s",
-		EnvReaperInterval:       "7s",
-		EnvReaperBatch:          "42",
-		EnvReaperGapFloor:       "90s",
-		EnvReaperComponent:      " reaper , api ,scheduler-a, jobrunner ",
-		EnvHeartbeatEvery:       "4s",
-		EnvNodeSelfFence:        "30s",
-		EnvFenceMargin:          "9s",
-		EnvNodeADBEndpoint:      "10.0.0.9:5037",
-		EnvNodeHostID:           "rack1-host7",
-		EnvWatchdogInterval:     "6s",
-		EnvMigrationsTable:      "farm.schema_version",
-		EnvMigrationsDir:        "/srv/migrations",
-		EnvArtifactGCGrace:      "2h",
+		EnvDatabaseURL:           "postgres://farm:hunter2@db.internal:6432/farm",
+		EnvDBMaxConns:            "17",
+		EnvDBConnectTimeout:      "11s",
+		EnvComponent:             "scheduler-a",
+		EnvLogLevel:              "debug",
+		EnvShutdownGrace:         "45s",
+		EnvAPIAddr:               "127.0.0.1:8517",
+		EnvMetricsAddr:           "127.0.0.1:9517",
+		EnvNodeAddr:              "127.0.0.1:8518",
+		EnvAPIBaseURL:            "https://farm.example:8443",
+		EnvLeaseTTL:              "30m",
+		EnvLeaseGrace:            "40m",
+		EnvLeaseRenewInterval:    "45s",
+		EnvLeaseWitnessInterval:  "3m",
+		EnvLeaseWitnessMaxExt:    "7",
+		EnvSlotRearm:             "40s",
+		EnvReaperInterval:        "7s",
+		EnvReaperBatch:           "42",
+		EnvReaperGapFloor:        "90s",
+		EnvReaperComponent:       " reaper , api ,scheduler-a, jobrunner ",
+		EnvHeartbeatEvery:        "4s",
+		EnvNodeSelfFence:         "30s",
+		EnvFenceMargin:           "9s",
+		EnvNodeADBEndpoint:       "10.0.0.9:5037",
+		EnvNodeHostID:            "rack1-host7",
+		EnvWatchdogInterval:      "6s",
+		EnvMigrationsTable:       "farm.schema_version",
+		EnvMigrationsDir:         "/srv/migrations",
+		EnvArtifactGCGrace:       "2h",
+		EnvNodeToken:             "s3cret-node-token",
+		EnvSysfsRoot:             "/host/sys/bus/usb/devices",
+		EnvTopoOverrides:         "/etc/farm/overrides.json",
+		EnvTopoRetireVanished:    "true",
+		EnvTopoMaxRetireFraction: "0.5",
+		EnvTopoDryRun:            "1",
+		EnvTopoMinPorts:          "4",
+		EnvTopoAdoptEmpty:        "TRUE",
+		EnvTopoIncludeRootHubs:   "t",
+		EnvTopoInclude:           " 3-1.4 , 3-1.5 ",
+		EnvTopoExclude:           "1-0",
+		EnvTopoInterval:          "2m",
+		EnvTopoCallTimeout:       "20s",
 	})
 	cfg, err := Load("scheduler")
 	if err != nil {
@@ -526,6 +674,17 @@ func TestEveryVariableIsRead(t *testing.T) {
 		{EnvMigrationsTable, cfg.MigrationsTable, "farm.schema_version"},
 		{EnvMigrationsDir, cfg.MigrationsDir, "/srv/migrations"},
 		{EnvArtifactGCGrace, cfg.ArtifactGCGrace, 2 * time.Hour},
+		{EnvNodeToken, cfg.Node.Token, "s3cret-node-token"},
+		{EnvSysfsRoot, cfg.Topo.SysfsRoot, "/host/sys/bus/usb/devices"},
+		{EnvTopoOverrides, cfg.Topo.OverridesPath, "/etc/farm/overrides.json"},
+		{EnvTopoRetireVanished, cfg.Topo.RetireVanished, true},
+		{EnvTopoMaxRetireFraction, cfg.Topo.MaxRetireFraction, 0.5},
+		{EnvTopoDryRun, cfg.Topo.DryRun, true},
+		{EnvTopoMinPorts, cfg.Topo.MinPorts, 4},
+		{EnvTopoAdoptEmpty, cfg.Topo.AdoptEmpty, true},
+		{EnvTopoIncludeRootHubs, cfg.Topo.IncludeRootHubs, true},
+		{EnvTopoInterval, cfg.Topo.Interval, 2 * time.Minute},
+		{EnvTopoCallTimeout, cfg.Topo.CallTimeout, 20 * time.Second},
 	}
 	for _, c := range checks {
 		if c.got != c.want {
@@ -535,6 +694,12 @@ func TestEveryVariableIsRead(t *testing.T) {
 	// The list is split, trimmed and emptied of blanks.
 	if want := []string{"reaper", "api", "scheduler-a", "jobrunner"}; !slices.Equal(cfg.Reaper.Components, want) {
 		t.Errorf("%s: got %v, want %v", EnvReaperComponent, cfg.Reaper.Components, want)
+	}
+	if want := []string{"3-1.4", "3-1.5"}; !slices.Equal(cfg.Topo.Include, want) {
+		t.Errorf("%s: got %v, want %v", EnvTopoInclude, cfg.Topo.Include, want)
+	}
+	if want := []string{"1-0"}; !slices.Equal(cfg.Topo.Exclude, want) {
+		t.Errorf("%s: got %v, want %v", EnvTopoExclude, cfg.Topo.Exclude, want)
 	}
 	// FARM_COMPONENT reached the component this process IS.
 	if got := cfg.ComponentFor("scheduler"); got != "scheduler-a" {
@@ -830,6 +995,125 @@ func TestSummaryShowsWhatTheProcessDecided(t *testing.T) {
 	}
 	if !strings.Contains(off.Summary(), "no /metrics listener") {
 		t.Errorf("a disabled metrics listener is not stated:\n%s", off.Summary())
+	}
+}
+
+// TestSummaryNeverPrintsTheNodeToken. The summary goes to stderr of every
+// role at info level, which is to say into every log aggregator the farm has.
+// The token authenticates a call that cuts power to a port holding somebody's
+// lease, so the line may say that it exists and nothing else.
+func TestSummaryNeverPrintsTheNodeToken(t *testing.T) {
+	const token = "tok-9f2a1c-never-in-a-log"
+	env(t, withDSN(map[string]string{EnvNodeToken: token}))
+	cfg, err := Load("recovery")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := cfg.Summary()
+	if strings.Contains(s, token) {
+		t.Fatalf("the startup summary printed the node token:\n%s", s)
+	}
+	if !strings.Contains(s, "node token") || !strings.Contains(s, "set") {
+		t.Errorf("the summary does not say that a node token is set:\n%s", s)
+	}
+
+	// And its absence is stated with its consequence, since nothing else in
+	// the process will say so after the first warning.
+	env(t, withDSN(nil))
+	none, err := Load("recovery")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s := none.Summary(); !strings.Contains(s, "unset") || !strings.Contains(s, "tiers 3 and 4") {
+		t.Errorf("an unset node token is not stated with its consequence:\n%s", s)
+	}
+}
+
+// TestSummarySaysWhatDiscoveryWillDo. Every topo knob has to be visible in the
+// summary, and the retirement policy in particular has to read as OFF when it
+// is off: an operator who sees no line about vanished ports assumes they are
+// handled, and they are not.
+func TestSummarySaysWhatDiscoveryWillDo(t *testing.T) {
+	env(t, withDSN(map[string]string{
+		EnvSysfsRoot:       "/host/sys/bus/usb/devices",
+		EnvTopoInclude:     "3-1.4",
+		EnvTopoExclude:     "1-0",
+		EnvTopoMinPorts:    "7",
+		EnvTopoInterval:    "3m",
+		EnvTopoCallTimeout: "9s",
+	}))
+	cfg, err := Load("api")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := cfg.Summary()
+	for _, want := range []string{
+		"/host/sys/bus/usb/devices", "3-1.4", "1-0", "min 7 ports", "3m0s", "9s",
+		"overrides none", "adopt empty off", "root hubs off",
+		"topo removals    = off", "25%",
+	} {
+		if !strings.Contains(s, want) {
+			t.Errorf("summary omits %q:\n%s", want, s)
+		}
+	}
+	if strings.Contains(s, "DRY RUN") {
+		t.Errorf("summary claims a dry run that was not asked for:\n%s", s)
+	}
+
+	env(t, withDSN(map[string]string{
+		EnvTopoRetireVanished:    "true",
+		EnvTopoMaxRetireFraction: "0.4",
+		EnvTopoDryRun:            "true",
+		EnvTopoAdoptEmpty:        "true",
+	}))
+	on, err := Load("api")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s = on.Summary()
+	for _, want := range []string{"retire vanished ports", "40%", "DRY RUN", "adopt empty on"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("summary omits %q:\n%s", want, s)
+		}
+	}
+}
+
+// TestOverridesFileIsCheckedOnlyWhereItIsRead. A shared manifest hands every
+// role the same FARM_TOPO_OVERRIDES, and the file exists on the device host
+// alone. The node must refuse a path it cannot open; the API must not refuse
+// to start over a file it will never read.
+func TestOverridesFileIsCheckedOnlyWhereItIsRead(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "absent.json")
+	env(t, withDSN(map[string]string{EnvTopoOverrides: missing}))
+	if _, err := Load("api"); err != nil {
+		t.Errorf("api refused to start over an overrides file it never reads: %v", err)
+	}
+	_, err := Load("node")
+	if err == nil {
+		t.Fatal("node accepted an overrides path that does not exist")
+	}
+	if !strings.Contains(err.Error(), EnvTopoOverrides) {
+		t.Errorf("refusal does not name %s:\n%s", EnvTopoOverrides, err)
+	}
+
+	// A directory is not a file that can hold a JSON object.
+	env(t, withDSN(map[string]string{EnvTopoOverrides: t.TempDir()}))
+	if _, err := Load("node"); err == nil || !strings.Contains(err.Error(), "directory") {
+		t.Errorf("node accepted a directory as an overrides file: %v", err)
+	}
+
+	// A file that exists is accepted here; its content is topo's to judge.
+	present := filepath.Join(t.TempDir(), "overrides.json")
+	if err := os.WriteFile(present, []byte(`{"hub_tokens":{"3-1.4":"3"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	env(t, withDSN(map[string]string{EnvTopoOverrides: present}))
+	cfg, err := Load("node")
+	if err != nil {
+		t.Fatalf("node refused an overrides file that exists: %v", err)
+	}
+	if cfg.Topo.OverridesPath != present {
+		t.Errorf("OverridesPath = %q, want %q", cfg.Topo.OverridesPath, present)
 	}
 }
 

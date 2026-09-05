@@ -143,7 +143,9 @@ type Config struct {
 	// Source reads the USB tree. Use [Sysfs] in production, [FromFS] in tests.
 	Source Source
 
-	// Overrides is the operator's naming map. See rackslot.go.
+	// Overrides is the operator's naming map. See rackslot.go. New sanitises
+	// it once and refuses a map whose entries collide, so a bad file stops
+	// the process that was given it rather than failing every pass.
 	Overrides Overrides
 
 	Filter HubFilter
@@ -195,9 +197,19 @@ func (c *Config) applyDefaults() {
 type Discoverer struct {
 	cfg Config
 	log *slog.Logger
+	// overrides is cfg.Overrides after the one sanitising pass New makes.
+	// Every labeler a pass builds starts from this map, never from
+	// cfg.Overrides: the map is checked where the process starts, and a pass
+	// has nothing left to refuse in it.
+	overrides Overrides
 }
 
 // New validates cfg and returns a Discoverer.
+//
+// It is where the naming map is judged. Two hubs claiming one token, or a
+// token that sanitises to nothing, is a mistake in a file the operator wrote
+// once; it is refused here, once, and named, instead of failing a pass every
+// Interval with the same message.
 func New(cfg Config) (*Discoverer, error) {
 	if cfg.Pool == nil {
 		return nil, errors.New("topo: Config.Pool is required")
@@ -209,10 +221,15 @@ func New(cfg Config) (*Discoverer, error) {
 		return nil, errors.New("topo: Config.Source is required; " +
 			"a discoverer with nothing to read would report an empty host")
 	}
+	overrides, err := normalizeOverrides(cfg.Overrides)
+	if err != nil {
+		return nil, fmt.Errorf("topo: Config.Overrides: %w", err)
+	}
 	cfg.applyDefaults()
 	return &Discoverer{
-		cfg: cfg,
-		log: cfg.Logger.With("component", "topo", "host", cfg.HostID),
+		cfg:       cfg,
+		log:       cfg.Logger.With("component", "topo", "host", cfg.HostID),
+		overrides: overrides,
 	}, nil
 }
 
@@ -315,11 +332,10 @@ func (d *Discoverer) Once(ctx context.Context) (rep Report, err error) {
 		return rep, err
 	}
 
-	labeler, err := NewLabeler(d.cfg.HostID, rack, unit, d.cfg.Overrides)
-	if err != nil {
-		scansTotal.WithLabelValues("failed").Inc()
-		return rep, err
-	}
+	// From the map New already sanitised: the only thing a pass can learn
+	// about the overrides that New could not is which hubs are present, and
+	// that is Labeler.Check below.
+	labeler := newLabeler(d.cfg.HostID, rack, unit, d.overrides)
 
 	hubs := d.selectHubs(tree, &rep)
 	paths := make([]string, 0, len(hubs))

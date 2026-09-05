@@ -1,7 +1,11 @@
 package topo
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -69,12 +73,97 @@ import (
 type Overrides struct {
 	// HubTokens maps a hub's USB path to the token that appears after "H".
 	// Example: {"3-1.4": "3"} renders R2-U14-H3-P5.
-	HubTokens map[string]string
+	HubTokens map[string]string `json:"hub_tokens"`
 
 	// SlotLabels maps a slot's USB path to a complete label, bypassing the
 	// scheme entirely. For the rack where somebody already stuck numbers on
 	// every socket.
-	SlotLabels map[string]string
+	SlotLabels map[string]string `json:"slot_labels"`
+}
+
+// LoadOverrides reads an Overrides map from a JSON file:
+//
+//	{"hub_tokens": {"3-1.4": "3"}, "slot_labels": {"3-1.4.2": "R2-U14-H3-P2"}}
+//
+// An empty path is no overrides. Unknown keys are refused rather than
+// skipped, because a file that spells "hubTokens" would otherwise load as an
+// empty map and every label on the host would quietly fall back to the derived
+// scheme.
+//
+// This reads the file and judges its shape; it does not judge the map. The
+// values come back as written, and [New] sanitises them and refuses the ones
+// that collide — once, when the process starts, and in one place, so that a
+// map built in code and a map read from a file are held to the same rule.
+func LoadOverrides(path string) (Overrides, error) {
+	if path == "" {
+		return Overrides{}, nil
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return Overrides{}, fmt.Errorf("topo: overrides: %w", err)
+	}
+	defer f.Close()
+
+	var ov Overrides
+	dec := json.NewDecoder(f)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&ov); err != nil {
+		return Overrides{}, fmt.Errorf("topo: overrides %s: %w", path, err)
+	}
+	// One object and nothing after it. A second object, or a stray brace, is
+	// a file that was hand-edited into two, and the half that loaded is not
+	// what the operator believes is in force.
+	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return Overrides{}, fmt.Errorf("topo: overrides %s: trailing data after the JSON object", path)
+	}
+	return ov, nil
+}
+
+// normalizeOverrides sanitises every override and refuses the ones that
+// collide. It runs once per map: in [New] for the map a Discoverer carries,
+// and in [NewLabeler] for a labeler built on its own. A map that came through
+// either is clean, and [newLabeler] takes it as it is.
+func normalizeOverrides(ov Overrides) (Overrides, error) {
+	out := Overrides{
+		HubTokens:  make(map[string]string, len(ov.HubTokens)),
+		SlotLabels: make(map[string]string, len(ov.SlotLabels)),
+	}
+
+	// Sorted, so that a map holding two bad entries always reports the same one
+	// first: an error message that changes between runs of the same config is
+	// an error message operators stop believing.
+	seen := make(map[string]string, len(ov.HubTokens))
+	for _, usbPath := range sortedKeys(ov.HubTokens) {
+		tok := sanitizeField(ov.HubTokens[usbPath])
+		if tok == "" {
+			return Overrides{}, fmt.Errorf("topo: hub token override for %q is empty after sanitising %q",
+				usbPath, ov.HubTokens[usbPath])
+		}
+		if other, dup := seen[tok]; dup {
+			return Overrides{}, fmt.Errorf("topo: hub token %q is claimed by both %s and %s; "+
+				"one label pointing at two hubs sends an operator to the wrong rack position",
+				tok, other, usbPath)
+		}
+		seen[tok] = usbPath
+		out.HubTokens[usbPath] = tok
+	}
+
+	seenLabel := make(map[string]string, len(ov.SlotLabels))
+	for _, usbPath := range sortedKeys(ov.SlotLabels) {
+		clean := sanitizeLabel(ov.SlotLabels[usbPath])
+		if clean == "" {
+			return Overrides{}, fmt.Errorf("topo: slot label override for %q is empty after sanitising %q",
+				usbPath, ov.SlotLabels[usbPath])
+		}
+		if other, dup := seenLabel[clean]; dup {
+			return Overrides{}, fmt.Errorf("topo: slot label %q is claimed by both %s and %s; "+
+				"two sockets under one label send an operator to the wrong device",
+				clean, other, usbPath)
+		}
+		seenLabel[clean] = usbPath
+		out.SlotLabels[usbPath] = clean
+	}
+	return out, nil
 }
 
 // Labeler renders rack_slot labels for one host.
@@ -98,57 +187,27 @@ type Labeler struct {
 // hubs answering to "H3" is worse than no label at all, since it sends an
 // operator confidently to the wrong one.
 func NewLabeler(hostID, rack string, rackUnit int, ov Overrides) (*Labeler, error) {
-	hostID = strings.TrimSpace(hostID)
-	if hostID == "" {
+	if strings.TrimSpace(hostID) == "" {
 		return nil, fmt.Errorf("topo: a labeler needs a host id")
 	}
+	clean, err := normalizeOverrides(ov)
+	if err != nil {
+		return nil, err
+	}
+	return newLabeler(hostID, rack, rackUnit, clean), nil
+}
 
-	l := &Labeler{
-		host:     hostID,
+// newLabeler builds a labeler from a map that normalizeOverrides has already
+// been over. It cannot fail: a clean map has nothing left to refuse, and the
+// host id was checked by whoever holds the map. Discovery calls this on every
+// pass with the map New sanitised, which is why the sanitising is not here.
+func newLabeler(hostID, rack string, rackUnit int, clean Overrides) *Labeler {
+	return &Labeler{
+		host:     strings.TrimSpace(hostID),
 		rack:     strings.TrimSpace(rack),
 		rackUnit: rackUnit,
-		ov: Overrides{
-			HubTokens:  make(map[string]string, len(ov.HubTokens)),
-			SlotLabels: make(map[string]string, len(ov.SlotLabels)),
-		},
+		ov:       clean,
 	}
-
-	seen := make(map[string]string, len(ov.HubTokens))
-	for _, usbPath := range sortedKeys(ov.HubTokens) {
-		tok := sanitizeField(ov.HubTokens[usbPath])
-		if tok == "" {
-			return nil, fmt.Errorf("topo: hub token override for %q is empty after sanitising %q",
-				usbPath, ov.HubTokens[usbPath])
-		}
-		if other, dup := seen[tok]; dup {
-			return nil, fmt.Errorf("topo: hub token %q is claimed by both %s and %s; "+
-				"one label pointing at two hubs sends an operator to the wrong rack position",
-				tok, other, usbPath)
-		}
-		seen[tok] = usbPath
-		l.ov.HubTokens[usbPath] = tok
-	}
-
-	// Sorted, so that a map holding two bad entries always reports the same one
-	// first: an error message that changes between runs of the same config is
-	// an error message operators stop believing.
-	seenLabel := make(map[string]string, len(ov.SlotLabels))
-	for _, usbPath := range sortedKeys(ov.SlotLabels) {
-		clean := sanitizeLabel(ov.SlotLabels[usbPath])
-		if clean == "" {
-			return nil, fmt.Errorf("topo: slot label override for %q is empty after sanitising %q",
-				usbPath, ov.SlotLabels[usbPath])
-		}
-		if other, dup := seenLabel[clean]; dup {
-			return nil, fmt.Errorf("topo: slot label %q is claimed by both %s and %s; "+
-				"two sockets under one label send an operator to the wrong device",
-				clean, other, usbPath)
-		}
-		seenLabel[clean] = usbPath
-		l.ov.SlotLabels[usbPath] = clean
-	}
-
-	return l, nil
 }
 
 // HubToken returns the "H" component for a hub.

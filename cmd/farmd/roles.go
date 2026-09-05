@@ -292,7 +292,7 @@ func runAPI(ctx context.Context, cfg *config.Config, log *slog.Logger, pool *pgx
 
 	// The artifact API needs a blob backend, which is a deployment choice the
 	// server has no business making, so it is contributed rather than built in.
-	if store, aerr := openArtifacts(cfg, pool); aerr != nil {
+	if store, backend, aerr := openArtifacts(cfg, pool); aerr != nil {
 		log.Warn("artifact endpoints are disabled", "err", aerr,
 			"consequence", "jobs with push or install steps will fail at the first artifact")
 	} else {
@@ -306,6 +306,17 @@ func runAPI(ctx context.Context, cfg *config.Config, log *slog.Logger, pool *pgx
 			// Artifact bytes. Without this a farm can store a 200MB APK it
 			// cannot hand back, and the blob store is the only copy.
 			a.RegisterBlobRoutes(mux)
+			// Reclaiming the bytes. DELETE removes the row and keeps the blob
+			// by design, so without this route the directory only grows and
+			// the sweep that exists to empty it has no caller. It runs only
+			// when an operator asks, and dry by default.
+			gc, gerr := api.NewBlobGC(srv, backend, api.WithBlobGCGrace(cfg.ArtifactGCGrace))
+			if gerr != nil {
+				log.Warn("artifact GC endpoint is disabled", "err", gerr,
+					"consequence", "disk under the blob root is reclaimable only by hand")
+				return
+			}
+			gc.Register(mux)
 		}))
 	}
 	// The reaper's kill switch. It is mounted here rather than in the router's
@@ -622,16 +633,24 @@ func waitForHosts(ctx context.Context, pool *pgxpool.Pool, want int) error {
 // openArtifacts builds the content-addressed artifact store. The blob backend
 // is a local directory here; the Backend interface is the seam for object
 // storage, and nothing above it knows the difference.
-func openArtifacts(cfg *config.Config, pool *pgxpool.Pool) (*artifacts.Store, error) {
+//
+// The backend is returned beside the store because the sweep that reclaims
+// disk needs to enumerate what the backend holds, which the Store's seam
+// deliberately does not offer.
+func openArtifacts(cfg *config.Config, pool *pgxpool.Pool) (*artifacts.Store, *artifacts.DirBackend, error) {
 	root := os.Getenv("FARM_ARTIFACT_DIR")
 	if root == "" {
 		root = filepath.Join(os.TempDir(), "device-farmer-artifacts")
 	}
 	backend, err := artifacts.NewDirBackend(root)
 	if err != nil {
-		return nil, fmt.Errorf("artifact backend at %s: %w", root, err)
+		return nil, nil, fmt.Errorf("artifact backend at %s: %w", root, err)
 	}
-	return artifacts.NewStore(pool, backend)
+	store, err := artifacts.NewStore(pool, backend)
+	if err != nil {
+		return nil, nil, err
+	}
+	return store, backend, nil
 }
 
 // runJobRunner executes jobs on the devices the scheduler allocated. It is the
@@ -642,7 +661,7 @@ func runJobRunner(ctx context.Context, cfg *config.Config, log *slog.Logger, poo
 		return fmt.Errorf("mint holder instance: %w", err)
 	}
 
-	store, err := openArtifacts(cfg, pool)
+	store, _, err := openArtifacts(cfg, pool)
 	if err != nil {
 		return err
 	}

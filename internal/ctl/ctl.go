@@ -42,12 +42,20 @@
 //	1  it failed
 //	2  the invocation was wrong
 //	3  the remote REFUSED the action (HTTP 409)
+//	4  the run completed and at least one target in it failed
 //
 // 3 is separate from 1 because a refusal is an answer, not a crash. "no
 // healthy device matched", "this job is already terminal", "this power cycle
 // would disturb a live lease" are the control plane working correctly. A
 // script that retries on 1 and stops on 3 is a script that does not fight the
 // farm.
+//
+// 4 is separate from 1 because "nine of sixty phones errored" and "could not
+// reach the API" are different problems with different next steps, and a
+// script that could not tell them apart would re-run a fleet-wide command to
+// recover from a transport blip. A partial outcome is a completed run: the
+// server has every target's row, and nothing about a failed target released
+// anything.
 //
 // # Configuration
 //
@@ -110,6 +118,13 @@ var (
 	// ErrRefused means the remote declined the action with 409: exit 3. It is
 	// not a failure of ctl and not a failure of the API — it is the answer.
 	ErrRefused = errors.New("the remote refused this action")
+
+	// ErrPartial means the run completed and some of what it addressed
+	// failed: exit 4. The invocation worked, the server has the full
+	// per-target record, and no lease was touched by any of the failures.
+	// Wrap it with the count, so the message says how much of the run this
+	// is about.
+	ErrPartial = errors.New("partial")
 )
 
 // ExitCode maps an error from Run onto this package's documented exit codes.
@@ -121,6 +136,8 @@ func ExitCode(err error) int {
 		return 2
 	case errors.Is(err, ErrRefused):
 		return 3
+	case errors.Is(err, ErrPartial):
+		return 4
 	default:
 		return 1
 	}
@@ -355,6 +372,14 @@ func (c *Client) Get(ctx context.Context, p string, q url.Values) (json.RawMessa
 // Post sends a JSON body and reads a JSON response. A nil body sends "{}",
 // which the API decodes into the zero request rather than rejecting.
 func (c *Client) Post(ctx context.Context, p string, body any) (json.RawMessage, error) {
+	return c.PostQuery(ctx, p, nil, body)
+}
+
+// PostQuery is Post with a query string, for the routes whose switches live
+// in the URL rather than the body — the artifact sweep reads ?apply and
+// ?reason there, because its body is nothing and its dry run must be the
+// request a mistyped command sends.
+func (c *Client) PostQuery(ctx context.Context, p string, q url.Values, body any) (json.RawMessage, error) {
 	payload := []byte("{}")
 	if body != nil {
 		var err error
@@ -363,7 +388,12 @@ func (c *Client) Post(ctx context.Context, p string, body any) (json.RawMessage,
 			return nil, fmt.Errorf("encode request for %s: %w", p, err)
 		}
 	}
-	return c.readJSON(ctx, http.MethodPost, p, nil, bytes.NewReader(payload), "application/json")
+	return c.readJSON(ctx, http.MethodPost, p, q, bytes.NewReader(payload), "application/json")
+}
+
+// Delete removes a resource and reads the JSON reply.
+func (c *Client) Delete(ctx context.Context, p string, q url.Values) (json.RawMessage, error) {
+	return c.readJSON(ctx, http.MethodDelete, p, q, nil, "")
 }
 
 // Stream opens a long-lived response — the SSE event stream — with no
@@ -705,9 +735,13 @@ var commands = []command{
 	{"leases", "[--state s] [--host h] [--device d]", "who holds what", cmdLeases},
 	{"lease", "revoke <id> --reason r", "take a device back from its holder", cmdLease},
 	{"reaper", "[disable|enable --reason r]", "the kill switch for automatic reclamation", cmdReaper},
-	{"recovery", "", "the ladder, recent attempts, open quarantines", cmdRecovery},
+	{"recovery", "[--outcome o] [--tier n] [--hub id] [--host h] [--device d] [--since d]", "the ladder, recent attempts, open quarantines", cmdRecovery},
+	// Top-level rather than a `slot` sub-verb: the slot is the address, but
+	// the action is a rung of the recovery ladder with a hub-sized blast
+	// radius, and it belongs beside the other things that disturb hardware.
+	{"power", "<slot id> --reason r", "cycle VBUS on one slot through the host agent", cmdSlotPower},
 	{"bulk", "--selector k=v -- <command>", "one command across a selector, streamed", cmdBulk},
-	{"artifacts", "", "what is in the artifact store", cmdArtifacts},
+	{"artifacts", "[--kind k] | gc [--apply --reason r] | delete <sha> --reason r", "the artifact store: list it, reclaim its disk, forget one", cmdArtifacts},
 	{"push", "<file> [--kind k] [--name n]", "upload an artifact", cmdPush},
 	{"watch", "", "follow the live event stream", cmdWatch},
 }
@@ -814,6 +848,7 @@ Exit codes:
   1  failure
   2  usage
   3  the remote refused the action (HTTP 409) — an answer, not a crash
+  4  partial — the run completed and at least one target in it failed
 
 A lease ends when its job ends, when a deadline the user wrote down elapses, or
 when a human revokes it. Nothing in this tool ends one for any other reason: a

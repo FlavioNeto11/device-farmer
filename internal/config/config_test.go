@@ -31,6 +31,7 @@ var allEnv = []string{
 	EnvHeartbeatEvery,
 	EnvNodeSelfFence, EnvFenceMargin, EnvNodeADBEndpoint, EnvNodeHostID,
 	EnvWatchdogInterval, EnvMigrationsTable, EnvMigrationsDir,
+	EnvArtifactGCGrace,
 }
 
 const testDSN = "postgres://farm@127.0.0.1:5432/farm?sslmode=disable"
@@ -129,6 +130,7 @@ func TestDefaultValues(t *testing.T) {
 		{EnvDBConnectTimeout, cfg.DBConnectTimeout, DefaultDBConnectTimeout},
 		{EnvWatchdogInterval, cfg.WatchdogInterval, DefaultWatchdogEvery},
 		{EnvMigrationsTable, cfg.MigrationsTable, DefaultMigrationsTable},
+		{EnvArtifactGCGrace, cfg.ArtifactGCGrace, DefaultArtifactGCGrace},
 	}
 	for _, c := range checks {
 		if c.got != c.want {
@@ -258,6 +260,13 @@ func TestPreflightRefusals(t *testing.T) {
 		role: "reaper",
 		envs: map[string]string{EnvReaperComponent: " , ,"},
 		want: []string{EnvReaperComponent, "disables gap accounting"},
+	}, {
+		// The sweep's grace is the fence around Put's commit-then-insert
+		// window; a grace of seconds is a race against every upload.
+		name: "artifact gc grace below the floor the sweep refuses",
+		role: "api",
+		envs: map[string]string{EnvArtifactGCGrace: "30s"},
+		want: []string{EnvArtifactGCGrace, "row is being written"},
 	}, {
 		// BLOCKER 8, the original shape: rename the process and the reaper is
 		// watching a name nothing writes.
@@ -470,6 +479,7 @@ func TestEveryVariableIsRead(t *testing.T) {
 		EnvWatchdogInterval:     "6s",
 		EnvMigrationsTable:      "farm.schema_version",
 		EnvMigrationsDir:        "/srv/migrations",
+		EnvArtifactGCGrace:      "2h",
 	})
 	cfg, err := Load("scheduler")
 	if err != nil {
@@ -507,6 +517,7 @@ func TestEveryVariableIsRead(t *testing.T) {
 		{EnvWatchdogInterval, cfg.WatchdogInterval, 6 * time.Second},
 		{EnvMigrationsTable, cfg.MigrationsTable, "farm.schema_version"},
 		{EnvMigrationsDir, cfg.MigrationsDir, "/srv/migrations"},
+		{EnvArtifactGCGrace, cfg.ArtifactGCGrace, 2 * time.Hour},
 	}
 	for _, c := range checks {
 		if c.got != c.want {
@@ -770,6 +781,8 @@ func TestSummaryShowsWhatTheProcessDecided(t *testing.T) {
 		"9090",  // the metrics listener that now exists
 		"40",    // 30m/45s renewal attempts
 		"xxxxx", // the password, gone
+		// the artifact sweep's fence, at its default
+		"artifact gc      = grace 1h0m0s",
 	} {
 		if !strings.Contains(s, want) {
 			t.Errorf("summary omits %q:\n%s", want, s)

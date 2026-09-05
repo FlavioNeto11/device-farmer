@@ -58,11 +58,28 @@ const (
 	SyncSend = "SEND"
 	SyncRecv = "RECV"
 	SyncStat = "STAT"
+	SyncList = "LIST"
+	SyncDent = "DENT"
 	SyncData = "DATA"
 	SyncDone = "DONE"
 	SyncOkay = "OKAY"
 	SyncFail = "FAIL"
 	SyncQuit = "QUIT"
+
+	// SyncMkdir is not a sync id. It is how the fake records a "mkdir -p"
+	// that arrived over the shell service, so a test can assert on it in the
+	// same list as the transfers it was issued between.
+	SyncMkdir = "MKDIR"
+)
+
+// shellServicePrefix is the device service a shell v2 command travels on.
+// The sync server answers exactly one command over it.
+const shellServicePrefix = "shell,v2,raw:"
+
+// Shell v2 packet ids, as the fake writes them.
+const (
+	shellPacketStderr = 2
+	shellPacketExit   = 3
 )
 
 // POSIX st_mode bits the fake needs: the type bit it stamps on a stored file,
@@ -70,7 +87,15 @@ const (
 const (
 	syncModeTypeMask = 0o170000
 	syncModeRegular  = 0o100000
+	syncModeDir      = 0o040000
 	syncModePerm     = 0o777
+
+	// syncDirMode is what every directory the fake reports looks like. Real
+	// directories have modes of their own; these are fixtures, and a test
+	// that cares about a directory's permissions is testing the wrong thing.
+	syncDirMode = syncModeDir | 0o755
+	// syncDirSize is the st_size ext4 reports for a directory.
+	syncDirSize = 4096
 )
 
 // SyncFile is one file in a device's virtual filesystem.
@@ -92,10 +117,10 @@ func (f SyncFile) Perm() uint32 { return f.Mode & syncModePerm }
 type SyncRequest struct {
 	At      time.Time
 	Devpath string
-	ID      string // "SEND", "RECV", "STAT", "QUIT"
-	Path    string // the remote path, with SEND's mode already split off
+	ID      string // "SEND", "RECV", "STAT", "LIST", "QUIT", or "MKDIR" for a shell mkdir
+	Path    string // the remote path, with SEND's mode already split off; the directory for MKDIR
 	Mode    uint32 // the mode a SEND carried, zero otherwise
-	Reply   string // "OKAY", "FAIL: <msg>", "STAT", "RESET", "TRUNCATED", "OVERSIZE"
+	Reply   string // "OKAY", "FAIL: <msg>", "STAT", "LIST", "EXIT n", "RESET", "TRUNCATED", "OVERSIZE"
 }
 
 // SyncStats are cheap counters a test can assert on. ChunksIn and ChunksOut
@@ -223,11 +248,15 @@ type SyncServer struct {
 	done chan struct{}
 	wg   sync.WaitGroup
 
-	mu       sync.Mutex
-	closed   bool
-	nextTID  int64
-	devices  []Device
-	files    map[string]map[string]SyncFile
+	mu      sync.Mutex
+	closed  bool
+	nextTID int64
+	devices []Device
+	files   map[string]map[string]SyncFile
+	// dirs holds the directories a test or a mkdir created explicitly. A
+	// directory that merely contains a file needs no entry here: it is
+	// implied by the file's path, the way it is on a real filesystem.
+	dirs     map[string]map[string]struct{}
 	faults   []*syncFaultRule
 	requests []*SyncRequest
 	conns    map[net.Conn]struct{}
@@ -246,6 +275,7 @@ func NewSync(devs ...Device) (*SyncServer, error) {
 		done:    make(chan struct{}),
 		conns:   make(map[net.Conn]struct{}),
 		files:   make(map[string]map[string]SyncFile),
+		dirs:    make(map[string]map[string]struct{}),
 		nextTID: 1,
 	}
 	s.wg.Add(1)
@@ -322,6 +352,9 @@ func (s *SyncServer) Add(d Device) Device {
 	if s.files[d.Devpath] == nil {
 		s.files[d.Devpath] = make(map[string]SyncFile)
 	}
+	if s.dirs[d.Devpath] == nil {
+		s.dirs[d.Devpath] = make(map[string]struct{})
+	}
 	return d
 }
 
@@ -392,6 +425,120 @@ func (s *SyncServer) Paths(devpath string) []string {
 	}
 	slices.Sort(out)
 	return out
+}
+
+// Mkdir creates a directory on a device, parents included, so a LIST or a
+// STAT of an empty directory has something to report. A directory that holds
+// a file needs no Mkdir: it exists by implication, as it would on a device.
+func (s *SyncServer) Mkdir(devpath, dir string) {
+	dir = cleanDir(dir)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.dirs[devpath] == nil {
+		s.dirs[devpath] = make(map[string]struct{})
+	}
+	s.dirs[devpath][dir] = struct{}{}
+}
+
+// Dirs returns the sorted directories a device holds explicitly — those made
+// by Mkdir or by a client's mkdir — and not the ones implied by files.
+func (s *SyncServer) Dirs(devpath string) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]string, 0, len(s.dirs[devpath]))
+	for d := range s.dirs[devpath] {
+		out = append(out, d)
+	}
+	slices.Sort(out)
+	return out
+}
+
+// cleanDir strips the trailing slash a client may leave on a directory, so
+// "/x/" and "/x" name one directory. The root keeps its one character.
+func cleanDir(dir string) string {
+	if len(dir) > 1 {
+		dir = strings.TrimRight(dir, "/")
+		if dir == "" {
+			dir = "/"
+		}
+	}
+	return dir
+}
+
+// syncEntry is one line of a listing before it is framed.
+type syncEntry struct {
+	name  string
+	mode  uint32
+	size  uint32
+	mtime uint32
+}
+
+// listDir reports whether dir exists on a device and, if so, its entries in
+// name order with "." and ".." first — which is what readdir on a real device
+// yields, and what a client must be prepared to drop.
+//
+// Existence is by implication as much as by declaration: a directory exists
+// if it was made, or if any file or made directory lies beneath it.
+func (s *SyncServer) listDir(devpath, dir string) ([]syncEntry, bool) {
+	dir = cleanDir(dir)
+	prefix := dir + "/"
+	if dir == "/" {
+		prefix = "/"
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_, exists := s.dirs[devpath][dir]
+	if dir == "/" {
+		exists = true
+	}
+	children := map[string]syncEntry{}
+	child := func(rest string, leaf syncEntry) {
+		exists = true
+		if i := strings.IndexByte(rest, '/'); i >= 0 {
+			// Something lives deeper down: the first component is a
+			// directory of this one, whatever the leaf was.
+			name := rest[:i]
+			children[name] = syncEntry{name: name, mode: syncDirMode, size: syncDirSize}
+			return
+		}
+		leaf.name = rest
+		children[rest] = leaf
+	}
+	for p, f := range s.files[devpath] {
+		if rest, ok := strings.CutPrefix(p, prefix); ok && rest != "" {
+			child(rest, syncEntry{mode: f.Mode, size: uint32(len(f.Data)), mtime: uint32(f.MTime.Unix())})
+		}
+	}
+	for d := range s.dirs[devpath] {
+		if rest, ok := strings.CutPrefix(d, prefix); ok && rest != "" {
+			child(rest, syncEntry{mode: syncDirMode, size: syncDirSize})
+		}
+	}
+	if !exists {
+		return nil, false
+	}
+
+	names := make([]string, 0, len(children))
+	for n := range children {
+		names = append(names, n)
+	}
+	slices.Sort(names)
+	out := make([]syncEntry, 0, len(names)+2)
+	out = append(out,
+		syncEntry{name: ".", mode: syncDirMode, size: syncDirSize},
+		syncEntry{name: "..", mode: syncDirMode, size: syncDirSize})
+	for _, n := range names {
+		out = append(out, children[n])
+	}
+	return out, true
+}
+
+// isDir reports whether a path is a directory a STAT should describe.
+func (s *SyncServer) isDir(devpath, p string) bool {
+	_, ok := s.listDir(devpath, p)
+	return ok
 }
 
 // ---------------------------------------------------------------------
@@ -645,19 +792,29 @@ func (s *SyncServer) transport(c net.Conn, br *bufio.Reader, text string) {
 	if err != nil {
 		return
 	}
-	if svc != "sync:" {
-		_ = writeAll(c, failBytes("fakeadb: the sync server implements only sync:, not "+svc))
-		return
-	}
-	if writeAll(c, []byte("OKAY")) != nil {
-		return
-	}
+	switch {
+	case svc == "sync:":
+		if writeAll(c, []byte("OKAY")) != nil {
+			return
+		}
+		s.mu.Lock()
+		s.stats.Sessions++
+		s.mu.Unlock()
+		s.serveSync(c, br, d.Devpath)
 
-	s.mu.Lock()
-	s.stats.Sessions++
-	s.mu.Unlock()
+	case strings.HasPrefix(svc, shellServicePrefix):
+		// The one shell command a sync client needs: the protocol has no
+		// mkdir, so a client that wants a directory has to ask the shell for
+		// it, and a fake that could not answer would leave "push into a
+		// directory that does not exist yet" untestable end to end.
+		if writeAll(c, []byte("OKAY")) != nil {
+			return
+		}
+		s.serveShell(c, d.Devpath, strings.TrimPrefix(svc, shellServicePrefix))
 
-	s.serveSync(c, br, d.Devpath)
+	default:
+		_ = writeAll(c, failBytes("fakeadb: the sync server implements sync: and shell mkdir, not "+svc))
+	}
 }
 
 // ---------------------------------------------------------------------
@@ -721,6 +878,12 @@ func (s *SyncServer) serveSync(c net.Conn, br *bufio.Reader, devpath string) {
 			path := string(payload)
 			rec := s.recordSync(devpath, id, path, 0)
 			if !s.doStat(c, devpath, path, rec) {
+				return
+			}
+		case SyncList:
+			path := string(payload)
+			rec := s.recordSync(devpath, id, path, 0)
+			if !s.doList(c, devpath, path, rec) {
 				return
 			}
 		case SyncQuit:
@@ -988,15 +1151,183 @@ func (s *SyncServer) doStat(c net.Conn, devpath, path string, rec *SyncRequest) 
 
 	out := make([]byte, 16)
 	copy(out[:4], SyncStat)
-	if file, ok := s.File(devpath, path); ok {
+	switch file, ok := s.File(devpath, path); {
+	case ok:
 		binary.LittleEndian.PutUint32(out[4:8], file.Mode)
 		binary.LittleEndian.PutUint32(out[8:12], uint32(len(file.Data)))
 		binary.LittleEndian.PutUint32(out[12:16], uint32(file.MTime.Unix()))
 		s.note(rec, "STAT")
-	} else {
+	case s.isDir(devpath, path):
+		binary.LittleEndian.PutUint32(out[4:8], syncDirMode)
+		binary.LittleEndian.PutUint32(out[8:12], syncDirSize)
+		binary.LittleEndian.PutUint32(out[12:16], uint32(time.Now().Unix()))
+		s.note(rec, "STAT: dir")
+	default:
 		s.note(rec, "STAT: absent")
 	}
 	return writeAll(c, out) == nil
+}
+
+// doList answers LIST: one DENT per entry, "." and ".." included as readdir
+// includes them, then a DONE that is a full dent with every field zero — the
+// daemon writes sizeof(dent) for it, not the 8-byte status.
+//
+// A directory the device does not have is answered with DONE and nothing
+// before it. That is not a shortcut: v1 LIST has no FAIL for a path it cannot
+// open, and a client that expects one will hang against real adbd.
+func (s *SyncServer) doList(c net.Conn, devpath, dir string, rec *SyncRequest) bool {
+	f := s.takeSyncFault(SyncList, devpath, dir)
+	if f != nil {
+		switch f.Kind {
+		case SyncFaultFail:
+			msg := faultMessage(f, "opendir failed: Permission denied")
+			s.note(rec, "FAIL: "+msg)
+			_ = writeAll(c, syncFailBytes(msg))
+			return false
+		case SyncFaultStall:
+			s.note(rec, "STALL")
+			s.hold(c)
+			return false
+		case SyncFaultReset:
+			s.note(rec, "RESET")
+			sever(c)
+			return false
+		}
+	}
+
+	entries, ok := s.listDir(devpath, dir)
+	if !ok {
+		s.note(rec, "LIST: absent")
+		return writeAll(c, syncDent(SyncDone, syncEntry{})) == nil
+	}
+	for i, e := range entries {
+		if f != nil && f.Kind == SyncFaultTruncate && i >= f.AfterChunks {
+			// Cut mid-listing: the client has entries and no DONE, which is
+			// a different failure from a directory that is not there.
+			s.note(rec, "TRUNCATED")
+			_ = c.Close()
+			return false
+		}
+		if writeAll(c, syncDent(SyncDent, e)) != nil {
+			return false
+		}
+	}
+	if f != nil && f.Kind == SyncFaultTruncate {
+		s.note(rec, "TRUNCATED")
+		_ = c.Close()
+		return false
+	}
+	s.note(rec, "LIST")
+	return writeAll(c, syncDent(SyncDone, syncEntry{})) == nil
+}
+
+// syncDent frames one directory entry, or the DONE that ends a listing.
+func syncDent(id string, e syncEntry) []byte {
+	b := make([]byte, 20, 20+len(e.name))
+	copy(b[:4], id)
+	binary.LittleEndian.PutUint32(b[4:8], e.mode)
+	binary.LittleEndian.PutUint32(b[8:12], e.size)
+	binary.LittleEndian.PutUint32(b[12:16], e.mtime)
+	binary.LittleEndian.PutUint32(b[16:20], uint32(len(e.name)))
+	return append(b, e.name...)
+}
+
+// ---------------------------------------------------------------------
+// The shell, as far as mkdir
+// ---------------------------------------------------------------------
+
+// serveShell answers the one shell command the sync server understands:
+// "mkdir -p" of a single-quoted word. Anything else exits 127 with a stderr
+// line saying so, because a fake that silently exits 0 for a command it
+// never ran is a fake that lets a mis-quoted path pass.
+//
+// The word is UNQUOTED here, deliberately. A client that sent the path bare,
+// or double-quoted, or with a quote left unescaped, would not parse as one
+// word and would be told so with an exit status — which is the only way this
+// fake can hold a client to the quoting it claims to do.
+func (s *SyncServer) serveShell(c net.Conn, devpath, command string) {
+	rec := s.recordSync(devpath, SyncMkdir, "", 0)
+	quoted, ok := strings.CutPrefix(command, "mkdir -p ")
+	dir, parsed := "", false
+	if ok {
+		dir, parsed = unquoteShellWord(quoted)
+	}
+	if !parsed {
+		s.note(rec, "EXIT 127")
+		_ = writeAll(c, shellPacket(shellPacketStderr,
+			"sh: fakeadb answers only mkdir -p of one single-quoted word, not: "+command+"\n"))
+		_ = writeAll(c, shellPacket(shellPacketExit, "\x7f"))
+		return
+	}
+	s.mu.Lock()
+	rec.Path = dir
+	s.mu.Unlock()
+
+	if f := s.takeSyncFault(SyncMkdir, devpath, dir); f != nil {
+		switch f.Kind {
+		case SyncFaultFail:
+			msg := faultMessage(f, "mkdir: '"+dir+"': Permission denied")
+			s.note(rec, "EXIT 1")
+			_ = writeAll(c, shellPacket(shellPacketStderr, msg+"\n"))
+			_ = writeAll(c, shellPacket(shellPacketExit, "\x01"))
+			return
+		case SyncFaultStall:
+			s.note(rec, "STALL")
+			s.hold(c)
+			return
+		case SyncFaultReset:
+			s.note(rec, "RESET")
+			sever(c)
+			return
+		case SyncFaultTruncate:
+			// The stream ends with no exit frame at all: the shape of a
+			// device that hung up mid-command.
+			s.note(rec, "TRUNCATED")
+			_ = c.Close()
+			return
+		}
+	}
+	s.Mkdir(devpath, dir)
+	s.note(rec, "EXIT 0")
+	_ = writeAll(c, shellPacket(shellPacketExit, "\x00"))
+}
+
+// unquoteShellWord accepts exactly the form a careful client produces — a run
+// of single-quoted segments, each joined to the next by a backslash-escaped
+// quote (which is how a quote inside the word is spelled) — and returns the
+// word the shell would see. Anything else is refused: a bare path, a
+// double-quoted one, a second word after the first.
+func unquoteShellWord(s string) (string, bool) {
+	var b strings.Builder
+	i := 0
+	for i < len(s) {
+		if s[i] != '\'' {
+			return "", false
+		}
+		j := strings.IndexByte(s[i+1:], '\'')
+		if j < 0 {
+			return "", false
+		}
+		b.WriteString(s[i+1 : i+1+j])
+		i += j + 2
+		if i < len(s) {
+			if !strings.HasPrefix(s[i:], `\'`) {
+				return "", false
+			}
+			b.WriteByte('\'')
+			i += 2
+		}
+	}
+	return b.String(), b.Len() > 0
+}
+
+// shellPacket frames one shell v2 packet: an id byte, a little-endian
+// length, and the payload.
+func shellPacket(id byte, payload string) []byte {
+	b := make([]byte, 5, 5+len(payload))
+	b[0] = id
+	binary.LittleEndian.PutUint32(b[1:5], uint32(len(payload)))
+	return append(b, payload...)
 }
 
 // hold keeps the connection open, writing nothing, until the client gives up

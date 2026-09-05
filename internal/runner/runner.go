@@ -645,6 +645,7 @@ func (r *Runner) execute(
 			out.Error = fmt.Sprintf("step %d (%s/%s): %v", i, st.ID, st.Kind(), err)
 			out.ReleaseReason = lease.ReasonFailed
 			log.Error("step failed", "step", st.ID, "kind", string(st.Kind()), "err", err)
+			r.recordSkipped(book, log, p, out.Attempt, spec.Steps, i)
 			// Deliberately not permanent, even for a non-retryable error. The
 			// same failure on four different devices is what tells an operator
 			// this is a job problem, and farm.job_attempts is the table that
@@ -673,6 +674,7 @@ func (r *Runner) execute(
 			out.ReleaseReason = lease.ReasonFailed
 			log.Error("step reported failure", "step", st.ID, "kind", string(st.Kind()),
 				"failure", result.Failure)
+			r.recordSkipped(book, log, p, out.Attempt, spec.Steps, i)
 			return execResult{}
 
 		default:
@@ -1164,6 +1166,100 @@ ON CONFLICT (job_id, attempt, step_index) DO UPDATE
 		log.Error("could not record step result", "step", st.ID, "index", index,
 			"state", state, "err", err)
 	}
+}
+
+// skippedRow is one step that was never reached, ready to be written.
+type skippedRow struct {
+	Index  int
+	ID     string
+	Kind   string
+	Detail map[string]any
+}
+
+// skippedAfter lists the steps after the one at failed, each carrying the
+// reason it was not run. It is pure so the reason can be checked without a
+// database: detail.reason is the sentence an operator reads, and
+// detail.failed_step is what a dashboard links.
+func skippedAfter(steps []jobspec.Step, failed int) []skippedRow {
+	if failed < 0 || failed+1 >= len(steps) {
+		return nil
+	}
+	cause := steps[failed]
+	reason := fmt.Sprintf("not run: step %d (%s/%s) failed and ended the attempt",
+		failed, cause.ID, cause.Kind())
+	out := make([]skippedRow, 0, len(steps)-failed-1)
+	for i := failed + 1; i < len(steps); i++ {
+		st := steps[i]
+		d := stepDetail(st)
+		d["reason"] = reason
+		d["failed_step"] = cause.ID
+		d["failed_step_index"] = failed
+		out = append(out, skippedRow{Index: i, ID: st.ID, Kind: string(st.Kind()), Detail: d})
+	}
+	return out
+}
+
+// recordSkipped writes a 'skipped' row for every step after the one that
+// ended the attempt, so the job's step list is complete.
+//
+// Without these rows a job that failed at step 2 of 4 shows two rows, and a
+// reader has to know the spec to learn that two more were never reached: the
+// dashboard's count and `ctl job steps` both looked like a job with two steps
+// that ran one of them. Each row names the step whose failure is its reason,
+// because 'skipped' on its own is also what a resumed attempt writes for a
+// step that already completed, and the reason is what tells the two apart.
+//
+// They are 'skipped' and never 'pending'. pending and running are the two
+// states the janitor sweeps and the job_steps_live index covers, and a row
+// for work nobody will do must not look like work somebody has yet to do.
+// started_at stays NULL — the step never started — so the API reports no
+// duration for it rather than a zero one.
+//
+// One statement for the whole tail: a failure at the first of forty steps
+// must not cost thirty-nine round trips to record. A row that already exists
+// at one of these indexes is overwritten, not merged: it can only be left
+// from an earlier run of this same attempt, and what it says about that run
+// is no longer what happened to this one.
+func (r *Runner) recordSkipped(ctx context.Context, log *slog.Logger, p Placement,
+	attempt int, steps []jobspec.Step, failed int) {
+
+	rows := skippedAfter(steps, failed)
+	if len(rows) == 0 {
+		return
+	}
+
+	const q = `
+INSERT INTO farm.job_steps (job_id, attempt, step_index, step_id, kind, state, finished_at, detail)
+SELECT $1::uuid, $2, s.step_index, s.step_id, s.kind, 'skipped', now(), s.detail::jsonb
+  FROM unnest($3::int[], $4::text[], $5::text[], $6::text[]) AS s(step_index, step_id, kind, detail)
+ON CONFLICT (job_id, attempt, step_index) DO UPDATE
+   SET step_id     = EXCLUDED.step_id,
+       kind        = EXCLUDED.kind,
+       state       = 'skipped',
+       started_at  = NULL,
+       finished_at = now(),
+       exit_code   = NULL,
+       output      = NULL,
+       error       = NULL,
+       detail      = EXCLUDED.detail`
+
+	indexes := make([]int32, len(rows))
+	ids := make([]string, len(rows))
+	kinds := make([]string, len(rows))
+	details := make([]string, len(rows))
+	for i, row := range rows {
+		indexes[i], ids[i], kinds[i], details[i] = int32(row.Index), row.ID, row.Kind, jsonOrEmpty(row.Detail)
+	}
+
+	cctx, cancel := r.db(ctx)
+	defer cancel()
+
+	if _, err := r.cfg.Pool.Exec(cctx, q, p.JobID, attempt, indexes, ids, kinds, details); err != nil {
+		log.Error("could not record the steps that were not run", "after", steps[failed].ID,
+			"count", len(rows), "err", err)
+		return
+	}
+	log.Info("steps after the failure recorded as skipped", "after", steps[failed].ID, "count", len(rows))
 }
 
 // writeJobState moves farm.jobs.state, fenced.

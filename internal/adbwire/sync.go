@@ -1,11 +1,14 @@
 package adbwire
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
+	"path"
 	"strconv"
 	"strings"
 	"sync"
@@ -185,11 +188,17 @@ func fileMode(p uint32) fs.FileMode {
 // Stat results
 // ---------------------------------------------------------------------------
 
-// FileInfo is what LSTAT_V1 reports about one remote path.
+// FileInfo is what LSTAT_V1 reports about one remote path, or what one DENT
+// of a LIST reports about one directory entry.
 type FileInfo struct {
-	// Path is the remote path that was asked about, echoed back so a result
-	// carried away from its call site still says what it describes.
+	// Path is the remote path this describes: the path a Stat asked about,
+	// echoed back so a result carried away from its call site still says
+	// what it is, or the directory joined with the entry's Name for a LIST.
 	Path string
+
+	// Name is the last element of Path. For a LIST entry it is the name
+	// exactly as the directory holds it.
+	Name string
 
 	// Mode is the wire mode translated into Go's encoding.
 	Mode fs.FileMode
@@ -199,10 +208,23 @@ type FileInfo struct {
 	// entry should not have to guess what was lost in translation.
 	PosixMode uint32
 
-	// Size is the file size in bytes. The v1 stat carries it as a uint32, so
-	// a file of 4 GiB or more is reported modulo 2^32; a caller that must be
-	// exact about such a file should read it rather than stat it.
+	// Size is the file size in bytes as the wire reported it. Both frames
+	// this package reads it from carry st_size as a uint32, so for a file of
+	// 4 GiB or more this is the true size modulo 2^32 — see SizeTruncated.
 	Size int64
+
+	// SizeTruncated records that Size may have lost its high bits. The
+	// LSTAT_V1 and DENT frames report st_size through a 32-bit field and say
+	// nothing about what did not fit, so a 5 GiB APK and a 1 GiB one arrive
+	// as the same number; the wire gives no way to tell them apart, and this
+	// is therefore true for every regular file rather than for the files it
+	// actually happened to. It is false for the types whose st_size cannot
+	// reach 4 GiB — a directory, a symlink (whose size is its target's
+	// length), a device node — and for a path that does not exist. A caller
+	// that must be exact about a file this is true for reads it rather than
+	// stats it. STAT_V2 and LIST_V2 carry a 64-bit size and would let this be
+	// false for every entry; neither is implemented here.
+	SizeTruncated bool
 
 	// ModTime is the device-side modification time, zero when the device
 	// reported none.
@@ -213,6 +235,24 @@ type FileInfo struct {
 	// failed lstat with a zeroed reply, so absence is inferred from a mode of
 	// zero and from nothing else.
 	Exists bool
+}
+
+// fileInfoFromWire builds the result both LSTAT_V1 and DENT produce, from the
+// three uint32 fields they share.
+func fileInfoFromWire(p, name string, mode, size, mtime uint32) FileInfo {
+	fi := FileInfo{
+		Path:      p,
+		Name:      name,
+		Mode:      fileMode(mode),
+		PosixMode: mode,
+		Size:      int64(size),
+		Exists:    mode != 0,
+	}
+	fi.SizeTruncated = fi.Exists && fi.Mode.IsRegular()
+	if fi.Exists && mtime != 0 {
+		fi.ModTime = time.Unix(int64(mtime), 0)
+	}
+	return fi
 }
 
 // IsDir reports whether the path is a directory.
@@ -504,6 +544,12 @@ func (s *SyncConn) Pull(ctx context.Context, remote string, w io.Writer) error {
 // A missing path is NOT an error: the v1 stat has no FAIL for one, and the
 // daemon answers with a zeroed reply. That is reported as Exists false, which
 // is what makes this usable as an existence check.
+//
+// The size is 32-bit. LSTAT_V1 is the only stat this package speaks, and its
+// reply carries st_size as a uint32, so a file of 4 GiB or more comes back as
+// its size modulo 2^32 with nothing on the wire to say so; the result marks
+// every regular file [FileInfo.SizeTruncated] for that reason. STAT_V2 would
+// report a 64-bit size and is not implemented.
 func (s *SyncConn) Stat(ctx context.Context, remote string) (FileInfo, error) {
 	const op = "sync_stat"
 
@@ -554,18 +600,7 @@ func (s *SyncConn) Stat(ctx context.Context, remote string) (FileInfo, error) {
 	}
 	size := binary.LittleEndian.Uint32(rest[0:4])
 	mtime := binary.LittleEndian.Uint32(rest[4:8])
-
-	fi := FileInfo{
-		Path:      remote,
-		Mode:      fileMode(mode),
-		PosixMode: mode,
-		Size:      int64(size),
-		Exists:    mode != 0,
-	}
-	if fi.Exists && mtime != 0 {
-		fi.ModTime = time.Unix(int64(mtime), 0)
-	}
-	return fi, nil
+	return fileInfoFromWire(remote, path.Base(remote), mode, size, mtime), nil
 }
 
 // ---------------------------------------------------------------------------
@@ -623,6 +658,113 @@ func (c *Client) Stat(ctx context.Context, devpath, remote string) (FileInfo, er
 	}
 	defer s.Close()
 	return s.Stat(ctx, remote)
+}
+
+// MkdirAll creates dir and every missing parent on the device at devpath,
+// like os.MkdirAll. A directory that already exists is a success.
+//
+// There is no sync verb for this: the file-sync protocol can send, receive,
+// stat and list, and nothing else. So the request is "mkdir -p" over the
+// ordinary shell service, which makes dir the one path in this package that
+// reaches a shell rather than a length-prefixed field. It is single-quoted,
+// with every quote inside it closed, escaped and reopened, so the shell sees
+// exactly one word however the path is spelled — a directory named "it's;
+// rm -rf /" is a directory named that and not two commands. The path is also
+// held to the same rule as every sync path: a NUL would end the argument
+// early on the device, and a caller that sends one is not asking for a
+// directory anybody can name.
+//
+// A mkdir that RAN and exited non-zero is returned as a *CommandError
+// carrying the exit status and what the shell said. That is neither a
+// transport failure nor a server refusal, and the caller is told so rather
+// than left to guess from the text.
+func (c *Client) MkdirAll(ctx context.Context, devpath, dir string) error {
+	const op = "mkdir"
+	if err := validateRemotePath(op, dir); err != nil {
+		return err
+	}
+	command := "mkdir -p " + shellQuote(dir)
+	res, err := c.Shell(ctx, devpath, command)
+	if err != nil {
+		return err
+	}
+	if !res.Exited {
+		// The stream ended before the device reported a status. ExitCode is
+		// -1 because nothing set it; reading that as "the directory is
+		// there" would let a bumped cable produce a directory that is not,
+		// and the transfer that follows would then fail somewhere far away
+		// from the cause. It is filed as the wire ending early, which is what
+		// it was.
+		return newTransportError(op, c.Endpoint(), devpath, KindPeerClosed,
+			errors.New("shell stream ended without an exit status"))
+	}
+	if res.ExitCode != 0 {
+		return &CommandError{
+			Op:       op,
+			Devpath:  devpath,
+			Command:  command,
+			ExitCode: res.ExitCode,
+			Stderr:   firstLineOf(res.Stderr, res.Stdout),
+		}
+	}
+	return nil
+}
+
+// CommandError means the device ran a shell command to completion and the
+// command exited non-zero. The wire worked and the ADB server did not refuse
+// anything; the answer came from the device's own shell.
+type CommandError struct {
+	// Op is the wire operation that issued the command.
+	Op string
+	// Devpath is the position the command ran at.
+	Devpath string
+	// Command is what the shell was given, quoted exactly as it went out.
+	Command string
+	// ExitCode is the shell's status.
+	ExitCode int
+	// Stderr is the first line the command wrote, stderr preferred, with the
+	// wire's control characters removed. Empty when it said nothing.
+	Stderr string
+}
+
+// Error implements error.
+func (e *CommandError) Error() string {
+	if e.Stderr != "" {
+		return fmt.Sprintf("adbwire: %s: %q exited %d on devpath=%s: %s",
+			e.Op, e.Command, e.ExitCode, e.Devpath, e.Stderr)
+	}
+	return fmt.Sprintf("adbwire: %s: %q exited %d on devpath=%s", e.Op, e.Command, e.ExitCode, e.Devpath)
+}
+
+// shellQuote wraps s so a POSIX shell reads it as one literal word. Inside
+// single quotes nothing is special except the quote itself, which is why
+// every other quoting scheme is a list of exceptions and this one is not.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// maxCommandLine bounds the line of device output quoted into a
+// *CommandError. The message is for a human; a shell that answers with a
+// megabyte is not explaining itself.
+const maxCommandLine = 512
+
+// firstLineOf renders the first line of what a command said, for an error
+// message: stderr when there is any, stdout otherwise. Device output can
+// carry anything, so it goes through the same filter as a wire id.
+func firstLineOf(stderr, stdout []byte) string {
+	out := stderr
+	if len(bytes.TrimSpace(out)) == 0 {
+		out = stdout
+	}
+	out = bytes.TrimSpace(out)
+	if i := bytes.IndexByte(out, '\n'); i >= 0 {
+		out = out[:i]
+	}
+	out = bytes.TrimSpace(out)
+	if len(out) > maxCommandLine {
+		out = out[:maxCommandLine]
+	}
+	return printable(out)
 }
 
 // ---------------------------------------------------------------------------

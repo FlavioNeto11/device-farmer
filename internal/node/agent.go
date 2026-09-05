@@ -435,7 +435,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	}
 
 	var wg sync.WaitGroup
-	errs := make(chan error, 5)
+	errs := make(chan error, 6)
 	start := func(name string, fn func(context.Context) error) {
 		wg.Add(1)
 		go func() {
@@ -454,6 +454,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	start("heartbeat", a.heartbeatLoop)
 	start("discover", a.discoverLoop)
 	start("enroll", a.enrollLoop)
+	start("chargegate", a.chargeGateLoop)
 	if a.cfg.Addr != "" {
 		start("serve", a.serve)
 	}
@@ -892,6 +893,7 @@ func (a *Agent) PortPowerWithDomain(ctx context.Context, hostID, devpath string,
 
 	err := platform.portPower(ctx, devpath, acknowledged, a.ops)
 	portPowers.WithLabelValues(outcomeLabel(err)).Inc()
+	a.chargeGateSuperseded(devpath, err)
 	switch {
 	case errors.Is(err, ErrRefused):
 		a.log.Warn("VBUS cycle refused", "devpath", devpath, "err", err)
@@ -980,6 +982,7 @@ func (a *Agent) Handler() (http.Handler, error) {
 		func(ctx context.Context, req opRequest) error {
 			return a.PortPowerWithDomain(ctx, req.HostID, req.Devpath, req.Acknowledged)
 		}))
+	a.registerChargeGateRoutes(mux, want[:])
 	// Health carries the same token as the two operations. It reports whether
 	// this host's adb server is answering and which epoch is in force, which is
 	// precisely the reconnaissance an attacker wants before deciding which port
@@ -1253,5 +1256,6 @@ func Collectors() []prometheus.Collector {
 	return []prometheus.Collector{
 		hostRegistrations, epochBumps, adbServerUp, usbResets, portPowers,
 		discoveries, enrollRestarts, beatFailures,
+		chargeGateSets, chargeGateExpiries, chargeGatesHeld,
 	}
 }

@@ -73,8 +73,19 @@ type fleetDevice struct {
 	BatteryPct      *int       `json:"battery_pct,omitempty"`
 	BatteryTempDeci *int       `json:"battery_temp_dc,omitempty"`
 	ConsecBad       *int       `json:"consec_bad,omitempty"`
-	LadderTier      *int       `json:"ladder_tier,omitempty"`
-	LastSeenAt      *time.Time `json:"last_seen_at,omitempty"`
+	// NextLadderTier is farm.device_runtime.ladder_tier, which holds the
+	// lowest rung the recovery ladder has NOT yet spent — the one that will
+	// run next, not the one that last ran.
+	//
+	// The JSON name says "next" because the number does not read that way on
+	// its own: a device whose port was just power-cycled at tier 4 reports 5,
+	// and a reader matching that against farm.recovery_tiers would conclude
+	// the ladder had reached quarantine. The column is deliberately one past
+	// the rung it spent (see next and rungAfter in internal/recovery), so 0
+	// means "nothing spent, observe first" rather than "observe already
+	// happened" — which is the whole reason tier 0 is reachable.
+	NextLadderTier *int       `json:"next_ladder_tier,omitempty"`
+	LastSeenAt     *time.Time `json:"last_seen_at,omitempty"`
 
 	// Lease is nil when the device is free. It is the denormalised live lease
 	// farm.devices.current_lease_id points at, so "free" here means "no live
@@ -144,7 +155,7 @@ func scanFleetDevice(sc scanner) (fleetDevice, error) {
 		&d.FenceFloor, &d.SlotID, &d.RackSlot, &d.USBPath, &d.ADBDevpath, &d.SlotState, &d.RearmAt,
 		&d.HubID, &d.HubPath, &d.VbusSwitchable, &d.HostID, &d.ADBEndpoint, &d.HostAdminState,
 		&d.ADBState, &d.Health, &d.HealthSince, &d.BatteryPct, &d.BatteryTempDeci,
-		&d.ConsecBad, &d.LadderTier, &d.LastSeenAt,
+		&d.ConsecBad, &d.NextLadderTier, &d.LastSeenAt,
 		&leaseID, &fence, &leaseState, &protected, &jobID, &tenantID, &holder,
 		&acquiredAt, &expiresAt, &reclaimableAt, &d.QuarantineID, &d.QuarantineReason,
 	)

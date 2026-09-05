@@ -81,8 +81,10 @@ type device struct {
 	BatteryPct      *int       `json:"battery_pct"`
 	BatteryTempDeci *int       `json:"battery_temp_dc"`
 	ConsecBad       *int       `json:"consec_bad"`
-	LadderTier      *int       `json:"ladder_tier"`
-	LastSeenAt      *time.Time `json:"last_seen_at"`
+	// See fleetDevice.NextLadderTier in internal/api: the lowest rung NOT yet
+	// spent, so a device that was just power-cycled at tier 4 reports 5.
+	NextLadderTier *int       `json:"next_ladder_tier"`
+	LastSeenAt     *time.Time `json:"last_seen_at"`
 
 	Lease *deviceLease `json:"lease"`
 
@@ -572,7 +574,10 @@ func renderDevice(e *env, resp deviceResponse) error {
 	f.Add("adb state", dash(d.ADBState))
 	f.Add("battery", batteryOf(d.BatteryPct, d.BatteryTempDeci))
 	f.Add("consecutive bad probes", dashInt(d.ConsecBad))
-	f.Add("recovery ladder tier", dashInt(d.LadderTier))
+	// "next", not "current": the column is one past the rung it last spent,
+	// so labelling it "recovery ladder tier" invited the reader to look the
+	// number up in farm.recovery_tiers and land one rung too far.
+	f.Add("next recovery rung", dashInt(d.NextLadderTier))
 	f.Addf("failure score", "%.2f", d.FailureScore)
 	f.Add("last seen", ago(d.LastSeenAt))
 	f.Addf("fence floor", "%d", d.FenceFloor)

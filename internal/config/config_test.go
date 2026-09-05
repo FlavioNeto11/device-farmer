@@ -26,7 +26,7 @@ import (
 // whitespace-only variable as absent, so t.Setenv(key, "") is the only way to
 // unset one and still have the test framework restore it afterwards.
 var allEnv = []string{
-	EnvDatabaseURL, EnvDBMaxConns, EnvDBConnectTimeout,
+	EnvDatabaseURL, EnvDBMaxConns, EnvDBConnectTimeout, EnvDBRole,
 	EnvComponent, EnvLogLevel, EnvShutdownGrace,
 	EnvAPIAddr, EnvMetricsAddr, EnvNodeAddr, EnvAPIBaseURL,
 	EnvLeaseTTL, EnvLeaseGrace, EnvLeaseRenewInterval,
@@ -369,6 +369,36 @@ func TestPreflightRefusals(t *testing.T) {
 		envs: map[string]string{EnvComponent: "scheduler-a"},
 		want: []string{EnvComponent, "cannot be honoured", "own process"},
 	}, {
+		// One pool serving six components cannot assume one component's
+		// role: as farm_reaper the scheduler inside would be blind to health.
+		name: "FARM_DB_ROLE on a multiplexed role",
+		role: "demo",
+		envs: map[string]string{EnvDBRole: DBRoleReaper},
+		want: []string{EnvDBRole, "cannot be honoured", "one connection pool", "own process"},
+	}, {
+		name: "FARM_DB_ROLE on all",
+		role: "all",
+		envs: map[string]string{EnvDBRole: DBRoleScheduler},
+		want: []string{EnvDBRole, "one connection pool"},
+	}, {
+		// The firewall is directional. A reaper running as the watchdog's
+		// role would have no path to a lease, and the process exists to end
+		// them.
+		name: "FARM_DB_ROLE that belongs to another process",
+		role: "reaper",
+		envs: map[string]string{EnvDBRole: DBRoleWatchdog},
+		want: []string{EnvDBRole, `"watchdog"`, `"reaper"`, EnvDBRole + "=" + DBRoleReaper},
+	}, {
+		name: "FARM_DB_ROLE on a process the firewall does not cover",
+		role: "api",
+		envs: map[string]string{EnvDBRole: DBRoleScheduler},
+		want: []string{EnvDBRole, `"api"`, "no runtime role"},
+	}, {
+		name: "FARM_DB_ROLE that is not a runtime role",
+		role: "reaper",
+		envs: map[string]string{EnvDBRole: "postgres"},
+		want: []string{EnvDBRole, "not a runtime role", DBRoleReaper},
+	}, {
 		name: "metrics address without a port",
 		role: "scheduler",
 		envs: map[string]string{EnvMetricsAddr: "9090"},
@@ -636,6 +666,7 @@ func TestEveryVariableIsRead(t *testing.T) {
 		EnvTopoExclude:           "1-0",
 		EnvTopoInterval:          "2m",
 		EnvTopoCallTimeout:       "20s",
+		EnvDBRole:                "farm_scheduler",
 	})
 	cfg, err := Load("scheduler")
 	if err != nil {
@@ -652,6 +683,7 @@ func TestEveryVariableIsRead(t *testing.T) {
 		{EnvShutdownGrace, cfg.ShutdownGrace, 45 * time.Second},
 		{EnvDBMaxConns, cfg.DBMaxConns, int32(17)},
 		{EnvDBConnectTimeout, cfg.DBConnectTimeout, 11 * time.Second},
+		{EnvDBRole, cfg.DBRole, "farm_scheduler"},
 		{EnvAPIAddr, cfg.APIAddr, "127.0.0.1:8517"},
 		{EnvMetricsAddr, cfg.MetricsAddr, "127.0.0.1:9517"},
 		{EnvNodeAddr, cfg.NodeAddr, "127.0.0.1:8518"},
@@ -834,6 +866,100 @@ func TestRoleComponentsCoversEveryRole(t *testing.T) {
 		if names, ok := roleComponents[r]; !ok || len(names) != 0 {
 			t.Errorf("roleComponents[%q] = %v, want an empty list: it writes no heartbeat", r, names)
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Runtime database role
+// ---------------------------------------------------------------------------
+
+// TestDBRoleFollowsTheProcess. FARM_DB_ROLE is accepted exactly when it names
+// the role of the process being started, and the summary then says the role
+// is in force; unset, the summary says out loud that the firewall is not
+// assumed, so a manifest is never read as more protected than it is.
+func TestDBRoleFollowsTheProcess(t *testing.T) {
+	for process, role := range dbRoleForProcess {
+		t.Run(process, func(t *testing.T) {
+			if _, ok := roleComponents[process]; !ok {
+				t.Fatalf("dbRoleForProcess names %q, which farmd cannot be started as", process)
+			}
+			env(t, withDSN(map[string]string{EnvDBRole: role}))
+			cfg, err := Load(process)
+			if err != nil {
+				t.Fatalf("Load(%q) refused its own role %s: %v", process, role, err)
+			}
+			if cfg.DBRole != role {
+				t.Errorf("DBRole = %q, want %q", cfg.DBRole, role)
+			}
+			s := cfg.Summary()
+			if !strings.Contains(s, role) || !strings.Contains(s, "SET ROLE") {
+				t.Errorf("the summary does not say the process runs as %s:\n%s", role, s)
+			}
+			if strings.Contains(s, "NOT assumed") {
+				t.Errorf("the summary calls the firewall unassumed while %s is set:\n%s", EnvDBRole, s)
+			}
+		})
+	}
+
+	env(t, withDSN(nil))
+	cfg, err := Load("reaper")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.DBRole != "" {
+		t.Errorf("DBRole = %q with %s unset, want empty", cfg.DBRole, EnvDBRole)
+	}
+	if s := cfg.Summary(); !strings.Contains(s, "NOT assumed") || !strings.Contains(s, EnvDBRole) {
+		t.Errorf("with %s unset the summary must say the firewall is not assumed:\n%s", EnvDBRole, s)
+	}
+
+	// ctl never opens the pool and migrate must run as the schema owner, so a
+	// stray FARM_DB_ROLE in a shared environment must not stop either — they
+	// are the two commands an operator reaches for when the loops are the
+	// thing being investigated.
+	for _, process := range []string{"ctl", "migrate"} {
+		env(t, map[string]string{EnvDBRole: DBRoleReaper})
+		if _, err := Load(process, WithoutDatabase()); err != nil {
+			t.Errorf("Load(%q) refused a %s it does not use: %v", process, EnvDBRole, err)
+		}
+	}
+}
+
+// TestDBRoleRefusedWhereNoRoleExists. Every process farmd can be started as
+// that opens the pool, is one component, and has no entry in the allowlist
+// refuses FARM_DB_ROLE by name, listing the processes the firewall covers.
+// The loop is over roleComponents rather than a literal list so a process
+// added later — the charge-policy mesh, say — is covered the day it appears:
+// it runs as the login user until it is given a role of its own, and never
+// silently as another process's.
+func TestDBRoleRefusedWhereNoRoleExists(t *testing.T) {
+	covered := 0
+	for process := range roleComponents {
+		if _, mapped := dbRoleForProcess[process]; mapped {
+			continue
+		}
+		if c := (&Config{role: process}); !c.opensPool() || c.multiplexed() {
+			continue
+		}
+		covered++
+		t.Run(process, func(t *testing.T) {
+			env(t, withDSN(map[string]string{EnvDBRole: DBRoleReaper}))
+			_, err := Load(process)
+			if err == nil {
+				t.Fatalf("Load(%q) accepted %s=%s, which belongs to the reaper", process, EnvDBRole, DBRoleReaper)
+			}
+			for _, want := range []string{
+				EnvDBRole, "no runtime role", `"` + process + `"`,
+				strings.Join(dbRoleProcesses(), ", "),
+			} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("the refusal for %q does not say %q:\n%s", process, want, err)
+				}
+			}
+		})
+	}
+	if covered == 0 {
+		t.Fatal("no process outside the allowlist opens the pool, so this test covers nothing")
 	}
 }
 

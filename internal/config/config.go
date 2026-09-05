@@ -23,9 +23,11 @@ package config
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"net/url"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -146,6 +148,41 @@ const (
 	// port floor above it would let no hub through, ever, and say nothing.
 	MaxHubPorts = 32
 )
+
+// U7 — runtime database role.
+//
+// FARM_DB_ROLE names the Postgres role a loop process assumes on every pooled
+// connection (SET ROLE once per physical connection; see openPool in
+// cmd/farmd). Empty means the process runs as the login user, which is what
+// every deployment did before the knob existed. The three values are the
+// NOLOGIN roles migrations/00002_lease.sql creates; migration 00015 is what
+// lets the login user assume them.
+//
+// Each role belongs to exactly one process, and dbRoleForProcess is the only
+// place that says which. The firewall is meaningless the other way round: a
+// reaper started as farm_scheduler could read health, a scheduler started as
+// farm_reaper could not allocate.
+//
+// The map is an allowlist. A process absent from it — the api, the loops that
+// read and write everything, a role added later such as the charge-policy
+// mesh — has no role to assume: it runs as the login user, and refuses the
+// variable by name rather than silently taking another process's role. Giving
+// such a process a role of its own is one entry here plus the grants a
+// migration makes; every message below derives its lists from the map so
+// none goes stale when that happens.
+const (
+	EnvDBRole = "FARM_DB_ROLE"
+
+	DBRoleReaper    = "farm_reaper"
+	DBRoleScheduler = "farm_scheduler"
+	DBRoleWatchdog  = "farm_watchdog"
+)
+
+var dbRoleForProcess = map[string]string{
+	"reaper":    DBRoleReaper,
+	"scheduler": DBRoleScheduler,
+	"watchdog":  DBRoleWatchdog,
+}
 
 // Mirrors of CHECK constraints in migrations/00001_core.sql. Duplicated on
 // purpose: the database is the authority, but a process that would inevitably
@@ -453,6 +490,9 @@ type Config struct {
 	DatabaseURL      string
 	DBMaxConns       int32
 	DBConnectTimeout time.Duration
+	// DBRole is the Postgres role every pooled connection assumes, or "" for
+	// the login user. Validated against the process role: see EnvDBRole.
+	DBRole string
 
 	APIAddr string
 	// MetricsAddr is where a role that is not the API binds its own /metrics
@@ -511,6 +551,7 @@ func Load(component string, opts ...Option) (*Config, error) {
 		DatabaseURL:      l.str(EnvDatabaseURL, ""),
 		DBMaxConns:       l.num32(EnvDBMaxConns, DefaultDBMaxConns),
 		DBConnectTimeout: l.dur(EnvDBConnectTimeout, DefaultDBConnectTimeout),
+		DBRole:           l.str(EnvDBRole, ""),
 
 		APIAddr:     l.str(EnvAPIAddr, DefaultAPIAddr),
 		MetricsAddr: l.str(EnvMetricsAddr, DefaultMetricsAddr),
@@ -644,6 +685,37 @@ func (c *Config) HeartbeatComponents() []string {
 func (c *Config) MetricsDisabled() bool {
 	return strings.EqualFold(strings.TrimSpace(c.MetricsAddr), MetricsOff)
 }
+
+// opensPool reports whether this role connects through cmd/farmd's pool, which
+// is the only place FARM_DB_ROLE takes effect. ctl talks to the API and never
+// to Postgres; migrate runs as the schema owner on its own database/sql handle,
+// necessarily — the migration that GRANTs the runtime roles cannot itself run
+// as one of them. For those two a stray FARM_DB_ROLE in a shared environment
+// is read and applied to nothing, for the same reason bindsMetrics lets them
+// ignore a metrics address.
+func (c *Config) opensPool() bool {
+	switch c.role {
+	case "ctl", "migrate":
+		return false
+	}
+	return true
+}
+
+// dbRoleOwner names the process a runtime role belongs to, or "" when the
+// string is not a runtime role at all.
+func dbRoleOwner(role string) string {
+	for process, r := range dbRoleForProcess {
+		if r == role {
+			return process
+		}
+	}
+	return ""
+}
+
+// dbRoleProcesses and dbRoles list the allowlist for refusals, in a fixed
+// order, so a message names exactly what the map covers today.
+func dbRoleProcesses() []string { return slices.Sorted(maps.Keys(dbRoleForProcess)) }
+func dbRoles() []string         { return slices.Sorted(maps.Values(dbRoleForProcess)) }
 
 // bindsMetrics reports whether this role has a process to hang a metrics
 // listener off at all. ctl is a one-shot command against the API and migrate
@@ -863,6 +935,36 @@ Fix by raising %s above %s + %s, or by lowering the proxy's self-fence timeout.`
 			fail("%s: %v", EnvDatabaseURL, err)
 		}
 	}
+	// ---- runtime database role -----------------------------------------
+	// The role is assumed by SET ROLE on every connection of ONE pool, so it
+	// can only be right for a process that is one component. Refusing the
+	// other shapes here is what keeps the summary line honest: a process that
+	// printed "database role = farm_reaper" and then ran a scheduler through
+	// that pool would be blind to health, and one that printed it and ran as
+	// the login user anyway would be a firewall that exists on paper.
+	if c.DBRole != "" && c.opensPool() {
+		switch owner := dbRoleOwner(c.DBRole); {
+		case owner == "":
+			fail("%s=%q is not a runtime role; the roles migrations/00002_lease.sql creates "+
+				"are %s", EnvDBRole, c.DBRole, strings.Join(dbRoles(), ", "))
+		case c.multiplexed():
+			fail("%s=%q cannot be honoured by the %q role: it runs %s in one process on one "+
+				"connection pool, and one pool cannot assume one role for all of them — as %s "+
+				"the components that must read health could not, or the reaper could. Run the "+
+				"%s as its own process to firewall it, or unset %s",
+				EnvDBRole, c.DBRole, c.role, strings.Join(roleComponents[c.role], ", "),
+				c.DBRole, owner, EnvDBRole)
+		case owner != c.role:
+			if want, ok := dbRoleForProcess[c.role]; ok {
+				fail("%s=%q belongs to the %q process and this process is %q; set %s=%s or unset it",
+					EnvDBRole, c.DBRole, owner, c.role, EnvDBRole, want)
+			} else {
+				fail("%s=%q belongs to the %q process and this process is %q, which has no "+
+					"runtime role: the firewall covers %s. Unset %s",
+					EnvDBRole, c.DBRole, owner, c.role, strings.Join(dbRoleProcesses(), ", "), EnvDBRole)
+			}
+		}
+	}
 	if c.WatchdogInterval <= 0 {
 		fail("%s must be positive", EnvWatchdogInterval)
 	}
@@ -1032,6 +1134,13 @@ func (c *Config) Summary() string {
 		strings.Join(c.HeartbeatComponents(), ", "), c.Reaper.HeartbeatInterval)
 	fmt.Fprintf(&b, "database         = %s (max %d conns, connect timeout %s)\n",
 		c.RedactedDatabaseURL(), c.DBMaxConns, c.DBConnectTimeout)
+	if c.DBRole != "" {
+		fmt.Fprintf(&b, "database role    = %s (SET ROLE on every pooled connection; the login "+
+			"user's own grants are not in effect)\n", c.DBRole)
+	} else {
+		fmt.Fprintf(&b, "database role    = login user (%s unset; the SQL role firewall is "+
+			"NOT assumed by this process)\n", EnvDBRole)
+	}
 	fmt.Fprintf(&b, "api addr         = %s\n", c.APIAddr)
 	if c.MetricsDisabled() {
 		fmt.Fprintf(&b, "metrics addr     = %s (no /metrics listener)\n", MetricsOff)

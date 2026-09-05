@@ -1,0 +1,819 @@
+package config
+
+import (
+	"os"
+	"regexp"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+)
+
+// A note on why every test here sets the whole environment.
+//
+// This package reads process-wide state, so a test that sets only the variable
+// it cares about is really asserting about the machine it runs on: a developer
+// with FARM_LEASE_TTL exported in a shell would see failures nobody else can
+// reproduce, and — much worse — a CI runner with FARM_REAPER_COMPONENTS set
+// would see the BLOCKER 8 assertions below pass for the wrong reason. Every
+// test therefore starts from a known-empty environment.
+//
+// An empty value is how "unset" is spelled: loader.raw treats an empty or
+// whitespace-only variable as absent, so t.Setenv(key, "") is the only way to
+// unset one and still have the test framework restore it afterwards.
+var allEnv = []string{
+	EnvDatabaseURL, EnvDBMaxConns, EnvDBConnectTimeout,
+	EnvComponent, EnvLogLevel, EnvShutdownGrace,
+	EnvAPIAddr, EnvMetricsAddr, EnvNodeAddr, EnvAPIBaseURL,
+	EnvLeaseTTL, EnvLeaseGrace, EnvLeaseRenewInterval,
+	EnvLeaseWitnessInterval, EnvLeaseWitnessMaxExt, EnvSlotRearm,
+	EnvReaperInterval, EnvReaperBatch, EnvReaperGapFloor, EnvReaperComponent,
+	EnvHeartbeatEvery,
+	EnvNodeSelfFence, EnvFenceMargin, EnvNodeADBEndpoint, EnvNodeHostID,
+	EnvWatchdogInterval, EnvMigrationsTable, EnvMigrationsDir,
+}
+
+const testDSN = "postgres://farm@127.0.0.1:5432/farm?sslmode=disable"
+
+// env clears every variable this package reads and then applies the given
+// ones. It never runs in parallel: t.Setenv forbids it, for exactly the reason
+// above.
+func env(t *testing.T, kv map[string]string) {
+	t.Helper()
+	for _, k := range allEnv {
+		t.Setenv(k, "")
+	}
+	for k, v := range kv {
+		if !slices.Contains(allEnv, k) {
+			t.Fatalf("test sets %s, which is not in allEnv and so is not cleared between tests", k)
+		}
+		t.Setenv(k, v)
+	}
+}
+
+// withDSN adds a valid DATABASE_URL to a set of overrides, since almost every
+// role requires one and no test here is about that fact.
+func withDSN(kv map[string]string) map[string]string {
+	out := map[string]string{EnvDatabaseURL: testDSN}
+	for k, v := range kv {
+		out[k] = v
+	}
+	return out
+}
+
+// ---------------------------------------------------------------------------
+// Defaults
+// ---------------------------------------------------------------------------
+
+// TestDefaultsLoadForEveryRole is the assertion behind the claim in the
+// package doc that "an operator who sets only DATABASE_URL gets a
+// configuration that satisfies every assertion below".
+//
+// It runs over every role because the assertions are role-dependent: the
+// BLOCKER 8 check asks what components the process runs, and a default that
+// satisfies it for `api` and refuses `all` would be a default that cannot
+// start a laptop farm.
+func TestDefaultsLoadForEveryRole(t *testing.T) {
+	for role := range roleComponents {
+		t.Run(role, func(t *testing.T) {
+			env(t, withDSN(nil))
+			cfg, err := Load(role)
+			if err != nil {
+				t.Fatalf("defaults refused for role %q: %v", role, err)
+			}
+			if cfg.Component != role {
+				t.Errorf("Component = %q, want the role name %q", cfg.Component, role)
+			}
+			if cfg.Role() != role {
+				t.Errorf("Role() = %q, want %q", cfg.Role(), role)
+			}
+		})
+	}
+}
+
+// TestDefaultValues pins the resolved defaults. They are load bearing: the
+// cross-field assertions are stated in terms of them, and a silent change to
+// one is a silent change to what a farm does with no manifest at all.
+func TestDefaultValues(t *testing.T) {
+	env(t, withDSN(nil))
+	cfg, err := Load("api")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	checks := []struct {
+		name string
+		got  any
+		want any
+	}{
+		{EnvLogLevel, cfg.LogLevel, DefaultLogLevel},
+		{EnvShutdownGrace, cfg.ShutdownGrace, DefaultShutdownGrace},
+		{EnvAPIAddr, cfg.APIAddr, DefaultAPIAddr},
+		{EnvMetricsAddr, cfg.MetricsAddr, DefaultMetricsAddr},
+		{EnvNodeAddr, cfg.NodeAddr, DefaultNodeAddr},
+		{EnvAPIBaseURL, cfg.APIBaseURL, DefaultAPIBaseURL},
+		{EnvLeaseTTL, cfg.Lease.TTL, DefaultLeaseTTL},
+		{EnvLeaseGrace, cfg.Lease.Grace, DefaultLeaseGrace},
+		{EnvLeaseRenewInterval, cfg.Lease.RenewInterval, DefaultLeaseRenewInterval},
+		{EnvLeaseWitnessInterval, cfg.Lease.WitnessInterval, DefaultLeaseWitnessInterval},
+		{EnvLeaseWitnessMaxExt, cfg.Lease.MaxWitnessExtensions, DefaultLeaseWitnessMaxExt},
+		{EnvSlotRearm, cfg.Lease.SlotRearm, DefaultSlotRearm},
+		{EnvReaperInterval, cfg.Reaper.Interval, DefaultReaperInterval},
+		{EnvReaperBatch, cfg.Reaper.Batch, DefaultReaperBatch},
+		{EnvReaperGapFloor, cfg.Reaper.GapFloor, DefaultReaperGapFloor},
+		{EnvHeartbeatEvery, cfg.Reaper.HeartbeatInterval, DefaultHeartbeatEvery},
+		{EnvNodeSelfFence, cfg.Node.SelfFenceTimeout, DefaultNodeSelfFence},
+		{EnvFenceMargin, cfg.Node.FenceSafetyMargin, DefaultFenceMargin},
+		{EnvNodeADBEndpoint, cfg.Node.ADBEndpoint, DefaultADBEndpoint},
+		{EnvDBMaxConns, cfg.DBMaxConns, int32(DefaultDBMaxConns)},
+		{EnvDBConnectTimeout, cfg.DBConnectTimeout, DefaultDBConnectTimeout},
+		{EnvWatchdogInterval, cfg.WatchdogInterval, DefaultWatchdogEvery},
+		{EnvMigrationsTable, cfg.MigrationsTable, DefaultMigrationsTable},
+	}
+	for _, c := range checks {
+		if c.got != c.want {
+			t.Errorf("%s: got %v, want %v", c.name, c.got, c.want)
+		}
+	}
+	if !slices.Equal(cfg.Reaper.Components, DefaultReaperComponents) {
+		t.Errorf("%s: got %v, want %v", EnvReaperComponent, cfg.Reaper.Components, DefaultReaperComponents)
+	}
+	// The list must be a copy: a caller that appends to it would otherwise
+	// mutate the package default for every later process in the same binary.
+	cfg.Reaper.Components[0] = "clobbered"
+	if DefaultReaperComponents[0] == "clobbered" {
+		t.Fatal("Reaper.Components aliases DefaultReaperComponents")
+	}
+}
+
+// TestDefaultReaperComponentsCoversTheRenewalPath is the guard that keeps the
+// default from being the thing that fails preflight.
+//
+// Every component this package considers to be on the renewal path must be
+// watched by default, or the default configuration for the role that runs it
+// is refused — and an operator's first response to a refusal they did not
+// cause is to widen the list until it stops complaining, which is how the
+// blind spot gets configured back in by hand.
+func TestDefaultReaperComponentsCoversTheRenewalPath(t *testing.T) {
+	seen := map[string]bool{}
+	for _, names := range roleComponents {
+		for _, name := range names {
+			if onRenewalPath(name) {
+				seen[name] = true
+			}
+		}
+	}
+	if len(seen) == 0 {
+		t.Fatal("no role runs a renewal-path component; the assertion below proves nothing")
+	}
+	for name := range seen {
+		if !slices.Contains(DefaultReaperComponents, name) {
+			t.Errorf("%q is on the renewal path but is not in DefaultReaperComponents (%v); "+
+				"farm.reaper_arm would not watch it and its outage would refund nothing",
+				name, DefaultReaperComponents)
+		}
+	}
+	// And nothing on the health side of the firewall may be there: a watchdog
+	// or recovery outage that moved lease deadlines would fuse device health
+	// into lease liveness.
+	for _, name := range DefaultReaperComponents {
+		if !onRenewalPath(name) {
+			t.Errorf("%q is watched by default but is not on the renewal path; its downtime "+
+				"would extend every live lease's deadline", name)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Preflight refusals
+// ---------------------------------------------------------------------------
+
+// TestPreflightRefusals drives one bad manifest per case and requires the
+// refusal to name the variable that caused it. The message matters as much as
+// the refusal: an operator reading a CrashLoopBackOff has the error text and
+// nothing else.
+func TestPreflightRefusals(t *testing.T) {
+	cases := []struct {
+		name string
+		role string
+		envs map[string]string
+		want []string // substrings that must all appear
+	}{{
+		// The assertion this whole package exists for: a slot that becomes
+		// schedulable before the previous holder's sockets are certainly gone
+		// hands one phone to two jobs.
+		name: "slot rearm below the node self-fence timeout",
+		role: "scheduler",
+		envs: map[string]string{EnvSlotRearm: "10s", EnvNodeSelfFence: "20s"},
+		want: []string{EnvSlotRearm, EnvNodeSelfFence, "Two tenants then share one phone"},
+	}, {
+		name: "slot rearm inside the safety margin",
+		role: "scheduler",
+		envs: map[string]string{EnvSlotRearm: "21s", EnvNodeSelfFence: "20s", EnvFenceMargin: "5s"},
+		want: []string{EnvSlotRearm, EnvFenceMargin},
+	}, {
+		name: "lease ttl below the schema floor",
+		role: "api",
+		envs: map[string]string{EnvLeaseTTL: "5m", EnvLeaseRenewInterval: "30s"},
+		want: []string{EnvLeaseTTL, "23514"},
+	}, {
+		name: "lease grace below the schema floor",
+		role: "api",
+		envs: map[string]string{EnvLeaseGrace: "1m", EnvLeaseWitnessInterval: "10s"},
+		want: []string{EnvLeaseGrace, "23514"},
+	}, {
+		// Two renewals must be losable — a rolling deploy, a failover, a GC
+		// pause — without the lease going suspect.
+		name: "renew interval leaves fewer than three attempts",
+		role: "jobrunner",
+		envs: map[string]string{EnvLeaseRenewInterval: "6m"},
+		want: []string{EnvLeaseRenewInterval, EnvLeaseTTL, "two consecutive renewals"},
+	}, {
+		name: "renew interval not positive",
+		role: "jobrunner",
+		envs: map[string]string{EnvLeaseRenewInterval: "0s"},
+		want: []string{EnvLeaseRenewInterval, "must be positive"},
+	}, {
+		name: "witness interval too coarse for the grace band",
+		role: "api",
+		envs: map[string]string{EnvLeaseWitnessInterval: "20m"},
+		want: []string{EnvLeaseWitnessInterval, EnvLeaseGrace},
+	}, {
+		name: "witness extensions below one",
+		role: "api",
+		envs: map[string]string{EnvLeaseWitnessMaxExt: "0"},
+		want: []string{EnvLeaseWitnessMaxExt},
+	}, {
+		name: "gap floor not positive",
+		role: "reaper",
+		envs: map[string]string{EnvReaperGapFloor: "0s"},
+		want: []string{EnvReaperGapFloor, "control-plane outage"},
+	}, {
+		name: "heartbeat too slow for the gap floor",
+		role: "reaper",
+		envs: map[string]string{EnvHeartbeatEvery: "45s", EnvReaperGapFloor: "60s"},
+		want: []string{EnvHeartbeatEvery, EnvReaperGapFloor},
+	}, {
+		name: "empty component watch list",
+		role: "reaper",
+		envs: map[string]string{EnvReaperComponent: " , ,"},
+		want: []string{EnvReaperComponent, "disables gap accounting"},
+	}, {
+		// BLOCKER 8, the original shape: rename the process and the reaper is
+		// watching a name nothing writes.
+		name: "renamed api is not watched",
+		role: "api",
+		envs: map[string]string{EnvComponent: "api-canary"},
+		want: []string{"api-canary", EnvReaperComponent, "renewal path"},
+	}, {
+		// BLOCKER 8, the shape the old check missed: the jobrunner holds the
+		// leases whose deadlines the reaper enforces, and could be left out of
+		// the watch list without a word.
+		name: "jobrunner omitted from the watch list",
+		role: "jobrunner",
+		envs: map[string]string{EnvReaperComponent: "reaper,api,scheduler"},
+		want: []string{"jobrunner", EnvReaperComponent, "renewal path"},
+	}, {
+		// The other shape the old check missed: `all` and `demo` put four
+		// components on the renewal path under a process name that is on it
+		// under neither name.
+		name: "all runs an unwatched renewal-path component",
+		role: "all",
+		envs: map[string]string{EnvReaperComponent: "reaper,scheduler,jobrunner"},
+		want: []string{`"api"`, EnvReaperComponent, "renewal path"},
+	}, {
+		name: "demo runs an unwatched renewal-path component",
+		role: "demo",
+		envs: map[string]string{EnvReaperComponent: "reaper,api,scheduler"},
+		want: []string{`"jobrunner"`, EnvReaperComponent},
+	}, {
+		// A watchdog beating under the API's key writes a fresh heartbeat for
+		// a component that may be an hour dead, so the reaper refunds nothing.
+		name: "an off-path component named after an on-path one",
+		role: "watchdog",
+		envs: map[string]string{EnvComponent: "api"},
+		want: []string{EnvComponent, "stand in for"},
+	}, {
+		// The knob that was read, validated and applied to nothing.
+		name: "FARM_COMPONENT on a multiplexed role",
+		role: "demo",
+		envs: map[string]string{EnvComponent: "scheduler-a"},
+		want: []string{EnvComponent, "cannot be honoured", "own process"},
+	}, {
+		name: "metrics address without a port",
+		role: "scheduler",
+		envs: map[string]string{EnvMetricsAddr: "9090"},
+		want: []string{EnvMetricsAddr, MetricsOff},
+	}, {
+		name: "metrics address with an empty port",
+		role: "scheduler",
+		envs: map[string]string{EnvMetricsAddr: "127.0.0.1:"},
+		want: []string{EnvMetricsAddr, "port"},
+	}, {
+		name: "component name the heartbeat key cannot hold",
+		role: "api",
+		envs: map[string]string{EnvComponent: "API_Canary"},
+		want: []string{EnvComponent, "[a-z][a-z0-9_-]*"},
+	}, {
+		name: "missing database url",
+		role: "scheduler",
+		envs: map[string]string{EnvDatabaseURL: ""},
+		want: []string{EnvDatabaseURL, "required"},
+	}, {
+		name: "database url that is neither form",
+		role: "scheduler",
+		envs: map[string]string{EnvDatabaseURL: "/var/run/postgres"},
+		want: []string{EnvDatabaseURL, "keyword/value"},
+	}, {
+		name: "api base url without a scheme",
+		role: "ctl",
+		envs: map[string]string{EnvAPIBaseURL: "127.0.0.1:8080"},
+		want: []string{EnvAPIBaseURL, "absolute URL"},
+	}, {
+		name: "api base url with the wrong scheme",
+		role: "ctl",
+		envs: map[string]string{EnvAPIBaseURL: "ftp://farm/api"},
+		want: []string{EnvAPIBaseURL, "http or https"},
+	}, {
+		name: "duration that is not a duration",
+		role: "api",
+		envs: map[string]string{EnvLeaseTTL: "15 minutes"},
+		want: []string{EnvLeaseTTL, "is not a duration"},
+	}, {
+		name: "connection count that is not a number",
+		role: "api",
+		envs: map[string]string{EnvDBMaxConns: "lots"},
+		want: []string{EnvDBMaxConns, "not a 32-bit integer"},
+	}, {
+		// Parsing this through int and narrowing would silently yield a pool
+		// of exactly one connection, which passes every check below it.
+		name: "connection count that overflows int32",
+		role: "api",
+		envs: map[string]string{EnvDBMaxConns: "4294967297"},
+		want: []string{EnvDBMaxConns, "not a 32-bit integer"},
+	}, {
+		name: "shutdown grace not positive",
+		role: "api",
+		envs: map[string]string{EnvShutdownGrace: "0s"},
+		want: []string{EnvShutdownGrace},
+	}, {
+		name: "watchdog interval not positive",
+		role: "watchdog",
+		envs: map[string]string{EnvWatchdogInterval: "-1s"},
+		want: []string{EnvWatchdogInterval},
+	}}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := withDSN(tc.envs)
+			if v, ok := tc.envs[EnvDatabaseURL]; ok {
+				e[EnvDatabaseURL] = v
+			}
+			env(t, e)
+
+			cfg, err := Load(tc.role)
+			if err == nil {
+				t.Fatalf("Load(%q) accepted a manifest it must refuse; got %+v", tc.role, cfg)
+			}
+			msg := err.Error()
+			for _, want := range tc.want {
+				if !strings.Contains(msg, want) {
+					t.Errorf("refusal does not mention %q.\ngot:\n%s", want, msg)
+				}
+			}
+		})
+	}
+}
+
+// TestEveryViolationIsReportedAtOnce is the "one edit, not five deploys" rule.
+// A manifest with four independent problems must name all four.
+func TestEveryViolationIsReportedAtOnce(t *testing.T) {
+	env(t, map[string]string{
+		EnvDatabaseURL: "", // required and absent
+		EnvLeaseTTL:    "1m",
+		EnvSlotRearm:   "1s",
+		EnvReaperBatch: "0",
+	})
+	_, err := Load("scheduler")
+	if err == nil {
+		t.Fatal("Load accepted four simultaneous violations")
+	}
+	msg := err.Error()
+	for _, want := range []string{EnvDatabaseURL, EnvLeaseTTL, EnvSlotRearm, EnvReaperBatch} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("report omits %s.\ngot:\n%s", want, msg)
+		}
+	}
+}
+
+// TestParseFailuresSuppressTheValidationNoise. A value that failed to parse
+// falls back to its default, and validating the default would print an
+// assertion about a number the operator never wrote.
+func TestParseFailuresSuppressTheValidationNoise(t *testing.T) {
+	env(t, withDSN(map[string]string{EnvLeaseTTL: "fifteen"}))
+	_, err := Load("api")
+	if err == nil {
+		t.Fatal("Load accepted an unparseable duration")
+	}
+	if strings.Contains(err.Error(), "23514") {
+		t.Errorf("a parse failure also reported a CHECK-constraint violation:\n%s", err)
+	}
+}
+
+// TestWithoutDatabase covers the one role that must keep working while the
+// control plane is the thing being investigated.
+func TestWithoutDatabase(t *testing.T) {
+	env(t, nil)
+	if _, err := Load("ctl", WithoutDatabase()); err != nil {
+		t.Fatalf("ctl refused to load without a DSN: %v", err)
+	}
+	if _, err := Load("ctl"); err == nil {
+		t.Fatal("a role that requires a DSN loaded without one")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Every variable reaches something
+// ---------------------------------------------------------------------------
+
+// TestEveryVariableIsRead sets each variable to a distinctive value and finds
+// it again on the Config. It is the direct guard against this package's
+// characteristic bug: a knob that is named, parsed, validated, and then not
+// carried anywhere.
+func TestEveryVariableIsRead(t *testing.T) {
+	env(t, map[string]string{
+		EnvDatabaseURL:          "postgres://farm:hunter2@db.internal:6432/farm",
+		EnvDBMaxConns:           "17",
+		EnvDBConnectTimeout:     "11s",
+		EnvComponent:            "scheduler-a",
+		EnvLogLevel:             "debug",
+		EnvShutdownGrace:        "45s",
+		EnvAPIAddr:              "127.0.0.1:8517",
+		EnvMetricsAddr:          "127.0.0.1:9517",
+		EnvNodeAddr:             "127.0.0.1:8518",
+		EnvAPIBaseURL:           "https://farm.example:8443",
+		EnvLeaseTTL:             "30m",
+		EnvLeaseGrace:           "40m",
+		EnvLeaseRenewInterval:   "45s",
+		EnvLeaseWitnessInterval: "3m",
+		EnvLeaseWitnessMaxExt:   "7",
+		EnvSlotRearm:            "40s",
+		EnvReaperInterval:       "7s",
+		EnvReaperBatch:          "42",
+		EnvReaperGapFloor:       "90s",
+		EnvReaperComponent:      " reaper , api ,scheduler-a, jobrunner ",
+		EnvHeartbeatEvery:       "4s",
+		EnvNodeSelfFence:        "30s",
+		EnvFenceMargin:          "9s",
+		EnvNodeADBEndpoint:      "10.0.0.9:5037",
+		EnvNodeHostID:           "rack1-host7",
+		EnvWatchdogInterval:     "6s",
+		EnvMigrationsTable:      "farm.schema_version",
+		EnvMigrationsDir:        "/srv/migrations",
+	})
+	cfg, err := Load("scheduler")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	checks := []struct {
+		name string
+		got  any
+		want any
+	}{
+		{EnvComponent, cfg.Component, "scheduler-a"},
+		{EnvLogLevel, cfg.LogLevel, "debug"},
+		{EnvShutdownGrace, cfg.ShutdownGrace, 45 * time.Second},
+		{EnvDBMaxConns, cfg.DBMaxConns, int32(17)},
+		{EnvDBConnectTimeout, cfg.DBConnectTimeout, 11 * time.Second},
+		{EnvAPIAddr, cfg.APIAddr, "127.0.0.1:8517"},
+		{EnvMetricsAddr, cfg.MetricsAddr, "127.0.0.1:9517"},
+		{EnvNodeAddr, cfg.NodeAddr, "127.0.0.1:8518"},
+		{EnvAPIBaseURL, cfg.APIBaseURL, "https://farm.example:8443"},
+		{EnvLeaseTTL, cfg.Lease.TTL, 30 * time.Minute},
+		{EnvLeaseGrace, cfg.Lease.Grace, 40 * time.Minute},
+		{EnvLeaseRenewInterval, cfg.Lease.RenewInterval, 45 * time.Second},
+		{EnvLeaseWitnessInterval, cfg.Lease.WitnessInterval, 3 * time.Minute},
+		{EnvLeaseWitnessMaxExt, cfg.Lease.MaxWitnessExtensions, 7},
+		{EnvSlotRearm, cfg.Lease.SlotRearm, 40 * time.Second},
+		{EnvReaperInterval, cfg.Reaper.Interval, 7 * time.Second},
+		{EnvReaperBatch, cfg.Reaper.Batch, 42},
+		{EnvReaperGapFloor, cfg.Reaper.GapFloor, 90 * time.Second},
+		{EnvHeartbeatEvery, cfg.Reaper.HeartbeatInterval, 4 * time.Second},
+		{EnvNodeSelfFence, cfg.Node.SelfFenceTimeout, 30 * time.Second},
+		{EnvFenceMargin, cfg.Node.FenceSafetyMargin, 9 * time.Second},
+		{EnvNodeADBEndpoint, cfg.Node.ADBEndpoint, "10.0.0.9:5037"},
+		{EnvNodeHostID, cfg.Node.HostID, "rack1-host7"},
+		{EnvWatchdogInterval, cfg.WatchdogInterval, 6 * time.Second},
+		{EnvMigrationsTable, cfg.MigrationsTable, "farm.schema_version"},
+		{EnvMigrationsDir, cfg.MigrationsDir, "/srv/migrations"},
+	}
+	for _, c := range checks {
+		if c.got != c.want {
+			t.Errorf("%s: got %v, want %v", c.name, c.got, c.want)
+		}
+	}
+	// The list is split, trimmed and emptied of blanks.
+	if want := []string{"reaper", "api", "scheduler-a", "jobrunner"}; !slices.Equal(cfg.Reaper.Components, want) {
+		t.Errorf("%s: got %v, want %v", EnvReaperComponent, cfg.Reaper.Components, want)
+	}
+	// FARM_COMPONENT reached the component this process IS.
+	if got := cfg.ComponentFor("scheduler"); got != "scheduler-a" {
+		t.Errorf("ComponentFor(scheduler) = %q, want the renamed %q", got, "scheduler-a")
+	}
+	// A password must not survive into a log line or a connection error.
+	if red := cfg.RedactedDatabaseURL(); strings.Contains(red, "hunter2") {
+		t.Errorf("RedactedDatabaseURL leaked the password: %s", red)
+	}
+}
+
+// TestRedactedDatabaseURL covers the forms a DSN actually arrives in.
+func TestRedactedDatabaseURL(t *testing.T) {
+	cases := []struct{ name, dsn, wantAbsent, wantPresent string }{
+		{"unset", "", "", "(unset)"},
+		{"userinfo password", "postgres://farm:hunter2@db/farm", "hunter2", "farm:xxxxx@db"},
+		{"query password", "postgres://farm@db/farm?password=hunter2", "hunter2", "xxxxx"},
+		{"sslpassword", "postgres://farm@db/farm?sslpassword=hunter2", "hunter2", "xxxxx"},
+		{"keyword form", "host=db user=farm password=hunter2", "hunter2", "(redacted)"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &Config{DatabaseURL: tc.dsn}
+			got := c.RedactedDatabaseURL()
+			if tc.wantAbsent != "" && strings.Contains(got, tc.wantAbsent) {
+				t.Errorf("%q leaked %q", got, tc.wantAbsent)
+			}
+			if !strings.Contains(got, tc.wantPresent) {
+				t.Errorf("got %q, want it to contain %q", got, tc.wantPresent)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Component naming
+// ---------------------------------------------------------------------------
+
+// TestComponentForNamesWhatTheProcessIs. FARM_COMPONENT renames the component
+// a process IS and never one it merely CONTAINS, because each component a
+// multiplexed process runs writes its own heartbeat row.
+func TestComponentForNamesWhatTheProcessIs(t *testing.T) {
+	cases := []struct {
+		role      string
+		component string
+		want      map[string]string // canonical -> heartbeat key
+	}{
+		{"scheduler", "scheduler-a", map[string]string{"scheduler": "scheduler-a"}},
+		{"api", "api-canary", map[string]string{"api": "api-canary"}},
+		{"watchdog", "watchdog-rack1", map[string]string{"watchdog": "watchdog-rack1"}},
+		{"node", "node-h7", map[string]string{"node": "node-h7", "enroll": "enroll"}},
+		{"all", "all", map[string]string{"api": "api", "scheduler": "scheduler", "jobrunner": "jobrunner"}},
+		{"demo", "demo", map[string]string{"api": "api", "reaper": "reaper"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.role+"/"+tc.component, func(t *testing.T) {
+			cfg := &Config{role: tc.role, Component: tc.component}
+			for canon, want := range tc.want {
+				if got := cfg.ComponentFor(canon); got != want {
+					t.Errorf("ComponentFor(%q) = %q, want %q", canon, got, want)
+				}
+			}
+		})
+	}
+}
+
+// TestHeartbeatComponentsMatchTheRole. The list is what the BLOCKER 8
+// assertion walks and what the startup summary prints, so it has to be the set
+// of rows the process will really write.
+func TestHeartbeatComponentsMatchTheRole(t *testing.T) {
+	env(t, withDSN(map[string]string{
+		EnvComponent:       "scheduler-a",
+		EnvReaperComponent: "reaper,api,scheduler-a,jobrunner",
+	}))
+	cfg, err := Load("scheduler")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.HeartbeatComponents(); !slices.Equal(got, []string{"scheduler-a"}) {
+		t.Errorf("HeartbeatComponents() = %v, want [scheduler-a]", got)
+	}
+
+	env(t, withDSN(nil))
+	all, err := Load("all")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := all.HeartbeatComponents(); !slices.Equal(got, roleComponents["all"]) {
+		t.Errorf("HeartbeatComponents() = %v, want %v", got, roleComponents["all"])
+	}
+	// An unknown role still gets an assertion rather than a free pass.
+	unknown := &Config{role: "invented", Component: "api"}
+	if got := unknown.HeartbeatComponents(); !slices.Equal(got, []string{"api"}) {
+		t.Errorf("HeartbeatComponents() for an unknown role = %v, want [api]", got)
+	}
+}
+
+// TestRoleComponentsCoversEveryRole reads the dispatch table out of
+// cmd/farmd/main.go and requires this package to know about every role in it.
+//
+// The two lists are the same fact stated twice: what farmd can be started as,
+// and what each of those writes to farm.component_heartbeat. When they drift,
+// a new role gets the fall-back assumption that it beats under its own name —
+// which is right for a single-component role and silently wrong for one that
+// runs several, and being silently wrong there is BLOCKER 8.
+func TestRoleComponentsCoversEveryRole(t *testing.T) {
+	src, err := os.ReadFile("../../cmd/farmd/main.go")
+	if err != nil {
+		t.Skipf("cannot read the dispatch table: %v", err)
+	}
+	// The multi-role case in run()'s switch, e.g.
+	//   case "api", "scheduler", ... "demo":
+	//       err = runRole(...)
+	block := regexp.MustCompile(`(?s)case ("[a-z]+",\s*)+"[a-z]+":\s*\n\s*err = runRole`)
+	m := block.Find(src)
+	if m == nil {
+		t.Skip("the dispatch table in cmd/farmd/main.go no longer has the shape this test reads")
+	}
+	roles := regexp.MustCompile(`"([a-z]+)"`).FindAllStringSubmatch(string(m), -1)
+	if len(roles) < 5 {
+		t.Fatalf("read only %d roles out of the dispatch table; the regexp is wrong", len(roles))
+	}
+	for _, r := range roles {
+		if _, ok := roleComponents[r[1]]; !ok {
+			t.Errorf("farmd can be started as %q but roleComponents does not say what it beats as; "+
+				"add it, or the BLOCKER 8 assertion assumes it writes exactly one row named %q",
+				r[1], r[1])
+		}
+	}
+	// ctl and migrate are dispatched separately and beat for nothing.
+	for _, r := range []string{"ctl", "migrate"} {
+		if names, ok := roleComponents[r]; !ok || len(names) != 0 {
+			t.Errorf("roleComponents[%q] = %v, want an empty list: it writes no heartbeat", r, names)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Metrics address
+// ---------------------------------------------------------------------------
+
+func TestMetricsAddr(t *testing.T) {
+	accept := []string{":9090", "127.0.0.1:9090", "[::1]:9090", "0.0.0.0:9090", "localhost:9090"}
+	for _, addr := range accept {
+		t.Run("accept "+addr, func(t *testing.T) {
+			env(t, withDSN(map[string]string{EnvMetricsAddr: addr}))
+			cfg, err := Load("scheduler")
+			if err != nil {
+				t.Fatalf("%s=%s refused: %v", EnvMetricsAddr, addr, err)
+			}
+			if cfg.MetricsDisabled() {
+				t.Errorf("%s=%s read as disabled", EnvMetricsAddr, addr)
+			}
+		})
+	}
+	for _, addr := range []string{"off", "OFF", " off "} {
+		t.Run("disable "+addr, func(t *testing.T) {
+			env(t, withDSN(map[string]string{EnvMetricsAddr: addr}))
+			cfg, err := Load("scheduler")
+			if err != nil {
+				t.Fatalf("%s=%q refused: %v", EnvMetricsAddr, addr, err)
+			}
+			if !cfg.MetricsDisabled() {
+				t.Errorf("%s=%q did not disable the listener", EnvMetricsAddr, addr)
+			}
+		})
+	}
+}
+
+// TestMetricsListenAddr covers who binds a second listener and who does not.
+//
+// The question is not "are the two strings equal". A role that never serves
+// HTTP has nothing on FARM_API_ADDR, so pointing both variables at one port
+// from a shared ConfigMap must still get that role a /metrics endpoint —
+// otherwise the roles this listener exists for are exactly the ones that
+// silently keep exporting nothing.
+func TestMetricsListenAddr(t *testing.T) {
+	cases := []struct {
+		name    string
+		role    string
+		metrics string
+		api     string
+		want    string
+		bind    bool
+	}{
+		{"scheduler binds its own", "scheduler", ":9090", ":8080", ":9090", true},
+		{"api binds a second port", "api", ":9090", ":8080", ":9090", true},
+		{"api already serves that address", "api", ":8080", ":8080", "", false},
+		{"api, wildcard spelled differently", "api", "0.0.0.0:8080", ":8080", "", false},
+		{"demo already serves that address", "demo", "[::]:8080", "0.0.0.0:8080", "", false},
+		{"all binds a second port", "all", ":9090", ":8080", ":9090", true},
+		// Nothing else in a scheduler binds FARM_API_ADDR, so one shared
+		// address is still one listener that has to exist.
+		{"scheduler with both variables equal", "scheduler", ":8080", ":8080", ":8080", true},
+		{"switched off", "reaper", MetricsOff, ":8080", "", false},
+		{"ctl never listens", "ctl", ":9090", ":8080", "", false},
+		{"migrate never listens", "migrate", ":9090", ":8080", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &Config{role: tc.role, MetricsAddr: tc.metrics, APIAddr: tc.api}
+			got, bind := cfg.MetricsListenAddr()
+			if bind != tc.bind || got != tc.want {
+				t.Errorf("MetricsListenAddr() = (%q, %v), want (%q, %v)", got, bind, tc.want, tc.bind)
+			}
+		})
+	}
+}
+
+// TestCtlSurvivesAMalformedMetricsAddr. ctl is the command an operator reaches
+// for when the control plane is the thing being investigated, and it binds
+// nothing. A stray variable in a shared environment must not be what stops it
+// from answering.
+func TestCtlSurvivesAMalformedMetricsAddr(t *testing.T) {
+	env(t, map[string]string{EnvMetricsAddr: "9090"})
+	if _, err := Load("ctl", WithoutDatabase()); err != nil {
+		t.Errorf("ctl refused to start over a listener it never binds: %v", err)
+	}
+	// The roles that do bind it are still refused.
+	env(t, withDSN(map[string]string{EnvMetricsAddr: "9090"}))
+	if _, err := Load("reaper"); err == nil {
+		t.Error("a role that binds the metrics listener accepted an address it cannot bind")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Summary
+// ---------------------------------------------------------------------------
+
+// TestSummaryShowsWhatTheProcessDecided. The summary is printed by every role
+// at startup, and it is the only place an operator sees the resolved values.
+// A field missing from it is a value that has to be guessed at from a
+// manifest.
+func TestSummaryShowsWhatTheProcessDecided(t *testing.T) {
+	env(t, withDSN(map[string]string{
+		EnvDatabaseURL:        "postgres://farm:hunter2@db.internal:6432/farm",
+		EnvLeaseRenewInterval: "45s",
+		EnvLeaseTTL:           "30m",
+	}))
+	cfg, err := Load("all")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s := cfg.Summary()
+	for _, want := range []string{
+		// the role, and every heartbeat key it will write
+		"all", "api, scheduler",
+		// the DSN, redacted, and the values the assertions were made about
+		"db.internal:6432", "30m0s", "45s",
+		"35s",   // slot rearm
+		"9090",  // the metrics listener that now exists
+		"40",    // 30m/45s renewal attempts
+		"xxxxx", // the password, gone
+	} {
+		if !strings.Contains(s, want) {
+			t.Errorf("summary omits %q:\n%s", want, s)
+		}
+	}
+	if strings.Contains(s, "hunter2") {
+		t.Fatalf("the startup summary printed the database password:\n%s", s)
+	}
+	// Every knob without a destination must say so where an operator will see
+	// it, rather than reading as though it were in force.
+	if !strings.Contains(s, "NOT STARTED") {
+		t.Errorf("the summary does not say that no role starts a witness loop:\n%s", s)
+	}
+
+	env(t, withDSN(map[string]string{EnvMetricsAddr: MetricsOff}))
+	off, err := Load("scheduler")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(off.Summary(), "no /metrics listener") {
+		t.Errorf("a disabled metrics listener is not stated:\n%s", off.Summary())
+	}
+}
+
+// TestValidateIsIdempotentAndSeparate. Validate must report the same
+// violations Load does, minus the DSN requirement, so a caller that builds a
+// Config by hand gets the same assertions.
+func TestValidateIsIdempotentAndSeparate(t *testing.T) {
+	env(t, withDSN(nil))
+	cfg, err := Load("api")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("a config Load accepted was refused by Validate: %v", err)
+	}
+
+	cfg.DatabaseURL = ""
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("Validate enforced the role-dependent DSN requirement, which is Load's: %v", err)
+	}
+
+	cfg.Lease.SlotRearm = time.Second
+	if err := cfg.Validate(); err == nil {
+		t.Error("Validate accepted a slot rearm below the node self-fence timeout")
+	}
+}

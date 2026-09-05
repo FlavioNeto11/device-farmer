@@ -2,7 +2,14 @@ package obs
 
 import (
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"io/fs"
 	"log/slog"
+	"os"
+	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -855,4 +862,340 @@ func gathered(t *testing.T, r *prometheus.Registry) []string {
 		names = append(names, mf.GetName())
 	}
 	return names
+}
+
+// ---------------------------------------------------------------------
+// Source-level guards.
+//
+// The two tests below read the repository instead of the running
+// program, because both regressions they catch are invisible at runtime.
+// A package whose collectors nobody registers looks exactly like a
+// package whose loop never ran — the counters are declared, they are
+// incremented, and /metrics is silent — and a duplicated metric name is
+// only discovered by a process that registers both declarations, which,
+// until the groups above were passed to RegisterAll, no process did.
+//
+// They live in this package because it is the one place that cannot
+// import the packages in question: everything that contributes a group
+// imports obs, so the check has to be made against the source rather
+// than against the symbols.
+// ---------------------------------------------------------------------
+
+// TestEveryCollectorGroupIsRegistered fails when a package exports
+// Collectors() and nothing passes the result to obs.RegisterAll.
+//
+// This is the regression the test exists for, not a hypothetical: nine of
+// the ten sets — every scheduler, reaper, jobrunner, janitor, watchdog,
+// node, topo, enroll and recovery counter in the project — were declared,
+// documented and incremented while reaching no registry at all, and the
+// gap was reported closed once before it actually was.
+func TestEveryCollectorGroupIsRegistered(t *testing.T) {
+	files := repoFiles(t)
+
+	// Keyed by package name, which is also the identifier a call site
+	// writes (`recovery.Collectors()`). An import alias would be read as
+	// a different package and reported as unregistered — noisy, but in
+	// the safe direction: this test can never pass a group that is
+	// genuinely missing.
+	declared := make(map[string]string) // package -> file declaring Collectors()
+	registered := make(map[string]bool) // package -> passed to obs.RegisterAll
+	for _, f := range files {
+		if declaresCollectors(f.file) {
+			declared[f.file.Name.Name] = f.path
+		}
+		for _, pkg := range registerAllArguments(f.file) {
+			registered[pkg] = true
+		}
+	}
+
+	if len(declared) == 0 {
+		t.Fatal("no Collectors() declarations found at all: the scan is broken, not the code")
+	}
+
+	var missing []string
+	for pkg, path := range declared {
+		if !registered[pkg] {
+			missing = append(missing, pkg+" ("+path+")")
+		}
+	}
+	sort.Strings(missing)
+	if len(missing) > 0 {
+		t.Errorf("these packages export Collectors() that nothing hands to obs.RegisterAll, so "+
+			"their metrics never reach /metrics and every rule over them returns no data and "+
+			"never fires:\n\t%s\nAdd the group to newRegistry in cmd/farmd/roles.go.",
+			strings.Join(missing, "\n\t"))
+	}
+}
+
+// TestNoDuplicateMetricNames fails when two declarations anywhere in the
+// module render the same fully-qualified metric name.
+//
+// farm_recovery_attempts_total was declared twice: here with
+// {tier, outcome, host, hub, rack_slot}, and in internal/recovery as
+// Namespace "farm" + Subsystem "recovery" + Name "attempts_total" with
+// {tier, outcome}. Registry.Register refuses the second of two
+// descriptors that disagree, and it refuses whichever arrives second, so
+// the collision did not cost one metric — it cost a whole package its
+// registration, which is why it has to be caught at the declaration and
+// not at the call site.
+func TestNoDuplicateMetricNames(t *testing.T) {
+	byName := make(map[string][]string)
+	for dir, files := range repoFilesByDir(t) {
+		// Constants are resolved per directory because this package
+		// writes `Namespace: namespace`, not `Namespace: "farm"`. A scan
+		// that only read string literals would have missed the very
+		// collision that motivated it.
+		consts := packageStringConsts(files)
+		for _, f := range files {
+			for _, name := range metricNamesDeclaredIn(f, consts) {
+				byName[name] = append(byName[name], dir+"/"+baseName(f.path))
+			}
+		}
+	}
+
+	var dupes []string
+	for name, sites := range byName {
+		if len(sites) > 1 {
+			sort.Strings(sites)
+			dupes = append(dupes, name+": "+strings.Join(sites, ", "))
+		}
+	}
+	sort.Strings(dupes)
+	if len(dupes) > 0 {
+		t.Errorf("these metric names are declared more than once. Prometheus refuses the second "+
+			"registration whenever the descriptors differ, and the refusal costs the package that "+
+			"loses the race every metric it owns:\n\t%s", strings.Join(dupes, "\n\t"))
+	}
+}
+
+// ---------------------------------------------------------------------
+// Source scanning.
+// ---------------------------------------------------------------------
+
+type parsedFile struct {
+	path string
+	file *ast.File
+}
+
+// moduleRoot is the module root relative to this package's directory,
+// which is where `go test` runs.
+const moduleRoot = "../.."
+
+func repoFiles(t *testing.T) []parsedFile {
+	t.Helper()
+	var all []parsedFile
+	for _, files := range repoFilesByDir(t) {
+		all = append(all, files...)
+	}
+	return all
+}
+
+// repoFilesByDir parses every non-test Go file of THIS module, grouped by
+// directory.
+func repoFilesByDir(t *testing.T) map[string][]parsedFile {
+	t.Helper()
+	fset := token.NewFileSet()
+	byDir := make(map[string][]parsedFile)
+
+	err := filepath.WalkDir(moduleRoot, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			if path == moduleRoot {
+				return nil
+			}
+			// Dot-directories are skipped wholesale, and .claude in
+			// particular: it holds .claude/worktrees/<agent>/, a complete
+			// checkout of this repository per branch in flight. Walking
+			// into those reports every metric in the project as declared
+			// a dozen times over and every package that is not on this
+			// branch as unregistered. A test that fails on work sitting
+			// in another checkout is a test that gets deleted.
+			name := d.Name()
+			if strings.HasPrefix(name, ".") || name == "vendor" || name == "node_modules" || name == "testdata" {
+				return fs.SkipDir
+			}
+			// A nested module is somebody else's build; its declarations
+			// are not in the binary this test makes claims about.
+			if _, serr := os.Stat(filepath.Join(path, "go.mod")); serr == nil {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		// Test files are excluded deliberately. A test that registered a
+		// group would satisfy TestEveryCollectorGroupIsRegistered while
+		// the binary still served nothing.
+		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		f, perr := parser.ParseFile(fset, path, nil, parser.SkipObjectResolution)
+		if perr != nil {
+			return perr
+		}
+		byDir[filepath.ToSlash(filepath.Dir(path))] = append(
+			byDir[filepath.ToSlash(filepath.Dir(path))],
+			parsedFile{path: filepath.ToSlash(path), file: f})
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk module: %v", err)
+	}
+	if len(byDir) == 0 {
+		t.Fatal("no Go files found: the scan is looking in the wrong place")
+	}
+	return byDir
+}
+
+func declaresCollectors(f *ast.File) bool {
+	for _, decl := range f.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if ok && fn.Recv == nil && fn.Name.Name == "Collectors" {
+			return true
+		}
+	}
+	return false
+}
+
+// registerAllArguments returns the package identifiers whose Collectors()
+// call is passed to obs.RegisterAll in f.
+func registerAllArguments(f *ast.File) []string {
+	var pkgs []string
+	ast.Inspect(f, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok || !isQualified(call.Fun, "obs", "RegisterAll") {
+			return true
+		}
+		for _, arg := range call.Args {
+			inner, ok := arg.(*ast.CallExpr)
+			if !ok {
+				continue
+			}
+			sel, ok := inner.Fun.(*ast.SelectorExpr)
+			if !ok || sel.Sel.Name != "Collectors" {
+				continue
+			}
+			if ident, ok := sel.X.(*ast.Ident); ok {
+				pkgs = append(pkgs, ident.Name)
+			}
+		}
+		return true
+	})
+	return pkgs
+}
+
+func isQualified(e ast.Expr, pkg, name string) bool {
+	sel, ok := e.(*ast.SelectorExpr)
+	if !ok || sel.Sel.Name != name {
+		return false
+	}
+	ident, ok := sel.X.(*ast.Ident)
+	return ok && ident.Name == pkg
+}
+
+// packageStringConsts maps package-level identifiers to their string
+// value, so `Namespace: namespace` resolves to "farm".
+func packageStringConsts(files []parsedFile) map[string]string {
+	out := make(map[string]string)
+	for _, f := range files {
+		for _, decl := range f.file.Decls {
+			gen, ok := decl.(*ast.GenDecl)
+			if !ok || (gen.Tok != token.CONST && gen.Tok != token.VAR) {
+				continue
+			}
+			for _, spec := range gen.Specs {
+				vs, ok := spec.(*ast.ValueSpec)
+				if !ok || len(vs.Names) != 1 || len(vs.Values) != 1 {
+					continue
+				}
+				if s, ok := literalString(vs.Values[0]); ok {
+					out[vs.Names[0].Name] = s
+				}
+			}
+		}
+	}
+	return out
+}
+
+// metricNamesDeclaredIn returns every fully-qualified metric name f
+// declares through a prometheus *Opts literal. A declaration whose Name
+// is computed rather than written down is skipped: there is nothing to
+// compare it against, and guessing would produce a false collision.
+func metricNamesDeclaredIn(f parsedFile, consts map[string]string) []string {
+	var out []string
+	ast.Inspect(f.file, func(n ast.Node) bool {
+		lit, ok := n.(*ast.CompositeLit)
+		if !ok {
+			return true
+		}
+		sel, ok := lit.Type.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		if x, ok := sel.X.(*ast.Ident); !ok || x.Name != "prometheus" {
+			return true
+		}
+		switch sel.Sel.Name {
+		case "Opts", "CounterOpts", "GaugeOpts", "HistogramOpts", "SummaryOpts", "UntypedOpts":
+		default:
+			return true
+		}
+
+		fields := make(map[string]string, 3)
+		for _, elt := range lit.Elts {
+			kv, ok := elt.(*ast.KeyValueExpr)
+			if !ok {
+				continue
+			}
+			key, ok := kv.Key.(*ast.Ident)
+			if !ok {
+				continue
+			}
+			if v, ok := resolveString(kv.Value, consts); ok {
+				fields[key.Name] = v
+			}
+		}
+		if fields["Name"] == "" {
+			return true
+		}
+		parts := make([]string, 0, 3)
+		for _, p := range []string{fields["Namespace"], fields["Subsystem"], fields["Name"]} {
+			if p != "" {
+				parts = append(parts, p)
+			}
+		}
+		out = append(out, strings.Join(parts, "_"))
+		return true
+	})
+	return out
+}
+
+func resolveString(e ast.Expr, consts map[string]string) (string, bool) {
+	if s, ok := literalString(e); ok {
+		return s, true
+	}
+	if ident, ok := e.(*ast.Ident); ok {
+		s, ok := consts[ident.Name]
+		return s, ok
+	}
+	return "", false
+}
+
+func literalString(e ast.Expr) (string, bool) {
+	lit, ok := e.(*ast.BasicLit)
+	if !ok || lit.Kind != token.STRING {
+		return "", false
+	}
+	s, err := strconv.Unquote(lit.Value)
+	if err != nil {
+		return "", false
+	}
+	return s, true
+}
+
+func baseName(path string) string {
+	if i := strings.LastIndex(path, "/"); i >= 0 {
+		return path[i+1:]
+	}
+	return path
 }

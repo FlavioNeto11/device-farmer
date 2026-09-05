@@ -31,14 +31,18 @@ import (
 // -o json passes the server's own body through untouched.
 // ---------------------------------------------------------------------------
 
+// deviceLease is the allocation on a fleet row. The five identity fields are
+// pointers because the server sends them as null to a tenant looking at
+// another tenant's lease: decoding null into an int64 would print "fence 0",
+// which is a fence a caller could believe in.
 type deviceLease struct {
-	ID            string    `json:"id"`
-	Fence         int64     `json:"fence"`
+	ID            *string   `json:"id"`
+	Fence         *int64    `json:"fence"`
 	State         string    `json:"state"`
 	Protected     bool      `json:"protected"`
-	JobID         string    `json:"job_id"`
-	TenantID      string    `json:"tenant_id"`
-	Holder        string    `json:"holder"`
+	JobID         *string   `json:"job_id"`
+	TenantID      *string   `json:"tenant_id"`
+	Holder        *string   `json:"holder"`
 	AcquiredAt    time.Time `json:"acquired_at"`
 	ExpiresAt     time.Time `json:"expires_at"`
 	ReclaimableAt time.Time `json:"reclaimable_at"`
@@ -429,8 +433,10 @@ func cmdFleet(ctx context.Context, s *session, args []string) error {
 			if d.Lease.Protected {
 				leaseCell += "*"
 			}
-			jobCell = shortID(d.Lease.JobID)
-			holderCell = d.Lease.Holder
+			// Both are withheld for a tenant reading another tenant's lease;
+			// the dash then means "not yours", the state column still says held.
+			jobCell = shortID(dash(d.Lease.JobID))
+			holderCell = dash(d.Lease.Holder)
 		}
 		health := dash(d.Health)
 		if d.QuarantineID != nil {
@@ -575,12 +581,16 @@ func renderDevice(e *env, resp deviceResponse) error {
 
 	if l := d.Lease; l != nil {
 		f.Gap()
-		f.Add("lease", l.ID)
+		if l.ID == nil {
+			f.Add("lease", "withheld — another tenant holds this device")
+		} else {
+			f.Add("lease", *l.ID)
+		}
 		f.Addf("lease state", "%s%s", l.State, protectedNote(l.Protected))
-		f.Addf("fence", "%d", l.Fence)
-		f.Add("job", l.JobID)
-		f.Add("tenant", l.TenantID)
-		f.Add("holder", l.Holder)
+		f.Add("fence", dashInt64(l.Fence))
+		f.Add("job", dash(l.JobID))
+		f.Add("tenant", dash(l.TenantID))
+		f.Add("holder", dash(l.Holder))
 		f.Add("acquired", stamp(&l.AcquiredAt))
 		f.Add("expires", stamp(&l.ExpiresAt))
 		f.Add("reclaimable", stamp(&l.ReclaimableAt))
@@ -676,10 +686,10 @@ func cmdDeviceExec(ctx context.Context, s *session, args []string) error {
 	headline := fmt.Sprintf("About to run a shell command on 1 device at %s.", rackSlotOf(d.RackSlot))
 	if d.Lease != nil {
 		f.Gap()
-		f.Add("live lease", d.Lease.ID)
-		f.Add("job", d.Lease.JobID)
-		f.Add("tenant", d.Lease.TenantID)
-		f.Add("holder", d.Lease.Holder)
+		f.Add("live lease", dash(d.Lease.ID))
+		f.Add("job", dash(d.Lease.JobID))
+		f.Add("tenant", dash(d.Lease.TenantID))
+		f.Add("holder", dash(d.Lease.Holder))
 		f.Addf("protected", "%s", yesNo(d.Lease.Protected))
 		if *force {
 			headline = fmt.Sprintf("About to run a shell command on %s WHILE SOMEBODY'S JOB IS USING IT.\n"+

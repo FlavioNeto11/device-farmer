@@ -1242,8 +1242,12 @@ function deviceTile(d) {
     el('span', { class: 'foot' },
       batteryEl(d.battery),
       el('span', { title: 'adb_state' }, d.adbState || 'adb ?'),
+      // The fence is null for a tenant looking at another tenant's lease: the
+      // API withholds it rather than omitting it, so "—" here means "not
+      // yours", never "unknown".
       d.leaseState === 'held' || d.leaseState === 'suspect'
-        ? el('span', { class: 'mono', title: 'lease fence' }, 'f' + (d.fence !== undefined ? d.fence : '?'))
+        ? el('span', { class: 'mono', title: d.fence === undefined ? 'lease fence: withheld, another tenant holds this device' : 'lease fence' },
+          d.fence === undefined ? '—' : 'f' + d.fence)
         : null));
   return tile;
 }

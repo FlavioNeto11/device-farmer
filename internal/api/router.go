@@ -110,9 +110,13 @@ func (s *Server) buildHandler() http.Handler {
 	// Recovery, quarantine and bulk work.
 	tenant("GET /api/v1/recovery", s.handleRecovery)
 	operator("POST /api/v1/quarantines/{id}/close", s.handleQuarantineClose)
-	tenant("GET /api/v1/bulk", s.handleBulkList)
+	// Bulk runs are operator data on the way out as well as on the way in: a
+	// run's output is the shell output of a command an operator ran across
+	// the farm, on devices that were holding other tenants' leases at the
+	// time. Only the role that can start one may read one.
+	operator("GET /api/v1/bulk", s.handleBulkList)
 	operator("POST /api/v1/bulk", s.handleBulkCreate)
-	tenant("GET /api/v1/bulk/{id}", s.handleBulkGet)
+	operator("GET /api/v1/bulk/{id}", s.handleBulkGet)
 
 	// Audit and live updates.
 	tenant("GET /api/v1/events", s.handleEvents)

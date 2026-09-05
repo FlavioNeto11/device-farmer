@@ -85,17 +85,41 @@ type fleetDevice struct {
 	QuarantineReason *string `json:"quarantine_reason,omitempty"`
 }
 
+// fleetLease is the live allocation on a device.
+//
+// The five identity fields are pointers because they are null for a
+// tenant-scoped caller looking at another tenant's lease. The fleet is shared
+// infrastructure and every tenant may see that a device is busy; WHOSE work is
+// on it — the lease id, the fence, the job, the holder — is not shared, and a
+// null says "withheld" where an empty string would read as "unknown".
 type fleetLease struct {
-	ID            string    `json:"id"`
-	Fence         int64     `json:"fence"`
+	ID            *string   `json:"id"`
+	Fence         *int64    `json:"fence"`
 	State         string    `json:"state"`
 	Protected     bool      `json:"protected"`
-	JobID         string    `json:"job_id"`
-	TenantID      string    `json:"tenant_id"`
-	Holder        string    `json:"holder"`
+	JobID         *string   `json:"job_id"`
+	TenantID      *string   `json:"tenant_id"`
+	Holder        *string   `json:"holder"`
 	AcquiredAt    time.Time `json:"acquired_at"`
 	ExpiresAt     time.Time `json:"expires_at"`
 	ReclaimableAt time.Time `json:"reclaimable_at"`
+}
+
+// leaseVisible reports whether a caller confined to scope may see who holds a
+// lease owned by tenant. An empty scope is an operator and sees everything.
+func leaseVisible(scope, tenant string) bool {
+	return scope == "" || tenant == scope
+}
+
+// maskForTenant withholds the identity of a lease the caller does not own.
+// State and protection stay: "this device is held, and the reaper will not
+// take it" is a fact about the fleet, not about the tenant holding it.
+func (d *fleetDevice) maskForTenant(scope string) {
+	if d.Lease == nil || leaseVisible(scope, derefString(d.Lease.TenantID)) {
+		return
+	}
+	d.Lease.ID, d.Lease.Fence = nil, nil
+	d.Lease.JobID, d.Lease.TenantID, d.Lease.Holder = nil, nil, nil
 }
 
 func scanFleetDevice(sc scanner) (fleetDevice, error) {
@@ -131,24 +155,14 @@ func scanFleetDevice(sc scanner) (fleetDevice, error) {
 		d.Labels = json.RawMessage(labels)
 	}
 	if leaseID != nil {
-		d.Lease = &fleetLease{ID: *leaseID}
-		if fence != nil {
-			d.Lease.Fence = *fence
+		d.Lease = &fleetLease{
+			ID: leaseID, Fence: fence, JobID: jobID, TenantID: tenantID, Holder: holder,
 		}
 		if leaseState != nil {
 			d.Lease.State = *leaseState
 		}
 		if protected != nil {
 			d.Lease.Protected = *protected
-		}
-		if jobID != nil {
-			d.Lease.JobID = *jobID
-		}
-		if tenantID != nil {
-			d.Lease.TenantID = *tenantID
-		}
-		if holder != nil {
-			d.Lease.Holder = *holder
 		}
 		if acquiredAt != nil {
 			d.Lease.AcquiredAt = *acquiredAt
@@ -206,6 +220,7 @@ func (s *Server) handleFleet(w http.ResponseWriter, r *http.Request) {
 		pool   = queryString(r, "pool")
 		q      = queryString(r, "q")
 		limit  = queryInt(r, "limit", 1000, 1, 5000)
+		scope  = tenantScope(r.Context())
 	)
 
 	var (
@@ -242,16 +257,21 @@ func (s *Server) handleFleet(w http.ResponseWriter, r *http.Request) {
 		add("f.pool_id = $%d", pool)
 	}
 	if q != "" {
-		args = append(args, q)
-		n := len(args)
+		args = append(args, q, scope)
+		n, sc := len(args)-1, len(args)
+		// The holder and job_id halves of the search are confined to the
+		// caller's own leases. Without that, a tenant that cannot read another
+		// tenant's holder or job id from the grid could still ask "does any
+		// device match holder X" and learn it, one probe at a time.
 		conds = append(conds, fmt.Sprintf(`(
 		     f.farm_uid ILIKE '%%' || $%d || '%%'
 		  OR f.adb_serial ILIKE '%%' || $%d || '%%'
 		  OR f.model ILIKE '%%' || $%d || '%%'
 		  OR f.rack_slot ILIKE '%%' || $%d || '%%'
-		  OR f.holder ILIKE '%%' || $%d || '%%'
 		  OR f.device_id::text = $%d
-		  OR f.job_id::text = $%d)`, n, n, n, n, n, n, n))
+		  OR (($%d = '' OR f.tenant_id = $%d)
+		      AND (f.holder ILIKE '%%' || $%d || '%%' OR f.job_id::text = $%d)))`,
+			n, n, n, n, n, sc, sc, n, n))
 	}
 
 	where := ""
@@ -286,6 +306,9 @@ SELECT %s
 			s.fail(w, r, "scan fleet row", err)
 			return
 		}
+		// The counts below are taken before the mask and stay whole: how many
+		// devices are busy is a fact about the farm. Whose they are is not.
+		d.maskForTenant(scope)
 		devices = append(devices, d)
 
 		counts.Total++
@@ -385,6 +408,8 @@ func (s *Server) handleDevice(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, "get device", err)
 		return
 	}
+	scope := tenantScope(r.Context())
+	d.maskForTenant(scope)
 
 	hubs, err := s.hubHealth(r.Context(), derefString(d.HostID), hubKeyOf(d))
 	if err != nil {
@@ -396,7 +421,8 @@ func (s *Server) handleDevice(w http.ResponseWriter, r *http.Request) {
 		hub = &hubs[0]
 	}
 
-	attempts, err := s.recoveryAttempts(r.Context(), recoveryFilter{deviceID: d.DeviceID, limit: 20})
+	attempts, err := s.recoveryAttempts(r.Context(),
+		recoveryFilter{deviceID: d.DeviceID, tenant: scope, limit: 20})
 	if err != nil {
 		s.fail(w, r, "get device recovery history", err)
 		return
@@ -524,10 +550,10 @@ func (s *Server) handleDeviceExec(w http.ResponseWriter, r *http.Request) {
 			"this device holds a live lease; running a command on it can corrupt that job's run. "+
 				"Retry with \"force\": true and a reason if you mean to do it anyway.",
 			map[string]any{
-				"lease_id":  d.Lease.ID,
-				"job_id":    d.Lease.JobID,
-				"tenant_id": d.Lease.TenantID,
-				"holder":    d.Lease.Holder,
+				"lease_id":  derefString(d.Lease.ID),
+				"job_id":    derefString(d.Lease.JobID),
+				"tenant_id": derefString(d.Lease.TenantID),
+				"holder":    derefString(d.Lease.Holder),
 				"protected": d.Lease.Protected,
 			})
 		return
@@ -559,8 +585,8 @@ func (s *Server) handleDeviceExec(w http.ResponseWriter, r *http.Request) {
 		"forced":      req.Force,
 	}
 	if d.Lease != nil {
-		detail["lease_id"] = d.Lease.ID
-		detail["job_id"] = d.Lease.JobID
+		detail["lease_id"] = derefString(d.Lease.ID)
+		detail["job_id"] = derefString(d.Lease.JobID)
 	}
 	if res != nil {
 		detail["exit_code"] = res.ExitCode
@@ -630,7 +656,7 @@ func (s *Server) handleDeviceExec(w http.ResponseWriter, r *http.Request) {
 		DurationMS: elapsed.Milliseconds(),
 	}
 	if d.Lease != nil {
-		resp.LeaseID = d.Lease.ID
+		resp.LeaseID = derefString(d.Lease.ID)
 	}
 	writeJSON(w, http.StatusOK, resp)
 }

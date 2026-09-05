@@ -735,13 +735,13 @@ var commands = []command{
 	{"leases", "[--state s] [--host h] [--device d]", "who holds what", cmdLeases},
 	{"lease", "revoke <id> --reason r", "take a device back from its holder", cmdLease},
 	{"reaper", "[disable|enable --reason r]", "the kill switch for automatic reclamation", cmdReaper},
-	{"recovery", "[--outcome o] [--tier n] [--hub id] [--host h] [--device d] [--since d]", "the ladder, recent attempts, open quarantines", cmdRecovery},
+	{"recovery", "[--outcome o --tier n --hub id --since d]", "the ladder, recent attempts, open quarantines", cmdRecovery},
 	// Top-level rather than a `slot` sub-verb: the slot is the address, but
 	// the action is a rung of the recovery ladder with a hub-sized blast
 	// radius, and it belongs beside the other things that disturb hardware.
 	{"power", "<slot id> --reason r", "cycle VBUS on one slot through the host agent", cmdSlotPower},
 	{"bulk", "--selector k=v -- <command>", "one command across a selector, streamed", cmdBulk},
-	{"artifacts", "[--kind k] | gc [--apply --reason r] | delete <sha> --reason r", "the artifact store: list it, reclaim its disk, forget one", cmdArtifacts},
+	{"artifacts", "| gc [--apply] | delete <sha> --reason r", "the artifact store: list it, reclaim its disk, forget one", cmdArtifacts},
 	{"push", "<file> [--kind k] [--name n]", "upload an artifact", cmdPush},
 	{"watch", "", "follow the live event stream", cmdWatch},
 }

@@ -212,10 +212,18 @@ var recoveryTiers = []RecoveryTier{
 // Valid reports whether t is a known recovery tier.
 func (t RecoveryTier) Valid() bool { return containsKind(recoveryTiers, t) }
 
-// RecoveryTierFromLadder maps device_runtime.ladder_tier onto the named
-// tiers, clamping at both ends. Clamping rather than formatting the
-// integer keeps the label set bounded even if the ladder grows a rung
-// before this package learns its name.
+// RecoveryTierFromLadder names the rung a recovery attempt is being made at,
+// clamping at both ends. Clamping rather than formatting the integer keeps the
+// label set bounded even if the ladder grows a rung before this package learns
+// its name.
+//
+// It takes the tier BEING ATTEMPTED — internal/recovery passes the rung it
+// selected — and not farm.device_runtime.ladder_tier, which the name still
+// carries from when the two were the same number. They are not: the column
+// holds the lowest rung not yet spent, so passing it here would label every
+// attempt with the rung after the one that ran. Renaming the function would
+// churn a metric label helper for a comment's sake; saying so here costs
+// nothing and is what a caller needs to know.
 func RecoveryTierFromLadder(n int) RecoveryTier {
 	switch {
 	case n <= 0:

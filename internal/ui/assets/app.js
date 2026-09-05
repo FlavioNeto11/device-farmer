@@ -286,7 +286,9 @@ function normDevice(raw) {
     battery: pick(raw, 'battery_pct'),
     batteryTempDC: pick(raw, 'battery_temp_dc'),
     consecBad: pick(raw, 'consec_bad'),
-    ladderTier: pick(raw, 'ladder_tier'),
+    // The lowest rung NOT yet spent. The old name is kept as a fallback so
+    // this dashboard still reads a server that has not been updated.
+    nextLadderTier: pick(raw, 'next_ladder_tier', 'ladder_tier'),
     lastSeen: pick(raw, 'last_seen_at'),
     leaseID: L ? pick(L, 'id', 'lease_id') : pick(raw, 'lease_id'),
     fence: L ? pick(L, 'fence') : pick(raw, 'fence'),
@@ -1962,7 +1964,7 @@ function renderDeviceBody(d) {
     kv('since', d.healthSince ? el('span', null, fmtAbs(d.healthSince), ' (', fmtRel(d.healthSince), ')') : '—'),
     kv('adb_state', d.adbState), kv('battery', batteryEl(d.battery)),
     kv('battery temp', d.batteryTempDC !== undefined ? (Number(d.batteryTempDC) / 10).toFixed(1) + ' °C' : '—'),
-    kv('consecutive bad', d.consecBad), kv('ladder tier', d.ladderTier),
+    kv('consecutive bad', d.consecBad), kv('next recovery rung', d.nextLadderTier),
     kv('last seen', d.lastSeen ? fmtRel(d.lastSeen) : '—'),
     kv('quarantine', d.quarantineID ? String(d.quarantineID) + ' — ' + (d.quarantineReason || '') : 'none'));
 

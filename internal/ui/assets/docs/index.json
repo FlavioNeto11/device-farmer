@@ -35,10 +35,10 @@
       "label": "Recovery",
       "blurb": "The ladder, blast radius, quarantine and bulk",
       "title": "Recovery, quarantine, blast radius and bulk operations",
-      "summary": "The recovery ladder repairs devices underneath live leases. It reads farm.leases in exactly one function, only to decide whether it is allowed to act, and no code path in internal/recovery writes one. Every rung declares a blast radius and the minimum disruption_policy a live lease in that radius must carry; a rung that would reach a lease forbidding it is refused outright, recorded in farm.recovery_attempts.refusal, and the device stays broken until the work on it ends. Three things will cost you a night if you do not read the gaps first: host drain is not enforced by the allocator, tiers 3 and 4 cannot execute in any shipped deployment, and closing a quarantine does nothing unless the recovery loop is running.",
+      "summary": "The recovery ladder repairs devices underneath live leases. It reads farm.leases in exactly one function, only to decide whether it is allowed to act, and no code path in internal/recovery writes one. Every rung declares a blast radius and the minimum disruption_policy a live lease in that radius must carry; a rung that would reach a lease forbidding it is refused outright, recorded in farm.recovery_attempts.refusal, and the device stays broken until the work on it ends. All three of the things that used to cost you a night are fixed: host drain is enforced by the allocator; tiers 3 and 4 have a client, a column to find a host agent through, and a refusal that survives into farm.recovery_attempts.refusal instead of being flattened to failed; and closing a quarantine now finishes where the operator called it. POST /api/v1/quarantines/{id}/close writes farm.device_runtime.health and farm.devices.admin_state in the SAME transaction as closed_at and answers with devices_released and devices_reenabled, so a farm running no recovery role still gets its devices back. The ladder's own metrics reach /metrics too: the name collision that made recovery.Collectors() unregisterable is gone, and cmd/farmd/roles.go registers every package's group.",
       "sections": 15,
       "examples": 25,
-      "gaps": 11
+      "gaps": 10
     },
     {
       "area": "surface",

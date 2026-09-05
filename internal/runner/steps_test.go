@@ -420,7 +420,18 @@ func TestReattachNeverGuessesAbsentFromAnAnswerItDoesNotUnderstand(t *testing.T)
 		wantRetried bool
 		wantState   string
 	}{
-		{name: "the command finished while we were away", out: okShell("done\n"), wantResult: true, wantState: "done"},
+		{name: "the command finished while we were away", out: okShell("done 0\n"), wantResult: true, wantState: "done"},
+		// "done" on its own is no longer an answer. A detached command that
+		// started and then FAILED used to be indistinguishable from one that
+		// succeeded, so the wrapper publishes the exit status with the token
+		// and a bare "done" is now something we do not understand — which must
+		// be retried, never read as absent.
+		{
+			name:        "done, with no exit status behind it",
+			out:         okShell("done\n"),
+			wantErr:     true,
+			wantRetried: true,
+		},
 		{name: "the command is still running", out: okShell("running\n"), wantResult: true, wantState: "running"},
 		{name: "the device carries no trace of it", out: okShell("absent\n")},
 		{

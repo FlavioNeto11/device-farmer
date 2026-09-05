@@ -306,6 +306,14 @@ func runAPI(ctx context.Context, cfg *config.Config, log *slog.Logger, pool *pgx
 			a.RegisterBlobRoutes(mux)
 		}))
 	}
+	// The reaper's kill switch. It is mounted here rather than in the router's
+	// own table because farm.reaper_state governs the reclaim loop, and a farm
+	// running without a reaper still has to be able to read the switch and say
+	// why it moved.
+	opts = append(opts, api.WithRoutes(func(srv *api.Server, mux *http.ServeMux) {
+		srv.RegisterReaperAdmin(mux)
+	}))
+
 	// Authentication is a deployment decision, and it is decided by
 	// configuration rather than by this line.
 	//

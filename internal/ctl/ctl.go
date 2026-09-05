@@ -704,6 +704,7 @@ var commands = []command{
 	{"resets", "--profile p [--tier t]", "exactly what a reset tier will run, before it runs", cmdSpecResets},
 	{"leases", "[--state s] [--host h] [--device d]", "who holds what", cmdLeases},
 	{"lease", "revoke <id> --reason r", "take a device back from its holder", cmdLease},
+	{"reaper", "[disable|enable --reason r]", "the kill switch for automatic reclamation", cmdReaper},
 	{"recovery", "", "the ladder, recent attempts, open quarantines", cmdRecovery},
 	{"bulk", "--selector k=v -- <command>", "one command across a selector, streamed", cmdBulk},
 	{"artifacts", "", "what is in the artifact store", cmdArtifacts},

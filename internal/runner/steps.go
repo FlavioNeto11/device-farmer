@@ -310,6 +310,12 @@ type detachedPaths struct {
 	log    string // stdout and stderr
 	pid    string // the worker shell's own pid
 	dir    string
+
+	// handle is the spec's own token, unsanitised. The file names above are
+	// built from the sanitised form; this one is what a message shows a human,
+	// because an operator greps their spec for what they wrote, not for what
+	// the filename sanitiser made of it.
+	handle string
 }
 
 func detachedPathsFor(p jobspec.ShellDetached) detachedPaths {
@@ -321,6 +327,7 @@ func detachedPathsFor(p jobspec.ShellDetached) detachedPaths {
 		log:    dir + "/" + h + ".log",
 		pid:    dir + "/" + h + ".pid",
 		dir:    dir,
+		handle: p.Handle,
 	}
 }
 
@@ -389,6 +396,49 @@ func execShellDetached(ctx context.Context, e *env, st jobspec.Step) (*Result, e
 	}
 	res.Output = fmt.Sprintf("started detached: handle %s, log %s, result %s",
 		p.Handle, hp.log, hp.result)
+
+	// The launch is not the outcome, and until this probe existed nothing in
+	// the runner ever asked for the outcome. The exit status checked above is
+	// the WRAPPER's — "did the daemonising one-liner run" — and a command that
+	// starts and then dies immediately (a binary that is not on the device, a
+	// script that exits on its first line, a directory that is read-only for
+	// the thing being run) leaves that status at 0 and publishes its own,
+	// non-zero one milliseconds later. Nobody was reading it, so that job went
+	// on to sit in its wait_for until a timeout written for a six-hour soak.
+	//
+	// A probe that cannot reach the device is NOT a failure here, and that
+	// asymmetry is deliberate: the launch already exited 0, so the wrapper is
+	// on the device with the work, and the status file it publishes will still
+	// be there for the next thing that looks — a wait_for, or a resume's
+	// re-attach. Failing a step that did exactly what it was asked to do
+	// because a socket blinked immediately afterwards is the fusion of
+	// transport and outcome this whole package exists to prevent.
+	pr, perr := probeDetached(ctx, e, hp)
+	switch {
+	case perr != nil:
+		d["status_unknown"] = true
+		e.log.Warn("started the detached command but could not read its status file just afterwards; "+
+			"the command is running and the DEVICE keeps the answer, so this is not a failure",
+			"step", st.ID, "handle", p.Handle, "result_path", hp.result, "err", perr)
+	case pr.state == detachedDone:
+		// It finished between the launch returning and this probe. The result
+		// file is this command's own: detachedCommand removes any earlier one
+		// before it starts, in the same shell invocation that just exited 0.
+		code := pr.exitCode
+		res.ExitCode = &code
+		d["already_finished"] = true
+		d["exit_code"] = code
+		want := detachedExpectExit(e)
+		if !containsInt(want, code) {
+			res.Failure = fmt.Sprintf(
+				"the detached command finished immediately with exit status %d (expected %s); "+
+					"it did start, so this is the command's own verdict, not a transport failure — "+
+					"its output is on the device at %s",
+				code, formatInts(want), hp.log)
+			return res, nil
+		}
+		res.Output += fmt.Sprintf(" (already finished, exit status %d)", code)
+	}
 	return res, nil
 }
 
@@ -402,6 +452,11 @@ func execShellDetached(ctx context.Context, e *env, st jobspec.Step) (*Result, e
 // (nil, nil) when the device carries no trace of it — the previous process
 // died between writing the checkpoint and launching anything — and the step
 // then simply runs.
+//
+// A run that finished while we were away is JUDGED, not merely noticed. Its
+// exit status is the only thing anyone was waiting for, and re-attaching to a
+// six-hour soak that died in minute three and reporting that as a re-attached
+// step is a green job over a red run.
 func reattachDetached(ctx context.Context, e *env, st jobspec.Step) (*Result, error) {
 	p, err := payloadOf[jobspec.ShellDetached](st)
 	if err != nil {
@@ -409,45 +464,162 @@ func reattachDetached(ctx context.Context, e *env, st jobspec.Step) (*Result, er
 	}
 	hp := detachedPathsFor(p)
 
-	out, err := e.dev.Shell(ctx, fmt.Sprintf(
-		`if [ -f %s ]; then echo done; elif [ -f %s ]; then echo running; else echo absent; fi`,
-		dq(hp.result), dq(hp.log)))
+	pr, err := probeDetached(ctx, e, hp)
 	if err != nil {
+		// The question was never asked. It is asked again on the next pass of
+		// the retry loop this function is called from, INSIDE the lease, and
+		// the answer it is asking about is a file on the device that is not
+		// going anywhere.
 		return nil, err
 	}
-	if !out.Exited {
-		return nil, errors.New("shell stream ended without an exit status while re-attaching")
-	}
-	// Only the three tokens the probe can print are answers. Anything else —
-	// a shell error, a truncated read, an adb banner that got demultiplexed
-	// into stdout — is an answer we did not understand, and the one reading it
-	// must not turn into is "absent", which would start a second copy of a
-	// command that may well be running right now. It is returned as an
-	// ordinary transport failure instead, so the probe is simply asked again
-	// inside the lease; if the device keeps answering nonsense, the step's own
-	// timeout ends it, which is the correct outcome for "we cannot find out
-	// whether our work is running".
-	//
-	// The token is also never stored raw. It reaches farm.job_steps.detail,
-	// which is jsonb, and Postgres rejects the escape Go emits for a NUL with
-	// SQLSTATE 22P05 — one NUL out of a half-dead shell would cost the row
-	// that says what happened.
-	switch state := strings.TrimSpace(string(out.Stdout)); state {
-	case "absent":
+
+	if pr.state == detachedAbsent {
 		return nil, nil
-	case "done", "running":
-		res := &Result{Output: fmt.Sprintf("re-attached to detached handle %s (%s)", p.Handle, state)}
-		d := res.detail()
-		d["handle"] = p.Handle
-		d["result_path"] = hp.result
-		d["log_path"] = hp.log
-		d["reattached_state"] = state
-		return res, nil
-	default:
-		return nil, fmt.Errorf(
-			"re-attach probe for handle %s answered %q, which is none of done/running/absent",
-			p.Handle, firstLine(state))
 	}
+
+	res := &Result{}
+	d := res.detail()
+	d["handle"] = p.Handle
+	d["result_path"] = hp.result
+	d["log_path"] = hp.log
+	d["reattached_state"] = string(pr.state)
+
+	if pr.state == detachedRunning {
+		res.Output = fmt.Sprintf("re-attached to detached handle %s (running)", p.Handle)
+		return res, nil
+	}
+
+	code := pr.exitCode
+	res.ExitCode = &code
+	d["exit_code"] = code
+	res.Output = fmt.Sprintf("re-attached to detached handle %s: it had already finished with exit status %d",
+		p.Handle, code)
+	want := detachedExpectExit(e)
+	if !containsInt(want, code) {
+		// A verdict, not an error: the device ran the command and the command
+		// said no. Retrying cannot change a status that is already written to
+		// a file, and the step must not be repeated — its side effects have
+		// all happened.
+		res.Failure = fmt.Sprintf(
+			"the detached command for handle %s finished with exit status %d (expected %s) "+
+				"while this job was away; its output is on the device at %s",
+			p.Handle, code, formatInts(want), hp.log)
+	}
+	return res, nil
+}
+
+// detachedState is what the device's marks say about one handle.
+type detachedState string
+
+const (
+	detachedAbsent  detachedState = "absent"  // no trace: nothing was ever started
+	detachedRunning detachedState = "running" // a log, but no published status
+	detachedDone    detachedState = "done"    // a status file, and it has been read
+)
+
+// detachedProbe is one answer from [probeDetached]. exitCode is meaningful
+// only when state is detachedDone.
+type detachedProbe struct {
+	state    detachedState
+	exitCode int
+}
+
+// statusRe accepts what the wrapper writes into the result file and nothing
+// else. The value comes from `echo $?` in a POSIX shell, so it is one to three
+// digits; anything wider was not written by the command we started.
+var statusRe = regexp.MustCompile(`^[0-9]{1,3}$`)
+
+// maxProbeAnswer bounds the bytes of an answer that are parsed.
+//
+// A result file holds at most four bytes. Anything at that path longer than
+// this is not this wrapper's work, and splitting a megabyte of somebody else's
+// file into fields to discover that would be a pointless allocation about a
+// device that is already misbehaving. The cap cannot hide a valid answer: a
+// valid one is its first nine bytes.
+const maxProbeAnswer = 512
+
+// probeDetached asks the device what became of a handle, in one round trip.
+//
+// It is the function shell_detached turns on, and the reason it reads the
+// status in the SAME command that finds the file is a race: a probe that
+// answered "the result file is there" and a second call that read it could see
+// the file removed in between, and would then have to invent a verdict for a
+// state that never existed on the device. One question, one answer, one
+// snapshot of the device's own filesystem.
+//
+// A failure here is a failure to ASK, never an answer. It comes back as an
+// ordinary error so the caller retries it inside the lease — this is the whole
+// design of shell_detached: the device owns the outcome, so nothing that
+// happens to a socket can change what that outcome was, and the file will
+// still be there on the next poll.
+func probeDetached(ctx context.Context, e *env, hp detachedPaths) (detachedProbe, error) {
+	out, err := e.dev.Shell(ctx, fmt.Sprintf(
+		`if [ -f %s ]; then echo done; cat %s; elif [ -f %s ]; then echo running; else echo absent; fi`,
+		dq(hp.result), dq(hp.result), dq(hp.log)))
+	if err != nil {
+		return detachedProbe{}, err
+	}
+	if !out.Exited {
+		return detachedProbe{}, fmt.Errorf(
+			"shell stream ended without an exit status while probing detached handle %s", hp.handle)
+	}
+
+	raw := out.Stdout
+	if len(raw) > maxProbeAnswer {
+		raw = raw[:maxProbeAnswer]
+	}
+
+	// Only these three shapes are answers. Anything else — a shell error, a
+	// truncated read, an adb banner that got demultiplexed into stdout, a
+	// result file something other than this wrapper wrote — is an answer we did
+	// not understand, and the one reading it must not turn into is "absent",
+	// which would start a second copy of a command that may well be running
+	// right now. It is returned as an ordinary transport failure instead, so
+	// the probe is simply asked again inside the lease; if the device keeps
+	// answering nonsense, the step's own timeout ends it, which is the correct
+	// outcome for "we cannot find out what became of our work".
+	//
+	// The answer is also never stored raw. It reaches farm.job_steps.detail,
+	// which is jsonb, and Postgres rejects the escape Go emits for a NUL with
+	// SQLSTATE 22P05 — one NUL out of a half-dead shell would cost the row that
+	// says what happened. What is stored is a state token from the list above
+	// and an integer that matched statusRe; the unparsed text appears only in
+	// the error message below, through firstLine, which sanitises it.
+	fields := strings.Fields(string(raw))
+	switch {
+	case len(fields) == 1 && fields[0] == string(detachedAbsent):
+		return detachedProbe{state: detachedAbsent}, nil
+	case len(fields) == 1 && fields[0] == string(detachedRunning):
+		return detachedProbe{state: detachedRunning}, nil
+	case len(fields) == 2 && fields[0] == string(detachedDone) && statusRe.MatchString(fields[1]):
+		code, cerr := strconv.Atoi(fields[1])
+		if cerr != nil {
+			// Unreachable: statusRe admits at most three digits. Reported
+			// rather than ignored, because a silent zero here would be a
+			// failed run recorded as a successful one.
+			return detachedProbe{}, fmt.Errorf(
+				"detached handle %s published exit status %q, which does not parse: %w",
+				hp.handle, fields[1], cerr)
+		}
+		return detachedProbe{state: detachedDone, exitCode: code}, nil
+	default:
+		return detachedProbe{}, fmt.Errorf(
+			"the probe for detached handle %s answered %q, which is none of "+
+				"absent, running, or done followed by an exit status",
+			hp.handle, firstLine(string(raw)))
+	}
+}
+
+// detachedExpectExit is the set of exit codes a detached run may end with and
+// still be a success.
+//
+// jobspec.ShellDetached has no expect_exit of its own — the field exists on
+// Shell and not on it — so the spec-level default is the only statement its
+// author can make about what counts as success, and it is what applies here.
+// Hard-coding a second meaning of success for detached runs would judge the
+// same command differently depending on which step kind started it.
+func detachedExpectExit(e *env) []int {
+	return e.spec.ExpectExit(jobspec.Shell{})
 }
 
 var pidRe = regexp.MustCompile(`^[0-9]{1,10}$`)

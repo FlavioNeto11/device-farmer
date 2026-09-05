@@ -105,6 +105,15 @@ func newRegistry(log *slog.Logger) (*prometheus.Registry, error) {
 	// A metric naming collision must not take down a control plane. Every
 	// counter this fails to register is a graph an operator loses; every
 	// lease it would have protected is one it does not. Log it and carry on.
+	// The scrape path's own health, registered first so it is present even in a
+	// process whose package collectors are later refused.
+	if err := reg.Register(metricsListenerUp); err != nil {
+		var dup prometheus.AlreadyRegisteredError
+		if !errors.As(err, &dup) {
+			log.Error("could not register the metrics-listener gauge", "err", err)
+		}
+	}
+
 	if err := obs.RegisterAll(reg, log,
 		adbwire.Collectors(),
 		enroll.Collectors(),
@@ -162,8 +171,25 @@ func withMetrics(ctx context.Context, cfg *config.Config, log *slog.Logger, reg 
 
 	srv, ln, err := newMetricsServer(addr, reg)
 	if err != nil {
-		return err
+		// NOT fatal. A taken port is a monitoring fault, and killing the role
+		// over it converts one into an outage: a reaper that will not start is
+		// the only automatic release path gone, and a scheduler that will not
+		// start is a farm that places nothing. Neither is an improvement on a
+		// process nobody can scrape.
+		//
+		// It must not be silent either, because the failure mode it leaves
+		// behind — a role doing its work while invisible — is exactly the one
+		// this listener exists to end. So it is logged at Error and recorded
+		// on the registry; see metricsListenerUp for which of the two signals
+		// actually reaches a scraper for which role.
+		metricsListenerUp.Set(0)
+		log.Error("the metrics listener could not bind; this role is running and "+
+			"is not scrapeable, so alert on it through farm.component_heartbeat "+
+			"and /api/v1/capabilities until the port is free",
+			"err", err, "addr", addr, "env", config.EnvMetricsAddr)
+		return role(ctx)
 	}
+	metricsListenerUp.Set(1)
 	log.Info("metrics listening", "addr", ln.Addr().String(), "path", "/metrics")
 
 	served := make(chan struct{})
@@ -189,6 +215,30 @@ func withMetrics(ctx context.Context, cfg *config.Config, log *slog.Logger, reg 
 
 // newMetricsServer builds the metrics listener. Split out of withMetrics so a
 // test can bind it without running a role.
+// metricsListenerUp is 1 when this process bound its own /metrics listener and
+// 0 when it tried and could not.
+//
+// A gauge about the scrape path is only readable where the registry has a
+// second way out, and that is the case it is for: api, all and demo publish
+// this same registry on the API port, so a failed bind of the separate metrics
+// port shows up there as a 0 rather than as nothing at all.
+//
+// For a role with no HTTP surface of its own, a failed bind means nothing from
+// that process is scrapeable, and no gauge can say so from inside it. What says
+// so is the scraper: the pod stays in the metrics Service's endpoints —
+// publishNotReadyAddresses is set for this reason — so Prometheus keeps a
+// target for it and reports `up == 0`. That is the alertable signal, and the
+// Error log names the port so an operator knows which of the two they are
+// looking at.
+//
+// A plain gauge, not a vector: a vector with no children exports nothing, and
+// a rule over a series that does not exist never fires.
+var metricsListenerUp = prometheus.NewGauge(prometheus.GaugeOpts{
+	Namespace: "farm", Name: "metrics_listener_up",
+	Help: "1 when this process bound FARM_METRICS_ADDR, 0 when the bind failed. " +
+		"A bind failure is deliberately not fatal to the role.",
+})
+
 func newMetricsServer(addr string, reg *prometheus.Registry) (*http.Server, net.Listener, error) {
 	mux := http.NewServeMux()
 	mux.Handle("GET /metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{

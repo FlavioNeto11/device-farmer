@@ -277,6 +277,18 @@ role reclamation runs as.
 with fault injection for `FAIL` replies, mid-stream resets and hangs, plus a
 duplicate-serial fixture.
 
+`test/e2e` is the acceptance harness. It builds the shipped binary, creates and
+migrates a scratch database per scenario with `farmd migrate up`, seeds the
+physical tree, starts a `fakeadb` server per host, and then runs the roles the
+scenario asked for as **real processes** on ports it picks itself — so it fails
+when `cmd/farmd` wires the packages together wrongly, which is the one thing no
+in-process test can do. It needs a database and skips without one:
+
+```bash
+DATABASE_URL="postgres://farm@127.0.0.1:55432/postgres?sslmode=disable" \
+  go test -count=1 -v ./test/e2e/
+```
+
 ## Status
 
 Working and exercised end to end against simulated hardware: enrollment,

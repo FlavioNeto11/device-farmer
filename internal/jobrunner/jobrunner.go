@@ -162,6 +162,31 @@ var _ Executor = (*runner.Runner)(nil)
 // test can drive the whole loop against a fake device.
 type Dialer func(endpoint, devpath string) (runner.Conn, error)
 
+// leaseHolder is the part of *lease.Holder that ENDING a lease uses.
+//
+// It exists for the same reason lease.leaseOps does, and for the same single
+// decision: the refusal in releaseLease to release a lease this process was
+// fenced out of is the one line standing between a stale process and somebody
+// else's running job, and a line that can only be exercised against a live
+// Postgres and a real renewal loop is a line that never gets exercised.
+//
+// Notice what is absent. There is no Acquire, no Renew, no Witness and no
+// Stop: nothing reachable through this interface can start a lease, extend one
+// or take one over. It can ask whether we still hold the device, and it can
+// give one back — which is exactly the pair of facts every release site below
+// needs and nothing more.
+type leaseHolder interface {
+	// Fenced reports whether this process lost the lease. It is the only thing
+	// in the system that can tell two placements at one fence apart, because a
+	// re-attach hands the replacement the SAME fence.
+	Fenced() bool
+
+	// Release ends the lease with a reason the JOB produced.
+	Release(ctx context.Context, reason lease.ReleaseReason, rearm time.Duration) (bool, error)
+}
+
+var _ leaseHolder = (*lease.Holder)(nil)
+
 // Config is the loop's wiring. Pool, Store, Runner, Holder and HolderInstance
 // are required.
 type Config struct {
@@ -1017,7 +1042,7 @@ func (jr *JobRunner) requeueOrphan(ctx context.Context, log *slog.Logger, jobID 
 // position forever, and farm.job_attempts would show nothing, because no
 // attempt was ever opened. The event row below is the evidence in its place.
 func (jr *JobRunner) unaddressable(ctx context.Context, log *slog.Logger,
-	h *lease.Holder, job jobRow, l lease.Lease, reason string) {
+	h leaseHolder, job jobRow, l lease.Lease, reason string) {
 
 	if h.Fenced() {
 		// We lost the lease while working this out, so both halves below are
@@ -1054,7 +1079,7 @@ func (jr *JobRunner) unaddressable(ctx context.Context, log *slog.Logger,
 // unwind releases the lease of a job that reached a terminal state elsewhere.
 // It mirrors the scheduler's own unwind: the reason comes from the job, never
 // from anything observed about the device.
-func (jr *JobRunner) unwind(ctx context.Context, log *slog.Logger, h *lease.Holder, state string) {
+func (jr *JobRunner) unwind(ctx context.Context, log *slog.Logger, h leaseHolder, state string) {
 	var reason lease.ReleaseReason
 	switch state {
 	case "cancelled":
@@ -1077,7 +1102,7 @@ func (jr *JobRunner) unwind(ctx context.Context, log *slog.Logger, h *lease.Hold
 // such a release raises check_violation instead of quietly destroying hours of
 // work. That refusal is logged as the caller's bug it would be.
 func (jr *JobRunner) releaseLease(ctx context.Context, log *slog.Logger,
-	h *lease.Holder, reason lease.ReleaseReason) {
+	h leaseHolder, reason lease.ReleaseReason) {
 
 	// This check is load-bearing, and it is the one thing standing between a
 	// fenced process and somebody else's running job.

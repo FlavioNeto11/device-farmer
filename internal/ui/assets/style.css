@@ -501,6 +501,22 @@ details summary:focus-visible { outline: 2px solid var(--accent); }
   max-width: 90ch;
 }
 .doc-warn-glyph { color: var(--warn); font-weight: 700; line-height: 1.4; }
+/* The retry on a failed area fetch, and the line explaining why it is worth
+   pressing. A transient fetch failure used to be permanent for the tab. */
+.doc-retry {
+  margin-top: 0.6rem;
+  padding: 0.3rem 0.75rem;
+  font: inherit;
+  font-size: 0.85rem;
+  color: var(--text);
+  background: var(--panel);
+  border: 1px solid var(--line-2);
+  border-radius: 4px;
+  cursor: pointer;
+}
+.doc-retry:hover { background: var(--panel-2); }
+.doc-warn-hint { margin-top: 0.35rem; font-size: 0.85rem; opacity: 0.8; }
+
 .doc-warn-title { font-weight: 600; margin-bottom: .15rem; }
 .doc-warn-fix   { color: var(--dim); margin-top: .3rem; font-size: .9rem; }
 

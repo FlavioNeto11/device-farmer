@@ -148,6 +148,32 @@ func newRegistry(log *slog.Logger) (*prometheus.Registry, error) {
 		}
 	}
 
+	// The runtime and the process itself. internal/obs deliberately leaves
+	// these to the binary — they describe a PROCESS, not the farm — and the
+	// binary is here, so this is where they go.
+	//
+	// They are what tells "the reaper is quiet because nothing is reclaimable"
+	// from "the reaper is quiet because it is wedged on a goroutine leak", and
+	// what puts a number on an OOM before the pod restarts and takes its
+	// evidence with it. Registered on the same registry as everything else, so
+	// they arrive through the same scrape and carry the same role label.
+	//
+	// Errors are logged rather than returned, for the reason the whole function
+	// gives: a metrics fault must not stop a control plane.
+	for _, c := range []prometheus.Collector{
+		collectors.NewGoCollector(),
+		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
+	} {
+		if err := reg.Register(c); err != nil {
+			var dup prometheus.AlreadyRegisteredError
+			if !errors.As(err, &dup) {
+				log.Error("could not register a runtime collector; this process is "+
+					"scrapeable but its own goroutines, heap and file descriptors are not",
+					"err", err)
+			}
+		}
+	}
+
 	if err := obs.RegisterAll(reg, log,
 		adbwire.Collectors(),
 		chargepolicy.Collectors(),

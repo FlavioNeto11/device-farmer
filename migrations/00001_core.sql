@@ -16,6 +16,31 @@
 -- unrepresentable. See 00002_lease.sql.
 -- =====================================================================
 
+-- ---------------------------------------------------------------------
+-- The version floor, stated once and enforced before anything is created.
+--
+-- 14 is not a guess. farm.lease_acquire and the reaper's sweeps are written
+-- as one statement each around a CTE that UPDATEs and RETURNs, and they take
+-- their rows with FOR UPDATE SKIP LOCKED; the partial unique indexes that make
+-- "one live lease per device" a schema fact, the GENERATED columns, and the
+-- ltree ancestry all predate 14, but 14 is the oldest release still receiving
+-- fixes when this line was written, and running a farm's allocator on an
+-- unpatched database is not a saving.
+--
+-- Refused here rather than reported later: a schema that half-applies against
+-- an old server leaves an operator reading an error about a missing operator
+-- class, three migrations from the cause.
+DO $version$
+BEGIN
+  IF current_setting('server_version_num')::int < 140000 THEN
+    RAISE EXCEPTION
+      'device-farmer needs PostgreSQL 14 or newer; this server is %. '
+      'The compose file and the Helm chart both pin 17, which is what the '
+      'assertion suites and CI run against.', current_setting('server_version');
+  END IF;
+END
+$version$;
+
 CREATE SCHEMA IF NOT EXISTS farm;
 CREATE EXTENSION IF NOT EXISTS pgcrypto;  -- gen_random_uuid
 CREATE EXTENSION IF NOT EXISTS ltree;     -- USB ancestry as a prefix relation

@@ -154,6 +154,11 @@ Scale `jobrunner` freely: jobs are claimed with `SKIP LOCKED` and a lease is
 re-attached by `job_id`, so two replicas never fight over one device. The
 `reaper` elects itself with a Postgres advisory lock; a second replica idles.
 
+**PostgreSQL 14 or newer.** `migrations/00001_core.sql` refuses an older server
+before it creates anything, rather than failing three migrations later on a
+missing feature. `docker-compose.yml`, the Helm chart and CI all run 17, which
+is the version the assertion suites are checked against.
+
 ### 3. Submit work
 
 A job is an ordered list of typed steps against an abstract device. The

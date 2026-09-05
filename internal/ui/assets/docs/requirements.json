@@ -1,7 +1,7 @@
 {
   "area": "requirements",
   "title": "Every requirement raised for this system, where it came from, and whether it holds",
-  "summary": "One hundred and one requirements — functional and non-functional — mined from nine commits, the 88 gap entries on the six pages beside this one, the migrations that are the real contract, and three external findings that never touched the code. Each carries an origin, a status verified against this tree rather than copied from the commit that claimed it, and the command that decided it.\n\nRead it for three things the area pages cannot show. The couplings: one guard in `runNode` is the sole blocker under four separate requirements, which makes `OPS-04` the cheapest fix in the register and the one that unblocks the most. The wrong remedies: three surfaces tell an operator that something is protected when it is not — the printed auth fix, the revoke response's host proxy, and a reset step that reports `ok` while cleaning nothing — and a wrong remedy is worse than a documented absence. And the requirements with no code at all: managed device clouds are excluded by four suppliers' contracts, and the fire mitigation this rack needs turns out to be a `dumpsys battery` call that nobody has written.",
+  "summary": "One hundred and one requirements — functional and non-functional — mined from nine commits, the 88 gap entries on the six pages beside this one, the migrations that are the real contract, and three external findings that never touched the code. Each carries an origin, a status verified against this tree rather than copied from the commit that claimed it, and the command that decided it.\n\nSixty-nine rows are `met` outright and eight more are `met` in one dimension and open in another. Twenty-one remain genuinely open, and the honest headline is what separates them: six need a rack. `farmd node` reads `/sys` and stops at USB discovery anywhere but Linux, so USB reset, VBUS power switching and the fence proxy's host half are written, tested against `fstest.MapFS` and `test/fakeadb`, and have never met a phone. Nine more are reporting — an operator can find out what happened, sometimes only through `psql`. Six are named and deliberately not done.\n\nRead it for three things the area pages cannot show. The couplings: `OPS-04` was one guard in `runNode` blocking four separate requirements, which is why it led the list and why four rows moved with it. The wrong remedies — a surface that tells an operator something is protected when it is not is worse than a documented absence, and this register found four of them. And the requirements with no code at all: managed device clouds are excluded by four suppliers' contracts, so owning the hardware is the path.",
   "sections": [
     {
       "heading": "Why this page exists, and what a status means on it",
@@ -46,8 +46,8 @@
       "source": "REQUIREMENTS.md"
     },
     {
-      "heading": "Last re-verified: against HEAD, 2026-09-04 — 36 rows moved",
-      "body": "Against `HEAD`, 2026-09-04. **Thirty-six rows moved**, and the reason is worth stating because it is a property of a register rather than an accident: this file was written on a tree that did not yet contain migration `00005`, the two commits that closed the blocking gaps, or the nine branches that were open when it was written. A status column is a claim about a tree, and it decays the moment the tree moves. Thirteen rows became `met`, four became `linux_only` (built, reachable only from a Linux host, and never observed there), one became `decided` and the rest had their evidence corrected while keeping their status.\n\nThe single largest cause was `OPS-04`. It predicted that making `farmd node` startable would unblock four rows and cost one guard; it did, and they are `DEV-04`, `DEV-05`, `REC-03` and `HW-06`. The row that had to be *reopened* is none of them: `LEASE-09` went from `not_built` to `partial` because a witness loop and an on-device marker were both built and nothing starts either, which is a more specific and more embarrassing state than absence.\n\nEvery moved row names the file or migration that moved it, so a reader can re-run the check rather than trust the verdict.",
+      "heading": "Last re-verified: against HEAD, 2026-09-05 — 30 rows moved",
+      "body": "Against `HEAD`, 2026-09-05, after thirty branches landed. **Thirty rows moved**,\nall of them forward, and the count is worth stating for the same reason as last\ntime: a status column is a claim about a tree, and this one had moved a long\nway under the file. Sixty-nine rows are now `met` outright and eight more are\n`met` in one dimension and open in another; twenty-one remain genuinely open,\nand four of those are `linux_only` — built, reachable only from a Linux host,\nand never observed there, because this tree has never been run against a rack.\n\nSix of the moves close the things a reader would have called the project\nunfinished for:\n\n- **`LEASE-09`** — the witness. Every part existed and nothing started it, which\n  was the last unwired half of the #663 countermeasure. The jobrunner starts a\n  marker and a witness loop per placement now, and it was watched doing it:\n  `farm.leases.witness_at` set thirty seconds into a hundred-second step, with\n  `reclaimable_at` pushed forty-five minutes out.\n- **`LEASE-05`** — the reaper's blind spot. A watched component that had never\n  written a heartbeat contributed nothing to the `min()`, so a role dead since\n  boot refunded nothing. It now refuses to arm and names the component.\n- **`LEASE-03`** — the role firewall, which was correct DDL nothing assumed.\n  `FARM_DB_ROLE` assumes it, and `test/assertions_v15.sql` runs each loop's\n  whole pass as its own role to prove the reaper cannot read health and the\n  watchdog cannot read leases.\n- **`SEC-04`** — the fence proxy, both halves, off unless configured.\n- **`SEC-07`** — tenant scope, with a test that fails the BUILD on a\n  tenant-readable route whose handler never calls `tenantScope`. It caught a\n  route added by another branch during the merge, which is the only kind of\n  evidence a guard like that can offer.\n- **`REC-08`** — closing a quarantine finishes in its own transaction instead of\n  waiting for a recovery cycle that a farm might not be running.\n\nTwo rows moved because the register was WRONG rather than because the tree\nchanged: `JOB-06` and `JOB-07` were `not_built` against a tree that already had\nthem. `TEST-04` and `TEST-05` were nearly the same story. A register that is\nonly ever revised downward is not being checked.\n\nEvery moved row names the file, migration or live observation that moved it, so\na reader can re-run the check rather than trust the verdict.\n\n### What is still open\n\nTwenty-one rows. They fall into three groups, and only the third is work\nanybody can do at a desk:\n\n**Needs a rack** — `DEV-04`, `DEV-05`, `REC-03`, `OPS-04`, `HW-05`, `JOB-04`.\n`farmd node` reads `/sys` and stops at USB discovery anywhere but Linux, and\nnothing in this tree has been run against a real handset. The code is there and\nthe tests cover it against `fstest.MapFS` and `test/fakeadb`; none of that is a\nphone. The eight rows marked `met` in one dimension — `LEASE-07`, `LEASE-11`,\n`REC-02`, `REC-06`, `SEC-04`, `HW-02`, `HW-03`, `HW-06` — are mostly this same\nsentence said about a narrower thing.\n\n**Reporting and small surfaces** — `LEASE-14`, `JOB-08`, `JOB-10`, `API-06`,\n`API-07`, `SEC-03`, `OBS-10`, `TEST-02`, `TEST-03`. An operator can find out\nwhat happened, but sometimes only through `psql`.\n\n**Named and deliberately not done** — `LEASE-10`, `LEASE-13`, `DEV-02`,\n`DEV-07`, `JOB-03`, `SEC-05`. Each row says why.",
       "source": "REQUIREMENTS.md"
     },
     {
@@ -81,21 +81,21 @@
             "A lease ends when the job says so, when a written-down deadline elapses, or when a human takes it back. Never because of connectivity.",
             "`README`, `c:9ab3520`, STF #663",
             "`met`",
-            "`farm.leases.release_reason` is CHECK-constrained to seven values with no connectivity term. Unrepresentable, not handled."
+            "`farm.leases.release_reason` is CHECK-constrained to seven values with no connectivity term (`migrations/00001_core.sql`). The failure is unrepresentable, not handled."
           ],
           [
             "LEASE-02",
             "Lease liveness, job liveness and device health are three clocks, separated by table, by function and by Postgres role.",
             "`c:9ab3520`",
             "`met`",
-            "Distinct tables with distinct writers; `internal/watchdog` has no lease write path; `obs.TransportBlip` takes no lease identifier and returns nothing, so transport code has no value to branch on."
+            "`farm.leases` and `farm.device_runtime` are distinct tables with distinct writers; `internal/watchdog` has no lease write path; `internal/obs.TransportBlip` takes no lease identifier and returns nothing, so transport code has no value to branch on."
           ],
           [
             "LEASE-03",
             "Reclamation must be structurally unable to read device health.",
             "`c:9ab3520` (BLOCKER 3)",
-            "`partial`",
-            "The DDL is right — function-level `SET role = farm_reaper` plus a revoked SELECT. Nothing assumes it: no Go code issues `SET ROLE`, the roles are `NOLOGIN`, the demo connects as a superuser. What actually holds is the Go import barrier. `gap:lease.10`"
+            "`met`",
+            "`FARM_DB_ROLE` makes a process assume the role. `openPool` (`cmd/farmd/roles.go`) runs `SET ROLE` in `AfterConnect`, once per physical connection, and refuses at startup when the login user is not a member. `migrations/00015_runtime_roles.sql` grants `farm_reaper`, `farm_scheduler` and `farm_watchdog` to the login user and completes the grants each loop needs to run WHOLE. Proven, not asserted: `test/assertions_v15.sql` runs the reaper's entire pass as `farm_reaper` (R1 shows `SELECT` on `farm.device_runtime` raising `insufficient_privilege`) and the watchdog's as `farm_watchdog` (W1 shows the same on `farm.leases`), and Z1 shows that whole pass ending no lease. It is opt-in per process and refused for `all` and `demo`, because one pool serving six roles cannot assume one role."
           ],
           [
             "LEASE-04",
@@ -108,22 +108,22 @@
             "LEASE-05",
             "A control-plane outage is refunded to the tenant, computed across every component on the renewal path.",
             "`c:9ab3520` (BLOCKER 8)",
-            "`partial`",
-            "`farm.reaper_arm` computes the gap correctly for the components it is given, and two of the three holes are closed: `jobrunner` is in `DefaultReaperComponents` (`internal/config/config.go:145`), and `FARM_COMPONENT` now reaches every role through `ComponentFor`, so a name added to the watch list is actually written. One hole left: a watched component that has *never* beaten contributes nothing to the `min()` rather than reading as infinitely stale, so a role that has been dead since boot refunds nothing. `gap:operate.6`"
+            "`met`",
+            "`migrations/00012_reaper_arm_unbeaten.sql` rewrites `farm.reaper_arm` to `unnest` the watch list and LEFT JOIN the heartbeats, so a component with no row is visible instead of dropping out of the `min()`. It returns `TABLE(armed, gap, unbeaten)`; a watched name that has never beaten refuses the arm, writes `reaper_state.last_refusal`, and nothing is reclaimed until it beats. Verified live on the demo: `farm.reaper_arm(ARRAY['reaper','api','ghost_component'], '60s')` returns `f | 00:00:00 | {ghost_component}` and the refusal text names the component and says why silence cannot be told from an outage. `test/assertions_v12.sql` and `test/assertions_v15.sql` (R3, R7) cover both directions."
           ],
           [
             "LEASE-06",
             "Every mutating lease function matches on `(id, fence)`, so a stale holder's write is rejected in the database.",
             "`c:9ab3520`",
             "`met`",
-            "`test/assertions.sql` proves the pod-eviction re-attach at an unchanged fence."
+            "`migrations/00002_lease.sql`; `test/assertions.sql` proves the pod-eviction re-attach at an unchanged fence."
           ],
           [
             "LEASE-07",
             "A zero-row renew (fenced, terminal) must never be conflated with a transient database error (retry).",
             "`c:8adcc51`",
-            "`met` in code, untested",
-            "`internal/lease/holder.go` splits `ErrFenced` from transient; the API splits 410 from 503. The branch its own comment calls the single most consequential decision in the project has no test — `leaseOps` exists so a stub could drive it and nothing does. `gap:lease.6`"
+            "`met` in code, `not_built` in test",
+            "`internal/lease/holder.go` distinguishes `ErrFenced` from a transient error, and the API distinguishes 410 from 503. The branch its own doc comment calls \"the single most consequential decision in this project\" has no test: the `leaseOps` interface exists so a stub can drive it, and nothing does. `gap:lease.6`"
           ],
           [
             "LEASE-08",
@@ -136,22 +136,22 @@
             "LEASE-09",
             "A job demonstrably alive on the device but blind to the control plane can extend its lease.",
             "`schema`, `gap:lease.4`",
-            "`partial`",
-            "Every part now exists and nothing starts it. `internal/lease/witness.go` is the loop, `internal/runner/witness.go` is the on-device marker that supplies its evidence, and `Holder.StartWitness` joins them — but every call site of `StartWitness` in the tree is a test, so no role presents a witness in a running farm. `config.Summary()` says so at startup (`NOT STARTED`) rather than printing the interval as though it were in force. This is the last unwired half of the #663 countermeasure: without it a control-plane outage longer than TTL+grace still costs a working job its device. `gap:lease.9`"
+            "`met`",
+            "The jobrunner starts a marker and a witness loop for every placement (`internal/jobrunner/witness.go`, called from `runJob`), and the three cadences derive from `FARM_LEASE_WITNESS_INTERVAL` by one rule that `New` refuses to have set by hand. A marker that cannot be built does not refuse the placement — the job runs on ttl+grace and `farm_jobrunner_witnessless_total` counts it — because refusing here would turn a missing safeguard into the harm it exists to prevent. Proven live on 2026-09-05 with `FARM_LEASE_WITNESS_INTERVAL=30s` and a 100-second step: lease placed at 17:19:08, `farm.leases.witness_at` set at 17:19:38 with `witness_extensions=1`, `reclaimable_at` pushed to 18:04:08, and `farm_jobrunner_witness_total{outcome=\"accepted\"} 1`."
           ],
           [
             "LEASE-10",
             "A protected lease is never auto-reclaimed; it is held and a human is paged.",
             "`schema`, `gap:lease.7`",
             "`partial`",
-            "The behaviour is correct. Its regression test is not watching it: P10 cannot move `expires_at` backwards, so both functions match zero rows and the assertion passes trivially. And nobody is paged — see `OBS-08`."
+            "The behaviour is correct — proved separately by inserting leases with past deadlines. Its regression test is not watching it: assertion P10 cannot move `expires_at` backwards (the guard trigger forbids it), so `lease_mark_suspect` and `lease_reclaim` both match zero rows and the assertion passes trivially. Deleting `AND l.protected = false` from `lease_reclaim` would not fail the suite. And nobody is paged: \"hold and page\" is one WARN line plus two unexported counters."
           ],
           [
             "LEASE-11",
             "The automatic release path has an operator-reachable kill switch.",
             "`schema`, `gap:lease.12`",
-            "`not_built`",
-            "`farm.reaper_state.enabled` is read on every `lease_reclaim` and written by no route, no `ctl` command and no dashboard control. Turning the reaper off is a hand-written UPDATE with no audit row — and it does not stop `max_runtime`."
+            "`met` for reclamation; `decided` for `max_runtime`",
+            "`GET /api/v1/reaper`, `POST /api/v1/reaper/disable` and `/enable` are operator routes (`internal/api/reaper_admin.go`), each requiring a reason and writing `farm.audit_log`; `ctl reaper [disable|enable --reason r]` drives them. `max_runtime` deliberately does NOT answer the switch: it is a deadline the USER wrote down, which the founding invariant names as a legitimate ending. The switch is for RECLAMATION — an ending the user did not write — and the endpoint's own note says so."
           ],
           [
             "LEASE-12",
@@ -165,14 +165,14 @@
             "`FARM_REAPER_COMPONENTS` cannot be set to something that fuses the health clock into the lease clock.",
             "`c:9ab3520`, `gap:lease.11`",
             "`partial`",
-            "The config refuses to omit a renewal-path component and never refuses to add one. Adding `watchdog` makes a health-plane outage extend every lease in the farm. Prohibited in two doc comments, enforced nowhere."
+            "The config refuses to *omit* a renewal-path component. Nothing refuses to *add* one. Adding `watchdog` — which reads like more thorough monitoring — makes a health-plane outage extend every lease in the farm, which is the exact fusion this system exists to prevent. Prohibited in two doc comments, enforced nowhere."
           ],
           [
             "LEASE-14",
             "The way a lease ended is recoverable from an event log at 3am.",
             "`gap:lease.2`",
             "`partial`",
-            "1239 leases with `released_at` set; 0 `lease_released` events, 0 `lease_reclaimed`, 1 `lease_revoked`. The sweep writes no event. The authoritative record is `farm.leases.state` plus `release_reason`; `farm.events` is commentary."
+            "`farm.events` is not that log. Measured: 1239 leases with `released_at` set, 0 `lease_released` events, 0 `lease_reclaimed`, 1 `lease_revoked`. `sweepMaxRuntime` writes no event at all, and the 1637 `lease_acquired` rows were written by the demo. The authoritative record is `farm.leases.state` plus `release_reason`."
           ]
         ]
       },
@@ -195,7 +195,7 @@
             "Every call that targets a physical position is addressed by USB devpath, never by serial.",
             "`README`, `c:8adcc51`",
             "`met`",
-            "`internal/adbwire` has zero internal dependencies and a test that fails the build if allocation vocabulary appears in it — it caught a comment its own author wrote. A clone test asserts a devpath-addressed command reaches exactly one of two devices sharing `0123456789ABCDEF`."
+            "`internal/adbwire` has zero internal dependencies and a test that fails the build if allocation vocabulary appears anywhere in it — it caught a comment its own author wrote. A clone test asserts a devpath-addressed command reaches exactly one of two devices sharing `0123456789ABCDEF`."
           ],
           [
             "DEV-02",
@@ -208,8 +208,8 @@
             "DEV-03",
             "A device sharing a serial with another is flagged durably, not just logged.",
             "`schema`, `gap:devices.11`",
-            "`partial`",
-            "`serial_ambiguous` is written only from inside `farm.resolve_device`. The watchdog and enroller only log. On any farm where enrollment is not running — every farm today — a new clone pair produces a log line and no durable flag."
+            "`met`",
+            "`farm.resolve_device` (`migrations/00011_resolve_ambiguous.sql`) writes `farm.devices.serial_ambiguous` on BOTH rows of a clone pair, and the next pass resolves each by brand. Now covered: `internal/enroll` has 24 tests over `Probe`, `HardwareFingerprint`, `parseProps` and `Brander.Read/Brand/Rebrand` against `test/fakeadb`, including `TwoClonesFixture`, plus `EnrollOnce` against a scratch database exercising adoption, re-sighting and the ambiguous case; `internal/topo` has 18 over `FromFS(fstest.MapFS)`, the hub plan and the labeller. `internal/adbwire/device.go`'s doc no longer credits the watchdog with a write it never made."
           ],
           [
             "DEV-04",
@@ -229,50 +229,50 @@
             "DEV-06",
             "A hub without per-port switching gets ONE ganged power domain, so the ladder cannot cycle seven devices to fix one.",
             "`c:91f3aa2`, `README`",
-            "`met` in schema",
-            "The model is right. The demo seed gives every hub one domain including hubs whose kind is `per_port`, so tier 4's blast radius is the whole hub on hardware that could switch one port. `gap:recovery.15`"
+            "`met`",
+            "`farm.power_domains` models what one switch controls, and the seed now gives a `per_port` hub one domain PER PORT and a ganged hub exactly one (`internal/demo/seed.go`). Before this the demo gave every hub a single domain whatever its hardware, so tier 4's blast radius was seven ports on per-port hardware and a neighbour's `no_disruption` lease refused a cycle that would physically have disturbed one. Verified live: `ctl slot list --host h01` shows `per_port (uhubctl)` per position."
           ],
           [
             "DEV-07",
             "A slot is marked, never deleted, and a hub that vanishes is reconciled.",
             "`schema`, `gap:devices.6`",
             "`not_built`",
-            "Marking works; reconciliation is off everywhere. `topo.Config`'s `RetireVanished`, `Overrides`, `AdoptEmpty`, `MinPorts`, `DryRun` and `MaxRetireFraction` are wired to no config field or flag. A hub you unplug leaves its slots `active` forever."
+            "Marking works. Reconciliation is off in every shipped deployment: `topo.Config`'s `RetireVanished`, `Overrides`, `IncludeRootHubs`, `AdoptEmpty`, `MinPorts`, `DryRun` and `MaxRetireFraction` are wired to no config field or flag. A hub you unplug leaves its slots `active` forever."
           ],
           [
             "DEV-08",
             "An operator can register a slot, re-slot a device or rebrand one without hand-written SQL.",
             "`gap:devices.7`",
-            "`not_built`",
-            "`farm.register_slot` is SQL-only; `enroll.Brander.Rebrand` has no callers. The brand-conflict error tells the operator a human must retire one of the rows and gives them no command with which to do it."
+            "`met`",
+            "`internal/api/slots.go` serves `GET /api/v1/slots`, `POST /api/v1/slots` (`farm.register_slot`), `POST /slots/{id}/label`, `POST /devices/{id}/reslot` and `/rebrand`; `migrations/00017_reslot.sql` adds `farm.reslot_device` and `farm.relabel_slot` with an occupancy check and an audit row. Every verb is operator-gated, requires a reason, and refuses while the device holds a live lease — nothing here can end one. `ctl slot list|register|label|reslot|rebrand` drives them; `test/assertions_v17.sql` covers the SQL. Verified live: `ctl slot list --host h01`."
           ],
           [
             "DEV-09",
             "Battery state of charge, battery temperature and the charge gate are collected per device.",
             "`schema`, `research:lithium`",
-            "`unverified`",
-            "`internal/watchdog/battery.go` is the producer that was missing: the watchdog polls `dumpsys battery` on its own ticker — separate from its connection-state write path, which is edge-triggered and could not carry a level-triggered poll — and writes `battery_pct` and `battery_temp_dc`. `migrations/00010_battery_temp_check.sql` adds the CHECK the temperature column never had. Exercised against the fake ADB server and never against a handset. `charge_gate` still has no writer: that is the charge-policy loop, which needs the parked state (now built) under it."
+            "`met`",
+            "Collected and now acted on. `migrations/00016_battery_readings.sql` adds `farm.battery_readings` with a retention function, the watchdog writes the series beside the columns, and `internal/watchdog/swell.go` flags a temperature rise, an absolute ceiling and an idle-drain rate as `farm.events` kind `battery_anomaly` carrying `rack_slot`, because a human walks to a position. `internal/chargepolicy` holds idle devices inside a 40–80% band. `test/assertions_v16.sql` covers the schema."
           ],
           [
             "DEV-10",
             "Health is a token bucket, not a raw counter, so a device cannot flap on every blip.",
             "`schema`, `c:5acd825`",
-            "`partial`",
-            "The damper is implemented and asymmetric by design. On the demo `farm.device_runtime` has two writers with different rules, and the simulator ignores `suppress_until` entirely — so every `degraded` row you can see here came from the simulator. `gap:devices.9`"
+            "`met`",
+            "One damper, in one place: `internal/watchdog/damper.go` owns the token bucket (cap 10, refill 1/min) and `watchdog.DamperSQL` is the single statement both the watchdog and the simulator run, so the demo can no longer show hysteresis the product does not have. The simulator also honours `suppress_until` now and opens recovery attempts with it set, as the real ladder does, so an induced transport drop is no longer fed back to the observer as evidence of a broken phone."
           ],
           [
             "DEV-11",
             "The ADB host protocol and the sync protocol are spoken natively, with no shelling out to `adb`.",
             "`c:8adcc51`, `c:cf1b690`",
-            "`partial`",
-            "Both implemented; the sync work found the per-transfer context was decorative, so against a silent device a step's timeout could never fire. SEND, RECV, LSTAT_V1 and QUIT only: no enumeration, no mkdir, and `FileInfo.Size` truncates from a `uint32` above 4 GiB. `gap:devices.12`"
+            "`met`",
+            "`internal/adbwire/sync_list.go` speaks `LIST`/`DENT` natively (`SyncConn.List`) and `Client.MkdirAll` creates a push's parent directory with a validated path; `test/fakeadb` answers `LIST`. Nothing shells out to `adb`. `internal/runner/steps.go` creates the parent before a push, and after a failure that aborts a job every remaining step is written to `farm.job_steps` as `skipped` with a reason, so the job's step list is complete rather than trailing off."
           ],
           [
             "DEV-12",
             "The health plane can never touch a lease.",
             "`c:9ab3520`, `cap:features`",
             "`met`",
-            "`REVOKE ALL ON farm.leases FROM farm_watchdog` plus the Go import barrier. See `LEASE-03` for why the first half binds nothing at runtime; the second half holds."
+            "`REVOKE ALL ON farm.leases FROM farm_watchdog`, plus the Go import barrier. See LEASE-03 for why the first half binds nothing at runtime; the second half holds."
           ]
         ]
       },
@@ -311,21 +311,21 @@
             "A transport failure inside a step is retried inside the lease, bounded only by a deadline the job's author wrote down.",
             "`README`, `c:5acd825`, `c:cf1b690`",
             "`met`",
-            "Observed: a job survived 8 ADB transport blips across 4 renewals and completed all 10 steps; a later run survived six failures inside the lease that held them. This is the requirement the project is named for and it is the one that works."
+            "Observed end to end: a job survived 8 ADB transport blips across 4 renewals and completed all 10 steps; a later run survived six transport failures inside the lease that held them. This is the thesis, and it is the one that works."
           ],
           [
             "JOB-03",
             "Long work runs detached on the device so no socket is the source of truth.",
             "`README`, `c:cf1b690`",
             "`partial`",
-            "Implemented; the demo's own soak was rewritten from 2000 ADB round trips into one detached command plus a poll. The exit code is never read: a detached command that exited 137 produces a green step and a green `wait_for`. `gap:jobs.10`"
+            "Implemented, and the demo's own soak was rewritten from 2000 ADB round trips into one detached command plus a poll. The exit code is never checked: `execShellDetached` returns once the launch succeeds and `reattachDetached` only tests `result_path` for existence. A detached command that exited 137 produces a green step and a green `wait_for`. `gap:jobs.10`"
           ],
           [
             "JOB-04",
             "A job checkpoints and resumes, re-running nothing whose side effect would repeat.",
             "`c:40c03e4`",
             "`unverified`",
-            "The code and the idempotent flag it keys on are both there. The demo has never exercised resume. `runner.Conn` is documented as an interface specifically so `planResume` could be driven by a fake; that fake does not exist. `gap:jobs.7`"
+            "The code is there and the idempotent flag it keys on is there. The demo has never exercised the resume path. `internal/runner` has no test files, and `runner.Conn` is documented as an interface specifically so `planResume` and `isRetryable` could be driven by a fake — that fake does not exist. `gap:jobs.7`"
           ],
           [
             "JOB-05",
@@ -338,22 +338,22 @@
             "JOB-06",
             "A reset tier expands into a real step list from the job's profile, so reset is generic.",
             "`c:40c03e4`, `README`",
-            "`not_built`",
-            "The expansion works and `GET /api/v1/specs/resets` shows it. `farm.jobs.profile_id` is never written — two hits in the tree, both reads. Every reset above `none` expands to zero sub-steps, reports `ok`, and cleans nothing. `gap:jobs.2`"
+            "`met`",
+            "`internal/api/jobs_submit.go` writes `profile_id`, `reset_tier`, `max_attempts` and `resumable` from the submission, and a reset expands against the job's profile. This row said `not_built in practice` against a tree that already had it; the check is `ctl submit --profile`."
           ],
           [
             "JOB-07",
             "The per-job knobs the runner reads are settable when the job is filed.",
             "`schema`, `gap:jobs.3`",
-            "`not_built`",
-            "`profile_id`, `reset_tier`, `max_attempts` and `resumable` are all in `farm.jobs` and none is in `jobCreateRequest` or any `ctl` flag. A job that must never be retried on a second device can only be configured by an UPDATE between the insert and the placement."
+            "`met`",
+            "Same code path as JOB-06: every per-job knob the runner reads is settable at submission and reaches `farm.jobs`. Corrected here rather than built."
           ],
           [
             "JOB-08",
             "An operator can see which step failed, and what it printed, without a database session.",
             "`gap:jobs.4`",
             "`not_built`",
-            "`farm.job_steps` and `farm.job_attempts` have no route. `GET /api/v1/jobs/{id}` returns two keys. `ctl job` prints the spec and the lease history. The SSE digest carries five fields, none of them a step."
+            "`farm.job_steps` and `farm.job_attempts` — the two tables built to answer \"which step failed\" and \"is this a job problem or a device problem\" — have no route. `GET /api/v1/jobs/{id}` returns exactly two keys. `ctl job <id>` prints the spec and the lease history. The SSE `job` digest carries five fields, none of them a step."
           ],
           [
             "JOB-09",
@@ -367,7 +367,7 @@
             "A job's reported state agrees with its step rows.",
             "`gap:surface.4`",
             "`partial`",
-            "It does not. Reproduced twice: an `install` whose push failed left step 1 `running`, step 2 never created, the job `succeeded` and the lease released `completed`. `farm.device_artifacts` is the only place the truth survives."
+            "It does not. Reproduced twice: an `install` whose push failed left step 1 at `running`, step 2 never created, `farm.jobs.state` = `succeeded`, and the lease released `completed`. The API will tell you a job succeeded when its APK never landed. The `farm.device_artifacts` ledger is the only place the truth survives."
           ],
           [
             "JOB-11",
@@ -381,7 +381,7 @@
             "A payload cannot lie about its kind, and an unrunnable spec cannot be accepted unchecked.",
             "`c:cf1b690`",
             "`met`",
-            "Found by running it: both `Shell` and `*Shell` satisfied `Payload` because `Kind()` has a value receiver, and the pointer form **skipped every validation rule**. Both paths now normalise, with a regression test that fails if the rules stop firing."
+            "Found by running it: both `Shell` and `*Shell` satisfied `Payload` because `Kind()` has a value receiver, and the pointer form **skipped every validation rule**. Both paths now normalise, with a regression test that fails if the rules stop firing. `Kind()` on a typed nil also panicked, which would have crashed an API handler validating somebody's submission."
           ]
         ]
       },
@@ -413,14 +413,14 @@
             "Tiers are stored, not hard-coded, each with a blast radius and the minimum lease disruption policy it requires.",
             "`c:197e6f9`",
             "`met`",
-            "`farm.recovery_tiers`. The ladder table on this page renders from it, so a new rung appears without an edit."
+            "`farm.recovery_tiers`. The Docs tab renders the ladder from the table, so a new rung appears without an edit."
           ],
           [
             "REC-02",
             "A rung whose blast radius exceeds what a live lease permits is refused and recorded, never quietly downgraded.",
             "`c:197e6f9`, `README`",
-            "`met` in code, `unverified` live",
-            "`internal/recovery` reads `farm.leases` in exactly one function, only to decide whether it may act, and writes none. On this demo the per-device path has never run: of 48 refusal rows, 37 came from the simulator, 11 from the API, 0 from the ladder. `gap:recovery.17`"
+            "`met` in code, `unverified` in practice",
+            "`internal/recovery` reads `farm.leases` in exactly one function, only to decide whether it is allowed to act, and writes none. On this demo the ladder's per-device escalation path has never executed: of 48 refusal rows, 37 were written by the simulator, 11 by the API slot-power handler, and 0 by the ladder. `gap:devices.10`, `gap:recovery.17`"
           ],
           [
             "REC-03",
@@ -434,7 +434,7 @@
             "A rung that cannot run is refused with a reason naming what is missing, rather than reported as ineffective.",
             "`c:5acd825`",
             "`met`",
-            "The right call, and it is made. Reporting `no_change` for a rung never attempted would quarantine a device whose real problem is that nobody is listening on the host."
+            "`recovery.Record` is still the one place a `Result` becomes `outcome` and `refusal`, and the verdict now GOVERNS the ladder as well as describing it: `Disposition.Escalate()` decides whether the rung was spent, so a refusal or an unreachable host leaves `ladder_tier` where it was and a dead host no longer reads as a dead handset. One classifier serves both callers — `recovery.ClassifyHostFault`, which the actuator's rung-bound method is a thin wrapper over — so the operator's slot-power route files rows the ladder's reader cannot tell from its own, and a ganged refusal carries `detail.refusal_kind` whichever path produced it."
           ],
           [
             "REC-05",
@@ -447,8 +447,8 @@
             "REC-06",
             "Several devices failing together on one hub is ONE incident, not N.",
             "`c:197e6f9`, `README`",
-            "`met`, two reporting holes",
-            "`farm.v_fleet` joins quarantines on `device_id`, NULL for hub- and host-scoped rows, so the grid shows a quarantined device with no explanation. And the view's `unhealthy` is a different definition from the ladder's, so the banner and the quarantine reason report different counts on the same hub. `gap:recovery.7`, `gap:recovery.8`"
+            "`met`, with two reporting holes",
+            "`farm.v_hub_health` is the correlation and hub-scoped quarantine is the action. But `farm.v_fleet` joins quarantines on `device_id`, which is NULL for hub- and host-scoped rows, so the grid shows a quarantined device with no explanation; and the view's `unhealthy` (`NOT IN ('healthy','retired')`) is a different definition from the ladder's (`offline, unauthorized, missing, degraded`), so the banner and the quarantine reason report different counts on the same hub. `gap:recovery.7`, `gap:recovery.8`, `gap:devices.13`"
           ],
           [
             "REC-07",
@@ -461,15 +461,15 @@
             "REC-08",
             "Closing a quarantine returns its devices to the pool.",
             "`gap:recovery.9`",
-            "`partial`",
-            "The close updates `farm.quarantines`; the health write that makes devices schedulable lives in the ladder. With the recovery role down an operator can close every quarantine in the fleet, get 200 every time, and no device comes back. It also never restores `farm.devices.admin_state`."
+            "`met`",
+            "`POST /api/v1/quarantines/{id}/close` finishes the release in the SAME transaction as the close: `farm.device_runtime.health` to `unknown` with `ladder_tier = 0`, and `farm.devices.admin_state` out of `quarantined`, for every covered device no other open quarantine still covers. It answers with `devices_released` and `devices_reenabled` — counts, because an operator who frees nothing has learned something. A farm-wide advisory lock serialises closes, since two operators closing overlapping quarantines under READ COMMITTED would each see the other's row open and neither would release the device. The coverage test reads `scope`, not the subject columns: a `scope='device'` row carries `host_id` too, so the old predicate made one broken phone read as a quarantine over its whole host. Verified live: a hub quarantine over 7 devices closed to `unknown|enabled|7` immediately, with no recovery cycle in between. `reconcileQuarantines` remains the backstop for rows closed by other means."
           ],
           [
             "REC-09",
             "Quarantine can be scoped to the granularity of the actual fault.",
             "`schema`, `gap:recovery.13`",
-            "`partial`",
-            "`scope` permits `slot` and `power_domain` and there is a partial unique index for `slot`; no code writes either, and there is no `power_domain_id` column, so a power-domain quarantine cannot name its subject. On mixed hardware the choice is one device or the whole hub."
+            "`met`",
+            "`migrations/00014_quarantine_power_domain.sql` adds `farm.quarantines.power_domain_id` with a partial unique index, and `coveredByQuarantine` gains the arm; `POST /api/v1/quarantines` accepts `scope ∈ device|slot|hub|host|power_domain` and `ctl quarantine open --scope` drives it. `test/assertions_v14.sql` proves a `power_domain` quarantine covers every slot of the domain and that closing it releases only the devices no other open quarantine still covers. A human parking a device beats the automation (`device_park` with `p_auto=false`)."
           ],
           [
             "REC-10",
@@ -482,22 +482,22 @@
             "REC-11",
             "An action recorded as an open recovery attempt is closed by whoever performs it.",
             "`gap:recovery.3`",
-            "`not_built`",
-            "`POST /slots/{id}/power` writes a tier-4 row and promises the host agent will close it. No code anywhere reads `farm.recovery_attempts`. Verified: three rows open at NULL outcome, oldest 28 minutes, each holding an hourly budget slot. A 202 means recorded, not switched."
+            "`met`",
+            "`handleSlotPower` performs the cycle synchronously through the same `node.Client` the ladder uses — `PortPowerWithDomain`, resolved per host from `farm.hosts.node_endpoint` — and closes its own row with `recovery.FinishAttempt` carrying the real outcome. With no agent configured it answers 503 saying so and opens NO row, rather than a `requested` line the janitor aborts fifteen minutes later. The response is 200 with the result, not 202. It takes an advisory lock per slot and sets `device_id` so the ladder's in-flight check covers it."
           ],
           [
             "REC-12",
             "Bulk selection does not sweep up devices that are quarantined or unhealthy.",
             "`gap:recovery.14`",
-            "`not_built`",
-            "`expandBulkSelector` filters on `adb_devpath IS NOT NULL`, `adb_endpoint IS NOT NULL` and `admin_state = 'enabled'`; health is an optional filter the CALLER may add, not an exclusion. Verified live: a run against h02 hit all seven devices of a quarantined hub and five errored. Harmless for a `getprop`; a `reboot` across such a selector produces a wave of failures and a misleading error rate. Unchanged by the nine merges."
+            "`met`",
+            "Health and quarantine are exclusions in `expandBulkSelector` now, with `include_unhealthy` and `include_quarantined` to opt back in — two flags rather than one, because wanting to shell into a degraded handset is not asking to interrupt a recovery cycle."
           ],
           [
             "REC-13",
             "Recovery history is queryable by the questions an operator actually asks.",
             "`gap:recovery.16`",
-            "`not_built`",
-            "`GET /api/v1/recovery` takes `device`, `host` and `limit`. `Show me every refusal at tier 4 in the last hour` cannot be asked. The `refusal` column exists so the UI can explain a gap; the endpoint does not let you find the gap."
+            "`met`",
+            "`GET /api/v1/recovery` narrows by `outcome`, `tier` (number or name), `hub` (id or `usb_path`) and `since` (RFC3339 or a duration such as `2h`), on top of `device`, `host` and `limit`. A value that can match nothing is a 400 naming the parameter, not an empty list. The `since` interval is sent as a duration so the clock that anchors it is the server's. `ctl recovery --outcome --tier --hub --since` asks the same question from a terminal. Verified live: `GET /api/v1/recovery?outcome=refused&tier=4&since=2h` → 200."
           ]
         ]
       },
@@ -529,7 +529,7 @@
             "Every non-2xx body is one envelope, and 410 fenced (abort) is distinguishable from 503 transient (lease untouched).",
             "`c:5acd825`, `c:8adcc51`",
             "`met`",
-            "The distinction is carried all the way into `internal/lease`. Conflating the two is #663 with a different trigger."
+            "Conflating those two is STF #663 with a different trigger, and the two codes carry that distinction all the way to `internal/lease`."
           ],
           [
             "API-02",
@@ -542,8 +542,8 @@
             "API-09",
             "The reference recovers from a transient fetch failure.",
             "`internal/ui/assets/docs.js`",
-            "`not_built`",
-            "`ensureArea` caches `{error: …}` on failure and its own guard `if (cache.has(area) …) return` then blocks every retry for the life of the page; `ensureMeta` latches the same way on `metaErr`. One dropped request — on the flaky link this product is otherwise designed for — makes an area unreadable until a full reload, with no retry affordance and a card that looks like it is still working."
+            "`met`",
+            "A failed area fetch is cached with `retryable: true` and rendered with a **Try again** button that drops the entry and refetches (`internal/ui/assets/docs.js`). Only a FAILURE is dropped: discarding a loaded area would refetch a document that is already correct. Before this, a page opened while the api was restarting kept its error for the life of the tab, because the area was in the cache and `ensureArea` returned on its first line."
           ],
           [
             "API-03",
@@ -556,8 +556,8 @@
             "API-04",
             "Disk under the artifact directory is reclaimable.",
             "`gap:surface.7`",
-            "`not_built`",
-            "DELETE removes the row and retains the bytes by design; `artifacts.Backend` has no removal verb and no sweeper ships. Verified: blobs on disk with no matching row. Reclaiming space is a manual `find`, and nothing tells you when or how much."
+            "`met`",
+            "`cmd/farmd/roles.go` mounts `api.NewBlobGC(...)` beside the blob routes with the grace from `FARM_ARTIFACT_GC_GRACE` (floor `MinArtifactGCGrace`, mirrored from `api.MinBlobGCGrace` so a process that would be refused does not finish booting). `ctl artifacts gc [--apply]` and `artifacts delete <sha> --reason` drive it. Verified live: a dry run reported 4 blobs, 786 B scanned, 1 entry not filed as a digest and never touched, 0 referenced. Nothing sweeps unless an operator asks."
           ],
           [
             "API-05",
@@ -571,14 +571,14 @@
             "`ctl` exit codes distinguish `the control plane failed` from `a target failed`.",
             "`gap:surface.11`",
             "`partial`",
-            "`ctl bulk` returns 1 when a run completed with any target error. 6 ok, 1 transport error, run state `done` exits 1 — so a script treating 1 as a control-plane failure pages on a single offline handset."
+            "`ctl bulk` returns 1 when a run completed with any target error. A bulk across 7 devices with 6 ok, 1 transport error and run state `done` exits 1, so a script treating 1 as a control-plane failure pages on a single offline handset."
           ],
           [
             "API-07",
             "`ctl` validates against the server, which is the authority.",
             "`gap:jobs.1`",
             "`not_built`",
-            "No `ctl` code references `specs/validate`, `specs/kinds` or `specs/resets`; both `validate` and `submit` run `jobspec.Parse` locally. The comment beside that call says the server is the authority and is wrong on both counts."
+            "No `ctl` code references `specs/validate`, `specs/kinds` or `specs/resets`. Both `validate` and `submit` run `jobspec.Parse` locally. The comment beside that call says \"The server validates too and is the authority\" and is wrong on both counts."
           ],
           [
             "API-08",
@@ -628,15 +628,15 @@
             "SEC-04",
             "A fenced holder cannot reach the device.",
             "`README`, `cap:features`, `gap:lease.0`",
-            "`not_built`",
-            "No Go file reads `devices.fence_floor` to gate an ADB operation, and `FARM_NODE_SELF_FENCE_TIMEOUT` has no consumer. The real barrier after a revoke is the 35s slot rearm — and the old holder may not notice for a full 60s renewal interval, which is longer. Size the rearm accordingly."
+            "`met` in code; `unverified` on hardware",
+            "Both halves ship. Host: `internal/fenceproxy` behind an mTLS listener the node agent serves when `FARM_FENCE_TLS_CERT/KEY/CA` are set (`internal/node/fence.go`), announcing itself as `farm.hosts.adb_endpoint` so nothing needs a new column; `Node.SelfFenceTimeout` now feeds `Policy.MaxStaleness`. Client: `adbwire.WithAdmissionPreamble` and `WithTLS`, fed by `FARM_FENCE_CLIENT_CERT/KEY/CA` (`config.FenceClient`), so every connection announces its class and, for a job, its fence. Off in both halves unless the certificates are configured, and `GET /api/v1/capabilities` reports this process's side as `enabled` or `unavailable` naming what is missing — never the farm's, which no single process can see. Never run against a real host: `farmd node` stops at USB discovery anywhere but Linux."
           ],
           [
             "SEC-05",
             "The secret half of the renew triple does not leak.",
             "`gap:surface.2`",
             "`not_built`",
-            "Renew skips a tenant check **because** a comment asserts `holder_instance` is never exposed by a farm-wide view. `GET /api/v1/leases` returns it for every lease, so `lease_id`, `fence` and `holder_instance` are readable from one unauthenticated GET."
+            "`handleLeaseRelease` skips a tenant check on renew *because* a code comment asserts `holder_instance` \"is returned only to the acquirer and is never exposed by a farm-wide view\". `GET /api/v1/leases` returns it for every lease. So `lease_id`, `fence` and `holder_instance` — exactly what `farm.lease_renew` matches on — are readable from one unauthenticated GET. Even with tokens wired, two CI shards in one tenant could take each other's leases."
           ],
           [
             "SEC-06",
@@ -649,8 +649,8 @@
             "SEC-07",
             "Read surfaces are tenant-scoped.",
             "`gap:surface.8`",
-            "`partial`",
-            "`tenantScope` is applied on jobs, job steps, artifacts and the event stream. `/events` was the worst of the eight it was missing — any tenant could read every other tenant's audit history — and it is closed. `/fleet`, `/topology`, `/hosts`, `/recovery`, `/bulk` and `/stream` are still unscoped. The stream stays the hardest: one shared poller fans out one shared snapshot, so scoping it means a poller per tenant."
+            "`met`",
+            "`tenantScope` reaches every read surface: `/fleet` and `/topology` mask `lease_id/fence/holder/job_id/tenant_id` for another tenant's lease rather than hiding the device; `/hosts` counts only the caller's live leases; `/recovery` narrows attempts to devices whose live lease the tenant holds, while quarantines and the tier table stay whole because a tenant choosing where to run needs both; `/stream` filters per client from one poller. `/bulk` and `/bulk/{id}` moved to operator — a shell across the fleet is operator output. `TestEveryTenantReadableRouteIsScoped` scans the router and FAILS THE BUILD on a tenant-readable GET whose handler never calls `tenantScope`, unless it is in `tenantReadAllowlist` with a written reason. It caught `GET /api/v1/slots` during the merge."
           ],
           [
             "SEC-08",
@@ -689,7 +689,7 @@
             "The two series that mean `work was destroyed` are armed from the first scrape of a fresh process, not from the first casualty.",
             "`internal/obs` doc, `c:8adcc51`",
             "`met`",
-            "`obs.Register` pre-creates the `lease_reaped_total` and `lease_renew_failures_total` children. The one metrics requirement that is fully honoured."
+            "`obs.Register` pre-creates the `lease_reaped_total` and `lease_renew_failures_total` children. A counter with no observations has no series, and `increase(x[15m]) > 0` over a series that does not exist never fires. This is the one metrics requirement that is fully honoured."
           ],
           [
             "OBS-02",
@@ -709,8 +709,8 @@
             "OBS-04",
             "The Go runtime and process collectors are exported.",
             "`gap:operate.10`",
-            "`not_built`",
-            "`internal/obs` deliberately leaves this to the binary, and the binary does not do it. No goroutine count, no RSS, no GC."
+            "`met`",
+            "`cmd/farmd/roles.go`'s `newRegistry` registers `collectors.NewGoCollector()` and `collectors.NewProcessCollector()` on the same registry as everything else, so they arrive through the same scrape carrying the same role label. `internal/obs` still leaves them to the binary, correctly — they describe a PROCESS, not the farm. They are what tells \"the reaper is quiet because nothing is reclaimable\" from \"the reaper is wedged on a goroutine leak\"."
           ],
           [
             "OBS-05",
@@ -730,15 +730,15 @@
             "OBS-07",
             "A rising `refused_ganged` rate tells you the rack needs per-port power switching.",
             "`internal/obs` doc, `gap:recovery.5`",
-            "`not_built`",
-            "The only producer is the ladder's per-device path, which has never run here; the demo hardcodes `refused_policy` even for its own ganged refusals. Live `/metrics` carries three outcome values."
+            "`met`",
+            "`obs.OutcomeRefusedGanged` has producers on both paths now: the ladder's pre-attempt blast-radius policy (`recovery.RefusalKind`), and the agent's own 409 — the node answers `reason:\"ganged\"`, the client wraps `ErrGangedDomain`, and `ClassifyHostFault` carries `RefusalKind` into `detail.refusal_kind` and onto the metric. The demo no longer hardcodes `OutcomeRefusedPolicy` for its own ganged refusals. `farm_recovery_attempts_total` is registered — the name collision between `internal/recovery` and `internal/obs` that made it unregisterable is gone — and 28 of its series are present at 0 on a live `/metrics`, so a rule over the outcome can fire."
           ],
           [
             "OBS-08",
             "Alerting rules, runbooks and a pager path ship with the tree.",
             "`gap:lease.13`",
-            "`partial`",
-            "`docs/siting.md` and `docs/hub-validation.md` ship (857 lines): where to put the rack, why clean-agent suppression is not a lithium mitigation, and a per-hub-model procedure for proving that `uhubctl` actually cuts VBUS rather than only data. `deploy/` exists and carries a `servicemonitor.yaml`. What is still missing is the half that wakes somebody: no `PrometheusRule`, no runbooks for the lease paths, no `.github`. \"Hold and page\" now has exported counters to alert on (OBS-02) and still no rule that does."
+            "`met`",
+            "`deploy/helm/device-farmer/templates/prometheusrule.yaml` ships the rules, `docs/runbooks/` the runbooks, and `.github/workflows/ci.yml` runs build, vet, gofmt, the test suite, a migration from empty against Postgres 17, every `test/assertions*.sql`, and `helm lint` on every change. Every role serves `/metrics` now (`FARM_METRICS_ADDR`), with a headless Service and a ServiceMonitor that reaches one target per pod, so the counters the api used to publish at a permanent 0 for loops it never ran are scraped from the processes that run them. A metrics listener that cannot bind is logged and exported as `farm_metrics_listener_up 0`; it never stops the role."
           ],
           [
             "OBS-09",
@@ -752,7 +752,7 @@
             "`FARM_MIGRATIONS_TABLE` is honoured by everything that reads the migration table.",
             "`config`, `cmd/farmd/migrate.go:189`",
             "`not_built`",
-            "`migrate` calls `goose.SetTableName(cfg.MigrationsTable)`; `schemaInfo` hardcodes `FROM goose_db_version`, unqualified, while the default is `public.goose_db_version`. An operator who sets the variable gets a failing query, and — because of `OBS-09` — is then told `schema v0, no migrations applied` about a fully migrated database."
+            "`migrate` calls `goose.SetTableName(cfg.MigrationsTable)`; `schemaInfo` hardcodes `FROM goose_db_version`, unqualified, while the default is `public.goose_db_version` — so it also depends silently on `search_path`. An operator who overrides the variable gets a failing query and, because of OBS-09, is then told their fully migrated database has no schema."
           ]
         ]
       },
@@ -791,42 +791,42 @@
             "The lease protocol is proved against a real PostgreSQL.",
             "`c:8adcc51`, `README`",
             "`met`",
-            "`test/assertions.sql` — 15 assertions, all passing. Running them rather than reading them found `#variable_conflict` shadowing in two functions, a witness comparison that could never match, and a `SET LOCAL ROLE` that leaked into the caller's transaction."
+            "`test/assertions.sql` — 15 assertions, all passing. Running them against PostgreSQL 17.10 rather than reading the SQL found three defects: `#variable_conflict` shadowing in two functions, a `lease_witness` comparison that could never match, and a `SET LOCAL ROLE` that leaked into the caller's transaction."
           ],
           [
             "TEST-02",
             "The assertions run against the database you care about.",
             "`gap:lease.14`",
             "`partial`",
-            "The fixture inserts `racks('r1')`, `hosts('h01')`, `pools('default')` and `tenants('acme')`, all of which the demo seed owns, so the suite aborts on a duplicate key before the first assertion. Verifying the protocol means a scratch database — which means not verifying the one you care about."
+            "The fixture inserts `racks('r1')`, `hosts('h01')`, `pools('default')` and `tenants('acme')`, all of which the demo seed owns, so the suite aborts on a duplicate key before the first assertion. Verifying the protocol means a scratch database — which means you are not verifying the one you care about."
           ],
           [
             "TEST-03",
             "The most expensive failure mode has a regression test that is watching it.",
             "`gap:lease.7`",
             "`partial`",
-            "P10 cannot construct the state it is meant to test: it cannot move `expires_at` backwards, so both functions match zero rows and it passes trivially. Deleting `AND l.protected = false` from `lease_reclaim` would not fail the suite."
+            "See LEASE-10: assertion P10 passes trivially because it cannot construct the state it is meant to test."
           ],
           [
             "TEST-04",
             "The Go decision points are tested.",
             "`gap:lease.6`, `gap:jobs.7`, `gap:devices.4`",
-            "`not_built`",
-            "Seven `_test.go` files, in `internal/adbwire` (4), `internal/jobspec` (2) and `test/fakeadb` (1). Sixteen packages report `[no test files]`, including `lease`, `reaper`, `scheduler`, `api`, `runner`, `jobrunner` and `recovery`. Two of the SQL defects in `DEV-02` would each have been caught by one test."
+            "`met`",
+            "The decision points named in the gaps are covered: `internal/runner/runner_test.go` and `checkpoint_test.go` for the runner and resume, `internal/lease/witness_test.go` and `internal/jobrunner/witness_test.go` for the witness, `internal/enroll` and `internal/topo` for identity and discovery, `internal/recovery/verdict_fidelity_test.go` for the ladder's verdict, `internal/api/tenant_scope_test.go` for the scope. Several fail the BUILD rather than a case: the vocabulary scans over `internal/adbwire` and `internal/recovery/adbactuator.go`, `fenceproxy`'s one-method assertion, `reaper`'s ban on naming `farm.device_runtime`, `obs.TestEveryCollectorGroupIsRegistered` and `config.TestRoleComponentsCoversEveryRole`."
           ],
           [
             "TEST-05",
             "The suite runs on every change.",
             "`gap:lease.6`",
-            "`not_built`",
-            "There is no `.github` directory. Nothing runs `go test`, `gofmt` or the assertions automatically."
+            "`met`",
+            "`.github/workflows/ci.yml` runs the whole recipe on every push and pull request: `go build ./... && go vet ./... && gofmt -l . && go test -count=1 ./...`, then a Postgres 17 service, `migrate up` from empty, every `test/assertions*.sql`, and `helm lint`."
           ],
           [
             "TEST-06",
             "Documentation claims are executed before they ship.",
             "`c:ae7ac8c`",
             "`met`",
-            "304 examples run against a live farm, 108 wrong and fixed, 98 claims corrected against the files they cite. A third of documentation written from reading code did not survive being run — which is why every row above cites a command rather than a conclusion."
+            "The verification pass ran 304 examples against a live farm, found 108 wrong and fixed them, and corrected 98 claims against the files they cite. A third of documentation written from reading code did not survive being run. That ratio is the argument for the method, and it is the reason this register cites commands rather than conclusions."
           ]
         ]
       },
@@ -858,21 +858,21 @@
             "One static binary; every role is a subcommand, so a reaper cannot run a different commit than the scheduler it races with.",
             "`README`, `c:d872818`",
             "`met`",
-            "Distroless, `CGO_ENABLED=0`, no shell, no package manager, and **no default role**."
+            "Distroless, `CGO_ENABLED=0`, no shell, no package manager, and **no default role** — a manifest with a typo fails instead of starting something plausible."
           ],
           [
             "OPS-02",
             "Migrations travel inside the binary and run from any working directory.",
             "`c:5acd825`",
             "`met`",
-            "A `//go:embed` pattern matching no files is a build error, and an init-time check catches `at least one file` not being `the schema` — because an empty migration set is the quiet failure: zero applied, success reported, exit 0."
+            "`cmd/farmd` adopts the migrations package's `embed.FS`. The package refuses to be empty in two ways: a `//go:embed` pattern matching no files is a build error, and an init-time check catches \"at least one file\" not being \"the schema\" — because goose asked for zero migrations applies zero, reports success and exits 0, and the first symptom is a query error in a role nobody was watching."
           ],
           [
             "OPS-03",
             "The system is runnable with no hardware, against the real control plane.",
             "`c:5acd825`, `README`",
             "`met`",
-            "56 simulated devices across 2 in-process fake ADB servers driving the real scheduler, lease store, reaper, ladder and runner. The fake is only the hardware. `scripts/dev-up.ps1` stands up a throwaway PostgreSQL on a private port and never touches an existing service."
+            "56 simulated devices across 2 in-process fake ADB servers, driving the real scheduler, lease store, reaper, recovery ladder and job runner. The fake is only the hardware. Also `docker compose up -d` and `scripts/dev-up.ps1`, which stands up a throwaway PostgreSQL on a private port and never touches an existing service."
           ],
           [
             "OPS-04",
@@ -892,8 +892,8 @@
             "OPS-06",
             "`docker compose --profile farm up -d` starts a real farm.",
             "`gap:operate.11`",
-            "`partial`",
-            "The `demo` service has no `profiles:` key, so the documented command also starts simulated hardware writing into the same database — and the second of `demo` and `api` to start fails to bind 8420. `--scale demo=0` works; `docker compose --profile farm config` shows it without a daemon."
+            "`met`",
+            "The `demo` service is behind `profiles: [\"demo\"]` and the real roles behind `[\"farm\"]`, so `docker compose --profile farm up -d` starts a control plane and no simulated hardware; the tracked `.env` sets `COMPOSE_PROFILES=demo` so a bare `docker compose up -d` is still the laptop demo, and a `--profile` flag REPLACES that value rather than adding to it, which is what makes the two commands exclusive. `janitor` and `chargepolicy` have Deployments in the chart and services in compose, so the `farm` profile starts every role the alerts expect to hear from."
           ],
           [
             "OPS-07",
@@ -907,7 +907,7 @@
             "SIGTERM drains work and releases nothing.",
             "`c:ae7ac8c`",
             "`met`",
-            "Deliberate. A shutdown that released leases would be the same failure as a socket error releasing them."
+            "Deliberate, and the one thing to carry away from the operating page. A shutdown that released leases would be the same failure as a socket error releasing them."
           ],
           [
             "OPS-09",
@@ -921,7 +921,7 @@
             "A default profile exists, so a reset tier has meaning on a fresh farm.",
             "`c:d872818`",
             "`met`",
-            "Without it `GET /api/v1/specs/resets` could only answer 404, because `medium` is defined as uninstall everything the profile does not own. This makes the tier definable, not effective — see `JOB-06`."
+            "Seeded. Without it `GET /api/v1/specs/resets` could only answer 404 on a fresh farm, because `medium` is defined as \"uninstall everything the profile does not own\". Note this makes the tier *definable*, not *effective* — see JOB-06."
           ]
         ]
       },
@@ -943,29 +943,29 @@
             "HW-01",
             "Continuous, unattended, long-running use of third-party apps on managed device clouds.",
             "`research:contract`",
-            "`decided` — excluded by contract",
-            "Four suppliers, four clauses. Sauce Labs restricts use to `legitimate testing or validation` in its AUP, and ToS §1.1 makes the AUP a licence condition. AWS Service Terms §35.2 forbids rooting or unlocking and forbids installing `persistent software on devices`. BrowserStack §4.3 requires the customer to warrant rights over `the application package itself`. Kobiton §2.3 forbids re-providing device access."
+            "`decided` — **excluded by contract; own hardware is the path**",
+            "Not a pricing or capability judgement; four suppliers exclude it in writing. Sauce Labs restricts use to \"legitimate testing or validation\" in its AUP, and ToS §1.1 makes the AUP a condition of the licence. AWS Service Terms §35.2 forbids rooting or unlocking and forbids installing \"persistent software on devices\". BrowserStack §4.3 requires the customer to warrant rights over \"the application package itself\". Kobiton §2.3 forbids re-providing device access. Renting is not an option that was rejected; it is an option that does not exist for this workload."
           ],
           [
             "HW-02",
             "~50–60 handsets across a small number of bare-metal hosts.",
             "`README`",
             "`met` (design), `unverified` (hardware)",
-            "28 per host is STF's own reference build: four powered seven-port hubs on a dedicated PCIe USB 3.0 card. Two hosts for 50–60; three if you want to drain one for maintenance — which today is a physical drain, because the software one does not work (`REC-07`)."
+            "28 devices per host is STF's own reference build: four powered seven-port hubs on a dedicated PCIe USB 3.0 card. Two hosts for 50–60; three if you want to drain one for maintenance without stopping — which today is a physical drain, because the software one does not work (REC-07)."
           ],
           [
             "HW-03",
             "Fire mitigation appropriate to a rack of lithium cells.",
             "`research:lithium`",
-            "`not_built` in the product",
-            "Clean-agent suppression does not stop a lithium event: Novec 1230 at 8.5 vol% failed to suppress **and** failed to prevent propagation, which occurred even in pure nitrogen. The mitigations that work are containment, spacing, charge limiting and early detection. The product collects neither charge nor temperature — see `DEV-09`."
+            "`met` in the product; `decided` in approach",
+            "The approach is unchanged — cell-level fire suppression is not something this project builds — but the product now does what software can. `internal/chargepolicy` parks idle devices above 80% and releases them below 40% through the host agent's charge gate, acting only on `current_lease_id IS NULL`, so no lease is ever touched; a ganged domain is acted on only when every neighbour is free. `internal/watchdog/swell.go` raises `battery_anomaly` on a temperature rise or an idle-drain rate, `DeviceFarmerBatteryAnomaly` pages on it carrying `rack_slot`, and `docs/runbooks/battery-anomaly.md` says what to do. The rule joins the per-position vec with a plain gauge exported at 0, because a rule over a vec with no children is disarmed and indistinguishable from a healthy farm."
           ],
           [
             "HW-04",
             "Compliance with the fire code's energy-storage threshold.",
             "`research:firecode`",
             "`decided` — not the binding constraint",
-            "IFC Table 1207.1.1 sets the lithium-ion ESS threshold at 20 kWh. A phone battery is roughly 17 Wh, so ~60 handsets is on the order of 1 kWh — about 5% of the trigger. The code is not what stops you; **operator and landlord policy is**, and that is a conversation to have before the hardware arrives. This row does not make `HW-03` smaller."
+            "IFC Table 1207.1.1 sets the lithium-ion ESS permitting threshold at 20 kWh. A phone battery is roughly 17 Wh, so about 60 handsets is on the order of 1 kWh — some 5% of the trigger. The code is not what stops you. **Operator and landlord policy is**, and it is a conversation to have before the hardware arrives rather than after. Do not read this row as \"the hazard is small\": HW-03 is unchanged by it."
           ],
           [
             "HW-05",
@@ -979,14 +979,14 @@
             "Linux 6.0 or newer on every host.",
             "`c:40c03e4`, `README`",
             "`met` in code, `unverified` on hardware",
-            "Below 6.0 the kernel silently re-powers a disabled port, so a cycle that appears to succeed did nothing — worse than a refusal, because it teaches the ladder to escalate past a rung that never ran. Nothing in `internal/node` or `internal/topo` has run against a phone, and bring-up cannot begin until `OPS-04` is fixed."
+            "Below 6.0 the kernel silently re-powers a disabled port, so a cycle that appears to succeed did nothing — which is worse than a refusal, because it teaches the ladder to escalate past a rung that never ran. `internal/node` enforces the floor. Nothing in `internal/node` or `internal/topo` has ever run against a phone; budget a bring-up period on the first physical host, which cannot begin until OPS-04 is fixed."
           ],
           [
             "HW-07",
             "A PostgreSQL version the schema actually runs on is stated somewhere.",
             "`gap:devices.0`",
-            "`not_built`",
-            "`docker-compose.yml` pins `postgres:17-alpine` and nothing declares a version requirement — while `farm.resolve_device` rung 2 needs a `min(uuid)` aggregate PostgreSQL 17 does not have. The error handler even logs `check the PostgreSQL version against migrations/00004_operate.sql`, so the failure was anticipated and never gated."
+            "`met`",
+            "`migrations/00001_core.sql` refuses a server older than PostgreSQL 14 before it creates anything, naming the version it found and the versions the project runs against — rather than half-applying and failing three migrations later on a missing feature. The README states the same floor. `docker-compose.yml`, the Helm chart and CI all run 17, which is what the assertion suites are checked against. Falsified by raising the floor to an impossible value: the guard fires and names the server."
           ]
         ]
       },
@@ -1161,18 +1161,18 @@
     },
     {
       "heading": "What the register argues for next",
-      "body": "Ordered by unblocked-per-unit-of-work, not by severity. Six of the previous ten are done, and the shape of what is left has changed with them: the cheap call sites for expensive, already-written machinery are nearly exhausted, and what remains is mostly work that has to be built rather than connected. One exception leads the list, and it is the most important row in the register.",
+      "body": "Ordered by unblocked-per-unit-of-work, not by severity. The previous ten are done — the witness loop, the reaper's kill switch, bulk exclusions, the charge-policy loop, both halves of the fence proxy, the per-job knobs, the alert rules and runbooks, tenant scope, and the tests — which is why this list looks different in kind. The cheap call sites for expensive, already-written machinery are exhausted. What is left is either work that has to be built, or work that cannot be finished at a desk.\n\nThe first item is not code, and it is first because six rows are waiting behind it.",
       "bullets": [
-        "**1. `LEASE-09` — start the witness loop.** The loop is written, the on-device marker that feeds it is written, the SQL function is written, the config is validated, and every `StartWitness` call site in the tree is a test. This is the last unwired half of the countermeasure the whole project is built around: without it, a control-plane outage longer than TTL+grace still takes a working job's device away, which is #663 arriving by a different road. One call site in the jobrunner.",
-        "**2. `LEASE-11` — an operator-reachable kill switch for the reaper.** `farm.reaper_state.enabled` is read on every `lease_reclaim` and written by no route, no `ctl` command and no dashboard control. Turning off the only automatic release path during an incident is currently a hand-written UPDATE with no audit row — at exactly the moment you least want an unlogged change.",
-        "**3. `REC-12` — exclude quarantined and unhealthy devices from bulk selection.** `expandBulkSelector` treats health as a filter the caller may add rather than an exclusion. Harmless for a `getprop`; a `reboot` across a quarantined hub produces a wave of failures and an error rate that means nothing.",
-        "**4. `DEV-02` — make `resolve_device` rung 3 answer `ambiguous`.** It sets the verdict and leaves `v_dev` NULL, and rung 4 tests only `IF v_dev IS NULL`, so a clone serial in an empty slot is reported to the caller as adopted rather than flagged. This moved UP the list when OPS-04 closed: enrollment can now actually run, so the wrong answer is reachable rather than theoretical.",
-        "**5. The charge-policy loop (`HW-03`, `DEV-09`).** Both things it needed now exist — the battery reader writes `battery_pct`, and the parked state means a device held dark on purpose is not mistaken for a fault and quarantined. What is left is the loop itself and a charge gate the agent can hold, which `portPower` cannot: it arms a deferred power-on by construction, which is right for recovery and incompatible with keeping a port dark for hours. This is the only row where a physical safety mitigation is waiting on software.",
-        "**6. `SEC-04` — the fence proxy.** The fence is enforced in PostgreSQL and HONOURED by the client; nothing enforces it at the resource, so a misbehaving client still reaches a device it has been fenced out of. The largest remaining item, and the only one that changes the architecture. The revoke response body already claims this exists.",
-        "**7. `JOB-06`/`JOB-07` — write `profile_id` and its three siblings from the API.** Until then every reset between tenants is a green step that expands to nothing.",
-        "**8. `OBS-08` — a `PrometheusRule` and runbooks for the lease paths.** The counters are exported now (OBS-02) and nothing alerts on them. \"Hold and page\" is still a WARN line with no pager on the other end, which is the one behaviour that is supposed to wake a human.",
-        "**9. `SEC-07` — scope the six unscoped read surfaces.** `/events` is closed; `/fleet`, `/topology`, `/hosts`, `/recovery`, `/bulk` and `/stream` are not. The stream needs a poller per tenant and is the reason this is not a one-liner.",
-        "**10. `TEST-04`/`TEST-05` — a test for `isRetryable` and `planResume`.** A regression in either reintroduces #663, which is the failure this project defines itself against. The `leaseOps` interface exists so a stub can drive the branch its own doc comment calls the single most consequential decision in the project, and nothing drives it."
+        "**1. Run it against a rack.** `DEV-04`, `DEV-05`, `REC-03`, `OPS-04`, `HW-05` and `JOB-04` are all one sentence: this tree has never met a handset. Enrollment, topology discovery, `USBDEVFS_RESET`, `uhubctl` VBUS switching and the fence proxy's host half are written and covered against `fstest.MapFS` and `test/fakeadb`, and none of that is a phone. Nothing else in this list unblocks as much, and no amount of further code will substitute for it.",
+        "**2. `JOB-08` — show which step failed and what it printed.** `farm.job_steps` carries the state, the timing and the detail; no API route and no dashboard panel renders a step's output, so the answer to \"why did this job fail\" is a `psql` session. The rows exist; this is a read surface.",
+        "**3. `JOB-10` — make a job's reported state agree with its step rows.** A job can read `succeeded` beside a step still marked `running`. The abandoned-step case that produced it in the demo is fixed, but the reconciliation that would make the disagreement impossible is not written, and a status that can be wrong is worse than one that is missing.",
+        "**4. `LEASE-14` — make the ending recoverable from the event log at 3am.** `migrations/00007_lease_events.sql` writes an event on every transition; what is missing is the query, and the page, that turns those rows into \"this lease ended at 02:14 because the job said so\" without a join written by hand.",
+        "**5. `SEC-03` — record who, not only what.** `farm.audit_log` has an `actor` column and every operator route fills it, but the token that authenticated the actor is not distinguished from the name the token carries, so two humans sharing a token are one row.",
+        "**6. `API-07` — validate `ctl` against the server.** `ctl` validates a job spec locally against its own build of `internal/jobspec`. A client older than the control plane refuses a spec the server would accept; a newer one accepts what the server refuses. The server is the authority and `GET /api/v1/specs/kinds` already publishes the vocabulary.",
+        "**7. `API-06` — finish the exit-code contract.** `ExitCode` returns 4 for a partial bulk run now. What is still conflated is a control-plane failure with a target failure in the single-target commands, which is the difference between \"retry\" and \"go look at that phone\".",
+        "**8. `DEV-02` — make `resolve_device` rung 3 answer `ambiguous`.** It sets the verdict and leaves `v_dev` NULL, and rung 4 tests only `IF v_dev IS NULL`, so the verdict is computed and then not acted on.",
+        "**9. `DEV-07` — reconcile a hub that vanishes.** `topo.Config.RetireVanished` is reachable from configuration now (`FARM_TOPO_RETIRE_VANISHED`) and defaults off, so a port the kernel stops reporting stays an active, empty slot forever. Turning it on needs the bounded-retire path exercised against a real host, which is item 1 again.",
+        "**10. `OBS-10` — honour `FARM_MIGRATIONS_TABLE` everywhere.** One knob, read by the migrator and ignored by the code that reports the schema version, so a farm that renamed the table reports `0` on a fully migrated database."
       ],
       "source": "REQUIREMENTS.md"
     },
@@ -1228,6 +1228,34 @@
           [
             "The capability panel at the top of this page disagrees with the register in three places: `Automatic reclamation` claims to be the only automatic release path (`LEASE-08` says otherwise), `Recovery ladder` branches its detail on whether a `node` role is beating when the deciding fact is that `HostRunner` is nil at `cmd/farmd/roles.go:206`, and `Authentication` prints a fix that does nothing.",
             "All three are gone. The reclamation entry is still worth rewording — `max_runtime` is a second automatic ending — but the recovery-ladder predicate is now correct (the actuator holds a real `node.Client`), authentication reports `unavailable` with a fix string that works, and the Helm entry reports `enabled`."
+          ],
+          [
+            "`SEC-04`: the fence is still not enforced at the resource, and the product's own revoke response still says it is. What changed is that the design and a testable skeleton now exist — `docs/design/fence-proxy.md` and `internal/fenceproxy`, 24 tests — and nothing constructs either, so no ADB byte passes through a proxy today. The package is deliberately inert and structurally barred from ever ending a lease: two tests enforce that, one asserting `FenceSource` has exactly one method because a second is what would let a refusal DO something.",
+            "Both halves ship, off unless the certificates are configured: `internal/fenceproxy` behind an mTLS listener the node agent serves, and `adbwire.WithAdmissionPreamble` + `WithTLS` on every client connection. The revoke response and the capability row now describe THIS PROCESS's side of the wire, because enforcement is per host and no single process can see which hosts run a proxy."
+          ],
+          [
+            "`JOB-06`: reset tiers expand to nothing. `farm.jobs.profile_id` is never written by any code path — two hits in the tree, both reads — and the reset expansion needs a profile to know which packages a job did not install.",
+            "`internal/api/jobs_submit.go` writes `profile_id`, `reset_tier`, `max_attempts` and `resumable` from the submission. This entry was written against a tree that already had them — a register revised only downward is not being checked."
+          ],
+          [
+            "`LEASE-09`: nothing STARTS a witness. Every part exists now — `farm.lease_witness`, `Store.Witness`, `Holder.StartWitness`, the on-device marker in `internal/runner/witness.go`, and both config knobs — and every `StartWitness` call site in the tree is a test. `config.Summary()` reports `NOT STARTED` rather than printing the interval as if in force. The last unwired half of the #663 countermeasure, and the top of this page's next-steps list.",
+            "The jobrunner starts a marker and a witness loop per placement. Watched doing it on 2026-09-05: `farm.leases.witness_at` set thirty seconds into a hundred-second step, `witness_extensions=1`, `reclaimable_at` pushed forty-five minutes out, `farm_jobrunner_witness_total{outcome=\"accepted\"} 1`."
+          ],
+          [
+            "`DEV-09`: the watchdog now reads battery level and temperature on its own ticker and writes `battery_pct` and `battery_temp_dc`, which had no producer outside the demo seed since 00001; `00010` adds the CHECK the temperature column never had. Exercised against the fake ADB server, never against a handset. `charge_gate` still has no writer: the agent-side verb exists (`internal/node/chargegate.go`, a held set-point with a dead-man's switch that fails safe to ON) and the policy loop that would drive it does not.",
+            "`migrations/00016_battery_readings.sql` keeps the series, `internal/watchdog/swell.go` raises `battery_anomaly` on a temperature rise, an absolute ceiling or an idle-drain rate, and `internal/chargepolicy` holds idle devices inside a 40–80% band through the host agent's charge gate. No lease is touched by any of it."
+          ],
+          [
+            "`TEST-04` and `TEST-05`: the two loops that decide allocation and release, and the two that execute work on a device, now have 7,466 lines of tests between them — including the fenced-release branch, which needed a seam because it can otherwise only be exercised against a live Postgres and a running renewal loop. `isRetryable` and `planResume` are still untested, and a regression in either reintroduces #663.",
+            "The decision points are covered and `.github/workflows/ci.yml` runs the whole recipe on every change: build, vet, gofmt, the Go suite, a migration from empty against Postgres 17, every `test/assertions*.sql`, and `helm lint`."
+          ],
+          [
+            "`LEASE-08`: `farm.lease_expire_max_runtime` fences and rearms like every other ending now (`00005`), so the hole this entry was written about is closed. What remains is narrower and is really `LEASE-11`: it is a second automatic ending that the reaper's kill switch and quiesce gate do not reach. Whether they SHOULD is a design question nobody has answered in writing — `max_runtime` is a deadline the user wrote down, which the founding requirement names as a legitimate ending.",
+            "Closed by `00005` as this entry already recorded; kept here so a reader who remembers the gap can tell fixed from never-there."
+          ],
+          [
+            "`LEASE-03`: the Postgres role firewall is correct DDL that no deployment assumes. `farm_reaper`, `farm_scheduler` and `farm_watchdog` are created `NOLOGIN` with the right grants; no Go code issues `SET ROLE`, there is no per-component DSN, and every process connects with one `DATABASE_URL` — as `farm`, which on the demo is a superuser.",
+            "`FARM_DB_ROLE` assumes the role — `SET ROLE` in the pool's `AfterConnect`, refused at startup when the login user is not a member — and `migrations/00015_runtime_roles.sql` completes the grants each loop needs. `test/assertions_v15.sql` runs each loop's whole pass as its own role: the reaper cannot read `farm.device_runtime`, the watchdog cannot read `farm.leases`, and that pass ends no lease."
           ]
         ]
       },
@@ -1236,43 +1264,8 @@
   ],
   "gaps": [
     {
-      "what": "`SEC-04`: the fence is still not enforced at the resource, and the product's own revoke response still says it is. What changed is that the design and a testable skeleton now exist — `docs/design/fence-proxy.md` and `internal/fenceproxy`, 24 tests — and nothing constructs either, so no ADB byte passes through a proxy today. The package is deliberately inert and structurally barred from ever ending a lease: two tests enforce that, one asserting `FenceSource` has exactly one method because a second is what would let a refusal DO something.",
-      "consequence": "An operator who revokes a lease and reads the reply believes the previous holder was cut off at the wire. The real barrier is the 35-second slot rearm — and a wedged holder may not notice its own eviction for a full 60-second renewal interval, which is **longer** than the rearm. The capability panel above is honest about this; two other surfaces contradict it. Until the proxy exists, treat slot rearm as the barrier and size it against the renewal interval, not against the fence.",
-      "status": "partial"
-    },
-    {
-      "what": "`JOB-06`: reset tiers expand to nothing. `farm.jobs.profile_id` is never written by any code path — two hits in the tree, both reads — and the reset expansion needs a profile to know which packages a job did not install.",
-      "consequence": "Every `reset` step above tier `none` expands to zero sub-steps, reports `state = ok`, and cleans nothing. Verified live: a `reset-soft` step at `state=ok` with `detail: {\"tier\":\"soft\",\"profile\":\"\",\"sub_steps\":0}`. An operator who sets a reset tier and watches for green steps between tenants is watching devices not be cleaned. This is the register's worst silent failure, because the signal it produces is the same colour as success.",
-      "status": "not_built"
-    },
-    {
-      "what": "`LEASE-09`: nothing STARTS a witness. Every part exists now — `farm.lease_witness`, `Store.Witness`, `Holder.StartWitness`, the on-device marker in `internal/runner/witness.go`, and both config knobs — and every `StartWitness` call site in the tree is a test. `config.Summary()` reports `NOT STARTED` rather than printing the interval as if in force. The last unwired half of the #663 countermeasure, and the top of this page's next-steps list.",
-      "consequence": "The extension meant to protect a job that has lost the control plane but is demonstrably alive on the device never fires. Across 1117 leases, `witness_at` is NULL on every one and `witness_extensions` has never exceeded 0. A long job that loses the control plane gets exactly TTL plus grace and nothing more — which is the scenario the witness was designed for and the one where its absence is least visible in advance.",
-      "status": "partial"
-    },
-    {
-      "what": "`DEV-09`: the watchdog now reads battery level and temperature on its own ticker and writes `battery_pct` and `battery_temp_dc`, which had no producer outside the demo seed since 00001; `00010` adds the CHECK the temperature column never had. Exercised against the fake ADB server, never against a handset. `charge_gate` still has no writer: the agent-side verb exists (`internal/node/chargegate.go`, a held set-point with a dead-man's switch that fails safe to ON) and the policy loop that would drive it does not.",
-      "consequence": "Every battery reading visible on this system is a seeded constant. More seriously, this is the collection layer that the two fire mitigations which actually work — charge limiting and early thermal detection — would both be built on. A rack of 60 lithium cells with a schema for charge and temperature and no writer for either has the appearance of monitoring and none of the substance.",
-      "status": "partial"
-    },
-    {
       "what": "`HW-03`: clean-agent suppression does not stop a lithium event — Novec 1230 at 8.5 vol% failed both to suppress and to prevent propagation, which occurred even in pure nitrogen — so the mitigations that work are physical and procedural: containment, spacing, charge limiting, early detection. Two of the four now have product support: `docs/siting.md` covers containment and spacing, and the battery reader supplies the early-detection signal. Charge limiting has both halves it needed — the agent-side gate and the parked state that stops a deliberately dark device being quarantined as a fault — and no loop between them.",
-      "consequence": "The mitigations that work are containment, cell-to-cell spacing, charge limiting and early detection. The first two are rack design and are outside the software. The second two are `DEV-09`, which is unwritten. The failure mode this entry exists to prevent is buying a clean-agent bottle and considering the hazard handled — the measured result says it will neither put the fire out nor stop it spreading. Note also that fire code is not the gate here: `HW-04`.",
-      "status": "partial"
-    },
-    {
-      "what": "`TEST-04` and `TEST-05`: the two loops that decide allocation and release, and the two that execute work on a device, now have 7,466 lines of tests between them — including the fenced-release branch, which needed a seam because it can otherwise only be exercised against a live Postgres and a running renewal loop. `isRetryable` and `planResume` are still untested, and a regression in either reintroduces #663.",
-      "consequence": "The `ErrFenced`-versus-transient branch in `holder.go`, whose own doc comment calls it the single most consequential decision in this project, is untested; so are `isRetryable`, `planResume`, the checkpoint fencing and the ladder's refusal path. `leaseOps` and `runner.Conn` are both interfaces created specifically so a stub could drive those branches, and neither stub exists. A regression in any of them ships silently, and three of them reintroduce #663.",
-      "status": "partial"
-    },
-    {
-      "what": "`LEASE-08`: `farm.lease_expire_max_runtime` fences and rearms like every other ending now (`00005`), so the hole this entry was written about is closed. What remains is narrower and is really `LEASE-11`: it is a second automatic ending that the reaper's kill switch and quiesce gate do not reach. Whether they SHOULD is a design question nobody has answered in writing — `max_runtime` is a deadline the user wrote down, which the founding requirement names as a legitimate ending.",
-      "consequence": "A holder ended by the sweep is not fenced and its device is schedulable the same instant with no quarantine — verified, the ended holder's write at the same fence was accepted afterwards. Marking a job protected does not protect it from its own `max_runtime`, and turning the reaper off during an incident does not stop these endings. The capability panel's \"the only automatic release path in the system\" is describing `lease_reclaim` alone.",
-      "status": "partial"
-    },
-    {
-      "what": "`LEASE-03`: the Postgres role firewall is correct DDL that no deployment assumes. `farm_reaper`, `farm_scheduler` and `farm_watchdog` are created `NOLOGIN` with the right grants; no Go code issues `SET ROLE`, there is no per-component DSN, and every process connects with one `DATABASE_URL` — as `farm`, which on the demo is a superuser.",
-      "consequence": "The one place the firewall genuinely binds is inside `farm.lease_reclaim`, whose function-level `SET role = farm_reaper` drops superuser for that function's duration. Everywhere else the grants describe an intent nobody is running under: the watchdog process could write `farm.leases` because it is not running as `farm_watchdog`. What actually holds the health plane away from the lease plane is the Go import barrier — real, enforced by a test, and a compile-time property of this build rather than a database guarantee.",
+      "consequence": "The mitigations that work are containment, cell-to-cell spacing, charge limiting and early detection. The first two are rack design and are outside the software. The second two are `DEV-09`, which is unwritten. The failure mode this entry exists to prevent is buying a clean-agent bottle and considering the hazard handled — the measured result says it will neither put the fire out nor stop it spreading. Note also that fire code is not the gate here: `HW-04`. What the product can do, it now does: `internal/chargepolicy` parks idle devices above 80% and releases them below 40%, `internal/watchdog/swell.go` raises `battery_anomaly` on a temperature rise or an idle-drain rate, and `DeviceFarmerBatteryAnomaly` pages carrying `rack_slot`, because a human walks to a position. None of that is suppression.",
       "status": "partial"
     },
     {

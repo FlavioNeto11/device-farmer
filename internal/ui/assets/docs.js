@@ -51,9 +51,24 @@
     if (cache.has(area) || pending.has(area)) return;
     const p = loadJSON(area + '.json')
       .then((d) => { cache.set(area, d); })
-      .catch((e) => { cache.set(area, { error: String(e && e.message || e) }); })
+      /* A failure is cached so the guard above does not refetch on every
+       * render, and marked `retryable` so it can be thrown away deliberately.
+       * Without that flag a page loaded while the api was restarting kept its
+       * error for the life of the tab: the area is in `cache`, so ensureArea
+       * returns on the first line and nothing ever asks again. */
+      .catch((e) => { cache.set(area, { error: String(e && e.message || e), retryable: true }); })
       .finally(() => { pending.delete(area); window.renderDocs && window.renderDocs(); });
     pending.set(area, p);
+  }
+
+  /* retryArea drops a cached failure and asks again. Only a failure: dropping
+   * a loaded area would refetch a document that is already correct. */
+  function retryArea(area) {
+    const doc = cache.get(area);
+    if (!doc || !doc.retryable) return;
+    cache.delete(area);
+    ensureArea(area);
+    window.renderDocs && window.renderDocs();
   }
 
   /* ---------------------------------------------------------- inline text */
@@ -476,10 +491,16 @@
       return wrap;
     }
     if (doc.error) {
+      const again = el('button', { class: 'doc-retry', type: 'button' }, 'Try again');
+      again.addEventListener('click', () => retryArea(area));
       wrap.append(el('div', { class: 'doc-warn' },
         el('span', { class: 'doc-warn-glyph', 'aria-hidden': 'true' }, '✕'),
         el('div', null, el('div', { class: 'doc-warn-title' }, 'Could not load this area'),
-          el('div', null, doc.error))));
+          el('div', null, doc.error),
+          el('div', { class: 'doc-warn-hint' },
+            'A restarting api, a dropped connection — nothing about this page has to be wrong '
+            + 'for the fetch to fail.'),
+          again)));
       return wrap;
     }
 

@@ -532,6 +532,30 @@
         ],
         "rows": [
           [
+            "`internal/enroll` and `internal/topo` still have zero test files. `internal/watchdog` now has one (`battery_test.go`, covering the battery and temperature reader against the fake ADB server), so the package with the only `UPDATE` on `farm.device_runtime` is no longer wholly untested — but its reconciliation path, the one that decides what `health` becomes, still is. The identity ladder's Go side, the USB tree parser, the mass-removal guard, the rack-label collision checks and the flap damper are all unexercised by `go test ./...`. The two SQL defects above would each have been caught by one test. Treat behaviour in these packages as documented-but-unverified unless you have watched it run.",
+            "24 tests on `internal/enroll` (`Probe`, `HardwareFingerprint`, `parseProps`, `Brander.Read/Brand/Rebrand` against `test/fakeadb` including the clone pair, and `EnrollOnce` against a scratch database) and 18 on `internal/topo` (`FromFS(fstest.MapFS)`, the hub plan, the labeller, and a dry-run pass)."
+          ],
+          [
+            "topo.Config's Overrides, RetireVanished, IncludeRootHubs, AdoptEmpty, MinPorts, DryRun and MaxRetireFraction are not wired to any config field or flag. cmd/farmd/roles.go:553-559 constructs it with Pool, HostID, Source, Actor and Logger only. Removal reconciliation is OFF in every shipped deployment: a hub you unplug leaves its slots `active` forever, and they simply never have a device in them. There is no supported way to supply a HubTokens or SlotLabels override map — the label an operator reads in the rack cannot be corrected without editing Go and rebuilding, and on a host with more than one hub per bus the derived labels are dotted (H3.1, H3.2) rather than the H1..H4 the demo shows. There is also no dry-run surface for checking what a first discovery pass would create before it writes.",
+            "All thirteen fields reach `topo.Config` from the environment: `FARM_TOPO_OVERRIDES` (a JSON naming map), `FARM_TOPO_RETIRE_VANISHED`, `FARM_TOPO_MAX_RETIRE_FRACTION`, `FARM_TOPO_DRY_RUN`, `FARM_TOPO_MIN_PORTS`, `FARM_TOPO_ADOPT_EMPTY`, `FARM_TOPO_INCLUDE_ROOT_HUBS`, `FARM_TOPO_INCLUDE`, `FARM_TOPO_EXCLUDE`, `FARM_TOPO_INTERVAL`, `FARM_TOPO_CALL_TIMEOUT` and `FARM_SYSFS_ROOT`, each validated and printed by `Summary()`. `FARM_NODE_TOKEN` moved out of a raw `os.Getenv` at the same time."
+          ],
+          [
+            "There is no operator surface for registering a slot, re-slotting a device, or rebranding one. The API's physical endpoints are GET /api/v1/topology, POST /api/v1/slots/{id}/power, POST /api/v1/devices/{id}/exec and POST /api/v1/hosts/{id}/drain|undrain (internal/api/router.go:73-82). farm.register_slot is SQL-only; enroll.Brander.Rebrand (brand.go:264) has no callers anywhere; adbwire.Client.UnsafeBySerial has none outside its test. Bootstrapping a rack on a host that cannot run discovery, or correcting a device whose row is provably wrong, means hand-written SQL against farm.register_slot and farm.devices. The brand-conflict error tells the operator \"one of those two device rows is wrong and a human must retire it\" (brand.go:127-129) and gives them no command with which to do it.",
+            "`internal/api/slots.go` serves `GET/POST /api/v1/slots`, `POST /slots/{id}/label`, `POST /devices/{id}/reslot` and `/rebrand`, over `farm.reslot_device` and `farm.relabel_slot` (`migrations/00017_reslot.sql`) with an occupancy check and an audit row; `ctl slot list|register|label|reslot|rebrand` drives them. Every verb refuses while the device holds a live lease — nothing here can end one."
+          ],
+          [
+            "The SQL role firewall is defined but not assumed at runtime. openPool (cmd/farmd/roles.go:54-75) connects with whatever DATABASE_URL says, and no Go process issues SET ROLE. The only SET ROLE in the system is inside farm.lease_reclaim (migrations/00002_lease.sql:533), which strips the reaper's device_runtime privilege for that function's duration. `REVOKE ALL ON farm.leases FROM farm_watchdog` binds only if you give each role its own login role and DSN — and you cannot today without extra DDL, because farm_reaper, farm_scheduler and farm_watchdog are all created NOLOGIN (verified: rolcanlogin = f for all three). The live demo connects as `farm`, which is a superuser (rolsuper = t), so the watchdog process there could write a lease if its code tried to. The protection actually in force is the Go import barrier, which is real but is a compile-time property of this build, not a database guarantee.",
+            "See the lease page: `FARM_DB_ROLE` assumes the role on every pooled connection, and `test/assertions_v15.sql` proves the reaper cannot read `farm.device_runtime` and the watchdog cannot read `farm.leases`."
+          ],
+          [
+            "In the demo, farm.device_runtime is written by TWO reconcilers with different rules: internal/watchdog (real, one worker per host, heartbeats present) and the demo's own simulator loop (internal/demo/demo.go:596-700), which has its own damper CASE, emits `degraded` whenever adb_state='device' and credits<1, and — unlike the real watchdog — does not consult suppress_until at all. internal/watchdog.healthFor maps `device` to `healthy` and only ever produces `degraded` for `no_permissions`, so every `degraded` row visible on this system came from the simulator, not the real loop. Calibrating flap thresholds or writing alerts against what this demo shows means calibrating against the simulator. The simulator's disregard for suppress_until also means the freeze-during-induced-reset behaviour described above is not what you are watching here.",
+            "One damper, in one place. `internal/watchdog/damper.go` owns the token bucket and `watchdog.DamperSQL` is the single statement both the watchdog and the simulator run, so the demo can no longer show hysteresis the product does not have. The simulator also honours `suppress_until` now."
+          ],
+          [
+            "The sync client implements SEND, RECV, LSTAT_V1 and QUIT only. There is no LIST/directory enumeration, no mkdir, no STAT_V2, and FileInfo.Size is truncated from a uint32. A push to a path whose parent directory does not exist fails at the daemon; nothing creates it. A file of 4 GiB or more stats as its size modulo 2^32, so an existence-plus-size check on a large artifact silently compares the wrong number — read it rather than stat it. There is no way to enumerate a remote directory.",
+            "`internal/adbwire/sync_list.go` speaks `LIST`/`DENT` natively (`SyncConn.List`), and `Client.MkdirAll` creates a push's parent with a validated path. `test/fakeadb` answers `LIST`. Nothing shells out to `adb`."
+          ],
+          [
             "The hardware-fingerprint rung of `farm.resolve_device` could not execute. It called `min(d.id)` on a uuid column and PostgreSQL has no `min(uuid)` aggregate, so rung 2 raised SQLSTATE 42883 on exactly the collision it exists to adjudicate — and `enroll.classifyResolveError` recorded the sighting as `pending` forever.",
             "`migrations/00005_correctness.sql:68-78` counts first and fetches second: `count(*) = 1` identifies a row without needing an aggregate, and `count(*) > 1` records `ambiguous` rather than flipping a coin between two devices. `test/assertions_v5.sql` V1 proves the rung executes."
           ],
@@ -563,31 +587,6 @@
       "status": "linux_only"
     },
     {
-      "what": "`internal/enroll` and `internal/topo` still have zero test files. `internal/watchdog` now has one (`battery_test.go`, covering the battery and temperature reader against the fake ADB server), so the package with the only `UPDATE` on `farm.device_runtime` is no longer wholly untested — but its reconciliation path, the one that decides what `health` becomes, still is.",
-      "consequence": "The identity ladder's Go side, the USB tree parser, the mass-removal guard, the rack-label collision checks and the flap damper are all unexercised by `go test ./...`. The two SQL defects above would each have been caught by one test. Treat behaviour in these packages as documented-but-unverified unless you have watched it run.",
-      "status": "partial"
-    },
-    {
-      "what": "topo.Config's Overrides, RetireVanished, IncludeRootHubs, AdoptEmpty, MinPorts, DryRun and MaxRetireFraction are not wired to any config field or flag. cmd/farmd/roles.go:553-559 constructs it with Pool, HostID, Source, Actor and Logger only.",
-      "consequence": "Removal reconciliation is OFF in every shipped deployment: a hub you unplug leaves its slots `active` forever, and they simply never have a device in them. There is no supported way to supply a HubTokens or SlotLabels override map — the label an operator reads in the rack cannot be corrected without editing Go and rebuilding, and on a host with more than one hub per bus the derived labels are dotted (H3.1, H3.2) rather than the H1..H4 the demo shows. There is also no dry-run surface for checking what a first discovery pass would create before it writes.",
-      "status": "not_built"
-    },
-    {
-      "what": "There is no operator surface for registering a slot, re-slotting a device, or rebranding one. The API's physical endpoints are GET /api/v1/topology, POST /api/v1/slots/{id}/power, POST /api/v1/devices/{id}/exec and POST /api/v1/hosts/{id}/drain|undrain (internal/api/router.go:73-82). farm.register_slot is SQL-only; enroll.Brander.Rebrand (brand.go:264) has no callers anywhere; adbwire.Client.UnsafeBySerial has none outside its test.",
-      "consequence": "Bootstrapping a rack on a host that cannot run discovery, or correcting a device whose row is provably wrong, means hand-written SQL against farm.register_slot and farm.devices. The brand-conflict error tells the operator \"one of those two device rows is wrong and a human must retire it\" (brand.go:127-129) and gives them no command with which to do it.",
-      "status": "not_built"
-    },
-    {
-      "what": "The SQL role firewall is defined but not assumed at runtime. openPool (cmd/farmd/roles.go:54-75) connects with whatever DATABASE_URL says, and no Go process issues SET ROLE. The only SET ROLE in the system is inside farm.lease_reclaim (migrations/00002_lease.sql:533), which strips the reaper's device_runtime privilege for that function's duration.",
-      "consequence": "`REVOKE ALL ON farm.leases FROM farm_watchdog` binds only if you give each role its own login role and DSN — and you cannot today without extra DDL, because farm_reaper, farm_scheduler and farm_watchdog are all created NOLOGIN (verified: rolcanlogin = f for all three). The live demo connects as `farm`, which is a superuser (rolsuper = t), so the watchdog process there could write a lease if its code tried to. The protection actually in force is the Go import barrier, which is real but is a compile-time property of this build, not a database guarantee.",
-      "status": "partial"
-    },
-    {
-      "what": "In the demo, farm.device_runtime is written by TWO reconcilers with different rules: internal/watchdog (real, one worker per host, heartbeats present) and the demo's own simulator loop (internal/demo/demo.go:596-700), which has its own damper CASE, emits `degraded` whenever adb_state='device' and credits<1, and — unlike the real watchdog — does not consult suppress_until at all.",
-      "consequence": "internal/watchdog.healthFor maps `device` to `healthy` and only ever produces `degraded` for `no_permissions`, so every `degraded` row visible on this system came from the simulator, not the real loop. Calibrating flap thresholds or writing alerts against what this demo shows means calibrating against the simulator. The simulator's disregard for suppress_until also means the freeze-during-induced-reset behaviour described above is not what you are watching here.",
-      "status": "partial"
-    },
-    {
       "what": "farm.recovery_attempts in the demo has three writers — internal/recovery/ladder.go (742, 950, 1054), internal/api/ops.go (692, 738) and internal/demo/demo.go (2077) — and the real recovery ladder has refused nothing on this system.",
       "consequence": "Verified by attributing all 48 refusal rows by their text: 37 written by the demo simulator, 11 by the API slot-power handler (2 of them from this verification), 0 by internal/recovery/ladder.go, whose refusals begin \"tier N (name) has blast radius …\" (ladder.go:920). An operator reading the refusal census, the UI, or `sum by (outcome) (farm_recovery_attempts_total)` on this demo is reading a scripted narrative, not the ladder's blast-radius logic. The ladder's own refusal path is unexercised here and untested (see the zero-test-files gap).",
       "status": "partial"
@@ -595,11 +594,6 @@
     {
       "what": "Snapshot.AmbiguousSerials is detected and logged by the watchdog (watchdog.go:522-525) and by the enroller, but farm.devices.serial_ambiguous is written only from inside farm.resolve_device — at rung 3 when the serial count exceeds one (00004_operate.sql:307), and again after an adoption (:352).",
       "consequence": "On a farm where enrollment is not running — which includes this demo — a newly appearing clone pair produces a log line and an unregistered gauge, and no durable flag on either row. The flag on the two live clone rows here was seeded by internal/demo/seed.go, not observed. Use the GROUP BY … HAVING count(*) > 1 query in Operator recipes rather than trusting the column.",
-      "status": "partial"
-    },
-    {
-      "what": "The sync client implements SEND, RECV, LSTAT_V1 and QUIT only. There is no LIST/directory enumeration, no mkdir, no STAT_V2, and FileInfo.Size is truncated from a uint32.",
-      "consequence": "A push to a path whose parent directory does not exist fails at the daemon; nothing creates it. A file of 4 GiB or more stats as its size modulo 2^32, so an existence-plus-size check on a large artifact silently compares the wrong number — read it rather than stat it. There is no way to enumerate a remote directory.",
       "status": "partial"
     },
     {

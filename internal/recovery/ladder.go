@@ -1047,14 +1047,7 @@ SELECT l.id::text AS lease_id, l.job_id::text, d.id::text AS device_id,
 		}
 
 		neighbour := devID != c.DeviceID
-		outcome := obs.OutcomeRefusedPolicy
-		if neighbour && powerKind == "ganged" {
-			// A ganged power domain is the classic case: cutting power to the
-			// broken phone also cuts it for the one next to it that is running
-			// somebody's six-hour test. A rising rate here means the rack needs
-			// per-port switching, not that the ladder is broken.
-			outcome = obs.OutcomeRefusedGanged
-		}
+		outcome := RefusalKind(neighbour, powerKind)
 
 		who := "this device's own lease"
 		if neighbour {

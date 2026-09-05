@@ -48,8 +48,8 @@
 //     the same fence back;
 //   - jobs.max_runtime elapsing — one of the only two automatic endings the
 //     system permits, and the only one a user asked for;
-//   - a flapping handset burning its flap credits until the damper marks it
-//     degraded, and refilling them once it settles;
+//   - a flapping handset burning its flap credits until the damper stops
+//     believing its recoveries, and earning them back once it settles;
 //   - a whole hub failing at once, which becomes ONE hub-scoped quarantine
 //     rather than seven device alerts, and is then closed by a simulated
 //     operator with an audit row.
@@ -75,6 +75,7 @@ import (
 	"github.com/flaviopadilha/device-farmer/internal/jobspec"
 	"github.com/flaviopadilha/device-farmer/internal/lease"
 	"github.com/flaviopadilha/device-farmer/internal/obs"
+	"github.com/flaviopadilha/device-farmer/internal/recovery"
 	"github.com/flaviopadilha/device-farmer/internal/watchdog"
 	"github.com/flaviopadilha/device-farmer/test/fakeadb"
 )
@@ -120,15 +121,13 @@ const (
 	// to show is worth making a lease easier to lose.
 	demoTTL   = 10 * time.Minute
 	demoGrace = 5 * time.Minute
-
-	// flapCreditCap and flapRefillPerSecond drive the damper. A device pays
-	// one credit for every healthy -> not-healthy transition and earns them
-	// back with quiet time, so a handset that blinks once is still healthy
-	// while one that blinks constantly is degraded and stops being scheduled.
-	// A raw counter would flip it between healthy and quarantined forever.
-	flapCreditCap       = 10.0
-	flapRefillPerSecond = 1.0 / 30.0
 )
+
+// The flap damper has no parameters of its own here. observeSQL is handed
+// watchdog.DefaultFlapCap, DefaultFlapRefill, DefaultMinBad and DefaultMinGood
+// — the values the real watchdog running beside this simulation uses — because
+// there is one damper, and a bucket that refilled faster for the simulator
+// than for the watchdog would be a second rule wearing the first one's CASE.
 
 // Options configures the simulation.
 type Options struct {
@@ -268,6 +267,11 @@ type simDevice struct {
 	product  string
 	codename string
 	initial  string // seeded adb_state
+	// powerKind is farm.power_domains.kind for the slot, or 'none' when the
+	// slot has no domain. It decides which hub the chaos script breaks: the
+	// refusal the ladder issues over a neighbour's lease exists only on a
+	// ganged one.
+	powerKind string
 }
 
 func (d *simDevice) slot() obs.Slot {
@@ -434,11 +438,13 @@ func (r *Runner) loadFleet(ctx context.Context) error {
 	const q = `
 SELECT d.id::text, d.host_id, s.id, hb.id, hb.usb_path, COALESCE(s.rack_slot,''),
        s.adb_devpath, COALESCE(d.adb_serial,''), COALESCE(d.model,''),
-       COALESCE(d.product,''), COALESCE(d.device_codename,''), rt.adb_state
+       COALESCE(d.product,''), COALESCE(d.device_codename,''), rt.adb_state,
+       COALESCE(pd.kind, 'none')
   FROM farm.devices d
   JOIN farm.slots s          ON s.id = d.current_slot_id
   JOIN farm.hubs hb          ON hb.id = s.hub_id
   JOIN farm.device_runtime rt ON rt.device_id = d.id
+  LEFT JOIN farm.power_domains pd ON pd.id = s.power_domain_id
  WHERE d.host_id = ANY($1::text[])
  ORDER BY d.host_id, s.usb_path`
 
@@ -451,7 +457,7 @@ SELECT d.id::text, d.host_id, s.id, hb.id, hb.usb_path, COALESCE(s.rack_slot,'')
 		d := &simDevice{}
 		if err := rows.Scan(&d.deviceID, &d.hostID, &d.slotID, &d.hubID, &d.hubPath,
 			&d.rackSlot, &d.devpath, &d.serial, &d.model, &d.product, &d.codename,
-			&d.initial); err != nil {
+			&d.initial, &d.powerKind); err != nil {
 			return fmt.Errorf("demo: scan fleet: %w", err)
 		}
 		r.devices = append(r.devices, d)
@@ -539,7 +545,7 @@ func (r *Runner) startSeededFlappers() {
 			r.mu.Unlock()
 			r.log.Info("seeded flaky handset is flapping in the simulated hardware",
 				"rack_slot", d.rackSlot, "devpath", d.devpath,
-				"note", "the damper will settle it at degraded; no lease is involved")
+				"note", "the damper will hold it at its last bad state until it stops blinking; no lease is involved")
 		}
 	}
 }
@@ -613,6 +619,7 @@ func (r *Runner) watchHost(ctx context.Context, hostID string, cli *adbwire.Clie
 func (r *Runner) applySnapshot(ctx context.Context, hostID string, snap adbwire.Snapshot) {
 	devpaths := make([]string, 0, len(snap.Devices))
 	states := make([]string, 0, len(snap.Devices))
+	candidates := make([]string, 0, len(snap.Devices))
 	tids := make([]int64, 0, len(snap.Devices))
 	for _, d := range snap.Devices {
 		if d.Devpath == "" {
@@ -620,68 +627,76 @@ func (r *Runner) applySnapshot(ctx context.Context, hostID string, snap adbwire.
 		}
 		devpaths = append(devpaths, d.Devpath)
 		states = append(states, string(d.State))
+		// The candidate comes from the watchdog's own mapping, so the simulator
+		// cannot disagree with the real loop about what an ADB state means.
+		candidates = append(candidates, string(watchdog.HealthFor(d.State)))
 		tids = append(tids, d.TransportID)
 	}
 
-	// The observation half. flap_credits is a token bucket recomputed
-	// server-side from flap_updated_at, so no client timestamp is involved.
+	// The observation half, evaluated through watchdog.DamperSQL — the SAME
+	// expression the real reconcile uses, embedded rather than reimplemented.
+	//
+	// It used to carry a CASE of its own whose only hysteresis was the token
+	// bucket, so it emitted 'degraded' on a state the real damper reaches by a
+	// different road and never emitted 'booting' at all. Two dampers with
+	// different rules on one table means every threshold an operator calibrates
+	// against a demo is calibrated against the simulator instead of against the
+	// loop that will run in production.
+	//
+	// It also ignored suppress_until, so an induced reset — the transport
+	// dropping BECAUSE the ladder asked it to — was recorded as a fresh fault
+	// and re-armed the ladder on the device it had just recovered. The column is
+	// read here for exactly the reason the real loop reads it.
+	//
+	// flap_credits is a token bucket recomputed server-side from
+	// flap_updated_at, so no client timestamp is involved.
 	const observed = `
-WITH obs AS (
-  SELECT * FROM unnest($2::text[], $3::text[], $4::bigint[]) AS t(devpath, adb_state, transport_id)
-), tgt AS (
-  SELECT d.id AS device_id, o.adb_state, o.transport_id
-    FROM obs o
-    JOIN farm.slots s   ON s.host_id = $1 AND s.adb_devpath = o.devpath
-    JOIN farm.devices d ON d.current_slot_id = s.id
-), calc AS (
-  SELECT t.device_id, t.adb_state, t.transport_id, r.health AS old_health,
-         GREATEST(0::float8, LEAST($5::float8,
-           r.flap_credits::float8
-             + EXTRACT(EPOCH FROM (now() - r.flap_updated_at))::float8 * $6::float8
-             - CASE WHEN t.adb_state <> 'device' AND r.adb_state = 'device' THEN 1 ELSE 0 END
-         )) AS credits,
-         CASE WHEN t.adb_state = 'device' THEN r.consec_good + 1 ELSE 0 END AS good,
-         CASE WHEN t.adb_state = 'device' THEN 0 ELSE r.consec_bad + 1 END AS bad
-    FROM tgt t
-    JOIN farm.device_runtime r ON r.device_id = t.device_id
-   -- Both of these are HUMAN verdicts and a probe may not overturn either: a
-   -- quarantine is closed by a person, and a retired device stays retired
-   -- however cheerfully it answers.
-   WHERE r.health NOT IN ('quarantined','retired')
-), verdict AS (
-  SELECT c.*, CASE
-           WHEN c.adb_state = 'device' AND c.credits < 1 THEN 'degraded'
-           WHEN c.adb_state = 'device' THEN 'healthy'
-           WHEN c.adb_state = 'offline' THEN 'offline'
-           WHEN c.adb_state = 'unauthorized' THEN 'unauthorized'
-           WHEN c.adb_state = 'absent' THEN 'missing'
-           WHEN c.adb_state IN ('bootloader','recovery','sideload','rescue') THEN 'recovering'
-           ELSE 'degraded'
-         END AS health
-    FROM calc c
+WITH o AS (
+  SELECT t.devpath, t.adb_state, t.candidate, t.transport_id,
+         t.candidate <> 'healthy' AS bad
+    FROM unnest($2::text[], $3::text[], $4::text[], $5::bigint[])
+           AS t(devpath, adb_state, candidate, transport_id)
+), c AS (
+  SELECT o.*, d.id AS device_id, r.health AS cur_health,
+         (r.suppress_until IS NOT NULL AND r.suppress_until > now()) AS suppressed,
+         LEAST($6::numeric, r.flap_credits
+               + EXTRACT(EPOCH FROM (now() - r.flap_updated_at)) / 60.0 * $7::numeric) AS credits,
+         CASE WHEN o.bad THEN r.consec_bad + 1 ELSE 0 END AS consec_bad,
+         CASE WHEN o.bad THEN 0 ELSE r.consec_good + 1 END AS consec_good,
+         $8::int AS min_bad, $9::int AS min_good
+    FROM o
+    JOIN farm.slots s          ON s.host_id = $1 AND s.adb_devpath = o.devpath
+    JOIN farm.devices d        ON d.current_slot_id = s.id
+    JOIN farm.device_runtime r ON r.device_id = d.id
+), n AS (
+  SELECT c.*, ` + watchdog.DamperSQL + ` AS next_health
+    FROM c
 )
 UPDATE farm.device_runtime r
-   SET adb_state       = v.adb_state,
-       transport_id    = v.transport_id,
+   SET adb_state       = n.adb_state,
+       transport_id    = n.transport_id,
        host_epoch      = (SELECT h.host_epoch FROM farm.hosts h WHERE h.id = $1),
-       consec_good     = v.good,
-       consec_bad      = v.bad,
-       flap_credits    = v.credits,
+       consec_good     = n.consec_good,
+       consec_bad      = n.consec_bad,
+       flap_credits    = CASE WHEN n.next_health <> r.health AND NOT n.bad
+                              THEN GREATEST(0::numeric, n.credits - 1)
+                              ELSE n.credits END,
        flap_updated_at = now(),
-       health          = v.health,
-       health_since    = CASE WHEN v.health <> r.health THEN now() ELSE r.health_since END,
-       last_seen_at    = now(),
+       health          = n.next_health,
+       health_since    = CASE WHEN n.next_health <> r.health THEN now() ELSE r.health_since END,
+       last_seen_at    = CASE WHEN n.adb_state = 'absent' THEN r.last_seen_at ELSE now() END,
        updated_at      = now()
-  FROM verdict v
- WHERE r.device_id = v.device_id
-   AND (r.adb_state <> v.adb_state
-        OR r.health <> v.health
+  FROM n
+ WHERE r.device_id = n.device_id
+   AND (r.adb_state <> n.adb_state
+        OR r.health <> n.next_health
         OR r.last_seen_at IS NULL
         OR r.last_seen_at < now() - interval '10 seconds')
-RETURNING r.device_id::text, r.adb_state, r.health, v.old_health, r.flap_credits::float8`
+RETURNING r.device_id::text, r.adb_state, r.health, n.cur_health AS old_health, r.flap_credits::float8`
 
-	rows, err := r.pool.Query(ctx, observed, hostID, devpaths, states, tids,
-		flapCreditCap, flapRefillPerSecond*r.opts.Speed)
+	rows, err := r.pool.Query(ctx, observed, hostID, devpaths, states, candidates, tids,
+		watchdog.DefaultFlapCap, watchdog.DefaultFlapRefill*r.opts.Speed,
+		watchdog.DefaultMinBad, watchdog.DefaultMinGood)
 	if err != nil {
 		if !errors.Is(err, context.Canceled) {
 			r.log.Warn("demo: writing device health failed", "host", hostID, "err", err)
@@ -1781,11 +1796,17 @@ func (r *Runner) offlineIncident(ctx context.Context) {
 	// Anything harsher than a probe has to pass the holder's own policy
 	// first. This refusal is computed from the live lease and the slot's
 	// power domain, and it is what the recovery view shows instead of a gap.
-	if refusal := r.escalationRefusal(ctx, run.dev); refusal != "" {
+	if ref := r.escalationRefusal(ctx, run.dev); ref.reason != "" {
 		refused := r.openRecovery(ctx, run.dev, 4, map[string]any{"considered": "port_power"})
-		r.finishRecovery(ctx, refused, "refused", refusal, nil)
-		obs.RecoveryAttempt(run.dev.slot(), obs.TierPortPowerCycle, obs.OutcomeRefusedPolicy)
-		r.log.Warn("tier 4 (port power) REFUSED", "rack_slot", run.dev.rackSlot, "refusal", refusal)
+		r.finishRecovery(ctx, refused, "refused", ref.reason, nil)
+		// Classified by the ladder's own rule rather than a constant. This site
+		// hardcoded refused_policy, so obs.OutcomeRefusedGanged had no producer
+		// anywhere a demo could reach — and that series is the one whose rate
+		// tells an operator the rack needs per-port switching.
+		kind := recovery.RefusalKind(ref.neighbour, ref.powerKind)
+		obs.RecoveryAttempt(run.dev.slot(), obs.TierPortPowerCycle, kind)
+		r.log.Warn("tier 4 (port power) REFUSED", "rack_slot", run.dev.rackSlot,
+			"refusal", ref.reason, "outcome", string(kind))
 	}
 
 	if !r.sleep(ctx, r.scale(baseOutage)) {
@@ -1858,8 +1879,9 @@ func (r *Runner) offlineIncident(ctx context.Context) {
 }
 
 // flapIncident makes a healthy, idle handset flap so the damper can be watched
-// working: credits drain, the device goes degraded and stops being scheduled,
-// then quiet time refills them.
+// working: every believed recovery costs a credit, the bucket runs dry, the
+// device is held at its last bad state and stops being scheduled, then quiet
+// time refills the bucket and the next real recovery is believed again.
 func (r *Runner) flapIncident(ctx context.Context) {
 	dev := r.pickIdleDevice()
 	if dev == nil {
@@ -2037,21 +2059,36 @@ func (r *Runner) hubIncident(ctx context.Context) {
 // be refused, and why. Both halves are read from the database: the live
 // lease's disruption_policy, and whether the power domain is ganged (in which
 // case cutting power for one device cuts it for every device on the hub).
-func (r *Runner) escalationRefusal(ctx context.Context, dev *simDevice) string {
+// refusal is why a tier was not attempted, and the two facts that decide which
+// metric label it carries: whether the lease that forbids it is on a NEIGHBOUR
+// and what kind of power domain this position sits on. Both are read from the
+// database, so the label the demo narrates is the one the ladder would have
+// written for the same lease in the same domain.
+type refusal struct {
+	reason    string
+	neighbour bool
+	powerKind string
+}
+
+func (r *Runner) escalationRefusal(ctx context.Context, dev *simDevice) refusal {
 	const q = `
 SELECT COALESCE(pd.kind,'none'),
        COALESCE((SELECT l.disruption_policy FROM farm.leases l
                   WHERE l.device_id = $1::uuid AND l.state IN ('held','suspect')), ''),
+       -- NEIGHBOURS only. The ladder classifies a refusal as ganged when the
+       -- lease that forbids the cycle belongs to a device other than the
+       -- target; counting our own lease here would make every ganged refusal
+       -- look like somebody else's work.
        (SELECT count(*) FROM farm.slots s2
           JOIN farm.devices d2 ON d2.current_slot_id = s2.id
           JOIN farm.leases l2  ON l2.device_id = d2.id AND l2.state IN ('held','suspect')
-         WHERE s2.power_domain_id = s.power_domain_id)
+         WHERE s2.power_domain_id = s.power_domain_id AND d2.id <> $1::uuid)
   FROM farm.slots s
   LEFT JOIN farm.power_domains pd ON pd.id = s.power_domain_id
  WHERE s.id = $2`
 	var kind, policy string
-	var leasesInDomain int
-	if err := r.pool.QueryRow(ctx, q, dev.deviceID, dev.slotID).Scan(&kind, &policy, &leasesInDomain); err != nil {
+	var neighbourLeases int
+	if err := r.pool.QueryRow(ctx, q, dev.deviceID, dev.slotID).Scan(&kind, &policy, &neighbourLeases); err != nil {
 		// Fail CLOSED. An empty string here means "nothing forbids cutting the
 		// power", and answering that because a SELECT failed would let an
 		// unanswered question authorise the most destructive tier in the
@@ -2061,20 +2098,32 @@ SELECT COALESCE(pd.kind,'none'),
 			r.log.Warn("demo: could not read the escalation policy for this position",
 				"rack_slot", dev.rackSlot, "err", err)
 		}
-		return "the disruption policy and power domain for this position could not be " +
-			"read, and an unanswered question is not consent"
+		return refusal{reason: "the disruption policy and power domain for this position " +
+			"could not be read, and an unanswered question is not consent"}
 	}
 	switch {
-	case policy == "no_disruption" || policy == "allow_soft_reset":
-		return fmt.Sprintf("the live lease on this device carries disruption_policy=%q, "+
-			"which forbids a tier-4 power cycle", policy)
+	case !recovery.PolicyPermits(policy, "allow_port_power_cycle"):
+		// Our OWN holder forbids it, so no neighbour is involved.
+		return refusal{
+			reason: fmt.Sprintf("the live lease on this device carries disruption_policy=%q, "+
+				"which forbids a tier-4 power cycle", policy),
+			powerKind: kind,
+		}
 	case kind == "none":
-		return "this hub has no switchable VBUS: there is nothing to power cycle"
-	case kind == "ganged" && leasesInDomain > 0:
-		return fmt.Sprintf("the power domain is ganged and %d live lease(s) share it: "+
-			"cutting power here would disturb work that is not ours", leasesInDomain)
+		return refusal{
+			reason:    "this hub has no switchable VBUS: there is nothing to power cycle",
+			powerKind: kind,
+		}
+	case kind == "ganged" && neighbourLeases > 0:
+		return refusal{
+			reason: fmt.Sprintf("the power domain is ganged and %d live lease(s) on OTHER "+
+				"devices share it: cutting power here would disturb work that is not ours",
+				neighbourLeases),
+			neighbour: true,
+			powerKind: kind,
+		}
 	default:
-		return ""
+		return refusal{powerKind: kind}
 	}
 }
 
@@ -2144,13 +2193,39 @@ func (r *Runner) openRecovery(ctx context.Context, dev *simDevice, tier int, det
 	if err != nil {
 		body = []byte("{}")
 	}
+	// Opening an attempt SUPPRESSES the device, exactly as Ladder.begin does.
+	//
+	// A rung induces a transport drop; suppression is what stops the health
+	// plane recording that drop as a fresh fault and re-arming the ladder on
+	// the device it is in the middle of recovering. The simulator opened
+	// attempts without it, so every simulated recovery fed its own induced
+	// blip back to the observer as evidence of a broken phone.
+	//
+	// The three states that are not observations are held: 'quarantined' and
+	// 'retired' are human verdicts, and 'parked' is a deliberate absence, so
+	// none of them may be overwritten by a rung starting.
 	const q = `
-INSERT INTO farm.recovery_attempts (device_id, slot_id, hub_id, host_id, tier, detail)
-VALUES ($1::uuid, $2, $3, $4, $5, $6::jsonb)
-RETURNING id`
+WITH a AS (
+  INSERT INTO farm.recovery_attempts (device_id, slot_id, hub_id, host_id, tier, detail)
+  VALUES ($1::uuid, $2, $3, $4, $5, $6::jsonb)
+  RETURNING id, device_id
+), s AS (
+  UPDATE farm.device_runtime r
+     SET suppress_until = now() + LEAST(make_interval(secs => $7::float8), make_interval(secs => $8::float8)),
+         health         = CASE WHEN r.health IN ('quarantined','retired','parked')
+                               THEN r.health ELSE 'recovering' END,
+         health_since   = CASE WHEN r.health IN ('quarantined','retired','parked','recovering')
+                               THEN r.health_since ELSE now() END,
+         updated_at     = now()
+    FROM a
+   WHERE r.device_id = a.device_id
+  RETURNING 1
+)
+SELECT id FROM a`
 	var id int64
 	if err := r.pool.QueryRow(ctx, q, dev.deviceID, dev.slotID, dev.hubID, dev.hostID,
-		tier, string(body)).Scan(&id); err != nil {
+		tier, string(body), r.scale(baseOutage).Seconds(),
+		recovery.DefaultMaxSuppress.Seconds()).Scan(&id); err != nil {
 		// Zero disables finishRecovery, so a failure here silently removes the
 		// whole attempt from the recovery view. Say so rather than leaving the
 		// reader to wonder why a tier never appeared.
@@ -2431,16 +2506,32 @@ func (r *Runner) pickIdleDevice() *simDevice {
 }
 
 // pickHubVictim prefers a hub that currently holds a live lease, because the
-// interesting half of a hub failure is what happens to the work on it.
+// interesting half of a hub failure is what happens to the work on it — and,
+// among those, a ganged one, because the hub story has a second half that
+// exists nowhere else: the ladder refusing to cut power to the broken device
+// because the only switch would also darken the neighbour mid-run. That
+// refusal is the refused_ganged series, the one whose rate tells an operator
+// the rack needs per-port hubs, and a demo that never broke a ganged hub
+// would never emit it.
 func (r *Runner) pickHubVictim() *simDevice {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	var leased *simDevice
 	for _, run := range r.live {
 		// Never pick the hub the seed already broke: it is the cold-start
 		// exhibit and overwriting it would confuse the two stories.
-		if run.dev.hubPath != r.seed.FaultyHub || run.dev.hostID != r.seed.FaultyHost {
+		if run.dev.hubPath == r.seed.FaultyHub && run.dev.hostID == r.seed.FaultyHost {
+			continue
+		}
+		if run.dev.powerKind == "ganged" {
 			return run.dev
 		}
+		if leased == nil {
+			leased = run.dev
+		}
+	}
+	if leased != nil {
+		return leased
 	}
 	for _, d := range r.devices {
 		if d.hubPath != r.seed.FaultyHub || d.hostID != r.seed.FaultyHost {

@@ -618,19 +618,13 @@ type writeResult struct {
 // damped reports whether the damper withheld the state the observation implied.
 func (r writeResult) damped() bool { return r.Next != r.Candidate }
 
-// write reconciles one device.
-//
-// The whole decision — credit refill, hysteresis, transition — is one statement
-// evaluated against the server's now(). No clock on this pod is consulted and
-// none is sent: a watchdog with a skewed clock must not be able to hand a
-// device a bucket full of tokens it did not earn.
-func (w *Watchdog) write(ctx context.Context, pos slotRow, host string,
-	state adbwire.ConnState, transport, epoch *int64) (writeResult, error) {
-
-	candidate := healthFor(state)
-	bad := candidate != obs.HealthHealthy
-
-	const q = `
+// reconcileSQL is the whole decision for one device: credit refill,
+// hysteresis, transition. It is one statement evaluated against the server's
+// now() so that no clock on this pod is consulted and none is sent — a
+// watchdog with a skewed clock must not be able to hand a device a bucket
+// full of tokens it did not earn. The transition itself is DamperSQL, the
+// single definition every writer of health shares.
+const reconcileSQL = `
 WITH o AS (
   SELECT $1::uuid    AS device_id,
          $2::text    AS host_id,
@@ -657,43 +651,7 @@ WITH o AS (
     FROM farm.device_runtime r
     JOIN o ON o.device_id = r.device_id
 ), n AS (
-  SELECT c.*,
-         CASE
-           -- Retirement is an administrative fact, quarantine belongs to the
-           -- recovery ladder, and 'parked' is a human (or a charge limiter)
-           -- saying "out of service ON PURPOSE". None of the three is an
-           -- observation this loop may overwrite.
-           --
-           -- 'parked' is the one that changes what this loop MEANS. A parked
-           -- device usually has no VBUS, so the ADB tracker reports it absent
-           -- and healthFor() calls that 'missing' — which is true about the
-           -- wire and false about the device. Writing it would put a perfectly
-           -- good handset in front of the recovery ladder, which would climb
-           -- to a port power cycle and then quarantine it. The authority for
-           -- the state is farm.devices.admin_state='parked', which this role
-           -- can read and cannot write; the value here is its mirror, and
-           -- migration 00008 carries a trigger that holds it even if this CASE
-           -- is ever edited away.
-           WHEN c.cur_health IN ('retired','quarantined','parked') THEN c.cur_health
-           -- An induced reset is in flight: the transport is EXPECTED to drop,
-           -- so a drop proves nothing.
-           WHEN c.suppressed THEN c.cur_health
-           WHEN c.candidate = c.cur_health THEN c.cur_health
-           -- 'unknown' is the absence of history, not a history of instability:
-           -- nobody has looked at this device since it was enrolled, or since a
-           -- quarantine was closed. Hysteresis exists to damp oscillation and
-           -- there is nothing here to oscillate against, so one good look is
-           -- enough. The token is still charged.
-           WHEN NOT c.bad AND c.cur_health = 'unknown' AND c.credits >= 1 THEN c.candidate
-           -- Falling is free but debounced: a device that is failing must leave
-           -- the schedulable set even with an empty bucket.
-           WHEN c.bad AND c.consec_bad >= c.min_bad THEN c.candidate
-           -- Rising costs a token on top of the hysteresis. This is the
-           -- expensive direction because it is the one that puts a device back
-           -- in front of a tenant.
-           WHEN NOT c.bad AND c.consec_good >= c.min_good AND c.credits >= 1 THEN c.candidate
-           ELSE c.cur_health
-         END AS next_health
+  SELECT c.*, ` + DamperSQL + ` AS next_health
     FROM c
 )
 UPDATE farm.device_runtime r
@@ -716,11 +674,18 @@ UPDATE farm.device_runtime r
  WHERE r.device_id = n.device_id
 RETURNING n.cur_health, r.health, n.candidate, n.credits::float8, n.consec_bad, n.consec_good, n.suppressed`
 
+// write reconciles one device with reconcileSQL.
+func (w *Watchdog) write(ctx context.Context, pos slotRow, host string,
+	state adbwire.ConnState, transport, epoch *int64) (writeResult, error) {
+
+	candidate := HealthFor(state)
+	bad := candidate != obs.HealthHealthy
+
 	cctx, cancel := context.WithTimeout(ctx, w.cfg.CallTimeout)
 	defer cancel()
 
 	var out writeResult
-	err := w.cfg.Pool.QueryRow(cctx, q,
+	err := w.cfg.Pool.QueryRow(cctx, reconcileSQL,
 		pos.DeviceID, host, pos.SlotID, string(state), string(candidate), bad,
 		transport, epoch, w.cfg.FlapCap, w.cfg.FlapRefill, w.cfg.MinBad, w.cfg.MinGood,
 	).Scan(&out.Previous, &out.Next, &out.Candidate, &out.Credits,
@@ -748,7 +713,7 @@ RETURNING n.cur_health, r.health, n.candidate, n.credits::float8, n.consec_bad, 
 	rctx, rcancel := context.WithTimeout(ctx, w.cfg.CallTimeout)
 	defer rcancel()
 
-	err = w.cfg.Pool.QueryRow(rctx, q,
+	err = w.cfg.Pool.QueryRow(rctx, reconcileSQL,
 		pos.DeviceID, host, pos.SlotID, string(state), string(candidate), bad,
 		transport, epoch, w.cfg.FlapCap, w.cfg.FlapRefill, w.cfg.MinBad, w.cfg.MinGood,
 	).Scan(&out.Previous, &out.Next, &out.Candidate, &out.Credits,
@@ -894,39 +859,6 @@ SELECT COALESCE(s.host_id, r.host_id, ''), COALESCE(hb.usb_path, ''), r.health, 
 // ---------------------------------------------------------------------------
 // State mapping
 // ---------------------------------------------------------------------------
-
-// healthFor maps an ADB connection state onto the health vocabulary of
-// farm.device_runtime.health.
-//
-// Every arm is a statement about the WIRE, never about the lease on the device.
-// "offline" here means the ADB server cannot talk to it; it does not mean the
-// job running on it has stopped, and it may never be read as a reason to take
-// the device away from that job.
-func healthFor(s adbwire.ConnState) obs.HealthState {
-	switch s {
-	case adbwire.StateDevice:
-		return obs.HealthHealthy
-	case adbwire.StateOffline:
-		return obs.HealthOffline
-	case adbwire.StateUnauthorized:
-		return obs.HealthUnauthorized
-	case adbwire.StateAuthorizing, adbwire.StateConnecting:
-		return obs.HealthBooting
-	case adbwire.StateAbsent, adbwire.StateDetached:
-		return obs.HealthMissing
-	case adbwire.StateBootloader, adbwire.StateRecovery,
-		adbwire.StateSideload, adbwire.StateRescue:
-		// The device is alive and addressable, just not in a state that can run
-		// a test. Distinguished from 'offline' because the operator response is
-		// different: one is a cable, the other is a mode.
-		return obs.HealthRecovering
-	case adbwire.StateNoPermissions:
-		// udev rules on the host, not a fault of the device.
-		return obs.HealthDegraded
-	default:
-		return obs.HealthUnknown
-	}
-}
 
 func orAll(s string) string {
 	if s == "" {

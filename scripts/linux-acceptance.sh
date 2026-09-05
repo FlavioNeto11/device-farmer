@@ -41,6 +41,12 @@
 
 set -uo pipefail
 
+# Never prompt, and never wait forever. A PGURL whose role does not exist used
+# to hang this script on psql's password prompt — in CI that is worse than a
+# wrong answer, because there is nothing to read and nothing to act on.
+export PGCONNECT_TIMEOUT="${PGCONNECT_TIMEOUT:-10}"
+PSQL="psql -w"
+
 PGURL="${PGURL:-postgres://farm@127.0.0.1:5432/postgres?sslmode=disable}"
 DBNAME="${DBNAME:-farm_acceptance}"
 API_ADDR="${API_ADDR:-127.0.0.1:18080}"
@@ -61,12 +67,12 @@ have() { command -v "$1" >/dev/null 2>&1; }
 cleanup() {
   pkill -f "$BIN" 2>/dev/null
   sleep 1
-  psql "$PGURL" -c "DROP DATABASE IF EXISTS $DBNAME WITH (FORCE)" >/dev/null 2>&1
+  $PSQL "$PGURL" -c "DROP DATABASE IF EXISTS $DBNAME WITH (FORCE)" >/dev/null 2>&1
   [ -n "${KEEP_WORK:-}" ] || rm -rf "$WORK"
 }
-trap cleanup EXIT
+trap 'rc=$?; cleanup; exit $rc' EXIT
 
-q() { psql "$DB" -tAqc "$1" 2>&1; }
+q() { $PSQL "$DB" -tAqc "$1" 2>&1; }
 
 # --------------------------------------------------------------------------
 step "platform"
@@ -74,7 +80,7 @@ step "platform"
 echo "  kernel    $(uname -r)"
 echo "  workdir   $WORK"
 for t in psql curl; do have "$t" || { echo "  missing $t"; exit 2; }; done
-echo "  postgres  $(psql "$PGURL" -tAqc 'SHOW server_version' 2>&1 | head -1)"
+echo "  postgres  $($PSQL "$PGURL" -tAqc 'SHOW server_version' 2>&1 | head -1)"
 
 # --------------------------------------------------------------------------
 step "the binary under test"
@@ -93,8 +99,8 @@ fi
 
 # --------------------------------------------------------------------------
 step "migrate an empty database"
-psql "$PGURL" -c "DROP DATABASE IF EXISTS $DBNAME WITH (FORCE)" >/dev/null 2>&1
-psql "$PGURL" -c "CREATE DATABASE $DBNAME" >/dev/null 2>&1 || { bad "CREATE DATABASE (the role needs CREATEDB)"; exit 1; }
+$PSQL "$PGURL" -c "DROP DATABASE IF EXISTS $DBNAME WITH (FORCE)" >/dev/null 2>&1
+$PSQL "$PGURL" -c "CREATE DATABASE $DBNAME" >/dev/null 2>&1 || { bad "CREATE DATABASE (the role needs CREATEDB)"; exit 1; }
 out=$(DATABASE_URL="$DB" "$BIN" migrate up 2>&1)
 ver=$(printf '%s' "$out" | grep -oE 'schema version: [0-9]+' | grep -oE '[0-9]+$')
 count=$(ls migrations/*.sql | wc -l)
@@ -103,7 +109,7 @@ if [ "$ver" = "$count" ]; then ok "schema v$ver from empty, $count migrations"; 
 # --------------------------------------------------------------------------
 step "every SQL assertion suite, on this server"
 for f in test/assertions*.sql; do
-  a=$(psql "$DB" -v ON_ERROR_STOP=1 -f "$f" 2>&1)
+  a=$($PSQL "$DB" -v ON_ERROR_STOP=1 -f "$f" 2>&1)
   if printf '%s' "$a" | grep -q 'ASSERTIONS PASSED'; then ok "$(basename "$f")"
   else bad "$(basename "$f")"; printf '%s\n' "$a" | grep -Ei '^psql.*(ERROR|FATAL)' | head -2 | sed 's/^/        /'; fi
 done
@@ -278,10 +284,12 @@ grep -q 'enrollment cycle' "$WORK/node.log" \
 # --------------------------------------------------------------------------
 step "result"
 if [ "$fails" -eq 0 ]; then
-  echo "  every check passed on $(uname -sr), PostgreSQL $(psql "$PGURL" -tAqc 'SHOW server_version' | head -1)"
+  echo "  every check passed on $(uname -sr), PostgreSQL $($PSQL "$PGURL" -tAqc 'SHOW server_version' | head -1)"
   echo "  NOT proved here: USBDEVFS_RESET and uhubctl against real hardware (REC-03, HW-05)."
+  echo "  exiting 0"
   exit 0
 fi
 echo "  $fails check(s) failed. Logs kept under $WORK (set KEEP_WORK=1 to keep them next time)."
+echo "  exiting 1"
 KEEP_WORK=1
 exit 1

@@ -131,10 +131,14 @@ type SeedResult struct {
 //
 // Idempotency here is structural rather than defensive: every attribute of
 // every row is a pure function of the position it belongs to (host, hub,
-// port), and every insert names the natural key the schema already enforces —
+// port), and every write names the natural key the schema already enforces —
 // hosts.id, (host_id, root_bus), (host_id, usb_path) for hubs and slots,
-// devices.farm_uid. Re-running it against a live farm therefore converges to
-// the same rows instead of accumulating duplicates or shuffling identities.
+// devices.farm_uid. The topology rows themselves are written by
+// farm.register_slot, the same function a real host's discovery calls, so the
+// hubs, slots and power domains of a simulated rack have exactly the shape a
+// real one would; only the handsets are the seed's own. Re-running it against
+// a live farm therefore converges to the same rows instead of accumulating
+// duplicates or shuffling identities.
 //
 // Two columns are deliberately left alone once they exist:
 //
@@ -226,6 +230,10 @@ ON CONFLICT (id) DO UPDATE
 		return fmt.Errorf("demo: seed host %s: %w", h.ID, err)
 	}
 
+	// The controller rows go in first, with the PCI address and kind that
+	// discovery reads off sysfs and farm.register_slot does not take. The
+	// function's own upsert on (host_id, root_bus) then finds them and leaves
+	// both columns as they are.
 	for _, bus := range h.Buses {
 		const ctlSQL = `
 INSERT INTO farm.controllers (host_id, pci_addr, kind, root_bus)
@@ -242,74 +250,95 @@ ON CONFLICT (host_id, root_bus) DO NOTHING`
 			return err
 		}
 	}
+
+	// A power domain no slot sits in is a switch that controls nothing. On a
+	// host this seed owns, such a row can only be a leftover of an earlier
+	// shape of the seed, and it is not harmless: an operator counting domains
+	// would count one more than the rack has. Real hosts are never touched.
+	if _, err := tx.Exec(ctx, `
+DELETE FROM farm.power_domains pd
+ WHERE pd.host_id = $1
+   AND NOT EXISTS (SELECT 1 FROM farm.slots s WHERE s.power_domain_id = pd.id)`, h.ID); err != nil {
+		return fmt.Errorf("demo: prune power domains of %s: %w", h.ID, err)
+	}
 	return nil
 }
 
 func seedHub(ctx context.Context, tx pgx.Tx, opts SeedOptions, h *hostPlan, hb *hubPlan) error {
-	// farm.power_domains carries no natural key, so notes holds a stable one.
-	// A power domain models what a single switch actually controls: on the
-	// ganged hub below, "power-cycle this device" really means "power-cycle
-	// these seven", which is why the API must refuse it while any of the seven
-	// holds a live lease.
-	const pdSQL = `
-INSERT INTO farm.power_domains (host_id, kind, control, control_addr, notes)
-SELECT $1,$2,$3,$4,$5
- WHERE NOT EXISTS (SELECT 1 FROM farm.power_domains p WHERE p.notes = $5)`
-	if _, err := tx.Exec(ctx, pdSQL,
-		h.ID, hb.Power.Kind, hb.Power.Control, nullable(hb.Power.Addr), hb.Power.Notes); err != nil {
-		return fmt.Errorf("demo: seed power domain %s: %w", hb.Power.Notes, err)
-	}
-	var powerID int64
-	if err := tx.QueryRow(ctx,
-		`SELECT id FROM farm.power_domains WHERE notes = $1`, hb.Power.Notes).Scan(&powerID); err != nil {
-		return fmt.Errorf("demo: read power domain %s: %w", hb.Power.Notes, err)
-	}
-
-	const hubSQL = `
-INSERT INTO farm.hubs (host_id, controller_id, usb_path, model, port_count, vbus_switchable)
-SELECT $1, c.id, $2, $3, $4, $5
-  FROM farm.controllers c
- WHERE c.host_id = $1 AND c.root_bus = $6
-ON CONFLICT (host_id, usb_path) DO UPDATE
-   SET controller_id   = EXCLUDED.controller_id,
-       model           = EXCLUDED.model,
-       port_count      = EXCLUDED.port_count,
-       vbus_switchable = EXCLUDED.vbus_switchable
-RETURNING id`
-	var hubID int64
-	if err := tx.QueryRow(ctx, hubSQL,
-		h.ID, hb.USB, hb.Model, hb.Ports, hb.Vbus, hb.Bus).Scan(&hubID); err != nil {
-		return fmt.Errorf("demo: seed hub %s/%s: %w", h.ID, hb.USB, err)
-	}
-
+	// Every port goes through farm.register_slot — the schema's own
+	// registration function, and the one a real host's discovery calls for
+	// every position it finds (internal/topo/discover.go, registerHub). It
+	// writes the controller, the hub, the hub's power domain and the slot, and
+	// it decides the domain's shape from p_switchable exactly as it does for
+	// real hardware: a hub that cannot switch VBUS per port gets ONE ganged
+	// domain, so the ladder knows before it acts that "cycle this port" means
+	// "cycle these seven". A seed that wrote those rows by hand was a second
+	// opinion on the topology model, and it disagreed with the first: it gave
+	// per-port hubs one domain too, so tier 4's blast radius on hardware that
+	// could switch a single port was the whole hub. This seed has no opinion;
+	// it plugs the hubs in and lets the function say what they are.
 	for i := range hb.Slots {
-		if err := seedSlot(ctx, tx, opts, h, hb, hubID, powerID, &hb.Slots[i]); err != nil {
+		sl := &hb.Slots[i]
+		if err := tx.QueryRow(ctx,
+			`SELECT farm.register_slot($1, $2, $3, $4, $5, $6, $7, $8)`,
+			h.ID, sl.USB, hb.USB, sl.Port, hb.Model, hb.Ports, hb.Switchable, sl.RackSlot,
+		).Scan(&sl.SlotID); err != nil {
+			return fmt.Errorf("demo: register slot %s/%s: %w", h.ID, sl.USB, err)
+		}
+	}
+	if hb.Switchable {
+		if err := splitPowerDomains(ctx, tx, h.ID, hb.USB); err != nil {
+			return err
+		}
+	}
+	for i := range hb.Slots {
+		if err := seedDevice(ctx, tx, opts, h, &hb.Slots[i]); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func seedSlot(ctx context.Context, tx pgx.Tx, opts SeedOptions, h *hostPlan, hb *hubPlan,
-	hubID, powerID int64, sl *slotPlan) error {
-
-	const slotSQL = `
-INSERT INTO farm.slots (host_id, hub_id, power_domain_id, port_number, usb_path, topo_path, rack_slot, state)
-VALUES ($1,$2,$3,$4,$5,$6::ltree,$7,'active')
-ON CONFLICT (host_id, usb_path) DO UPDATE
-   SET hub_id          = EXCLUDED.hub_id,
-       power_domain_id = EXCLUDED.power_domain_id,
-       port_number     = EXCLUDED.port_number,
-       topo_path       = EXCLUDED.topo_path,
-       rack_slot       = EXCLUDED.rack_slot
-RETURNING id`
-	var slotID int64
-	if err := tx.QueryRow(ctx, slotSQL,
-		h.ID, hubID, powerID, sl.Port, sl.USB, sl.Topo, sl.RackSlot).Scan(&slotID); err != nil {
-		return fmt.Errorf("demo: seed slot %s/%s: %w", h.ID, sl.USB, err)
+// splitPowerDomains gives every port of a per-port hub its own power domain.
+//
+// farm.power_domains models "what a single switch actually controls", and on
+// a per-port hub that is one port. farm.register_slot keys a hub's domain by
+// the hub's path and so gives a per-port hub one domain for all of its ports
+// — correct for the ganged case it was written to protect against, and one
+// size too large for this one: the recovery ladder computes tier 4's blast
+// radius as every slot in the domain, so a neighbour's lease on a hub that
+// could have switched one port would refuse a cycle the hardware can do
+// cleanly. Splitting the domain here, after the function has registered the
+// hub, is the seed describing the switches that exist without contradicting
+// the function about anything it does say. It is idempotent: a re-seed finds
+// the per-port domains already there and points the slots back at them.
+func splitPowerDomains(ctx context.Context, tx pgx.Tx, hostID, hubPath string) error {
+	stmts := []string{
+		// One domain per port, addressed by the port's own usb_path — which
+		// is what a per-port switch is told to act on.
+		`INSERT INTO farm.power_domains (host_id, kind, control, control_addr, notes)
+		 SELECT s.host_id, 'per_port', 'uhubctl', s.usb_path, 'one switch per port'
+		   FROM farm.slots s
+		   JOIN farm.hubs hb ON hb.id = s.hub_id
+		  WHERE hb.host_id = $1 AND hb.usb_path = $2
+		    AND NOT EXISTS (SELECT 1 FROM farm.power_domains pd
+		                     WHERE pd.host_id = s.host_id AND pd.control_addr = s.usb_path)`,
+		`UPDATE farm.slots s
+		    SET power_domain_id = pd.id
+		   FROM farm.hubs hb, farm.power_domains pd
+		  WHERE hb.id = s.hub_id AND hb.host_id = $1 AND hb.usb_path = $2
+		    AND pd.host_id = s.host_id AND pd.control_addr = s.usb_path
+		    AND s.power_domain_id IS DISTINCT FROM pd.id`,
 	}
-	sl.SlotID = slotID
+	for _, q := range stmts {
+		if _, err := tx.Exec(ctx, q, hostID, hubPath); err != nil {
+			return fmt.Errorf("demo: split power domains of %s/%s: %w", hostID, hubPath, err)
+		}
+	}
+	return nil
+}
 
+func seedDevice(ctx context.Context, tx pgx.Tx, opts SeedOptions, h *hostPlan, sl *slotPlan) error {
 	d := sl.Device
 	if d == nil {
 		return nil // an empty position; the slot still exists and is still schedulable-looking
@@ -345,7 +374,7 @@ RETURNING id::text`
 	if err := tx.QueryRow(ctx, devSQL,
 		d.FarmUID, d.Serial, d.Ambiguous, d.Manufacturer, d.Model, d.Product,
 		d.Codename, d.Release, d.SDK, d.ABIs, d.Fingerprint,
-		slotID, h.ID, opts.Pool, d.Labels).Scan(&deviceID); err != nil {
+		sl.SlotID, h.ID, opts.Pool, d.Labels).Scan(&deviceID); err != nil {
 		return fmt.Errorf("demo: seed device %s: %w", d.FarmUID, err)
 	}
 	d.DeviceID = deviceID
@@ -372,18 +401,11 @@ ON CONFLICT (device_id) DO NOTHING`
 		good, bad, credits = 0, 3, 3.0
 	}
 	if _, err := tx.Exec(ctx, rtSQL,
-		deviceID, h.ID, slotID, d.ADBState, d.Health,
+		deviceID, h.ID, sl.SlotID, d.ADBState, d.Health,
 		d.Battery, d.TempDC, d.ADBState == "device", good, bad, credits); err != nil {
 		return fmt.Errorf("demo: seed runtime %s: %w", d.FarmUID, err)
 	}
 	return nil
-}
-
-func nullable(s string) any {
-	if s == "" {
-		return nil
-	}
-	return s
 }
 
 // ---------------------------------------------------------------------
@@ -421,22 +443,17 @@ type hubPlan struct {
 	USB   string
 	Model string
 	Ports int
-	Vbus  bool
-	Power powerPlan
-	Slots []slotPlan
-}
-
-type powerPlan struct {
-	Kind    string
-	Control string
-	Addr    string
-	Notes   string
+	// Switchable is what discovery would report to farm.register_slot for
+	// this hub: true only on positive evidence of per-port VBUS switching. It
+	// decides the shape of the hub's power domain, and it is the only thing
+	// about power the seed states.
+	Switchable bool
+	Slots      []slotPlan
 }
 
 type slotPlan struct {
 	Port     int
 	USB      string
-	Topo     string
 	RackSlot string
 	SlotID   int64
 	Device   *devicePlan
@@ -532,22 +549,20 @@ func planFarm(opts SeedOptions) farmPlan {
 				h.Buses = append(h.Buses, bus)
 			}
 			hb := hubPlan{
-				Index: hub,
-				Bus:   bus,
-				Port:  hubPort,
-				USB:   fmt.Sprintf("%d-%d", bus, hubPort),
-				Model: hubModels[hub%len(hubModels)],
-				Ports: opts.SlotsPerHub,
+				Index:      hub,
+				Bus:        bus,
+				Port:       hubPort,
+				USB:        fmt.Sprintf("%d-%d", bus, hubPort),
+				Model:      hubModels[hub%len(hubModels)],
+				Ports:      opts.SlotsPerHub,
+				Switchable: perPortSwitching(hub),
 			}
-			hb.Power = planPower(h.ID, hub, hb.USB)
-			hb.Vbus = hb.Power.Kind != "none"
 
 			for port := 1; port <= opts.SlotsPerHub; port++ {
 				usb := fmt.Sprintf("%s.%d", hb.USB, port)
 				sl := slotPlan{
 					Port:     port,
 					USB:      usb,
-					Topo:     topoPath(h.ID, bus, hb.USB, usb),
 					RackSlot: fmt.Sprintf("R%s-U%02d-H%d-P%d", trimRack(opts.Rack), h.RackUnit, hub+1, port),
 				}
 				if placed < opts.Devices {
@@ -577,24 +592,19 @@ func planFarm(opts SeedOptions) farmPlan {
 	return p
 }
 
-// planPower gives each hub a different switching story, because the API's
-// power endpoint has to refuse the ganged case and an all-per_port farm would
-// never exercise that refusal.
-func planPower(hostID string, hubIdx int, hubUSB string) powerPlan {
-	notes := fmt.Sprintf("demo:%s:%s", hostID, hubUSB)
-	switch hubIdx % 4 {
-	case 2:
-		// One switch for the whole hub: cutting VBUS for one device cuts it
-		// for all seven.
-		return powerPlan{Kind: "ganged", Control: "smarthub",
-			Addr: fmt.Sprintf("smarthub://%s/%s", hostID, hubUSB), Notes: notes}
-	case 3:
-		// A dumb hub. Nothing to switch; recovery stops at the soft tiers.
-		return powerPlan{Kind: "none", Control: "none", Notes: notes}
-	default:
-		return powerPlan{Kind: "per_port", Control: "uhubctl",
-			Addr: fmt.Sprintf("uhubctl://%s/%s", hostID, hubUSB), Notes: notes}
-	}
+// perPortSwitching gives the hubs two switching stories, because the ladder
+// has to refuse the ganged case and an all-per-port farm would never exercise
+// that refusal. The first two hubs of every host switch VBUS per port; the
+// other two do not — one because its switch feeds every port at once, one
+// because it is a dumb hub with no switch at all. Discovery cannot tell those
+// two apart from sysfs and does not try: both are "no positive evidence of
+// per-port switching", both are reported as not switchable, and
+// farm.register_slot gives each ONE ganged domain with control 'none'. That is
+// the honest model — the ladder must treat seven ports as one blast radius on
+// either — and it is what a real rack of these hubs looks like in this
+// database, so it is what the demo shows.
+func perPortSwitching(hubIdx int) bool {
+	return hubIdx%4 < 2
 }
 
 // planDevice derives every attribute from the position, so the seed is a pure
@@ -666,7 +676,7 @@ func deviceLabels(m deviceModel, hostIdx, hubIdx int) string {
 		"vendor":      strings.ToLower(m.Manufacturer),
 		// A label an operator would actually select on: the devices wired for
 		// battery measurement sit on the hubs with per-port switching.
-		"power_metered": hubIdx%4 == 0 || hubIdx%4 == 1,
+		"power_metered": perPortSwitching(hubIdx),
 		"rack_side":     map[bool]string{true: "front", false: "rear"}[hostIdx%2 == 0],
 	}
 	b, err := json.Marshal(labels)
@@ -729,17 +739,6 @@ func plausibleSerial(manufacturer string, h uint64) string {
 		body = "0" + body
 	}
 	return prefix + body[:12]
-}
-
-// topoPath builds the ltree ancestry, e.g. h01.c3.p3_1.p3_1_4. ltree labels
-// admit only alphanumerics and underscore, so both separators in a usb_path
-// have to be folded.
-func topoPath(hostID string, bus int, hubUSB, slotUSB string) string {
-	label := func(s string) string {
-		return "p" + strings.NewReplacer("-", "_", ".", "_").Replace(s)
-	}
-	return fmt.Sprintf("%s.c%d.%s.%s",
-		strings.NewReplacer("-", "_", ".", "_").Replace(hostID), bus, label(hubUSB), label(slotUSB))
 }
 
 // trimRack turns "r1" into "1" so a rack_slot reads "R1-U04-H2-P3".

@@ -606,10 +606,14 @@ func runNode(ctx context.Context, cfg *config.Config, log *slog.Logger, pool *pg
 	}
 
 	agent, err := node.New(node.Config{
-		Pool:         pool,
-		HostID:       hostID,
-		ADBEndpoint:  cfg.Node.ADBEndpoint,
-		Component:    "node",
+		Pool:        pool,
+		HostID:      hostID,
+		ADBEndpoint: cfg.Node.ADBEndpoint,
+		// Per-host, exactly like the watchdog component above:
+		// farm.component_heartbeat is keyed by component, so a constant "node"
+		// would have every host agent in the farm overwriting one row and
+		// keeping it fresh for the hosts that are dead.
+		Component:    node.DefaultComponentPrefix + hostID,
 		AgentVersion: version,
 		// Discovery must run before enrollment: a device at a USB position with
 		// no registered slot cannot be resolved, only recorded as pending.
@@ -617,11 +621,15 @@ func runNode(ctx context.Context, cfg *config.Config, log *slog.Logger, pool *pg
 			_, derr := disco.Once(c)
 			return derr
 		},
-		Enroll: func(c context.Context) error {
-			_, err := enr.EnrollOnce(c)
-			return err
-		},
-		Addr: cfg.NodeAddr,
+		// Run, not EnrollOnce. node.EnrollFunc is a continuous job: a function
+		// that performs one pass and returns is read as a fault, restarted on a
+		// doubling backoff, and warned about every cycle — so a healthy farm
+		// would enroll less and less often, and a phone plugged in at 02:00
+		// would wait out the worst-case delay. Run also owns enrollment's own
+		// interval and logs each cycle's summary, which the one-pass call
+		// discarded along with it.
+		Enroll: enr.Run,
+		Addr:   cfg.NodeAddr,
 		// node.New refuses an HTTP surface with no credential, which is
 		// right: an unauthenticated endpoint that power-cycles USB ports is
 		// worse than no endpoint. Serving nothing is a legitimate deployment

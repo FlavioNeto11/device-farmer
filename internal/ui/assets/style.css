@@ -295,8 +295,11 @@ main { padding: 8px 12px 40px; }
 .chip-recovering,
 .chip-booting      { background: var(--info-bg);    color: var(--info);    border-color: var(--info); }
 .chip-quarantined  { background: var(--magenta-bg); color: var(--magenta); border-color: var(--magenta); }
+/* Parked is grey with the other deliberate states, never red: a device held
+   off VBUS by charge limiting must not read as an incident on the grid. */
 .chip-unknown,
 .chip-retired,
+.chip-parked,
 .chip-free         { background: var(--gray-bg);    color: var(--gray);    border-color: var(--line-2); }
 .chip-held         { background: var(--info-bg);    color: var(--info);    border-color: var(--info); }
 .chip-suspect      { background: var(--warn-bg);    color: var(--warn);    border-color: var(--warn); }

@@ -59,9 +59,10 @@
       <label>Health
         <select id="f-health">
           <option value="">any health</option>
-          <!-- The API reads "unhealthy" as every state except healthy and
-               retired. It is the set the Fleet tab's pip counts, so it needs a
-               way to be clicked. -->
+          <!-- The API reads "unhealthy" as every state except healthy and the
+               two that are decisions rather than faults, retired and parked.
+               It is the set the Fleet tab's pip counts, so it needs a way to
+               be clicked. -->
           <option value="unhealthy">not healthy (any fault)</option>
           <option value="healthy">healthy</option>
           <option value="degraded">degraded</option>
@@ -72,6 +73,10 @@
           <option value="booting">booting</option>
           <option value="quarantined">quarantined</option>
           <option value="unknown">unknown</option>
+          <!-- Out of service on purpose. Deliberately NOT part of "any fault"
+               above, so it needs its own entry or a charge-limited shelf
+               cannot be found at all. -->
+          <option value="parked">parked</option>
           <option value="retired">retired</option>
         </select>
       </label>

@@ -229,7 +229,7 @@ func zeroFill() {
 		leaseSuspect.WithLabelValues(unknownLabel, unknownLabel, strconv.FormatBool(protected))
 	}
 
-	// SetDeviceHealth already zero-fills all ten states for every hub it
+	// SetDeviceHealth already zero-fills every health state for every hub it
 	// has seen. Before the first census it has seen none, so the correlated
 	// hub-failure rule has nothing to read at all; this covers that window.
 	for _, state := range healthStates {

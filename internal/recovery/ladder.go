@@ -113,6 +113,10 @@ const (
 	//	               devices under active recovery on a three-device hub reach
 	//	               quorum and quarantine the healthy third.
 	//	'quarantined'  our own bookkeeping, not a new observation.
+	//	'parked'       out of service ON PURPOSE. Charge limiting parks whole
+	//	               shelves of handsets at a time and holds them off VBUS for
+	//	               hours; counting that as fault evidence would quarantine a
+	//	               hub for doing exactly what it was told.
 	//	'booting'      authorizing/connecting is transient and normal; a
 	//	               legitimate mass reboot would otherwise read as a hub fault.
 	//
@@ -500,6 +504,18 @@ func (c candidate) slot() obs.Slot {
 // With no watchdog running there is no confirmation and the ladder stalls. A
 // stalled ladder leaves broken devices broken; a ladder driven by a dead
 // health plane power-cycles a working rack.
+//
+// # And nothing that is out of service on purpose
+//
+// health 'parked' is excluded alongside 'quarantined' and 'retired', and it is
+// the one this loop would otherwise get catastrophically wrong. A device held
+// off VBUS by charge limiting is absent from the ADB tracker, which is not
+// evidence of a fault — it is evidence that somebody is looking after its
+// battery. Adopting it here climbs a ladder that ends in quarantining a
+// perfectly good handset. The d.admin_state = 'enabled' predicate below already
+// excludes it, since farm.devices.admin_state is the authority for the state
+// (migration 00008); the health value is named too because a reader of this
+// WHERE clause should not have to know which of the two carries the fact.
 func (l *Ladder) candidates(ctx context.Context) ([]candidate, error) {
 	const q = `
 SELECT r.device_id::text, r.health, r.ladder_tier,
@@ -510,7 +526,7 @@ SELECT r.device_id::text, r.health, r.ladder_tier,
   JOIN farm.slots   s ON s.id = d.current_slot_id
   JOIN farm.hubs   hb ON hb.id = s.hub_id
   JOIN farm.hosts  ho ON ho.id = s.host_id
- WHERE r.health NOT IN ('healthy','retired','quarantined','unknown')
+ WHERE r.health NOT IN ('healthy','retired','quarantined','parked','unknown')
    AND r.adb_state <> 'device'
    AND r.health_since < now() - $1::interval
    AND (r.suppress_until IS NULL
@@ -721,13 +737,18 @@ RETURNING id`, st.HubID, st.HostID, reason).Scan(&qid)
 		return false, fmt.Errorf("recovery: open hub quarantine: %w", err)
 	}
 
+	// 'parked' joins 'quarantined' and 'retired' in the exclusion because this
+	// statement is a SWEEP: it takes every device on the hub out of service in
+	// one go, and a device somebody deliberately parked is not the hub's fault
+	// and must not have that reason overwritten. Migration 00008 holds the value
+	// anyway, so the predicate is here to say so rather than to enforce it.
 	if _, err := tx.Exec(cctx, `
 UPDATE farm.device_runtime r
    SET health = 'quarantined', health_since = now(), updated_at = now()
   FROM farm.devices d, farm.slots s
  WHERE r.device_id = d.id AND d.current_slot_id = s.id
    AND s.hub_id = $1::bigint
-   AND r.health NOT IN ('quarantined','retired')`, st.HubID); err != nil {
+   AND r.health NOT IN ('quarantined','retired','parked')`, st.HubID); err != nil {
 		return false, fmt.Errorf("recovery: quarantine hub devices: %w", err)
 	}
 
@@ -1063,12 +1084,18 @@ RETURNING id`,
 	// Climb the ladder and hold health steady for the settle window. The
 	// suppression is what stops the watchdog from recording an INDUCED
 	// transport drop as a fresh fault and re-arming the whole ladder.
+	//
+	// 'parked' is held here too. candidates() already excludes parked devices,
+	// so reaching this statement with one means it was parked in the window
+	// between the candidate query and this attempt — rare, and exactly when a
+	// wrong answer costs the most, since the next rung after 'recovering' is a
+	// port power cycle on a device somebody is deliberately holding.
 	if _, err := tx.Exec(cctx, `
 UPDATE farm.device_runtime
    SET ladder_tier    = $2::int,
        suppress_until = now() + LEAST($3::interval, $4::interval),
-       health         = CASE WHEN health IN ('quarantined','retired') THEN health ELSE 'recovering' END,
-       health_since   = CASE WHEN health IN ('quarantined','retired','recovering') THEN health_since ELSE now() END,
+       health         = CASE WHEN health IN ('quarantined','retired','parked') THEN health ELSE 'recovering' END,
+       health_since   = CASE WHEN health IN ('quarantined','retired','parked','recovering') THEN health_since ELSE now() END,
        updated_at     = now()
  WHERE device_id = $1::uuid`,
 		c.DeviceID, t.Tier, pgInterval(t.Cooldown), pgInterval(l.cfg.MaxSuppress)); err != nil {
@@ -1195,7 +1222,7 @@ RETURNING id`, c.DeviceID, c.SlotID, c.HostID, reason).Scan(&qid)
 	if _, err := tx.Exec(cctx, `
 UPDATE farm.device_runtime
    SET health = 'quarantined', health_since = now(), suppress_until = NULL, updated_at = now()
- WHERE device_id = $1::uuid AND health <> 'retired'`, c.DeviceID); err != nil {
+ WHERE device_id = $1::uuid AND health NOT IN ('retired','parked')`, c.DeviceID); err != nil {
 		return err
 	}
 
@@ -1245,13 +1272,16 @@ RETURNING id`, c.HostID, reason).Scan(&qid)
 		return err
 	}
 
+	// Same sweep, same exclusion as the hub case: a whole-host quarantine is a
+	// statement about the host, and it does not get to relabel the devices an
+	// operator had already taken out of service on purpose.
 	if _, err := tx.Exec(cctx, `
 UPDATE farm.device_runtime r
    SET health = 'quarantined', health_since = now(), updated_at = now()
   FROM farm.devices d, farm.slots s
  WHERE r.device_id = d.id AND d.current_slot_id = s.id
    AND s.host_id = $1::text
-   AND r.health NOT IN ('quarantined','retired')`, c.HostID); err != nil {
+   AND r.health NOT IN ('quarantined','retired','parked')`, c.HostID); err != nil {
 		return err
 	}
 

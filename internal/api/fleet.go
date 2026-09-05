@@ -229,8 +229,12 @@ func (s *Server) handleFleet(w http.ResponseWriter, r *http.Request) {
 	case "":
 	case "unhealthy":
 		// The operational question is "what is not fine", which is every state
-		// except healthy — and retired, which is not a fault but a decision.
-		conds = append(conds, "f.health IS NOT NULL AND f.health NOT IN ('healthy','retired')")
+		// except healthy — and except the two that are decisions rather than
+		// faults: 'retired', and 'parked', which is a charge limiter holding a
+		// battery or an operator who took a handset out and said why. Counting
+		// a deliberate hold here fills the grid with devices that are fine,
+		// during exactly the incident the filter exists for.
+		conds = append(conds, "f.health IS NOT NULL AND f.health NOT IN ('healthy','retired','parked')")
 	default:
 		add("f.health = $%d", health)
 	}
@@ -290,7 +294,10 @@ SELECT %s
 			h = *d.Health
 		}
 		counts.Health[h]++
-		if h != "healthy" && h != "retired" {
+		// Same exclusion as the "unhealthy" filter above and as
+		// farm.v_hub_health. These three must agree, or one response reports
+		// four unhealthy devices in counts and zero on the hubs they sit on.
+		if h != "healthy" && h != "retired" && h != "parked" {
 			counts.Unhealthy++
 		}
 		hostID := "unassigned"

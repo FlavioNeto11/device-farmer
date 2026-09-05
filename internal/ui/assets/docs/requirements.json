@@ -1175,33 +1175,70 @@
         "**10. `TEST-04`/`TEST-05` — a test for `isRetryable` and `planResume`.** A regression in either reintroduces #663, which is the failure this project defines itself against. The `leaseOps` interface exists so a stub can drive the branch its own doc comment calls the single most consequential decision in the project, and nothing drives it."
       ],
       "source": "REQUIREMENTS.md"
+    },
+    {
+      "heading": "Gaps closed since this register was written",
+      "body": "Recorded rather than deleted, for the reason the six area pages give: a reader who remembers a gap has to be able to tell **fixed** from **never there**, and the change that closed one is usually the shortest true description of what the behaviour is now.\n\nEleven of the twenty-two entries below closed, and six more narrowed rather than vanished — which is the more interesting half. `LEASE-09` and `SEC-04` both went from \"not built\" to \"built and not started\", a state that is more specific and more embarrassing than absence: the expensive work is done and the call site is missing.",
+      "table": {
+        "columns": [
+          "what was wrong",
+          "what closed it"
+        ],
+        "rows": [
+          [
+            "`OPS-04`: `farmd node` cannot start in any environment. `runNode` passes `Addr: cfg.NodeAddr` and never passes `Token`, `node.New` errors whenever `Addr != \"\" && Token == \"\"`, and `FARM_NODE_ADDR` cannot be blanked because the config loader treats an empty value as unset and substitutes the `:8082` default.",
+            "`runNode` passes `Token: os.Getenv(\"FARM_NODE_TOKEN\")` alongside `Addr`, so the guard that refused an unauthenticated USB-power endpoint is satisfiable. Run here with `FARM_HOST_ID` and the token set, the agent gets through configuration, heartbeats as `node, enroll`, and stops at USB discovery — which needs Linux. It predicted it would unblock four rows and it did: `DEV-04`, `DEV-05`, `REC-03`, `HW-06`."
+          ],
+          [
+            "`JOB-05`: the spec gate is written and never called. `specSubmissionError` is documented at `internal/api/specs.go:565` as \"the gate POST /api/v1/jobs applies to a spec\" and `grep -rn specSubmissionError` returns its comment and its definition, nothing else.",
+            "`internal/api/jobs_submit.go:215` calls it. Seven jobs had failed with `jobspec: invalid spec` after each burning an attempt on a different real device."
+          ],
+          [
+            "`SEC-02`: the remedy the product prints for its own open port does not work. `authInfo()` reports the fix as \"set FARM_API_TOKENS to a token list\"; `api.AuthenticatorFromEnv`, the only function that reads that variable, has zero callers anywhere in the tree.",
+            "`cmd/farmd/roles.go:321` calls `api.AuthenticatorFor(cfg, log)`, which reads `FARM_API_TOKENS` and REFUSES to start an exposed listener with no credentials rather than booting open. Verified live: 401 without a credential, 200 with one."
+          ],
+          [
+            "`REC-07`: host drain is written and never read. `POST /api/v1/hosts/{id}/drain` sets `farm.hosts.admin_state='draining'` and returns \"no new leases will be placed on this host\". `farm.hosts` occurs once in `migrations/00002_lease.sql`, inside a GRANT, and both `admin_state` checks in `lease_acquire` are on the device, not the host.",
+            "`farm.lease_acquire` joins `farm.hosts` and requires `h.admin_state = 'enabled'` in both allocation queries (`migrations/00005_correctness.sql`). The allocator had been filtering the DEVICE's admin_state and never the host's."
+          ],
+          [
+            "`JOB-11`: `farm.jobs.selector` is stored, validated, echoed by the API and never used for placement. The string `selector` does not occur anywhere in `migrations/00002_lease.sql`, and `internal/lease/store.go` documents `ErrNoCapacity` as \"no device … matched the job's selector\", which is not what the SQL does.",
+            "`farm.device_matches` and `farm.selector_unknown_keys` land in `00005`, and `lease_acquire` filters on the first in both allocation queries. A selector key the schema does not support is now an exception naming the supported keys, rather than a filter that silently matched everything."
+          ],
+          [
+            "`OBS-03`: registering the role collectors is not a one-line fix, and attempting it as one breaks the binary. `internal/obs` declares namespace `farm` + name `recovery_attempts_total` with `{tier,outcome,host,hub,rack_slot}`; `internal/recovery` declares namespace `farm` + subsystem `recovery` + name `attempts_total` with `{tier,outcome}`. Both resolve to `farm_recovery_attempts_total`.",
+            "Sequenced exactly as this entry instructed: the colliding declaration was resolved first, then all ten `Collectors()` groups were registered. 92 distinct `farm_*` names on a live `/metrics`, against 15."
+          ],
+          [
+            "`DEV-02` and `HW-07`: `farm.resolve_device` rung 2 calls `min()` on a `uuid` column and PostgreSQL 17 has no `min(uuid)` aggregate, while `docker-compose.yml` pins `postgres:17-alpine` and nothing anywhere declares a version requirement.",
+            "Rung 2 was rewritten to count and fetch separately, so the `min(uuid)` that raised 42883 on the second-strongest identity signal — in exactly the duplicate-fingerprint case it exists to adjudicate — is gone (`00005`). Rung 3 now reports `ambiguous` instead of being overwritten by the adoption branch (`00011`)."
+          ],
+          [
+            "`OPS-07`: no Helm chart and no Kubernetes manifests. `docker-compose.yml` is the only deployment artifact in the repository, while the README's architecture diagram places the whole control plane in Kubernetes.",
+            "`deploy/helm/device-farmer` ships one Deployment per role, and fails the render if `config.extra` carries `DATABASE_URL`, `FARM_API_TOKENS` or `FARM_COMPONENT` — the last because one shared component name makes the reaper's gap accounting blind to the role that is down, so its outage goes unrefunded and its leases are reclaimed on schedule."
+          ],
+          [
+            "`OBS-09`: the capability panel at the top of this page cannot tell \"I measured zero\" from \"I could not measure\". `schemaInfo` and `fleetCounts` discard their query error with `_ =`, `roleStatuses` populates its map only `if err == nil`, and `handleCapabilities` returns 200 in every case.",
+            "Each probe returns its error and a report that could not be taken is a 503 naming which observation is missing and what must not be concluded from it: the schema is unknown and it is NOT v0; the counts are unknown and they are NOT zero. An empty `goose_db_version` is kept as an ANSWER, because a fresh database that genuinely needs migrating is the case the note was written for."
+          ],
+          [
+            "`SEC-08`: `GET /api/v1/capabilities` is the one route in `buildHandler` registered with a bare `mux.HandleFunc` rather than through `tenant(...)` or `operator(...)`, so it carries no role — which is also why `API-02`, the invariant that no endpoint can exist without a level, reads `partial` rather than `met`.",
+            "Registered through `tenant(...)` like every other route. Tenant is the lowest role there is, which is the design: under an open authenticator the stub grants every caller operator, so the debugging case the route was left open for still reaches it, and the same line starts asking for a credential the moment `FARM_API_TOKENS` is set."
+          ],
+          [
+            "The capability panel at the top of this page disagrees with the register in three places: `Automatic reclamation` claims to be the only automatic release path (`LEASE-08` says otherwise), `Recovery ladder` branches its detail on whether a `node` role is beating when the deciding fact is that `HostRunner` is nil at `cmd/farmd/roles.go:206`, and `Authentication` prints a fix that does nothing.",
+            "All three are gone. The reclamation entry is still worth rewording — `max_runtime` is a second automatic ending — but the recovery-ladder predicate is now correct (the actuator holds a real `node.Client`), authentication reports `unavailable` with a fix string that works, and the Helm entry reports `enabled`."
+          ]
+        ]
+      },
+      "source": "REQUIREMENTS.md"
     }
   ],
   "gaps": [
     {
-      "what": "`OPS-04`: `farmd node` cannot start in any environment. `runNode` passes `Addr: cfg.NodeAddr` and never passes `Token`, `node.New` errors whenever `Addr != \"\" && Token == \"\"`, and `FARM_NODE_ADDR` cannot be blanked because the config loader treats an empty value as unset and substitutes the `:8082` default.",
-      "consequence": "This single guard is why four other rows in the register read `not_built`: `DEV-04` (dynamic enrollment), `DEV-05` (topology discovery), `REC-03` (recovery tiers 3 and 4) and `HW-06` (hardware bring-up). Nothing else in the register unblocks four requirements. It is also the reason the enrollment and topology machinery — several thousand lines of it, verified only by calling its SQL and its Go functions in isolation — has never run as a loop anywhere.",
-      "status": "not_built"
-    },
-    {
-      "what": "`JOB-05`: the spec gate is written and never called. `specSubmissionError` is documented at `internal/api/specs.go:565` as \"the gate POST /api/v1/jobs applies to a spec\" and `grep -rn specSubmissionError` returns its comment and its definition, nothing else.",
-      "consequence": "A job whose spec cannot run is filed, the scheduler allocates a real device through `farm.lease_acquire`, and the runner discovers at `jobspec.Parse` that the document is nonsense. Verified live: seven jobs failed with `jobspec: invalid spec`, each having burned an attempt on a **different** device. Bad specs are never re-queued, so each one costs a phone and is permanent.",
-      "status": "not_built"
-    },
-    {
-      "what": "`SEC-02`: the remedy the product prints for its own open port does not work. `authInfo()` reports the fix as \"set FARM_API_TOKENS to a token list\"; `api.AuthenticatorFromEnv`, the only function that reads that variable, has zero callers anywhere in the tree.",
-      "consequence": "An operator who reads the capability panel above, sets the variable and restarts has changed nothing, and now believes the port is closed. That is strictly worse than the documented absence beside it. Deleting the fix string is a one-line change and is more urgent than wiring the authenticator, because it converts a false sense of safety back into a known one.",
-      "status": "not_built"
-    },
-    {
-      "what": "`SEC-04`: the fence is not enforced at the resource, and the product's own text says it is. The revoke response body and `ctl lease revoke` both print \"any socket still carrying fence N is refused at the host proxy\"; no host proxy exists, no Go file reads `devices.fence_floor` to gate an ADB operation, and `FARM_NODE_SELF_FENCE_TIMEOUT` has no consumer.",
+      "what": "`SEC-04`: the fence is still not enforced at the resource, and the product's own revoke response still says it is. What changed is that the design and a testable skeleton now exist — `docs/design/fence-proxy.md` and `internal/fenceproxy`, 24 tests — and nothing constructs either, so no ADB byte passes through a proxy today. The package is deliberately inert and structurally barred from ever ending a lease: two tests enforce that, one asserting `FenceSource` has exactly one method because a second is what would let a refusal DO something.",
       "consequence": "An operator who revokes a lease and reads the reply believes the previous holder was cut off at the wire. The real barrier is the 35-second slot rearm — and a wedged holder may not notice its own eviction for a full 60-second renewal interval, which is **longer** than the rearm. The capability panel above is honest about this; two other surfaces contradict it. Until the proxy exists, treat slot rearm as the barrier and size it against the renewal interval, not against the fence.",
-      "status": "not_built"
-    },
-    {
-      "what": "`REC-07`: host drain is written and never read. `POST /api/v1/hosts/{id}/drain` sets `farm.hosts.admin_state='draining'` and returns \"no new leases will be placed on this host\". `farm.hosts` occurs once in `migrations/00002_lease.sql`, inside a GRANT, and both `admin_state` checks in `lease_acquire` are on the device, not the host.",
-      "consequence": "An operator drains a host before physical work and believes jobs have stopped landing on it. Verified live: h02 was drained and acquired seven new leases in the following sixty seconds while reading `draining` throughout. The only thing that actually stops allocation to a host is a host-scoped quarantine, because that writes a column the allocator reads. Physically unplugging a hub is currently more reliable than the drain endpoint.",
-      "status": "not_built"
+      "status": "partial"
     },
     {
       "what": "`JOB-06`: reset tiers expand to nothing. `farm.jobs.profile_id` is never written by any code path — two hits in the tree, both reads — and the reset expansion needs a profile to know which packages a job did not install.",
@@ -1209,68 +1246,33 @@
       "status": "not_built"
     },
     {
-      "what": "`JOB-11`: `farm.jobs.selector` is stored, validated, echoed by the API and never used for placement. The string `selector` does not occur anywhere in `migrations/00002_lease.sql`, and `internal/lease/store.go` documents `ErrNoCapacity` as \"no device … matched the job's selector\", which is not what the SQL does.",
-      "consequence": "A job asking for `{\"model\":\"Pixel 7\"}` gets whatever device is next in the failure-score ordering. Verified: a job with `selector: {\"model\":\"NoSuchPhone9000\"}` was granted a device at HTTP 200 where a working selector would have returned 409. Only `pin_device` narrows placement, so any capability-targeted workload has to pin by device id and lose the pooling.",
-      "status": "not_built"
-    },
-    {
-      "what": "`LEASE-09`: nothing produces a witness. `farm.lease_witness`, `Store.Witness`, `Holder.Witness`, `FARM_LEASE_WITNESS_INTERVAL` and `FARM_LEASE_WITNESS_MAX_EXT` all exist; `Holder.Witness`'s only caller is inside `internal/lease`, there is no API route, and no on-device agent touches a marker file.",
+      "what": "`LEASE-09`: nothing STARTS a witness. Every part exists now — `farm.lease_witness`, `Store.Witness`, `Holder.StartWitness`, the on-device marker in `internal/runner/witness.go`, and both config knobs — and every `StartWitness` call site in the tree is a test. `config.Summary()` reports `NOT STARTED` rather than printing the interval as if in force. The last unwired half of the #663 countermeasure, and the top of this page's next-steps list.",
       "consequence": "The extension meant to protect a job that has lost the control plane but is demonstrably alive on the device never fires. Across 1117 leases, `witness_at` is NULL on every one and `witness_extensions` has never exceeded 0. A long job that loses the control plane gets exactly TTL plus grace and nothing more — which is the scenario the witness was designed for and the one where its absence is least visible in advance.",
-      "status": "not_built"
+      "status": "partial"
     },
     {
-      "what": "`OBS-03`: registering the role collectors is not a one-line fix, and attempting it as one breaks the binary. `internal/obs` declares namespace `farm` + name `recovery_attempts_total` with `{tier,outcome,host,hub,rack_slot}`; `internal/recovery` declares namespace `farm` + subsystem `recovery` + name `attempts_total` with `{tier,outcome}`. Both resolve to `farm_recovery_attempts_total`.",
-      "consequence": "Prometheus rejects the second registration with \"a previously registered descriptor with the same fully-qualified name … has different label names\", and `newRegistry` propagates the error rather than swallowing it — so adding `recovery.Collectors()` makes `farmd` fail to start. Anyone fixing `OBS-02` in the obvious order will see a startup failure and read it as a regression in their own change. Rename one descriptor first, then register the other eight packages' collectors.",
-      "status": "not_built"
-    },
-    {
-      "what": "`DEV-09`: battery state of charge, battery temperature and the charge gate are modelled everywhere and collected nowhere. `farm.device_runtime` has all three columns, `farm.v_fleet` exposes two, `internal/api/fleet.go` serialises them and `ctl` prints them. The only writer in the tree is `internal/demo/seed.go`, once, at seed time.",
+      "what": "`DEV-09`: the watchdog now reads battery level and temperature on its own ticker and writes `battery_pct` and `battery_temp_dc`, which had no producer outside the demo seed since 00001; `00010` adds the CHECK the temperature column never had. Exercised against the fake ADB server, never against a handset. `charge_gate` still has no writer: the agent-side verb exists (`internal/node/chargegate.go`, a held set-point with a dead-man's switch that fails safe to ON) and the policy loop that would drive it does not.",
       "consequence": "Every battery reading visible on this system is a seeded constant. More seriously, this is the collection layer that the two fire mitigations which actually work — charge limiting and early thermal detection — would both be built on. A rack of 60 lithium cells with a schema for charge and temperature and no writer for either has the appearance of monitoring and none of the substance.",
-      "status": "not_built"
+      "status": "partial"
     },
     {
-      "what": "`HW-03`: the product supports none of the lithium mitigations that are known to work. Clean-agent suppression is not one of them: Novec 1230 at 8.5 vol% failed both to suppress a cell fire and to prevent propagation to its neighbours, and propagation occurred even in a pure-nitrogen atmosphere, because thermal runaway supplies its own oxidiser.",
+      "what": "`HW-03`: clean-agent suppression does not stop a lithium event — Novec 1230 at 8.5 vol% failed both to suppress and to prevent propagation, which occurred even in pure nitrogen — so the mitigations that work are physical and procedural: containment, spacing, charge limiting, early detection. Two of the four now have product support: `docs/siting.md` covers containment and spacing, and the battery reader supplies the early-detection signal. Charge limiting has both halves it needed — the agent-side gate and the parked state that stops a deliberately dark device being quarantined as a fault — and no loop between them.",
       "consequence": "The mitigations that work are containment, cell-to-cell spacing, charge limiting and early detection. The first two are rack design and are outside the software. The second two are `DEV-09`, which is unwritten. The failure mode this entry exists to prevent is buying a clean-agent bottle and considering the hazard handled — the measured result says it will neither put the fire out nor stop it spreading. Note also that fire code is not the gate here: `HW-04`.",
-      "status": "not_built"
+      "status": "partial"
     },
     {
-      "what": "`DEV-02` and `HW-07`: `farm.resolve_device` rung 2 calls `min()` on a `uuid` column and PostgreSQL 17 has no `min(uuid)` aggregate, while `docker-compose.yml` pins `postgres:17-alpine` and nothing anywhere declares a version requirement.",
-      "consequence": "Any resolution reaching rung 2 with a non-NULL fingerprint raises SQLSTATE 42883, which `enroll.classifyResolveError` maps to `pending` — so a brand-new phone, which has no brand and therefore a computed fingerprint, is recorded as pending forever and never joins the fleet. This is latent today only because `OPS-04` stops enrollment running at all. Fix them in that order and the first symptom of the node agent finally starting is every new device parking at `pending`.",
-      "status": "not_built"
-    },
-    {
-      "what": "`TEST-04` and `TEST-05`: seven `_test.go` files exist in a twenty-package tree — four in `internal/adbwire`, two in `internal/jobspec`, one in `test/fakeadb` — and there is no `.github` directory, so nothing runs `go test`, `gofmt` or `test/assertions.sql` automatically.",
+      "what": "`TEST-04` and `TEST-05`: the two loops that decide allocation and release, and the two that execute work on a device, now have 7,466 lines of tests between them — including the fenced-release branch, which needed a seam because it can otherwise only be exercised against a live Postgres and a running renewal loop. `isRetryable` and `planResume` are still untested, and a regression in either reintroduces #663.",
       "consequence": "The `ErrFenced`-versus-transient branch in `holder.go`, whose own doc comment calls it the single most consequential decision in this project, is untested; so are `isRetryable`, `planResume`, the checkpoint fencing and the ladder's refusal path. `leaseOps` and `runner.Conn` are both interfaces created specifically so a stub could drive those branches, and neither stub exists. A regression in any of them ships silently, and three of them reintroduce #663.",
-      "status": "not_built"
+      "status": "partial"
     },
     {
-      "what": "`OPS-07`: no Helm chart and no Kubernetes manifests. `docker-compose.yml` is the only deployment artifact in the repository, while the README's architecture diagram places the whole control plane in Kubernetes.",
-      "consequence": "An operator writes their own Deployments and, with them, their own answers to the questions this code has opinions about: which roles must be singletons, PodDisruptionBudgets that respect the advisory-lock leaders, ordering the migrate Job ahead of everything else, and `terminationGracePeriodSeconds` exceeding `FARM_SHUTDOWN_GRACE` so that `OPS-08`'s drain-and-release-nothing actually completes.",
-      "status": "not_built"
-    },
-    {
-      "what": "`LEASE-08`: `farm.lease_expire_max_runtime` is a second automatic ending that none of the reaper's controls reach. It bumps neither `fence_floor` nor `slots.rearm_at`, has no `protected` filter, and is gated by neither `reaper_state.enabled` nor `quiesce_until`.",
+      "what": "`LEASE-08`: `farm.lease_expire_max_runtime` fences and rearms like every other ending now (`00005`), so the hole this entry was written about is closed. What remains is narrower and is really `LEASE-11`: it is a second automatic ending that the reaper's kill switch and quiesce gate do not reach. Whether they SHOULD is a design question nobody has answered in writing — `max_runtime` is a deadline the user wrote down, which the founding requirement names as a legitimate ending.",
       "consequence": "A holder ended by the sweep is not fenced and its device is schedulable the same instant with no quarantine — verified, the ended holder's write at the same fence was accepted afterwards. Marking a job protected does not protect it from its own `max_runtime`, and turning the reaper off during an incident does not stop these endings. The capability panel's \"the only automatic release path in the system\" is describing `lease_reclaim` alone.",
       "status": "partial"
     },
     {
       "what": "`LEASE-03`: the Postgres role firewall is correct DDL that no deployment assumes. `farm_reaper`, `farm_scheduler` and `farm_watchdog` are created `NOLOGIN` with the right grants; no Go code issues `SET ROLE`, there is no per-component DSN, and every process connects with one `DATABASE_URL` — as `farm`, which on the demo is a superuser.",
       "consequence": "The one place the firewall genuinely binds is inside `farm.lease_reclaim`, whose function-level `SET role = farm_reaper` drops superuser for that function's duration. Everywhere else the grants describe an intent nobody is running under: the watchdog process could write `farm.leases` because it is not running as `farm_watchdog`. What actually holds the health plane away from the lease plane is the Go import barrier — real, enforced by a test, and a compile-time property of this build rather than a database guarantee.",
-      "status": "partial"
-    },
-    {
-      "what": "`OBS-09`: the capability panel at the top of this page cannot tell \"I measured zero\" from \"I could not measure\". `schemaInfo` and `fleetCounts` discard their query error with `_ =`, `roleStatuses` populates its map only `if err == nil`, and `handleCapabilities` returns 200 in every case.",
-      "consequence": "With PostgreSQL unreachable — or the pool merely saturated, which the package doc warns about by name — this page renders a diagnosis rather than an outage: `schema v0` with the note \"no migrations applied; run farmd migrate up\", every control-plane role \"never beat\", every fleet count zero, and features reading \"No reaper is beating: an abandoned lease will never be reclaimed and its device stays out of the pool.\" Nine specific false statements, none flagged. And because the response is 200, the dashboard's own \"control plane is not answering\" banner never fires either, so the most alarming screen in the product appears during the one incident where it is not the truth. An operator acting on it would go looking for a missing migration during a database outage.",
-      "status": "not_built"
-    },
-    {
-      "what": "`SEC-08`: `GET /api/v1/capabilities` is the one route in `buildHandler` registered with a bare `mux.HandleFunc` rather than through `tenant(...)` or `operator(...)`, so it carries no role — which is also why `API-02`, the invariant that no endpoint can exist without a level, reads `partial` rather than `met`.",
-      "consequence": "The exception is deliberate and the reasoning in the comment is sound: an operator debugging a farm whose auth is the broken thing still needs to see its state. But the route returns rather more than that — device, host, live-lease, quarantine, job and artifact counts, the VCS revision, the schema version, the lease TTL, grace, renewal and rearm windows, the reaper gap floor, and per-role liveness. So it is the one surface that stays open in the deployment where `SEC-01` and `SEC-02` are finally fixed. Split it: the build, schema and auth halves answer unauthenticated; the fleet counts and timings go behind the tenant role.",
-      "status": "not_built"
-    },
-    {
-      "what": "The capability panel at the top of this page disagrees with the register in three places: `Automatic reclamation` claims to be the only automatic release path (`LEASE-08` says otherwise), `Recovery ladder` branches its detail on whether a `node` role is beating when the deciding fact is that `HostRunner` is nil at `cmd/farmd/roles.go:206`, and `Authentication` prints a fix that does nothing.",
-      "consequence": "The panel is the most-read status surface in the product and is measured from the live deployment, which is exactly why a wrong entry carries further than a wrong sentence in prose. The `Recovery ladder` entry is the subtle one: it is correct today only because no node agent can beat, so fixing `OPS-04` would make it start printing \"a host agent is present, so tiers 3 and 4 can act\" while tiers 3 and 4 remain unreachable.",
       "status": "partial"
     },
     {
@@ -1284,7 +1286,7 @@
       "status": "unverified"
     },
     {
-      "what": "This register is a point-in-time verification and nothing re-checks it. Every status above was confirmed against this tree at the commit that added the file — by grep, by build, or against a live farm — and there is no test, no CI job and no assertion that fails when a row goes stale.",
+      "what": "This register is a point-in-time verification and nothing re-checks it — and the cost of that is now measured rather than predicted. It was written on `ca91c1c`; by the time it was next read, 36 of its 101 rows were wrong, because migration `00005` and nine merged branches had landed underneath it. Every status is still confirmed by a command a reader can re-run, and nothing runs them on a schedule. A register that decays silently is a gap list that will one day be read as reassurance.",
       "consequence": "A row that reads `not_built` after somebody has built the thing is the same failure this page exists to prevent, pointed the other way. The cheapest guard is to treat the greps in the examples above as the register's test suite: each is a single command whose output is printed beside it, so a status is falsifiable in one paste. Until `TEST-05` exists there is nothing to hang them on.",
       "status": "unverified"
     }

@@ -38,6 +38,11 @@ const (
 // the only other place a uid could come from is a file on a phone.
 var uidRe = regexp.MustCompile(`^df-[0-9a-f]{32}$`)
 
+// IsFarmUID reports whether s has the shape of a farm uid. It is the one
+// check a caller outside this package may make before handing a uid to a
+// Brander, so a request body cannot name a "uid" the schema would refuse.
+func IsFarmUID(s string) bool { return uidRe.MatchString(s) }
+
 // Exit statuses the brand commands use to say something the output cannot.
 const (
 	// brandAbsent means there is no brand file. It is deliberately distinct
@@ -72,9 +77,40 @@ var brandReadCmd = "if [ -e " + BrandPath + " ]; then cat " + BrandPath +
 // never to do — overwrite another device's identity and fuse two devices'
 // histories — would rest on a `cat` having succeeded a second earlier.
 func brandWriteCmd(uid string) string {
-	return "if [ -s " + BrandPath + " ] && [ \"$(cat " + BrandPath + " 2>/dev/null)\" != '" + uid +
-		"' ]; then exit " + strconv.Itoa(brandOccupied) + "; fi; " +
-		"mkdir -p " + BrandDir +
+	return brandGuard(uid) + brandInstall(uid)
+}
+
+// brandReplaceCmd is the write a rebrand makes. Its device-side check admits
+// exactly one brand besides uid: prev, the identity the human authorised the
+// overwrite against. A brand that changed between the read and this write is
+// refused on the device, as any other brand is for a first write, because the
+// authorisation was for a particular identity and not for whatever happens to
+// be in the file when the command lands.
+//
+// The guard in brandWriteCmd cannot serve here: the file a rebrand exists to
+// replace holds, by definition, a different uid, and that guard refuses every
+// different uid.
+func brandReplaceCmd(uid, prev string) string {
+	return brandGuard(uid, prev) + brandInstall(uid)
+}
+
+// brandGuard exits brandOccupied unless the brand file is absent, empty, or
+// holds one of the admitted uids. Every admitted value matches uidRe by the
+// time it gets here, so it contains nothing a shell reads as syntax; the
+// single quotes are still there, because the safety of this line should not
+// rest on a check in another function.
+func brandGuard(admitted ...string) string {
+	cond := "[ -s " + BrandPath + " ]"
+	for _, uid := range admitted {
+		cond += " && [ \"$(cat " + BrandPath + " 2>/dev/null)\" != '" + uid + "' ]"
+	}
+	return "if " + cond + "; then exit " + strconv.Itoa(brandOccupied) + "; fi; "
+}
+
+// brandInstall writes uid atomically: to a temporary file, then renamed over
+// the brand path.
+func brandInstall(uid string) string {
+	return "mkdir -p " + BrandDir +
 		" && printf '%s' '" + uid + "' > " + brandTmp +
 		" && chmod 600 " + brandTmp +
 		" && mv -f " + brandTmp + " " + BrandPath +
@@ -250,7 +286,7 @@ func (b *Brander) Brand(ctx context.Context, devpath, uid string) (BrandOutcome,
 	case have != "":
 		return BrandConflict, &ConflictError{Devpath: devpath, Have: have, Want: uid}
 	}
-	return b.write(ctx, devpath, uid)
+	return b.write(ctx, devpath, uid, brandWriteCmd(uid))
 }
 
 // Rebrand replaces the uid on a device that is already branded.
@@ -296,18 +332,24 @@ func (b *Brander) Rebrand(ctx context.Context, devpath, uid, prev, reason string
 	b.log.Error("REBRANDING a device: its previous identity is being abandoned",
 		"devpath", devpath, "previous_uid", have, "new_uid", uid, "reason", reason)
 
-	return b.write(ctx, devpath, uid)
+	// have is what Read returned, so it is a farm uid or empty. Empty means
+	// the file was absent or blank: nothing is being replaced, and the write
+	// is the ordinary one with the ordinary guard.
+	cmd := brandWriteCmd(uid)
+	if have != "" {
+		cmd = brandReplaceCmd(uid, have)
+	}
+	return b.write(ctx, devpath, uid, cmd)
 }
 
-// write creates the brand directory, writes the uid atomically, and verifies
-// it by reading it back.
+// write runs cmd, which installs uid on the device, and verifies the result
+// by reading it back.
 //
-// uid is known to match uidRe by the time it gets here, so it contains nothing
-// a shell reads as syntax. It is still single-quoted in the command, because
-// the safety of that line should not depend on a check three functions away.
-func (b *Brander) write(ctx context.Context, devpath, uid string) (BrandOutcome, error) {
+// uid is known to match uidRe by the time it gets here, and so is every other
+// uid in cmd, so the command contains nothing a shell reads as syntax.
+func (b *Brander) write(ctx context.Context, devpath, uid, cmd string) (BrandOutcome, error) {
 	cctx, cancel := context.WithTimeout(ctx, b.timeout)
-	res, err := b.sh.Shell(cctx, devpath, brandWriteCmd(uid))
+	res, err := b.sh.Shell(cctx, devpath, cmd)
 	cancel()
 	if err != nil {
 		return BrandFailed, fmt.Errorf("enroll: write the brand to %s: %w", devpath, err)

@@ -722,6 +722,7 @@ var commands = []command{
 	{"device", "<id|farm_uid> | exec <id> -- <command>", "one device in detail, or a shell command on it", cmdDevice},
 	{"hosts", "", "the hosts, with what a drain would have to wait for", cmdHosts},
 	{"host", "drain|undrain <id> --reason r", "stop or resume placement on a host", cmdHost},
+	{"slot", "list [--host h] | register ... | label <id> ... | reslot <device> ... | rebrand <device> ...", "the physical positions: list, register, label, re-slot a device, rebrand a phone", cmdSlot},
 	{"jobs", "[--state s] [--pool p] [--queue q]", "the work", cmdJobs},
 	{"job", "<id> | cancel <id> | steps <id> | attempts <id>", "one job, end one, or watch it run", cmdJob},
 	// submit and validate now ask the SERVER. The previous pair parsed with a

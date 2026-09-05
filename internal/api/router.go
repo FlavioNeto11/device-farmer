@@ -88,12 +88,19 @@ func (s *Server) buildHandler() http.Handler {
 	operator("POST /api/v1/devices/{id}/exec", s.handleDeviceExec)
 	operator("POST /api/v1/devices/{id}/park", s.handleDevicePark)
 	operator("POST /api/v1/devices/{id}/unpark", s.handleDeviceUnpark)
+	// reslot and rebrand change where a device is addressed and what the
+	// phone says it is. Both refuse while the device holds a live lease.
+	operator("POST /api/v1/devices/{id}/reslot", s.handleDeviceReslot)
+	operator("POST /api/v1/devices/{id}/rebrand", s.handleDeviceRebrand)
 
 	// Physical topology and host administration.
 	tenant("GET /api/v1/topology", s.handleTopology)
 	tenant("GET /api/v1/hosts", s.handleHosts)
 	operator("POST /api/v1/hosts/{id}/drain", s.handleHostDrain)
 	operator("POST /api/v1/hosts/{id}/undrain", s.handleHostUndrain)
+	tenant("GET /api/v1/slots", s.handleSlotList)
+	operator("POST /api/v1/slots", s.handleSlotRegister)
+	operator("POST /api/v1/slots/{id}/label", s.handleSlotLabel)
 	operator("POST /api/v1/slots/{id}/power", s.handleSlotPower)
 
 	// Work.

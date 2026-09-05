@@ -332,6 +332,9 @@ var tenantReadAllowlist = map[string]string{
 	"GET /api/v1/artifacts/{sha}/content": "the bytes under a digest: shared content, as above",
 	"GET /api/v1/devices/{id}/artifacts": "farm.device_artifacts is what is installed on a phone — a fact about the " +
 		"hardware that names no job and no tenant",
+	"GET /api/v1/slots": "slotView is the rack's geometry — position, hub, power domain, and which device_id " +
+		"occupies it. It carries no lease, job, tenant or holder field, so there is nothing here to mask; a " +
+		"tenant choosing where to run needs to see the positions",
 }
 
 var (

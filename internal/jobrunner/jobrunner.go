@@ -89,6 +89,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/flaviopadilha/device-farmer/internal/adbwire"
+	"github.com/flaviopadilha/device-farmer/internal/config"
 	"github.com/flaviopadilha/device-farmer/internal/lease"
 	"github.com/flaviopadilha/device-farmer/internal/obs"
 	"github.com/flaviopadilha/device-farmer/internal/runner"
@@ -220,6 +221,25 @@ type Config struct {
 	// holds. Its Interval is the clock the Takeover default is derived from.
 	HolderConfig lease.HolderConfig
 
+	// WitnessConfig configures the witness loop this loop starts for every
+	// placement: how often on-device proof of work is presented through
+	// farm.lease_witness (Interval, FARM_LEASE_WITNESS_INTERVAL) and how old
+	// that proof may be and still be presented (MaxEvidenceAge). Logger and
+	// Hooks are set per placement and ignored here.
+	//
+	// Set the Interval and leave the rest. The three cadences that make a
+	// witness worth anything — this one, MarkerConfig.Interval and
+	// MaxEvidenceAge — are derived from it by one rule (config.MarkersPerWitnessTick,
+	// config.EvidenceWindow) in applyDefaults, and New refuses a triple set by
+	// hand that the rule would not have produced. Zero means
+	// lease.DefaultWitnessInterval.
+	WitnessConfig lease.WitnessConfig
+
+	// MarkerConfig configures the on-device marker whose refreshes are the
+	// witness's evidence. A zero Interval is derived from the witness
+	// cadence; a zero Timeout is bounded by that interval; see applyDefaults.
+	MarkerConfig runner.MarkerConfig
+
 	// Dial builds the device connection. Defaults to a cached adbwire client
 	// per endpoint plus NewDeviceConn.
 	Dial Dialer
@@ -293,6 +313,53 @@ func (c *Config) applyDefaults() {
 	if c.Takeover < 3*interval {
 		c.Takeover = 3 * interval
 	}
+	// The witness triple, derived here and nowhere else in this package:
+	//
+	//   witness interval  ->  marker interval  ->  max evidence age
+	//
+	// The marker is rewritten config.MarkersPerWitnessTick times per witness
+	// tick, so a single lost write never leaves a tick without fresh
+	// evidence; and evidence is presented only while younger than
+	// config.EvidenceWindow marker intervals, so two consecutive lost writes
+	// are tolerated and a third is not. The window is measured in MARKER
+	// intervals because the marker is what touches the device: derived from
+	// the witness cadence instead — the lease package's own fallback of three
+	// witness ticks — it would let a device nobody has reached for six minutes
+	// read as demonstrably alive.
+	if c.WitnessConfig.Interval <= 0 {
+		c.WitnessConfig.Interval = lease.DefaultWitnessInterval
+	}
+	if c.MarkerConfig.Interval <= 0 {
+		c.MarkerConfig.Interval = config.MarkerIntervalFor(c.WitnessConfig.Interval)
+	}
+	if c.WitnessConfig.MaxEvidenceAge <= 0 {
+		c.WitnessConfig.MaxEvidenceAge = config.MaxEvidenceAgeFor(c.MarkerConfig.Interval)
+	}
+	// A refresh still in flight when the next tick is due has already failed
+	// to keep the evidence fresh, so the budget for one is at most the
+	// interval. Nothing else waits on a refresh: stopping the witness cancels
+	// it, and Remove has a budget of its own.
+	if c.MarkerConfig.Timeout <= 0 {
+		c.MarkerConfig.Timeout = min(runner.DefaultMarkerTimeout, c.MarkerConfig.Interval)
+	}
+}
+
+// validateWitness refuses a witness triple set by hand that the derivation
+// in applyDefaults would not have produced. It looks at the explicit values
+// only; the derived ones are coherent by construction.
+func (c *Config) validateWitness() error {
+	w, m := c.WitnessConfig, c.MarkerConfig
+	if m.Interval > 0 && w.MaxEvidenceAge > 0 && m.Interval >= w.MaxEvidenceAge {
+		return fmt.Errorf("jobrunner: MarkerConfig.Interval (%s) is not below WitnessConfig.MaxEvidenceAge (%s): "+
+			"the evidence would expire before it could be rewritten, and every witness would be skipped",
+			m.Interval, w.MaxEvidenceAge)
+	}
+	if m.Interval > 0 && w.Interval > 0 && m.Interval > w.Interval {
+		return fmt.Errorf("jobrunner: MarkerConfig.Interval (%s) is above WitnessConfig.Interval (%s): "+
+			"the marker must be rewritten at least once per witness tick, or alternate ticks present "+
+			"evidence that is already a tick old", m.Interval, w.Interval)
+	}
+	return nil
 }
 
 // JobRunner is the loop. Construct it with New and run it with Run.
@@ -340,6 +407,9 @@ func New(cfg Config) (*JobRunner, error) {
 	if cfg.HolderInstance == "" {
 		return nil, errors.New("jobrunner: Config.HolderInstance is required (mint one per process with lease.NewHolderInstance)")
 	}
+	if err := cfg.validateWitness(); err != nil {
+		return nil, err
+	}
 	cfg.applyDefaults()
 
 	jr := &JobRunner{
@@ -385,7 +455,10 @@ func (jr *JobRunner) Run(ctx context.Context) error {
 	jr.log.Info("jobrunner loop starting",
 		"interval", jr.cfg.Interval, "idle_interval", jr.cfg.IdleInterval,
 		"concurrency", jr.cfg.Concurrency, "batch", jr.cfg.Batch,
-		"takeover", jr.cfg.Takeover, "holder", jr.cfg.Holder)
+		"takeover", jr.cfg.Takeover, "holder", jr.cfg.Holder,
+		"witness_interval", jr.cfg.WitnessConfig.Interval,
+		"marker_interval", jr.cfg.MarkerConfig.Interval,
+		"max_evidence_age", jr.cfg.WitnessConfig.MaxEvidenceAge)
 
 	timer := time.NewTimer(0)
 	defer timer.Stop()
@@ -722,6 +795,17 @@ func (jr *JobRunner) runJob(ctx context.Context, c claim) {
 		Endpoint: job.Endpoint,
 	}
 
+	// The witness: on-device proof that the work is running, presented beside
+	// the renewals so the reaper leaves this lease alone through a
+	// control-plane outage longer than ttl+grace. Started here, on the same
+	// device connection the runner is about to use, because the runner is
+	// handed only Context and Fenced and must stay unable to extend a lease.
+	// Registered after the holder's own Stop so it is signalled first; it
+	// waits for nothing, so the holder's Stop and this goroutine's return are
+	// never behind a round trip to the device or the database.
+	wit := jr.startWitness(h, dev, p, log)
+	defer wit.stop()
+
 	log.Info("running job", "devpath", p.Devpath, "endpoint", p.Endpoint,
 		"attempt", job.Attempt, "max_attempts", job.MaxAttempts)
 
@@ -777,6 +861,13 @@ func (jr *JobRunner) runJob(ctx context.Context, c claim) {
 		log.Warn("attempt ended without a verdict; lease deliberately left held",
 			"state", string(out.State), "error", out.Error)
 	default:
+		// The marker goes before the lease does. Seconds after the release
+		// the device may belong to somebody else, and deleting a file on a
+		// device that is not ours is a thing this loop never does. The
+		// release waits behind this for at most the marker's own short
+		// remove budget; a leftover is harmless, the fence inside it says
+		// whose it was.
+		wit.remove(context.WithoutCancel(ctx))
 		jr.releaseLease(ctx, log, h, out.ReleaseReason)
 		log.Info("job finished", "state", string(out.State), "attempt", out.Attempt,
 			"steps", out.Steps, "skipped", out.Skipped, "error", out.Error)
@@ -1686,6 +1777,16 @@ func Collectors() []prometheus.Collector {
 	} {
 		outcomesTotal.WithLabelValues(string(st))
 	}
+	// Same reasoning for the witness: a rule over
+	// farm_jobrunner_witness_total{outcome="error"} is how an operator learns
+	// the control plane went blind to a placement, and it must exist before
+	// the first placement does.
+	for _, o := range witnessOutcomes {
+		witnessTotal.WithLabelValues(o)
+	}
+	for _, o := range markerOutcomes {
+		markerRefreshTotal.WithLabelValues(o)
+	}
 
 	return []prometheus.Collector{
 		cyclesTotal, claimedTotal, contendedTotal, reattachedTotal,
@@ -1693,5 +1794,6 @@ func Collectors() []prometheus.Collector {
 		unaddressableTotal, panicsTotal, runnerErrors, releaseErrors, writeErrors,
 		pollErrors, beatFailures, atCapacity,
 		runningGauge, placedGauge, deferredGauge,
+		witnessTotal, markerRefreshTotal, witnesslessTotal,
 	}
 }

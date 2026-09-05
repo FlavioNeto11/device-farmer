@@ -146,6 +146,44 @@ func TestEveryFailedProbeIsNamedWithItsConsequence(t *testing.T) {
 	}
 }
 
+// TestWitnessExtensionsAreReportedOnlyWhileAJobrunnerBeats. The witness loop
+// is started per placement by the jobrunner and by nothing else, so the
+// feature is a fact about that role's heartbeat: the SQL function and the
+// loop existing in the binary is not the same as a witness being presented
+// for anything.
+//
+// Falsify: make the entry's State a constant "enabled".
+func TestWitnessExtensionsAreReportedOnlyWhileAJobrunnerBeats(t *testing.T) {
+	t.Parallel()
+
+	s := unreachableServer(t)
+	for _, tc := range []struct {
+		running bool
+		want    string
+	}{
+		{true, "enabled"},
+		{false, "unavailable"},
+	} {
+		var got *FeatureStatus
+		for _, f := range s.featureStatuses(context.Background(), []RoleStatus{{Component: "jobrunner", Running: tc.running}}) {
+			if f.Name == "Witness extensions" {
+				f := f
+				got = &f
+			}
+		}
+		if got == nil {
+			t.Fatal("the capability list does not mention the witness at all; an operator would assume it does not exist")
+		}
+		if got.State != tc.want {
+			t.Errorf("jobrunner running=%v: witness state = %q, want %q", tc.running, got.State, tc.want)
+		}
+		if got.Detail == "" || got.How == "" {
+			t.Errorf("jobrunner running=%v: the witness entry says nothing about how it works or what its absence costs: %+v",
+				tc.running, got)
+		}
+	}
+}
+
 // TestNoMigrationsAppliedIsStillAnAnswer guards the fix against overcorrecting.
 // An empty goose_db_version is not a failure: v0 and "run farmd migrate up" are
 // both true then, and turning that into a 503 would break the one case the

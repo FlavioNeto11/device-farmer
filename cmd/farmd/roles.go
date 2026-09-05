@@ -724,12 +724,25 @@ func runJobRunner(ctx context.Context, cfg *config.Config, log *slog.Logger, poo
 		HolderConfig: lease.HolderConfig{
 			Interval: cfg.Lease.RenewInterval,
 			// Caps consecutive witness-only extensions. It reaches
-			// farm.lease_witness as p_max_extensions — for whenever something
-			// in this build starts producing a witness; nothing does yet.
+			// farm.lease_witness as p_max_extensions on every witness the
+			// loop below presents.
 			WitnessMaxExtensions: cfg.Lease.MaxWitnessExtensions,
 		},
-		SlotRearm: cfg.Lease.SlotRearm,
-		Logger:    log,
+		// The witness cadence, validated against the grace band and the floor
+		// at startup and consumed here: the jobrunner starts one witness loop
+		// per placement, fed by the marker it keeps fresh on the job's device.
+		// This is the second half of the #663 countermeasure — a job that
+		// can still touch its device keeps its lease through a control-plane
+		// outage longer than ttl+grace — and until this field was passed no
+		// role started it.
+		//
+		// Only the interval is set. The marker cadence and the evidence
+		// window are derived from it inside the jobrunner by the rule config
+		// owns (config.MarkersPerWitnessTick, config.EvidenceWindow), which
+		// is the same rule the startup summary printed a moment ago.
+		WitnessConfig: lease.WitnessConfig{Interval: cfg.Lease.WitnessInterval},
+		SlotRearm:     cfg.Lease.SlotRearm,
+		Logger:        log,
 	})
 	if err != nil {
 		return err

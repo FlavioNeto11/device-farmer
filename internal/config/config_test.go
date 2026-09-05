@@ -221,7 +221,7 @@ func TestPreflightRefusals(t *testing.T) {
 	}, {
 		name: "lease grace below the schema floor",
 		role: "api",
-		envs: map[string]string{EnvLeaseGrace: "1m", EnvLeaseWitnessInterval: "10s"},
+		envs: map[string]string{EnvLeaseGrace: "1m", EnvLeaseWitnessInterval: "30s"},
 		want: []string{EnvLeaseGrace, "23514"},
 	}, {
 		// Two renewals must be losable — a rolling deploy, a failover, a GC
@@ -240,6 +240,14 @@ func TestPreflightRefusals(t *testing.T) {
 		role: "api",
 		envs: map[string]string{EnvLeaseWitnessInterval: "20m"},
 		want: []string{EnvLeaseWitnessInterval, EnvLeaseGrace},
+	}, {
+		// The marker cadence follows the witness cadence at a quarter, so a
+		// witness interval with no floor is a marker written every few hundred
+		// milliseconds on every leased device on a host.
+		name: "witness interval below the floor",
+		role: "jobrunner",
+		envs: map[string]string{EnvLeaseWitnessInterval: "1s"},
+		want: []string{EnvLeaseWitnessInterval, MinLeaseWitnessInterval.String(), "shell round trip", "250ms"},
 	}, {
 		name: "witness extensions below one",
 		role: "api",
@@ -791,10 +799,28 @@ func TestSummaryShowsWhatTheProcessDecided(t *testing.T) {
 	if strings.Contains(s, "hunter2") {
 		t.Fatalf("the startup summary printed the database password:\n%s", s)
 	}
-	// Every knob without a destination must say so where an operator will see
-	// it, rather than reading as though it were in force.
-	if !strings.Contains(s, "NOT STARTED") {
-		t.Errorf("the summary does not say that no role starts a witness loop:\n%s", s)
+	// The witness line reads as a value in force because it is one: the
+	// jobrunner starts a witness loop for every placement. The summary said
+	// NOT STARTED for as long as that was true, and must not go on saying it
+	// now that an operator reading it would go looking for wiring that
+	// exists.
+	if strings.Contains(s, "NOT STARTED") {
+		t.Errorf("the summary still says no role starts a witness loop; the jobrunner does:\n%s", s)
+	}
+	if !strings.Contains(s, "started by the jobrunner") {
+		t.Errorf("the summary does not say which role starts the witness loop:\n%s", s)
+	}
+	// The two cadences the operator did NOT set are printed beside the one
+	// they did, because they are what the witness actually runs on: an
+	// operator reading "witness every 2m" and nothing else would have no way
+	// to know the evidence behind it goes stale after 90s.
+	for _, want := range []string{
+		"marker           = rewritten on the device every " + cfg.Lease.MarkerInterval().String(),
+		"younger than " + cfg.Lease.MaxEvidenceAge().String(),
+	} {
+		if !strings.Contains(s, want) {
+			t.Errorf("the summary does not print %q, the derived marker cadence:\n%s", want, s)
+		}
 	}
 
 	env(t, withDSN(map[string]string{EnvMetricsAddr: MetricsOff}))

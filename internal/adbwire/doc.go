@@ -61,6 +61,24 @@
 // is evidence about the socket, not about the phones. The last state the
 // server actually reported stands until the server itself reports otherwise.
 //
+// # The admission preamble
+//
+// A host may put its ADB server behind the fence proxy
+// (docs/design/fence-proxy.md), which admits a connection only over mutual
+// TLS and only after one frame announcing what the connection claims to
+// hold: "fence:v1 class=<class> devpath=<devpath> fence=<token>", in ADB's
+// own four-hex-digit framing, never acknowledged. [WithTLS] and
+// [WithAdmissionPreamble] are that client half. The barrier above is why the
+// option is not called WithFencePreamble and why the frame's magic word is
+// assembled rather than spelled in client.go: this package can carry a
+// number to the wire, and must stay unable to say what the number means.
+// The one class that carries a device token is likewise named by the package
+// that owns the binding — the job runner — and not here.
+//
+// The frame is sent only on a TLS connection. Over plain TCP the option is
+// inert, so a deployment installs both options everywhere and switches the
+// proxy on with a certificate alone; a bare ADB server never sees the frame.
+//
 // # Concurrency
 //
 // A [Client] is safe for concurrent use; it holds no connection of its own

@@ -661,9 +661,11 @@ type revokeRequest struct {
 //     when it is needed most,
 //   - audited, with the human's name and their reason in farm.audit_log,
 //   - fence-bumping: farm.devices.fence_floor is raised past the revoked fence,
-//     so the previous holder's sockets are refused at the host proxy rather
-//     than merely in the database, and the slot is quarantined for rearm so the
-//     next job cannot land on a device the old holder is still writing to.
+//     so the database refuses every write at the old fence; on a host running
+//     the fence proxy the old fence is also refused at the ADB socket, and on
+//     a host without one the holder is relied upon to honour it. The slot is
+//     quarantined for rearm so the next job cannot land on a device the old
+//     holder may still be writing to.
 //
 // It is written out here rather than through lease.Store.Release because that
 // path requires the fence, deliberately: a holder must present its fence, a
@@ -736,8 +738,9 @@ RETURNING device_id::text, slot_id, fence, job_id::text, tenant_id, holder`, lea
 		return
 	}
 
-	// Raise the floor past the fence we just closed. Until this lands, a socket
-	// the old holder still owns would be accepted at the host proxy.
+	// Raise the floor past the fence we just closed. Until this lands, the
+	// database still accepts the old holder's writes at the old fence, and a
+	// host running the fence proxy still admits its sockets.
 	var newFloor int64
 	if err := tx.QueryRow(r.Context(), `
 UPDATE farm.devices SET fence_floor = nextval('farm.fence_seq'), updated_at = now()
@@ -804,8 +807,10 @@ VALUES ('lease_revoked', $1::uuid, $2, $3::uuid, $4::uuid, $5, $6::jsonb)`,
 		"job_id":          jobID,
 		"revoked_fence":   oldFence,
 		"new_fence_floor": newFloor,
-		"note": "the previous holder is now fenced: any socket still carrying fence " +
-			fmt.Sprint(oldFence) + " is refused at the host proxy, and the slot is " +
+		"note": "the device's fence floor is raised past the revoked fence " +
+			fmt.Sprint(oldFence) + ", so the database refuses every write at the old fence; " +
+			"on a host running the fence proxy the old fence is also refused at the ADB socket, " +
+			"and on a host without one the holder is relied upon to honour it. The slot is " +
 			"unschedulable until its rearm window elapses",
 	})
 }

@@ -153,6 +153,12 @@ type Config struct {
 	MinBad     int
 	MinGood    int
 
+	// ADBOptions are applied to every adbwire client this watchdog builds: the
+	// track-devices reader per host and the battery poller. It is how a
+	// deployment gives these connections their transport identity for a host
+	// behind the fence proxy; the watchdog presents no fence, only a class.
+	ADBOptions []adbwire.Option
+
 	Logger *slog.Logger
 }
 
@@ -401,7 +407,8 @@ func (w *Watchdog) reconcileWorkers(ctx context.Context, hosts []hostRow) {
 // lost socket produces no observations at all rather than a fabricated empty
 // device list.
 func (w *Watchdog) watchHost(ctx context.Context, wk *worker) {
-	client := adbwire.New(wk.endpoint, adbwire.WithLogger(w.log.With("host", wk.host)))
+	opts := append([]adbwire.Option{adbwire.WithLogger(w.log.With("host", wk.host))}, w.cfg.ADBOptions...)
+	client := adbwire.New(wk.endpoint, opts...)
 	tracker := client.TrackDevices(ctx)
 	defer tracker.Close()
 

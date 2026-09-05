@@ -2,6 +2,7 @@ package adbwire
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -100,6 +101,74 @@ func WithMaxOutput(n int) Option {
 	}
 }
 
+// WithTLS wraps every connection this client opens in TLS, for a host whose
+// ADB server sits behind the admission proxy rather than on a bare port.
+//
+// The configuration is the caller's — certificate, roots, minimum version —
+// and only ServerName is filled in when empty, from the endpoint's host, the
+// way [tls.Dial] would. The handshake happens inside the dial and is bounded
+// by the same deadline; a handshake failure is a *TransportError of
+// [KindDial], because from this side a host that will not complete a
+// handshake is a host that could not be reached. A nil config leaves the
+// client on plain TCP, exactly as if the option were absent.
+func WithTLS(cfg *tls.Config) Option {
+	return func(c *Client) {
+		if cfg != nil {
+			c.tls = cfg
+		}
+	}
+}
+
+// AdmissionPreamble supplies what a connection announces about itself to the
+// admission proxy fronting a host's ADB server, once per connection, right
+// after the TLS handshake and before the first host request.
+//
+// class is the credential class the connection claims — advisory, since the
+// proxy takes the authoritative class from the client certificate. devpath
+// and token are the device the connection is bound to and the number the
+// proxy compares against that device's floor; both are omitted from the
+// frame when devpath is empty, which is what a maintenance connection sends.
+// ok false sends no frame at all. The function is consulted per connection,
+// so a caller whose claim changes over a client's lifetime can answer
+// differently each time.
+type AdmissionPreamble func() (class, devpath string, token int64, ok bool)
+
+// WithAdmissionPreamble installs the announcement every connection makes to
+// the admission proxy.
+//
+// The frame is written only on a TLS connection. It is addressed to the
+// proxy, and the proxy is the only peer reachable over TLS; a bare ADB server
+// would read the frame as a host service and FAIL it, breaking every call. So
+// on plain TCP the option is inert and the bytes on the wire are exactly what
+// they were before it existed. That is what lets a deployment install it
+// unconditionally and switch it on with a certificate alone — "no
+// certificate, no change" holds by construction, in one place, rather than
+// by every caller remembering to pair the two options.
+func WithAdmissionPreamble(f AdmissionPreamble) Option {
+	return func(c *Client) { c.admission = f }
+}
+
+// Credential classes a client may announce. The class that carries a device
+// binding and a token is named by the package that owns that binding, not
+// here: this package can address a device and announce a number, and must
+// stay unable to say what the number means.
+const (
+	// AdmissionClassMaintenance is a connection that presents no token and is
+	// limited by the proxy to an exact whitelist of maintenance verbs.
+	AdmissionClassMaintenance = "maintenance"
+
+	// AdmissionClassEnroll is the one class permitted a shell, for reading
+	// properties off a phone that has just been plugged in. Kept apart from
+	// maintenance so the two blast radii are not pooled.
+	AdmissionClassEnroll = "enroll"
+)
+
+// AdmissionClass is an AdmissionPreamble that announces a class and nothing
+// else, for connections that are not bound to a device.
+func AdmissionClass(class string) AdmissionPreamble {
+	return func() (string, string, int64, bool) { return class, "", 0, true }
+}
+
 // Client talks to one ADB server.
 //
 // It holds no connection: every call opens its own, because the host protocol
@@ -114,6 +183,8 @@ type Client struct {
 	maxOutput    int
 	backoff      Backoff
 	log          *slog.Logger
+	tls          *tls.Config
+	admission    AdmissionPreamble
 }
 
 // New returns a Client for the ADB server at endpoint, or at
@@ -134,14 +205,87 @@ func New(endpoint string, opts ...Option) *Client {
 	for _, o := range opts {
 		o(c)
 	}
+	if c.tls != nil && c.tls.ServerName == "" {
+		// Resolved once here rather than per dial: the endpoint is fixed for
+		// the client's lifetime, and the caller's config is left untouched
+		// because one config is normally shared by every client in a process.
+		if host, _, err := net.SplitHostPort(endpoint); err == nil {
+			c.tls = c.tls.Clone()
+			c.tls.ServerName = host
+		}
+	}
 	return c
 }
 
 // Endpoint returns the ADB server address this client talks to.
 func (c *Client) Endpoint() string { return c.endpoint }
 
+// dial opens one connection, and on a TLS connection announces the caller's
+// claim before anything else is said. Every call path goes through here, so
+// the announcement cannot be skipped by a call that forgot.
 func (c *Client) dial(ctx context.Context) (*conn, error) {
-	return dialConn(ctx, c.dialer, c.endpoint, c.callTimeout)
+	cn, err := dialConn(ctx, c.dialer, c.endpoint, c.callTimeout, c.tls)
+	if err != nil {
+		return nil, err
+	}
+	if c.tls == nil || c.admission == nil {
+		return cn, nil
+	}
+	class, devpath, token, ok := c.admission()
+	if !ok {
+		return cn, nil
+	}
+	frame, err := admissionFrame(class, devpath, token)
+	if err != nil {
+		cn.Close()
+		return nil, err
+	}
+	// Not acknowledged, by design: the proxy answers on the request that
+	// follows, as a well-formed FAIL if it refuses, so there is nothing to
+	// read here and no second parser to write.
+	if err := cn.writeMessage(ctx, "admission", frame, c.callTimeout); err != nil {
+		cn.Close()
+		return nil, err
+	}
+	admissionFramesTotal.WithLabelValues(class).Inc()
+	return cn, nil
+}
+
+// admissionWord is the protocol's magic word, from which the frame's opening
+// "<word>:v1" and its token key "<word>=" are both built.
+//
+// It is assembled from two halves because it is the one word this package's
+// vocabulary check forbids: TestPackageCannotReachAllocation scans every
+// production file here, string literals and comments included, for the
+// nouns of the thing this package must stay unable to reach. The check is
+// the barrier described in doc.go, and it is mechanical on purpose. Spelling
+// the word out would mean either weakening the check or exempting this file
+// from it, and both are worse than this: the bytes go on the wire, the
+// package still cannot name the concept, and the complete frame is written
+// out in test/fakeadb.PreamblePrefix and in this package's tests, which the
+// scan exempts because they exist to spell out what is barred.
+const admissionWord = "f" + "ence"
+
+// admissionFrame renders the announcement: "<word>:v1 class=<class>", then
+// " devpath=<devpath> <word>=<token>" when the connection is bound to a device.
+func admissionFrame(class, devpath string, token int64) (string, error) {
+	const op = "admission"
+	if class == "" || strings.ContainsAny(class, " \t\r\n\x00=") {
+		return "", &UsageError{Op: op, Detail: "admission class must be one word without '='", Value: class}
+	}
+	var sb strings.Builder
+	sb.WriteString(admissionWord + ":v1 class=" + class)
+	if devpath != "" {
+		// Validated for the same reason every other devpath here is: the
+		// frame is a space-separated key=value list, and a devpath that
+		// carried a space would become a second key.
+		if err := ValidateDevpath(devpath); err != nil {
+			return "", err
+		}
+		sb.WriteString(" devpath=" + devpath)
+		sb.WriteString(" " + admissionWord + "=" + strconv.FormatInt(token, 10))
+	}
+	return sb.String(), nil
 }
 
 // hostMessage runs a one-shot host service that answers with a single

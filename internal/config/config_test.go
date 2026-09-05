@@ -31,6 +31,7 @@ var allEnv = []string{
 	EnvHeartbeatEvery,
 	EnvNodeSelfFence, EnvFenceMargin, EnvNodeADBEndpoint, EnvNodeHostID,
 	EnvWatchdogInterval, EnvMigrationsTable, EnvMigrationsDir,
+	EnvFenceClientCert, EnvFenceClientKey, EnvFenceClientCA,
 }
 
 const testDSN = "postgres://farm@127.0.0.1:5432/farm?sslmode=disable"

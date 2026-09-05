@@ -12,7 +12,6 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/flaviopadilha/device-farmer/internal/adbwire"
 	"github.com/flaviopadilha/device-farmer/internal/lease"
 	"github.com/flaviopadilha/device-farmer/internal/runner"
 )
@@ -150,7 +149,6 @@ func testLoop(tb testing.TB, mutate func(*Config)) (*JobRunner, *logCapture) {
 		log:      cfg.Logger,
 		busy:     make(map[string]struct{}),
 		deferred: make(map[string]*deferral),
-		clients:  make(map[string]*adbwire.Client),
 	}
 	jr.claims = &claimLocks{pool: cfg.Pool, log: jr.log, timeout: cfg.CallTimeout, held: make(map[string]int64)}
 	return jr, logs

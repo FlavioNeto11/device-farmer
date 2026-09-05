@@ -139,6 +139,66 @@ The `class` word in the preamble is **advisory**. The authoritative class comes
 from the certificate (section 9), so a lease client cannot promote itself to
 maintenance by editing one word.
 
+### 3.2 The client side
+
+The frame above is written by `internal/adbwire`, behind two options on
+`Client`: `WithTLS(*tls.Config)` and `WithAdmissionPreamble(func() (class,
+devpath string, token int64, ok bool))`. Every call path dials through one
+function, so the frame cannot be skipped by a call that forgot; it is written
+right after the handshake, in the same four-hex-digit framing as everything
+that follows, and nothing is read back.
+
+Three decisions on that side are worth stating, because each one is the
+answer to a question a reader will otherwise ask.
+
+**The preamble is sent only on a TLS connection.** The frame is addressed to
+the proxy, and the proxy is the only peer reachable over TLS; a bare ADB server
+would read it as a host service and `FAIL` it, breaking every call. So over
+plain TCP the option is inert and the bytes on the wire are exactly what they
+were before it existed. That is what lets every role in `cmd/farmd` install
+both options unconditionally and switch the proxy on with a certificate alone
+— `FARM_FENCE_CLIENT_CERT`, `_KEY`, `_CA`, all three or none, parsed at boot —
+rather than by every call site remembering to pair the two.
+
+**`adbwire` cannot spell the word `fence`.** The package is under a vocabulary
+barrier (`TestPackageCannotReachAllocation`) that scans every production file,
+string literals included, for the nouns of the thing a socket error must never
+reach. The option is therefore `WithAdmissionPreamble`, the magic word is
+assembled from two halves in `client.go`, and the one class that carries a
+device token — `lease` — is named by `internal/jobrunner`, which owns the
+binding, not by the transport. The watchdog and the recovery ladder announce
+`maintenance`; `recovery/adbactuator.go` is under its own barrier and takes the
+options as an opaque value from `cmd/farmd`, so it never names the class
+either.
+
+**`Placement.Fence` now reaches the wire.** `jobrunner.Dialer` is
+`Dial(endpoint, devpath string, admission int64)`, and the default dialer
+builds one `adbwire` client per placement whose preamble announces
+`class=lease devpath=<placement> fence=<placement's fence>`. The per-endpoint
+client cache it replaced would have needed an eviction policy tied to the
+lease's lifetime; a client is a dialer, not a connection, so building one per
+placement costs a struct and no socket.
+
+What the client half does **not** change is the sentence every ending path
+prints. With the proxy opt-in on both sides, "refused at the host proxy" is
+true on a host running one and false on a host without, so the revoke response,
+the `ctl` confirmation banner and the comments in `internal/lease` now say the
+conditional thing: the device's fence floor is raised past the revoked fence,
+so the database refuses every write at the old fence; on a host running the
+fence proxy the old fence is also refused at the ADB socket, and on a host
+without one the holder is relied upon to honour it. One site keeps the old
+wording on purpose: the comment inside `farm.lease_release` at
+`migrations/00002_lease.sql:404-405` is part of an applied migration, and
+applied migrations are not edited. Read it as the design intent it was written
+as; the conditional truth lives in the Go prose beside the callers.
+
+`/api/v1/capabilities` reports the same conditionality from the only vantage
+point a process has. "Fence enforcement at the resource" is `enabled` when the
+process holds a client certificate and `unavailable` when it does not, naming
+both halves of the knob — and in both states the detail says enforcement is per
+host, because a process can see its own side of the wire and cannot see which
+hosts run a proxy.
+
 ---
 
 ## 4. How the proxy learns the fence floor

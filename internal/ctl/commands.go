@@ -1686,9 +1686,11 @@ func cmdLease(ctx context.Context, s *session, args []string) error {
 		}
 	}
 
-	headline := "About to REVOKE this lease. This ENDS SOMEBODY'S RUN NOW: the holder is fenced " +
-		"out at the host proxy, the device's fence floor is raised past the revoked fence, and " +
-		"the slot is unschedulable until its rearm window elapses. The holder gets no warning."
+	headline := "About to REVOKE this lease. This ENDS SOMEBODY'S RUN NOW: the device's fence " +
+		"floor is raised past the revoked fence, so the database refuses every write at the old " +
+		"fence; on a host running the fence proxy the old fence is also refused at the ADB socket, " +
+		"and on a host without one the holder is relied upon to honour it. The slot is " +
+		"unschedulable until its rearm window elapses. The holder gets no warning."
 	if err := e.confirm(headline, f); err != nil {
 		return err
 	}

@@ -99,11 +99,17 @@ type Executor interface {
 // ExecutorFactory builds an Executor for one host's ADB endpoint.
 type ExecutorFactory func(endpoint string, timeout time.Duration, maxOutput int) Executor
 
-// defaultExecutorFactory dials the host's own ADB server.
-func defaultExecutorFactory(endpoint string, timeout time.Duration, maxOutput int) Executor {
-	return adbwire.New(endpoint,
-		adbwire.WithCallTimeout(timeout),
-		adbwire.WithMaxOutput(maxOutput))
+// defaultExecutorFactory dials the host's own ADB server — through the fence
+// proxy when cfg carries a client certificate, announcing the maintenance
+// class, since an operator's exec holds no lease and presents no fence.
+func defaultExecutorFactory(cfg *config.Config) ExecutorFactory {
+	return func(endpoint string, timeout time.Duration, maxOutput int) Executor {
+		return adbwire.New(endpoint,
+			adbwire.WithCallTimeout(timeout),
+			adbwire.WithMaxOutput(maxOutput),
+			adbwire.WithTLS(cfg.Fence.TLS),
+			adbwire.WithAdmissionPreamble(adbwire.AdmissionClass(adbwire.AdmissionClassMaintenance)))
+	}
 }
 
 // Server is the API. It is safe for concurrent use once constructed, and its
@@ -244,7 +250,7 @@ func New(cfg *config.Config, pool *pgxpool.Pool, opts ...Option) (*Server, error
 		leases:         lease.NewStore(pool),
 		log:            slog.Default(),
 		streamInterval: defaultStreamInterval,
-		newExecutor:    defaultExecutorFactory,
+		newExecutor:    defaultExecutorFactory(cfg),
 		execMaxOutput:  defaultExecMaxOutput,
 		startedAt:      time.Now(),
 	}

@@ -438,9 +438,12 @@ func runRecovery(ctx context.Context, cfg *config.Config, log *slog.Logger, pool
 		runner = c
 	}
 
+	act := recovery.NewADBActuator(log, runner)
+	act.ADBOptions = maintenanceADBOptions(cfg)
+
 	l, err := recovery.New(recovery.Config{
 		Pool:      pool,
-		Actuator:  recovery.NewADBActuator(log, runner),
+		Actuator:  act,
 		Component: cfg.ComponentFor("recovery"),
 		Logger:    log,
 	})
@@ -448,6 +451,32 @@ func runRecovery(ctx context.Context, cfg *config.Config, log *slog.Logger, pool
 		return err
 	}
 	return l.Run(ctx)
+}
+
+// fenceClientTLS is the transport every ADB client this binary builds takes:
+// the certificate FARM_FENCE_CLIENT_CERT/KEY/CA loaded, or nil, which leaves
+// the client on plain TCP exactly as before the knob existed. It is passed
+// unconditionally so the knob has one consumer per role rather than one `if`
+// per call site that a new call site could forget.
+func fenceClientTLS(cfg *config.Config) adbwire.Option {
+	return adbwire.WithTLS(cfg.Fence.TLS)
+}
+
+// maintenanceADBOptions are the options for a connection that holds no lease
+// and presents no fence: the watchdog's track-devices stream and battery
+// probes, and the recovery ladder's rungs. On a host running the fence proxy
+// such a connection is admitted to an exact whitelist of maintenance verbs
+// and nothing else; on a plain host the announcement is never sent.
+//
+// The class is named here rather than in those packages on purpose.
+// recovery/adbactuator.go is under a vocabulary barrier
+// (TestNothingHereCanEndALease) and must stay unable to say what a
+// connection is for; it takes the options as an opaque value.
+func maintenanceADBOptions(cfg *config.Config) []adbwire.Option {
+	return []adbwire.Option{
+		fenceClientTLS(cfg),
+		adbwire.WithAdmissionPreamble(adbwire.AdmissionClass(adbwire.AdmissionClassMaintenance)),
+	}
 }
 
 // watchdogsForHosts starts one watchdog per registered host. Health is
@@ -473,6 +502,7 @@ func watchdogsForHosts(ctx context.Context, cfg *config.Config, log *slog.Logger
 			HostID:      id,
 			ADBEndpoint: endpoint,
 			Interval:    cfg.WatchdogInterval,
+			ADBOptions:  maintenanceADBOptions(cfg),
 			Logger:      log.With("host", id),
 		}
 		out["watchdog:"+id] = func(ctx context.Context) error {
@@ -496,6 +526,7 @@ func runWatchdog(ctx context.Context, cfg *config.Config, log *slog.Logger, pool
 			HostID:      cfg.Node.HostID,
 			ADBEndpoint: cfg.Node.ADBEndpoint,
 			Interval:    cfg.WatchdogInterval,
+			ADBOptions:  maintenanceADBOptions(cfg),
 			Logger:      log,
 		})
 		if err != nil {
@@ -663,12 +694,14 @@ func runJobRunner(ctx context.Context, cfg *config.Config, log *slog.Logger, poo
 		Component:      cfg.ComponentFor("jobrunner"),
 		Holder:         hostname(),
 		HolderInstance: inst,
-		// One ADB client per device connection. The client is a dialer rather
-		// than a connection, so this is cheap and keeps each job's transport
-		// failures to itself.
-		Dial: func(endpoint, devpath string) (runner.Conn, error) {
-			return jobrunner.NewDeviceConn(adbwire.New(endpoint), devpath)
-		},
+		// The default Dialer: one ADB client per placement, announcing that
+		// placement's fence on every connection it opens. Only the transport
+		// is decided here — with FARM_FENCE_CLIENT_* set it is mutual TLS to
+		// the host's fence proxy, and the proxy can then refuse the fence at
+		// the socket; unset, it is plain TCP and nothing is announced. The
+		// class a job's connections claim is the loop's own word, not this
+		// file's, because it is the class that carries a fence.
+		ADBOptions: []adbwire.Option{fenceClientTLS(cfg)},
 		// The renewal cadence is how a holder proves it is alive, so it is the
 		// one timing knob that is load bearing on the invariant. Without this
 		// field the loop fell back to lease.DefaultRenewInterval and

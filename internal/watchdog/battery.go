@@ -209,11 +209,14 @@ func (w *Watchdog) newBatteryPoller() *batteryPoller {
 		probeTimeout: batteryProbeTimeout,
 		log:          w.log.With("reader", "battery"),
 	}
+	adbOpts := w.cfg.ADBOptions
 	p.dial = func(endpoint string) batteryShell {
-		return adbwire.New(endpoint,
+		opts := []adbwire.Option{
 			adbwire.WithLogger(p.log),
 			adbwire.WithCallTimeout(p.probeTimeout),
-			adbwire.WithMaxOutput(batteryMaxOutput))
+			adbwire.WithMaxOutput(batteryMaxOutput),
+		}
+		return adbwire.New(endpoint, append(opts, adbOpts...)...)
 	}
 	return p
 }

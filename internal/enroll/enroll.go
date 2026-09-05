@@ -176,6 +176,18 @@ type Config struct {
 	// Connect opens a client for one ADB server. Defaults to adbwire.
 	Connect func(endpoint string) (Host, error)
 
+	// ADBOptions are applied to every client the default Connect builds — a
+	// certificate and an enroll-class announcement, for an enrolment that
+	// reaches a host's ADB server through its fence proxy. Ignored when
+	// Connect is supplied.
+	//
+	// farmd node leaves this nil. Its enrolment runs on the host and dials
+	// the ADB server on loopback, which the proxy fronts for the network and
+	// not for the host itself; a certificate there would be presented to a
+	// server that does not speak TLS. The seam is for an enrolment that runs
+	// anywhere else.
+	ADBOptions []adbwire.Option
+
 	Logger *slog.Logger
 }
 
@@ -204,11 +216,14 @@ func (c *Config) applyDefaults() {
 	if c.Connect == nil {
 		probeTimeout := c.ProbeTimeout
 		log := c.Logger
+		adbOpts := c.ADBOptions
 		c.Connect = func(endpoint string) (Host, error) {
-			return adbwire.New(endpoint,
+			opts := []adbwire.Option{
 				adbwire.WithCallTimeout(probeTimeout),
 				adbwire.WithMaxOutput(maxProbeOutput),
-				adbwire.WithLogger(log)), nil
+				adbwire.WithLogger(log),
+			}
+			return adbwire.New(endpoint, append(opts, adbOpts...)...), nil
 		}
 	}
 }

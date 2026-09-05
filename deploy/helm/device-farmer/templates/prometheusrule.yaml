@@ -402,6 +402,59 @@ spec:
               means it kept trying to fix phones when the hub was the fault.
             runbook_url: {{ $rb }}/devices-quarantined.md
 
+        # THE ONE WHERE THE CLOCK IS MINUTES AND THE FIRST STEP IS A WALK.
+        #
+        # The watchdog's swell detector (internal/watchdog/swell.go) fits a
+        # slope through the last minutes of farm.battery_readings and flags a
+        # cell heating faster than 2.0 C/min, a case above 45.0 C, or an idle
+        # phone on a powered port losing charge. docs/siting.md §2 is why that
+        # is a page and not a ticket: clean-agent suppression does not stop a
+        # lithium event, and the time this buys is measured from the scrape.
+        # Hence no `for:` — one sample is the evidence, and a runaway does not
+        # wait for a second evaluation to confirm it.
+        #
+        # TWO SERIES, ONE RULE. farm_battery_anomaly{host,rack_slot,kind} is
+        # what the page has to carry — an operator walks to a rack position,
+        # and it is the only series that names one. But a vec with per-device
+        # labels has no child until the first phone runs hot, and a rule over
+        # an absent series returns no data and fires nothing: disarmed, and
+        # indistinguishable from a healthy farm. farm_battery_anomalies is a
+        # plain gauge the watchdog exports at 0 from its first scrape, so it
+        # can be seen to exist. The `or on()` joins them: when any position is
+        # at 1 the left side fires with its labels and the right side is
+        # suppressed entirely (on() matches every element against the empty
+        # label set); when no position exists but the count says otherwise,
+        # the right side fires without a rack_slot and the runbook's first
+        # step reads it out of farm.events. Verified against a live /metrics:
+        # farm_battery_anomalies is present at 0 on a fresh process.
+        #
+        # Critical: a decision is being waited on, and it is "walk". No
+        # lease is touched by any of this. The watchdog cannot read one.
+        - alert: DeviceFarmerBatteryAnomaly
+          expr: |-
+            farm_battery_anomaly == 1
+              or on()
+            (farm_battery_anomalies > 0)
+          for: 0m
+          labels:
+            severity: critical
+            component: device
+          annotations:
+            summary: >-
+              battery {{ `{{ $labels.kind }}` }} at {{ `{{ $labels.rack_slot }}` }}
+              (host {{ `{{ $labels.host }}` }}): walk there and unplug it
+            description: >-
+              A phone's battery is heating faster than a test can explain, is
+              above the charging band's ceiling, or is losing charge while idle
+              on a powered port. Suppression will not stop a lithium event;
+              distance will. Walk to rack_slot, unplug the cable at the phone,
+              move the phone away from every other cell, then park it. The job
+              on it, if any, is still running and will be interrupted by you,
+              not by the control plane. If rack_slot is empty, the fleet count
+              fired without a position: read the newest battery_anomaly rows
+              in farm.events.
+            runbook_url: {{ $rb }}/battery-anomaly.md
+
     # -----------------------------------------------------------------------
     # The recovery ladder.
     #

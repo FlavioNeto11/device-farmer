@@ -127,6 +127,18 @@ const (
 	// parsed.
 	batteryMaxOutput = 32 << 10
 
+	// batteryPruneEvery is how often farm.battery_readings_prune is called.
+	// It is checked against the wall clock at the end of a cycle rather than
+	// run off a ticker of its own: one goroutine, one clock, and a prune
+	// that runs between two batches of the same poller can never contend
+	// with a write from it. Wall clock rather than every Nth cycle so that
+	// an operator who slows the poll interval does not also, silently,
+	// lengthen retention. The function's default keep is seven days; a
+	// prune an hour is the coarsest cadence that still deletes in small
+	// bites, and the same rows deleted twice by two per-host pollers cost
+	// the second one a scan and nothing else.
+	batteryPruneEvery = time.Hour
+
 	// Plausible battery temperatures, in decidegrees Celsius. A lithium cell
 	// outside this range is not a cell, it is a sensor that is not there — the
 	// common form being a device that reports 0 or a huge sentinel for a
@@ -192,6 +204,15 @@ type batteryPoller struct {
 	// goroutine, which is why it needs no lock.
 	lastHosts map[string]struct{}
 
+	// lastPrune is when farm.battery_readings_prune last ran from this
+	// poller. Zero at start, so the first cycle prunes: a watchdog that has
+	// been down for a week has a week of backlog to trim.
+	lastPrune time.Time
+
+	// swell is the detector that reads the history this poller writes. It
+	// runs after every cycle, on the same goroutine.
+	swell *swellChecker
+
 	// dial builds the shell client for one host's ADB server. It is a field so
 	// a test can drive the reader against a fake, and it is the ONLY seam:
 	// everything below it is the shipping code path.
@@ -209,6 +230,8 @@ func (w *Watchdog) newBatteryPoller() *batteryPoller {
 		probeTimeout: batteryProbeTimeout,
 		log:          w.log.With("reader", "battery"),
 	}
+	p.swell = newSwellChecker(w.cfg.Pool, w.cfg.HostID, w.cfg.Component, w.cfg.Battery,
+		w.cfg.CallTimeout, w.log.With("reader", "swell"))
 	p.dial = func(endpoint string) batteryShell {
 		return adbwire.New(endpoint,
 			adbwire.WithLogger(p.log),
@@ -229,6 +252,12 @@ func (p *batteryPoller) run(ctx context.Context) {
 
 	ticker := time.NewTicker(p.interval)
 	defer ticker.Stop()
+
+	// The checker's share of farm_battery_anomalies leaves with it; see
+	// swellChecker.stop.
+	if p.swell != nil {
+		defer p.swell.stop()
+	}
 
 	for {
 		p.cycle(ctx)
@@ -270,6 +299,20 @@ func (p *batteryPoller) cycle(ctx context.Context) {
 					"devices", len(readings), "err", err)
 			}
 		}
+	}
+
+	// The detector runs whether or not this cycle wrote anything: a device
+	// that has stopped answering is judged on the history it left, and a
+	// rack with no targets at all still needs its stale findings cleared.
+	if p.swell != nil {
+		if err := p.swell.check(ctx); err != nil && ctx.Err() == nil {
+			swellCheckErrors.Inc()
+			p.log.Warn("battery swell check failed; gauges keep their last values", "err", err)
+		}
+	}
+
+	if time.Since(p.lastPrune) >= batteryPruneEvery {
+		p.prune(ctx)
 	}
 
 	// Published so an operator can see a cycle creeping toward the interval,
@@ -570,7 +613,9 @@ func parseBatteryDump(out []byte) (pct *int32, tempDC *int32) {
 	return pct, tempDC
 }
 
-// write records one cycle's readings in a single statement.
+// write records one cycle's readings in a single statement: the current
+// value onto farm.device_runtime, and the same reading appended to
+// farm.battery_readings.
 //
 // One statement rather than one per device: a cycle produces up to a rackful
 // of rows at once and they are independent, so there is nothing to be gained
@@ -578,16 +623,48 @@ func parseBatteryDump(out []byte) (pct *int32, tempDC *int32) {
 // answer from erasing a whole one — a device that reported a temperature but
 // no level must not lose the level somebody read from it a minute ago.
 //
+// The history row is written in the SAME statement, not a second one, so
+// that the two can never disagree: a cycle that updated the level but lost
+// the history would leave the swell detector fitting a slope through a gap
+// that the current column says is not there. The insert takes its device
+// list from the update's RETURNING rather than from the input, which is what
+// makes a device deleted between the listing and the write cost nothing —
+// its runtime row cascaded away, the update matched nothing, and no history
+// row is attempted against a foreign key that no longer holds.
+//
+// Only a reading with at least one value becomes a history row, the same
+// rule the table's CHECK states; readOne already refuses to produce an empty
+// reading, so the WHERE is the schema's rule said here as well, not a second
+// filter. ON CONFLICT DO NOTHING is the same argument as the CHECK filters in
+// parseBatteryDump: two cycles cannot share a transaction timestamp in
+// practice, but a batch that COULD fail on a key collision would discard
+// every other device's reading along with the one that collided.
+//
 // now() is the server's, as everywhere in this package: no clock reading from
-// this process is ever written to the database.
+// this process is ever written to the database, and the history row's `at`
+// is the statement's own timestamp.
 func (p *batteryPoller) write(ctx context.Context, readings []batteryReading) error {
 	const q = `
-UPDATE farm.device_runtime r
-   SET battery_pct     = COALESCE(v.pct, r.battery_pct),
-       battery_temp_dc = COALESCE(v.temp_dc, r.battery_temp_dc),
-       updated_at      = now()
-  FROM unnest($1::text[], $2::int[], $3::int[]) AS v(device_id, pct, temp_dc)
- WHERE r.device_id = v.device_id::uuid`
+WITH v AS (
+  SELECT device_id::uuid AS device_id, pct, temp_dc
+    FROM unnest($1::text[], $2::int[], $3::int[]) AS v(device_id, pct, temp_dc)
+), upd AS (
+  UPDATE farm.device_runtime r
+     SET battery_pct     = COALESCE(v.pct, r.battery_pct),
+         battery_temp_dc = COALESCE(v.temp_dc, r.battery_temp_dc),
+         updated_at      = now()
+    FROM v
+   WHERE r.device_id = v.device_id
+  RETURNING r.device_id
+), hist AS (
+  INSERT INTO farm.battery_readings (device_id, pct, temp_dc)
+  SELECT v.device_id, v.pct, v.temp_dc
+    FROM v JOIN upd USING (device_id)
+   WHERE v.pct IS NOT NULL OR v.temp_dc IS NOT NULL
+  ON CONFLICT (device_id, at) DO NOTHING
+  RETURNING device_id
+)
+SELECT (SELECT count(*) FROM upd), (SELECT count(*) FROM hist)`
 
 	ids := make([]string, len(readings))
 	pcts := make([]*int32, len(readings))
@@ -599,12 +676,33 @@ UPDATE farm.device_runtime r
 	cctx, cancel := context.WithTimeout(ctx, p.callTimeout)
 	defer cancel()
 
-	tag, err := p.pool.Exec(cctx, q, ids, pcts, temps)
-	if err != nil {
+	var updated, appended int64
+	if err := p.pool.QueryRow(cctx, q, ids, pcts, temps).Scan(&updated, &appended); err != nil {
 		return fmt.Errorf("watchdog: write battery observations: %w", err)
 	}
-	batteryRowsWritten.Add(float64(tag.RowsAffected()))
+	batteryRowsWritten.Add(float64(updated))
+	batteryHistoryRows.Add(float64(appended))
 	return nil
+}
+
+// prune trims farm.battery_readings to the function's own default window.
+// Retention is the schema's decision (see migrations/00016); this loop only
+// supplies the clock. A failure is logged and retried next hour: a table
+// that grows for an extra hour is not an incident.
+func (p *batteryPoller) prune(ctx context.Context) {
+	cctx, cancel := context.WithTimeout(ctx, p.callTimeout)
+	defer cancel()
+
+	var deleted int64
+	if err := p.pool.QueryRow(cctx, `SELECT farm.battery_readings_prune()`).Scan(&deleted); err != nil {
+		if ctx.Err() == nil {
+			p.log.Warn("could not prune battery history", "err", err)
+		}
+		return
+	}
+	p.lastPrune = time.Now()
+	batteryPrunedRows.Add(float64(deleted))
+	p.log.Debug("battery history pruned", "deleted", deleted)
 }
 
 // ---------------------------------------------------------------------------
@@ -640,6 +738,17 @@ var (
 		Help: "Cycles whose observations could not be written.",
 	})
 
+	batteryHistoryRows = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: "farm", Subsystem: "watchdog", Name: "battery_history_rows_total",
+		Help: "farm.battery_readings rows appended. Flat while battery_rows_written_total " +
+			"climbs means the history insert is being refused; the swell detector is blind.",
+	})
+
+	batteryPrunedRows = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: "farm", Subsystem: "watchdog", Name: "battery_history_pruned_total",
+		Help: "farm.battery_readings rows deleted by the hourly prune.",
+	})
+
 	batteryCycleSeconds = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace: "farm", Subsystem: "watchdog", Name: "battery_cycle_seconds",
 		Help: "Duration of the last battery cycle, by the scope of the poller that ran it: a host " +
@@ -648,10 +757,12 @@ var (
 	}, []string{"scope"})
 )
 
-// batteryCollectors returns this reader's metrics, for Collectors.
+// batteryCollectors returns this reader's metrics and the swell detector's,
+// for Collectors.
 func batteryCollectors() []prometheus.Collector {
-	return []prometheus.Collector{
+	return append([]prometheus.Collector{
 		batteryCyclesTotal, batteryReadings, batteryTargetsGauge,
 		batteryRowsWritten, batteryWriteErrors, batteryCycleSeconds,
-	}
+		batteryHistoryRows, batteryPrunedRows,
+	}, swellCollectors()...)
 }

@@ -473,6 +473,7 @@ func watchdogsForHosts(ctx context.Context, cfg *config.Config, log *slog.Logger
 			HostID:      id,
 			ADBEndpoint: endpoint,
 			Interval:    cfg.WatchdogInterval,
+			Battery:     batteryThresholds(cfg),
 			Logger:      log.With("host", id),
 		}
 		out["watchdog:"+id] = func(ctx context.Context) error {
@@ -486,6 +487,17 @@ func watchdogsForHosts(ctx context.Context, cfg *config.Config, log *slog.Logger
 	return out, rows.Err()
 }
 
+// batteryThresholds carries the U9 knobs from the environment into the
+// watchdog. One place, because two construction sites that each copy three
+// fields are two places for one of them to be forgotten.
+func batteryThresholds(cfg *config.Config) watchdog.BatteryThresholds {
+	return watchdog.BatteryThresholds{
+		TempRiseDCPerMin: cfg.Battery.TempRiseDCPerMin,
+		TempMaxDC:        cfg.Battery.TempMaxDC,
+		DrainPctPerHour:  cfg.Battery.DrainPctPerHour,
+	}
+}
+
 func runWatchdog(ctx context.Context, cfg *config.Config, log *slog.Logger, pool *pgxpool.Pool) error {
 	// A single-host watchdog is the production shape: one pod per host, named
 	// by FARM_HOST_ID. Without one, supervise every host in this process.
@@ -496,6 +508,7 @@ func runWatchdog(ctx context.Context, cfg *config.Config, log *slog.Logger, pool
 			HostID:      cfg.Node.HostID,
 			ADBEndpoint: cfg.Node.ADBEndpoint,
 			Interval:    cfg.WatchdogInterval,
+			Battery:     batteryThresholds(cfg),
 			Logger:      log,
 		})
 		if err != nil {

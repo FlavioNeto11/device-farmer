@@ -31,6 +31,7 @@ var allEnv = []string{
 	EnvHeartbeatEvery,
 	EnvNodeSelfFence, EnvFenceMargin, EnvNodeADBEndpoint, EnvNodeHostID,
 	EnvWatchdogInterval, EnvMigrationsTable, EnvMigrationsDir,
+	EnvBatteryTempRise, EnvBatteryTempMax, EnvBatteryDrain,
 }
 
 const testDSN = "postgres://farm@127.0.0.1:5432/farm?sslmode=disable"
@@ -129,6 +130,9 @@ func TestDefaultValues(t *testing.T) {
 		{EnvDBConnectTimeout, cfg.DBConnectTimeout, DefaultDBConnectTimeout},
 		{EnvWatchdogInterval, cfg.WatchdogInterval, DefaultWatchdogEvery},
 		{EnvMigrationsTable, cfg.MigrationsTable, DefaultMigrationsTable},
+		{EnvBatteryTempRise, cfg.Battery.TempRiseDCPerMin, DefaultBatteryTempRiseDCPerMin},
+		{EnvBatteryTempMax, cfg.Battery.TempMaxDC, DefaultBatteryTempMaxDC},
+		{EnvBatteryDrain, cfg.Battery.DrainPctPerHour, DefaultBatteryDrainPctPerHour},
 	}
 	for _, c := range checks {
 		if c.got != c.want {
@@ -253,6 +257,24 @@ func TestPreflightRefusals(t *testing.T) {
 		role: "reaper",
 		envs: map[string]string{EnvHeartbeatEvery: "45s", EnvReaperGapFloor: "60s"},
 		want: []string{EnvHeartbeatEvery, EnvReaperGapFloor},
+	}, {
+		// U9 — battery health. A ceiling the column cannot hold is a rule
+		// that never fires, which is worse than no rule: somebody believes
+		// they are covered.
+		name: "battery ceiling above the column CHECK",
+		role: "watchdog",
+		envs: map[string]string{EnvBatteryTempMax: "1501"},
+		want: []string{EnvBatteryTempMax, "never fire"},
+	}, {
+		name: "battery rise rate of zero",
+		role: "watchdog",
+		envs: map[string]string{EnvBatteryTempRise: "0"},
+		want: []string{EnvBatteryTempRise, "at least 1"},
+	}, {
+		name: "battery drain above one hundred points an hour",
+		role: "watchdog",
+		envs: map[string]string{EnvBatteryDrain: "101"},
+		want: []string{EnvBatteryDrain, "1..100"},
 	}, {
 		name: "empty component watch list",
 		role: "reaper",
@@ -470,6 +492,9 @@ func TestEveryVariableIsRead(t *testing.T) {
 		EnvWatchdogInterval:     "6s",
 		EnvMigrationsTable:      "farm.schema_version",
 		EnvMigrationsDir:        "/srv/migrations",
+		EnvBatteryTempRise:      "35",
+		EnvBatteryTempMax:       "500",
+		EnvBatteryDrain:         "25",
 	})
 	cfg, err := Load("scheduler")
 	if err != nil {
@@ -507,6 +532,9 @@ func TestEveryVariableIsRead(t *testing.T) {
 		{EnvWatchdogInterval, cfg.WatchdogInterval, 6 * time.Second},
 		{EnvMigrationsTable, cfg.MigrationsTable, "farm.schema_version"},
 		{EnvMigrationsDir, cfg.MigrationsDir, "/srv/migrations"},
+		{EnvBatteryTempRise, cfg.Battery.TempRiseDCPerMin, 35},
+		{EnvBatteryTempMax, cfg.Battery.TempMaxDC, 500},
+		{EnvBatteryDrain, cfg.Battery.DrainPctPerHour, 25},
 	}
 	for _, c := range checks {
 		if c.got != c.want {
@@ -770,6 +798,9 @@ func TestSummaryShowsWhatTheProcessDecided(t *testing.T) {
 		"9090",  // the metrics listener that now exists
 		"40",    // 30m/45s renewal attempts
 		"xxxxx", // the password, gone
+		// U9: the battery thresholds, in the degrees a human reads, and the
+		// statement that they end nothing.
+		"2.0 C/min", "45.0 C", "15 %/h", "ends nothing",
 	} {
 		if !strings.Contains(s, want) {
 			t.Errorf("summary omits %q:\n%s", want, s)

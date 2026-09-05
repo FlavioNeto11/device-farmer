@@ -71,6 +71,34 @@ const (
 	EnvMigrationsDir    = "FARM_MIGRATIONS_DIR"
 )
 
+// U9 — battery health.
+//
+// The thresholds the watchdog's swell detector flags on, in the units the
+// schema stores: decidegrees Celsius and percentage points. They are policy,
+// which is why they are here and not in a CHECK (00010 says so in as many
+// words): a lab that runs its phones hot on purpose retunes a manifest, not a
+// migration.
+const (
+	EnvBatteryTempRise = "FARM_BATTERY_TEMP_RISE_DC_PER_MIN"
+	EnvBatteryTempMax  = "FARM_BATTERY_TEMP_MAX_DC"
+	EnvBatteryDrain    = "FARM_BATTERY_DRAIN_PCT_PER_HOUR"
+
+	// 2.0 C/min. A phone under a heavy test warms at tenths of a degree a
+	// minute; a cell whose case is climbing two full degrees a minute is
+	// being heated from inside, and it does not matter what temperature it
+	// is passing through on the way.
+	DefaultBatteryTempRiseDCPerMin = 20
+	// 45.0 C. The top of the charging band every major cell vendor
+	// specifies, and the point at which Android's own thermal service starts
+	// throttling; a case above it on a shelf in a ventilated room is not
+	// being warmed by the room.
+	DefaultBatteryTempMaxDC = 450
+	// 15 points an hour, IDLE and on a powered port. A handset doing nothing
+	// on VBUS should gain charge or hold it; one that loses a sixth of its
+	// capacity an hour while plugged in cannot hold what it is given.
+	DefaultBatteryDrainPctPerHour = 15
+)
+
 // Mirrors of CHECK constraints in migrations/00001_core.sql. Duplicated on
 // purpose: the database is the authority, but a process that would inevitably
 // violate the authority should never finish booting.
@@ -79,6 +107,9 @@ const (
 	MinLeaseTTL = 10 * time.Minute
 	// farm.jobs.grace CHECK (grace >= interval '5 minutes')
 	MinLeaseGrace = 5 * time.Minute
+	// farm.device_runtime.battery_temp_dc CHECK (... BETWEEN -400 AND 1500),
+	// migrations/00010; farm.battery_readings.temp_dc carries the same one.
+	MaxBatteryTempDC = 1500
 )
 
 // MinRenewAttempts is how many renewal opportunities must fit inside one TTL.
@@ -230,6 +261,20 @@ type Node struct {
 	HostID            string
 }
 
+// Battery holds the early-detection thresholds of the watchdog's swell
+// detector (U9). Units are the schema's: decidegrees and percentage points.
+type Battery struct {
+	// TempRiseDCPerMin flags a cell whose temperature is climbing faster than
+	// this over the detector's short window, whatever its absolute value.
+	TempRiseDCPerMin int
+	// TempMaxDC flags any reading above this.
+	TempMaxDC int
+	// DrainPctPerHour flags an IDLE device on a port whose charge gate is not
+	// off losing charge faster than this. A device mid-job is never judged
+	// by it: a test can legitimately outrun a charger.
+	DrainPctPerHour int
+}
+
 // Config is the whole of farmd's environment-derived configuration.
 type Config struct {
 	// Component is the name written by farm.component_beat. It must match the
@@ -258,9 +303,10 @@ type Config struct {
 	NodeAddr    string
 	APIBaseURL  string
 
-	Lease  Lease
-	Reaper Reaper
-	Node   Node
+	Lease   Lease
+	Reaper  Reaper
+	Node    Node
+	Battery Battery
 
 	WatchdogInterval time.Duration
 	MigrationsTable  string
@@ -328,6 +374,11 @@ func Load(component string, opts ...Option) (*Config, error) {
 			HostID:            l.str(EnvNodeHostID, ""),
 		},
 
+		Battery: Battery{
+			TempRiseDCPerMin: l.num(EnvBatteryTempRise, DefaultBatteryTempRiseDCPerMin),
+			TempMaxDC:        l.num(EnvBatteryTempMax, DefaultBatteryTempMaxDC),
+			DrainPctPerHour:  l.num(EnvBatteryDrain, DefaultBatteryDrainPctPerHour),
+		},
 		WatchdogInterval: l.dur(EnvWatchdogInterval, DefaultWatchdogEvery),
 		MigrationsTable:  l.str(EnvMigrationsTable, DefaultMigrationsTable),
 		MigrationsDir:    l.str(EnvMigrationsDir, ""),
@@ -633,6 +684,21 @@ Fix by raising %s above %s + %s, or by lowering the proxy's self-fence timeout.`
 	if c.WatchdogInterval <= 0 {
 		fail("%s must be positive", EnvWatchdogInterval)
 	}
+	// U9 — battery health. A rate of zero flags every phone that warms up
+	// under a test; a ceiling outside what the column can hold can never
+	// fire, which is the silent-disarm failure this package exists to refuse.
+	if c.Battery.TempRiseDCPerMin < 1 {
+		fail("%s must be at least 1 (decidegrees per minute)", EnvBatteryTempRise)
+	}
+	if c.Battery.TempMaxDC < 1 || c.Battery.TempMaxDC > MaxBatteryTempDC {
+		fail("%s (%d) must be within 1..%d decidegrees: the column CHECK in "+
+			"migrations/00010 cannot hold a reading above %d, so a ceiling there would "+
+			"never fire", EnvBatteryTempMax, c.Battery.TempMaxDC, MaxBatteryTempDC, MaxBatteryTempDC)
+	}
+	if c.Battery.DrainPctPerHour < 1 || c.Battery.DrainPctPerHour > 100 {
+		fail("%s (%d) must be within 1..100 percentage points per hour",
+			EnvBatteryDrain, c.Battery.DrainPctPerHour)
+	}
 	// The metrics address is a listener now, so a malformed one is a bind
 	// failure at startup rather than a string nobody reads.
 	if c.bindsMetrics() {
@@ -722,6 +788,10 @@ func (c *Config) Summary() string {
 	fmt.Fprintf(&b, "reaper           = every %s, batch %d, gap floor %s, watching %s\n",
 		c.Reaper.Interval, c.Reaper.Batch, c.Reaper.GapFloor,
 		strings.Join(c.Reaper.Components, ","))
+	fmt.Fprintf(&b, "battery health   = temp rise > %.1f C/min, temp > %.1f C, idle drain > %d %%/h "+
+		"(raises farm.events battery_anomaly; ends nothing)\n",
+		float64(c.Battery.TempRiseDCPerMin)/10, float64(c.Battery.TempMaxDC)/10,
+		c.Battery.DrainPctPerHour)
 	fmt.Fprintf(&b, "shutdown grace   = %s (drains requests; releases nothing)\n", c.ShutdownGrace)
 	return b.String()
 }

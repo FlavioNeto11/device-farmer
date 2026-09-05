@@ -25,6 +25,7 @@ import (
 	"github.com/flaviopadilha/device-farmer/internal/ctl"
 	"github.com/flaviopadilha/device-farmer/internal/demo"
 	"github.com/flaviopadilha/device-farmer/internal/enroll"
+	"github.com/flaviopadilha/device-farmer/internal/fenceproxy"
 	"github.com/flaviopadilha/device-farmer/internal/janitor"
 	"github.com/flaviopadilha/device-farmer/internal/jobrunner"
 	"github.com/flaviopadilha/device-farmer/internal/lease"
@@ -107,6 +108,7 @@ func newRegistry(log *slog.Logger) (*prometheus.Registry, error) {
 	if err := obs.RegisterAll(reg, log,
 		adbwire.Collectors(),
 		enroll.Collectors(),
+		fenceproxy.Collectors(),
 		janitor.Collectors(),
 		jobrunner.Collectors(),
 		node.Collectors(),

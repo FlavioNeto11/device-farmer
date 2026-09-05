@@ -890,6 +890,9 @@ func (e *env) ensureAt(ctx context.Context, sha, dest string, mode fs.FileMode) 
 				"wire Config.Artifacts before scheduling jobs whose specs push or install", sha)
 	}
 	push := func(ctx context.Context, a artifacts.Artifact, blob artifacts.Blob) (string, error) {
+		if err := e.mkdirParent(ctx, dest); err != nil {
+			return "", err
+		}
 		if err := e.dev.Push(ctx, blob, dest, mode); err != nil {
 			return "", err
 		}
@@ -934,6 +937,52 @@ func (e *env) ensureAt(ctx context.Context, sha, dest string, mode fs.FileMode) 
 	}
 	ens, err = e.artifacts.EnsureOnDevice(ctx, e.place.DeviceID, sha, push)
 	return ens, classifyArtifactError(err)
+}
+
+// mkdirParent creates the directory a push will land in, immediately before
+// the bytes move.
+//
+// The sync protocol's SEND opens its destination with O_CREAT and nothing
+// more: a parent that is not there is answered with FAIL and the errno text,
+// after the transfer has already been set up, and the step then reports a
+// refused push where the real fact is "nobody made the directory". prepare's
+// scratch directory covers an install's staging path; a push step names any
+// absolute path its author chose, and a directory that does not exist yet is
+// the ordinary state of a device that was just reset.
+//
+// The three ways this can end are kept apart, because the runner does
+// different things with each:
+//
+//   - mkdir ran and exited non-zero — a read-only mount, a parent the shell
+//     user cannot write — is the device saying no, and asking again would get
+//     the same answer. It is NotRetryable and the message names the directory.
+//   - The stream ended before the device reported a status is the wire, not
+//     the device, and stays retryable. Reading it as "the directory is there"
+//     would let a bumped cable produce a directory that is not, and the push
+//     would then fail somewhere far from the cause.
+//   - An error from the connection itself is passed through as the adapter
+//     classified it.
+func (e *env) mkdirParent(ctx context.Context, dest string) error {
+	parent := path.Dir(dest)
+	if parent == "/" || parent == "." {
+		// The root is always there, and a bare name is a spec problem the
+		// push itself reports.
+		return nil
+	}
+	out, err := e.dev.Shell(ctx, "mkdir -p "+dq(parent))
+	if err != nil {
+		return err
+	}
+	if !out.Exited {
+		return errors.New("shell stream ended without an exit status while creating the push's destination directory")
+	}
+	if out.ExitCode != 0 {
+		return notRetryablef(
+			"could not create %s for the push (exit status %d: %s); the shell user cannot write there, "+
+				"so the step's dest must name a directory it can",
+			parent, out.ExitCode, firstLine(string(out.Stderr)+string(out.Stdout)))
+	}
+	return nil
 }
 
 // classifyArtifactError separates the store's permanent refusals from its

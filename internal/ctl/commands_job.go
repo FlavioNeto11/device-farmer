@@ -332,8 +332,28 @@ func stepOutputCellText(st jobStep) string {
 			return "(blank)"
 		}
 		return tail + truncationMark(st.OutputTruncated)
+	case st.State == "skipped":
+		return skipReason(st)
 	}
 	return ""
+}
+
+// skipReason is the one line a skipped row carries in detail.reason: why it
+// was not run. Two writers produce 'skipped' — a resumed attempt, for a step
+// that already completed in an earlier run, and a failure, for every step
+// after it — and the state alone does not say which, so the reason is the
+// cell. A row with no reason renders blank, as before.
+func skipReason(st jobStep) string {
+	if len(st.Detail) == 0 {
+		return ""
+	}
+	var d struct {
+		Reason string `json:"reason"`
+	}
+	if err := json.Unmarshal(st.Detail, &d); err != nil {
+		return ""
+	}
+	return d.Reason
 }
 
 func truncationMark(truncated bool) string {

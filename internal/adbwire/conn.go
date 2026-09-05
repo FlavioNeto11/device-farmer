@@ -92,6 +92,12 @@ func dialConn(ctx context.Context, d *net.Dialer, endpoint string, fallback time
 	}, nil
 }
 
+// armDeadlineMargin is how far behind the caller's deadline the socket
+// deadline is set. Large enough that the context always fires first on a
+// loaded machine, small enough that a context which never fires still frees
+// the socket promptly.
+const armDeadlineMargin = 250 * time.Millisecond
+
 // arm applies the caller's deadline to the socket and wires cancellation to
 // it, returning the function that undoes both.
 //
@@ -101,11 +107,28 @@ func dialConn(ctx context.Context, d *net.Dialer, endpoint string, fallback time
 // immediately, and the caller then reports the context error rather than the
 // induced timeout.
 func (c *conn) arm(ctx context.Context, fallback time.Duration) (disarm func()) {
-	dl, ok := ctx.Deadline()
+	dl, fromCtx := ctx.Deadline()
+	ok := fromCtx
 	if !ok && fallback > 0 {
 		dl, ok = time.Now().Add(fallback), true
 	}
 	if ok {
+		if fromCtx {
+			// Deliberately BEHIND the caller's deadline, not level with it.
+			//
+			// Set to the same instant, the socket timeout and the context
+			// expiry race, and the OS wins often enough to matter: the read
+			// fails, wrap asks contextError, the context has not quite expired
+			// by Go's clock, and the caller's own deadline is reported as a
+			// host timeout. That is a lie about whose fault it was — a step
+			// timeout counted against the host's health — and it appears only
+			// under load, which is when the classification is read.
+			//
+			// The AfterFunc below is the mechanism that should always win, and
+			// it fires on the context. This deadline is only the backstop for
+			// a context that somehow never fires, so it can afford to be late.
+			dl = dl.Add(armDeadlineMargin)
+		}
 		_ = c.nc.SetDeadline(dl)
 	} else {
 		_ = c.nc.SetDeadline(time.Time{})

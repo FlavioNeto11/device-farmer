@@ -1,0 +1,655 @@
+{{- if .Values.prometheusRule.enabled }}
+{{/*
+Alerting rules for device-farmer.
+
+WHY THIS FILE IS SHORT AND THE RUNBOOKS ARE LONG
+
+Every rule here was written against a metric name and label set read out of a
+live /metrics, not out of a design document. A rule over a series that does not
+exist returns no data, and no data fires nothing — so a disarmed page looks
+exactly like a farm that has lost no work. That is worse than having no rule at
+all, because somebody believes they are covered. Where a rule depends on a
+series this deployment may not be scraping, it says so in a comment above the
+rule rather than shipping quietly broken.
+
+WHAT IS DELIBERATELY NOT HERE
+
+farm_adb_transport_blips_total. Not at a high threshold, not over a long window,
+not "as a warning that routes to a channel". internal/obs/doc.go explains it at
+length: a blip means a socket died, sockets die, and the device is very probably
+still running the test it was leased for. Paging on it trains operators to read
+a transport failure as a device loss, and automation written to silence the page
+follows within the quarter. That is DeviceFarmer/STF #663 reached by a shorter
+path than a code change.
+
+WHAT rack_slot IS FOR
+
+An operator walks to a rack position, not to a UUID. internal/topo/rackslot.go
+synthesises R<rack>-U<unit>-H<hub token>-P<port> for exactly that reason. Every
+rule below whose subject is a slot keeps that label through its aggregation and
+names it in the summary. The hub-level rules have no slot to name — their
+subject is a whole hub, and farm_device_health is aggregated per hub on purpose
+so that a dead hub reads as one page instead of twelve — so they synthesise the
+part of the label they can prove: the hub token in a rack_slot is the hub's USB
+path with "-" rewritten to ".", which makes hub 3-1.4 the slots H3.1.4-P*.
+
+WHICH PROCESS PUBLISHES WHAT
+
+internal/obs is registered in every farmd process, but each of its gauges is
+PUBLISHED by exactly one role:
+
+    farm_lease_held, farm_lease_suspect, farm_slot_rearm_pending   reaper
+    farm_control_plane_gap_seconds                                 reaper
+    farm_device_health                                             watchdog
+    farm_recovery_attempts_total                                   recovery
+    farm_lease_reaped_total, farm_lease_renew_failures_total       api, jobrunner,
+                                                                   scheduler, reaper
+    farm_api_*                                                     api
+
+templates/servicemonitor.yaml scrapes the api Service and nothing else, because
+the other roles serve no HTTP — FARM_METRICS_ADDR is read by internal/config and
+listened on by nobody. In a split deployment (this chart's default) the api's
+registry therefore holds the other roles' gauges at their zero-filled seed
+values forever, and the pages that read them cannot fire. That is not a
+hypothetical; it is this chart's default topology.
+
+Two things follow, and both are load bearing:
+
+  1. DeviceFarmerAlertingBlind, near the bottom of this file, watches for
+     exactly that state and says so out loud. It is the rule that stops the
+     silence from being mistaken for good news.
+  2. Until the other roles serve FARM_METRICS_ADDR, either run one process with
+     every role in it (`farmd all`, one registry, everything published where the
+     api serves it) or scrape the other pods some other way. If you do neither,
+     DeviceFarmerAlertingBlind will tell you what you are not covering.
+
+SEVERITY
+
+  critical  work is being destroyed, or a human decision is being waited on
+  warning   a ticket. Somebody's Monday, not somebody's night.
+
+internal/obs/doc.go is explicit that a control-plane gap is a ticket and not a
+page: reaper_arm refunds the gap onto every live lease, so the tenant pays
+nothing for our outage. Treating it as an emergency is what leads to somebody
+disabling the quiesce gate, and disabling the quiesce gate is how a
+control-plane restart mass-reclaims a farm.
+*/}}
+{{- $rb := trimSuffix "/" .Values.prometheusRule.runbookBaseURL -}}
+{{- $apiJob := default (include "device-farmer.componentName" (dict "ctx" $ "component" "api")) .Values.prometheusRule.apiJob -}}
+{{- $t := .Values.prometheusRule.thresholds -}}
+{{- $hubSlots := "H{{ reReplaceAll \"-\" \".\" $labels.hub }}-P*" -}}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "device-farmer.fullname" . }}
+  namespace: {{ default .Release.Namespace .Values.prometheusRule.namespace }}
+  labels:
+    {{- include "device-farmer.labels" (dict "ctx" $ "component" "alerts") | nindent 4 }}
+    {{- with .Values.prometheusRule.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with .Values.prometheusRule.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  groups:
+    # -----------------------------------------------------------------------
+    # Lost work. The only true emergency in this system.
+    #
+    # Everything that ends a lease legitimately is already visible in the
+    # reason label; these three are the ones that mean the control plane
+    # destroyed something, or is about to be asked to.
+    # -----------------------------------------------------------------------
+    - name: device-farmer.lost-work
+      interval: {{ $t.evaluationInterval }}
+      rules:
+        # THE "hold and page" ALERT.
+        #
+        # A protected lease that has gone suspect is the one case the design
+        # deliberately refuses to resolve on its own: farm.lease_reclaim will
+        # never touch it, so it waits indefinitely for a human. That is
+        # correct, and it is exactly why nobody notices without this rule.
+        #
+        # Armed from the first scrape: obs.zeroFill creates
+        # farm_lease_suspect{protected="true"} at 0 before anything has
+        # happened, so this rule is not waiting on the first casualty to bring
+        # its own series into existence.
+        #
+        # max by, not sum by: the gauge is a fleet-wide census published by
+        # whichever reaper replica holds leadership. If two replicas are
+        # scraped in a leadership handover, sum would double-count.
+        - alert: DeviceFarmerProtectedLeaseSuspect
+          expr: max by (pool, tenant) (farm_lease_suspect{protected="true"}) > 0
+          for: {{ $t.protectedSuspectFor }}
+          labels:
+            severity: critical
+            component: lease
+          annotations:
+            summary: >-
+              {{ `{{ $value | printf "%.0f" }}` }} protected lease(s) suspect in
+              pool {{ `{{ $labels.pool }}` }} (tenant {{ `{{ $labels.tenant }}` }})
+            description: >-
+              A PROTECTED lease stopped renewing and has been marked suspect.
+              Nothing has been released and nothing will be — the reclaim sweep
+              skips protected leases by design — so a device is held, a job is
+              waiting, and the decision belongs to a person. Decide whether the
+              holder is coming back; if it is not, revoke the lease by hand.
+            runbook_url: {{ $rb }}/protected-lease-suspect.md
+
+        # A tombstone. The work is already gone; this exists so that it is
+        # known and counted rather than discovered from a queue that stopped
+        # moving.
+        - alert: DeviceFarmerLeaseReclaimed
+          expr: sum(increase(farm_lease_reaped_total{reason="holder_expired"}[{{ $t.lostWorkWindow }}])) > 0
+          labels:
+            severity: critical
+            component: lease
+          annotations:
+            summary: >-
+              {{ `{{ $value | printf "%.0f" }}` }} lease(s) reclaimed as
+              holder_expired in the last {{ $t.lostWorkWindow }}
+            description: >-
+              farm.lease_reclaim ended a lease whose holder stopped renewing for
+              ttl+grace across every control-plane component. This is the only
+              release reason in the system that represents work destroyed by us
+              rather than work that ended. In a healthy farm it is flat at zero.
+            runbook_url: {{ $rb }}/lease-reclaimed.md
+
+        # The same event seen from the holder. Zero rows from farm.lease_renew
+        # is the single unambiguous fence signal there is: the lease is gone,
+        # the job aborted, every ADB socket closed, nothing was written.
+        #
+        # kind="transient" is deliberately NOT alerted on. It proves nothing
+        # about the lease — a dial error, a statement timeout, a pool
+        # exhaustion — the supervisor retries and the deadline is untouched.
+        # Alerting on it would be the first step toward treating a database
+        # hiccup as a device loss.
+        - alert: DeviceFarmerLeaseFenced
+          expr: sum(increase(farm_lease_renew_failures_total{kind="fenced"}[{{ $t.fenceWindow }}])) > 0
+          labels:
+            severity: critical
+            component: lease
+          annotations:
+            summary: >-
+              {{ `{{ $value | printf "%.0f" }}` }} lease renewal(s) fenced in the
+              last {{ $t.fenceWindow }}
+            description: >-
+              farm.lease_renew returned zero rows, which is proof the lease is
+              gone. The job aborted and nothing was written to the device. A
+              fence is the system working correctly; the question this page asks
+              is what took the lease away in the first place.
+            runbook_url: {{ $rb }}/lease-fenced.md
+
+    # -----------------------------------------------------------------------
+    # The control plane itself.
+    # -----------------------------------------------------------------------
+    - name: device-farmer.control-plane
+      interval: {{ $t.evaluationInterval }}
+      rules:
+        # If this fires, every other rule in this file is also blind, because
+        # the api Service is the only thing templates/servicemonitor.yaml
+        # scrapes. It is listed first for that reason.
+        #
+        # The `or absent(...)` half covers the target disappearing from service
+        # discovery entirely, which `up == 0` cannot see. It has a second use:
+        # if prometheusRule.apiJob does not match the job label your Prometheus
+        # actually assigns, this fires immediately and permanently — a wrong
+        # selector announces itself instead of disarming the rule in silence.
+        #
+        # Leases do NOT end because the API is down. Holders cannot renew, so
+        # they burn TTL, and farm.reaper_arm refunds that TTL to every live
+        # lease when the reaper next arms. Nobody has to hurry in a way that
+        # risks the database.
+        - alert: DeviceFarmerAPIDown
+          expr: up{job="{{ $apiJob }}"} == 0 or absent(up{job="{{ $apiJob }}"})
+          for: {{ $t.apiDownFor }}
+          labels:
+            severity: critical
+            component: api
+          annotations:
+            summary: The device-farmer api target {{ `{{ $labels.instance }}` }} is not being scraped
+            description: >-
+              Prometheus cannot scrape the api. No lease ends because of this and
+              no device is reallocated, but holders cannot renew, the dashboard
+              is dark, and every other device-farmer alert is reading a registry
+              nobody is filling.
+            runbook_url: {{ $rb }}/api-down.md
+
+        # farm_api_auth_open is published once at construction from the
+        # authenticator the process actually installed, so a 1 here is a
+        # deliberate configuration rather than a transient.
+        #
+        # internal/api/auth_wiring.go already refuses the accidental cases — a
+        # network listener with no tokens does not start — so reaching this
+        # state takes FARM_API_AUTH=allow-all or FARM_API_ALLOW_ANONYMOUS=true
+        # in somebody's manifest. The startup WARN that announced it scrolled
+        # out of the log the same afternoon. This does not.
+        - alert: DeviceFarmerAPIAuthOpen
+          expr: max by (authenticator) (farm_api_auth_open) == 1
+          for: {{ $t.authOpenFor }}
+          labels:
+            severity: critical
+            component: api
+          annotations:
+            summary: >-
+              The device-farmer API is running unauthenticated
+              (authenticator={{ `{{ $labels.authenticator }}` }})
+            description: >-
+              Every caller that can reach this port is granted the operator role,
+              which can revoke a lease, drain a host and cut power to a USB port
+              holding a live job. This is the one configuration in which an
+              anonymous stranger can destroy somebody's work.
+            runbook_url: {{ $rb }}/api-auth-open.md
+
+        # A TICKET, NOT A PAGE. See internal/obs/doc.go: reaper_arm adds the gap
+        # back to every live lease's deadline and quiesces the reaper for the
+        # longest TTL it could have missed, so the tenant pays nothing for our
+        # outage. Paging on this is what leads to somebody disabling the quiesce
+        # gate, and disabling the quiesce gate is how a control-plane restart
+        # mass-reclaims a farm.
+        #
+        # TIMING, because it is counter-intuitive: farm.reaper_arm runs once per
+        # GAIN OF LEADERSHIP, not once per sweep. So this fires when a gap is
+        # discovered and refunded — typically when the reaper itself restarts —
+        # and NOT while an outage is still in progress. For the in-progress
+        # case see DeviceFarmerComponentBeatFailing in the roles group, and
+        # GET /api/v1/capabilities, which the runbook uses.
+        - alert: DeviceFarmerControlPlaneGap
+          expr: sum by (component) (increase(farm_control_plane_gap_seconds_count[{{ $t.gapWindow }}])) > 0
+          labels:
+            severity: warning
+            component: control-plane
+          annotations:
+            summary: >-
+              Control-plane gap refunded; the oldest component was
+              {{ `{{ $labels.component }}` }}
+            description: >-
+              farm.reaper_arm found min(beat_at) across FARM_REAPER_COMPONENTS
+              older than the gap floor and added the difference back to
+              expires_at and reclaimable_at on every live lease. This measures
+              OUR downtime, not a tenant's, and it destroyed nothing. Find out
+              why {{ `{{ $labels.component }}` }} stopped beating.
+            runbook_url: {{ $rb }}/control-plane-gap.md
+
+        - alert: DeviceFarmerControlPlaneGapBudget
+          expr: sum(increase(farm_control_plane_gap_seconds_sum[1h])) > {{ $t.gapBudgetSeconds }}
+          labels:
+            severity: warning
+            component: control-plane
+          annotations:
+            summary: >-
+              {{ `{{ $value | printf "%.0f" }}` }}s of lease deadline refunded in
+              the last hour
+            description: >-
+              More than {{ $t.gapBudgetSeconds }}s of control-plane downtime has
+              been added back to live lease deadlines within one hour. Every
+              refunded second is a second a device stayed held that nobody chose
+              to hold it for, and it compounds: the reaper also quiesces for the
+              longest TTL it could have missed. Fleet throughput is paying for a
+              control plane that keeps stopping.
+            runbook_url: {{ $rb }}/control-plane-gap.md
+
+    # -----------------------------------------------------------------------
+    # Correlated physical failure.
+    #
+    # The point of paging on the correlation rather than on the members:
+    # twelve simultaneous device alerts are noise a human silences, and one hub
+    # alert is a person walking to a rack. farm_device_health is aggregated per
+    # hub and zero-filled across all ten health states for exactly this — when
+    # a hub dies, healthy falls to a VISIBLE 0 rather than the series vanishing,
+    # and `== 0` matches a series at zero while matching nothing at all when the
+    # series is absent.
+    # -----------------------------------------------------------------------
+    - name: device-farmer.devices
+      interval: {{ $t.evaluationInterval }}
+      rules:
+        # The `> N` guard excludes two things at once: a hub with a single
+        # device (one dead phone is not correlated failure — the ladder handles
+        # it) and the all-"unknown" seed obs.zeroFill creates, whose total is 0.
+        - alert: DeviceFarmerHubDown
+          expr: |-
+            (sum by (host, hub) (farm_device_health{state="healthy"}) == 0)
+              and
+            (sum by (host, hub) (farm_device_health) > {{ $t.hubMinDevices }})
+          for: {{ $t.hubDownFor }}
+          labels:
+            severity: critical
+            component: device
+            rack_slot: '{{ $hubSlots }}'
+          annotations:
+            summary: >-
+              No healthy device left on hub {{ `{{ $labels.hub }}` }} of host
+              {{ `{{ $labels.host }}` }} (slots {{ `{{ $labels.rack_slot }}` }})
+            description: >-
+              Every device on one hub went unhealthy together. Suspect the hub,
+              its cable or its power domain — not the phones. Handsets do not
+              fail in unison. The rack_slot label is the slot prefix these
+              devices share; the R and U parts come from farm.hosts and the
+              runbook shows how to read them.
+            runbook_url: {{ $rb }}/hub-correlated-failure.md
+
+        # The same physical story, caught earlier and at lower confidence.
+        # Division is safe here: the seed series has a denominator of 0, and 0/0
+        # is NaN, which fails every comparison — and the `and` clause excludes it
+        # regardless.
+        - alert: DeviceFarmerHubDegraded
+          expr: |-
+            (
+              sum by (host, hub) (farm_device_health{state=~"{{ $t.hubUnhealthyStates }}"})
+                /
+              sum by (host, hub) (farm_device_health)
+            ) > {{ $t.hubUnhealthyRatio }}
+              and
+            sum by (host, hub) (farm_device_health) > {{ $t.hubMinDevices }}
+          for: {{ $t.hubDegradedFor }}
+          labels:
+            severity: warning
+            component: device
+            rack_slot: '{{ $hubSlots }}'
+          annotations:
+            summary: >-
+              {{ `{{ $value | humanizePercentage }}` }} of hub
+              {{ `{{ $labels.hub }}` }} on host {{ `{{ $labels.host }}` }} is
+              unhealthy (slots {{ `{{ $labels.rack_slot }}` }})
+            description: >-
+              Several devices on one hub are unhealthy at the same time. Read the
+              states before walking anywhere: offline and missing point at the
+              cable, the hub or the power domain; unauthorized across a whole hub
+              points at the host's adb key, not at the handsets.
+            runbook_url: {{ $rb }}/hub-correlated-failure.md
+
+        # Quarantine is the ladder's last rung: it stops scheduling to the slot
+        # and pages a human. One is a phone. Several is capacity leaving the
+        # fleet, and it does not come back on its own — a quarantine is closed
+        # by an operator, never by a timer.
+        #
+        # Fleet-wide AND per-hub, because they are different faults. Quarantine
+        # creep of one device on each of eight hubs is a fleet that is wearing
+        # out; four on one hub is one piece of broken hardware.
+        - alert: DeviceFarmerDevicesQuarantined
+          expr: sum(farm_device_health{state="quarantined"}) > {{ $t.quarantinedDevices }}
+          for: {{ $t.quarantinedFor }}
+          labels:
+            severity: warning
+            component: device
+          annotations:
+            summary: >-
+              {{ `{{ $value | printf "%.0f" }}` }} devices are quarantined across
+              the fleet
+            description: >-
+              The recovery ladder exhausted itself on these devices and took them
+              out of the pool. Nothing will return them: closing a quarantine is
+              an operator action. Until somebody does, this is capacity the
+              scheduler cannot see.
+            runbook_url: {{ $rb }}/devices-quarantined.md
+
+        - alert: DeviceFarmerHubQuarantined
+          expr: sum by (host, hub) (farm_device_health{state="quarantined"}) > {{ $t.quarantinedPerHub }}
+          for: {{ $t.quarantinedFor }}
+          labels:
+            severity: warning
+            component: device
+            rack_slot: '{{ $hubSlots }}'
+          annotations:
+            summary: >-
+              {{ `{{ $value | printf "%.0f" }}` }} devices quarantined on hub
+              {{ `{{ $labels.hub }}` }} of host {{ `{{ $labels.host }}` }} (slots
+              {{ `{{ $labels.rack_slot }}` }})
+            description: >-
+              Quarantines are concentrated on one hub. The ladder quarantines a
+              DEVICE when it runs out of rungs, so several on one hub usually
+              means it kept trying to fix phones when the hub was the fault.
+            runbook_url: {{ $rb }}/devices-quarantined.md
+
+    # -----------------------------------------------------------------------
+    # The recovery ladder.
+    #
+    # The refusals are not failures. They are the mechanism that protects live
+    # work from a well-meaning watchdog, and they are alerted on because a
+    # RISING RATE of them means the rack's wiring or the fleet's disruption
+    # policies — not the ladder — are why devices are staying broken.
+    #
+    # WHY tier IS FILTERED IN THE "failing" RULE BELOW, and this matters:
+    # internal/recovery folds every outcome except "recovered" onto obs's
+    # "failed", and three rungs return no_change ON SUCCESS — observe (tier 0),
+    # quarantine (tier 6) and host_drain (tier 8). Those map to the obs tiers
+    # "reprobe" and "quarantine", so an unfiltered outcome="failed" rule fires
+    # on the single most frequent healthy event in the whole ladder. The
+    # suggested form in internal/obs/doc.go is unfiltered; it would be a
+    # permanent false alarm, and this is the corrected version.
+    # -----------------------------------------------------------------------
+    - name: device-farmer.recovery
+      interval: {{ $t.evaluationInterval }}
+      rules:
+        # THE ONE THAT MEANS BUY HARDWARE. A ganged power domain shares VBUS
+        # between neighbouring sockets, so cutting power to a broken phone also
+        # cuts it for the one next to it running somebody's six-hour test. The
+        # ladder correctly refuses. A rising rate here means the rack needs
+        # per-port power switching; it does not mean the ladder is broken, and
+        # it must never be "fixed" by relaxing the check.
+        - alert: DeviceFarmerRecoveryRefusedGanged
+          expr: |-
+            sum by (host, hub, rack_slot, tier) (
+              increase(farm_recovery_attempts_total{outcome="refused_ganged"}[{{ $t.recoveryWindow }}])
+            ) > {{ $t.refusedGanged }}
+          labels:
+            severity: warning
+            component: recovery
+          annotations:
+            summary: >-
+              {{ `{{ $labels.rack_slot }}` }} cannot be power-cycled: its power
+              domain is ganged and a neighbour holds a live lease
+            description: >-
+              The ladder refused tier {{ `{{ $labels.tier }}` }} at
+              {{ `{{ $labels.rack_slot }}` }} on host {{ `{{ $labels.host }}` }}
+              ({{ `{{ $value | printf "%.0f" }}` }} times in
+              {{ $t.recoveryWindow }}) because cutting VBUS there would also cut
+              it for a neighbour running live work. The refusal is correct. The
+              rack is what needs changing.
+            runbook_url: {{ $rb }}/recovery-refused-ganged.md
+
+        # Also correct behaviour, and also worth a ticket: a device is stuck
+        # broken because the job holding it forbade the only rung that would fix
+        # it. Somebody is waiting on a phone that is not going to get better.
+        - alert: DeviceFarmerRecoveryRefusedPolicy
+          expr: |-
+            sum by (host, hub, rack_slot, tier) (
+              increase(farm_recovery_attempts_total{outcome="refused_policy"}[{{ $t.recoveryPolicyWindow }}])
+            ) > {{ $t.refusedPolicy }}
+          labels:
+            severity: warning
+            component: recovery
+          annotations:
+            summary: >-
+              {{ `{{ $labels.rack_slot }}` }} is stuck: its holder's
+              disruption_policy forbids tier {{ `{{ $labels.tier }}` }}
+            description: >-
+              A broken device is being kept broken by the disruption policy of
+              the job that holds it. That is the policy doing its job — the
+              alternative is a watchdog destroying live work — but the device
+              will not recover until the lease ends or a human intervenes.
+            runbook_url: {{ $rb }}/recovery-refused-policy.md
+
+        # Rungs that RAN and did not work. The commonest cause on a fresh rack
+        # is that `farmd node` is not running on the host, or uhubctl is not
+        # installed there: every hardware rung then reports the host
+        # unreachable, and the ladder walks a healthy-but-unreachable device all
+        # the way to quarantine without one physical action having happened.
+        - alert: DeviceFarmerRecoveryFailing
+          expr: |-
+            sum by (host, hub, rack_slot, tier) (
+              increase(farm_recovery_attempts_total{outcome="failed",tier=~"{{ $t.recoveryActionTiers }}"}[{{ $t.recoveryWindow }}])
+            ) > {{ $t.recoveryFailures }}
+          labels:
+            severity: warning
+            component: recovery
+          annotations:
+            summary: >-
+              Recovery tier {{ `{{ $labels.tier }}` }} keeps failing at
+              {{ `{{ $labels.rack_slot }}` }}
+            description: >-
+              {{ `{{ $value | printf "%.0f" }}` }} failed attempts at tier
+              {{ `{{ $labels.tier }}` }} on host {{ `{{ $labels.host }}` }} hub
+              {{ `{{ $labels.hub }}` }} in {{ $t.recoveryWindow }}. A rung that
+              runs and does not work is usually a missing host agent or a missing
+              uhubctl, not a broken phone — check the host before carrying a
+              handset anywhere.
+            runbook_url: {{ $rb }}/recovery-failing.md
+
+    # -----------------------------------------------------------------------
+    # Coverage. The rule that watches the other rules.
+    # -----------------------------------------------------------------------
+    - name: device-farmer.coverage
+      interval: {{ $t.evaluationInterval }}
+      rules:
+        # THE MOST IMPORTANT RULE IN THIS FILE, and the least interesting to
+        # read. Everything above that reads farm_device_health,
+        # farm_lease_suspect, farm_recovery_attempts_total or
+        # farm_control_plane_gap_seconds depends on the process that PUBLISHES
+        # that gauge being scraped. In this chart's default split deployment it
+        # is not: only the api Service is scraped, and the api registers those
+        # gauges without ever publishing into them, so they sit at their
+        # zero-filled seeds and every page over them is permanently disarmed.
+        #
+        # The witness is the watchdog's device census. obs.SetDeviceHealth
+        # publishes one row per (host, hub) unconditionally, every cycle, on any
+        # farm with a device in it — while obs.zeroFill's seed is the single
+        # series host="unknown",hub="unknown". So "no series with a real host"
+        # means nobody is publishing a census into anything Prometheus can see.
+        #
+        # The second clause keeps this quiet when device-farmer is not being
+        # scraped at all; that case is DeviceFarmerAPIDown's, and two pages for
+        # one fact is how a runbook stops being read.
+        #
+        # Warning and not critical: this is a configuration defect found in
+        # daylight, not an incident. It is here so that silence is never
+        # mistaken for good news.
+        - alert: DeviceFarmerAlertingBlind
+          expr: |-
+            (count(farm_device_health{host!="unknown"}) or vector(0)) == 0
+              and
+            (count(farm_api_auth_open) or vector(0)) > 0
+          for: {{ $t.blindFor }}
+          labels:
+            severity: warning
+            component: observability
+          annotations:
+            summary: >-
+              device-farmer is being scraped but no device health census is
+              reaching Prometheus
+            description: >-
+              farm_api_* is present, so an api pod is being scraped, but
+              farm_device_health carries only its zero-filled placeholder. The
+              watchdog publishes that census, so the watchdog is not being
+              scraped — and every hub, quarantine, lease-suspect and recovery
+              alert in this rule set is reading a seed value and cannot fire.
+              Alerting is not covering this farm.
+            runbook_url: {{ $rb }}/alerting-blind.md
+{{- if .Values.prometheusRule.roleScrape }}
+
+    # -----------------------------------------------------------------------
+    # Rules over the per-role metrics.
+    #
+    # OFF BY DEFAULT, and it must stay off until BOTH of these are true:
+    #
+    #   1. cmd/farmd passes each role's Collectors() to obs.RegisterAll. As of
+    #      this writing it calls RegisterAll(reg, log) with no groups, so nine
+    #      of the ten packages that export Collectors() are registered nowhere
+    #      and every farm_reaper_*, farm_scheduler_*, farm_jobrunner_* and
+    #      farm_watchdog_* series below is absent from /metrics.
+    #   2. The non-api roles serve FARM_METRICS_ADDR and something scrapes
+    #      them. internal/config reads that variable; nothing listens on it.
+    #
+    # Turning this on before then ships four rules that return no data and
+    # never fire, which is the exact failure this whole file is written to
+    # avoid. Turn it on in the same change that makes the series real.
+    # -----------------------------------------------------------------------
+    - name: device-farmer.roles
+      interval: {{ $t.evaluationInterval }}
+      rules:
+        # The IN-PROGRESS form of DeviceFarmerControlPlaneGap. farm.component_beat
+        # failing is what a component looks like on its way to becoming a gap —
+        # and while it is failing, min(beat_at) is sliding backwards and the next
+        # reaper_arm will refund that whole interval onto every live lease.
+        - alert: DeviceFarmerComponentBeatFailing
+          expr: |-
+            sum by (job, instance) (
+              rate({__name__=~"farm_(reaper|scheduler|jobrunner|recovery|watchdog|janitor|node)_heartbeat_failures_total"}[10m])
+            ) > 0
+          for: 10m
+          labels:
+            severity: warning
+            component: control-plane
+          annotations:
+            summary: >-
+              {{ `{{ $labels.job }}` }} cannot write its component heartbeat
+            description: >-
+              farm.component_beat is failing on {{ `{{ $labels.instance }}` }}.
+              If this role is in FARM_REAPER_COMPONENTS — reaper, api and
+              scheduler by default — the gap it is opening will be refunded onto
+              every live lease in the farm when the reaper next arms.
+            runbook_url: {{ $rb }}/component-beat-failing.md
+
+        # The reaper is the only thing that reclaims a lease, refunds a gap or
+        # marks a lease suspect. Two leaders is impossible — it is a Postgres
+        # advisory lock — so in practice this only ever fires as zero, which
+        # means nothing is reclaiming anything.
+        - alert: DeviceFarmerReaperNotLeading
+          expr: sum(farm_reaper_leader) != 1
+          for: 10m
+          labels:
+            severity: critical
+            component: reaper
+          annotations:
+            summary: No reaper holds leadership
+            description: >-
+              farm_reaper_leader sums to {{ `{{ $value }}` }} across all replicas
+              and must be exactly 1. With no leader, nothing marks a lease
+              suspect, nothing reclaims an expired one and no control-plane gap
+              is refunded. No device is lost; devices are simply never handed
+              back.
+            runbook_url: {{ $rb }}/reaper-not-leading.md
+
+        - alert: DeviceFarmerSchedulerNotLeading
+          expr: sum(farm_scheduler_leader) != 1
+          for: 10m
+          labels:
+            severity: critical
+            component: scheduler
+          annotations:
+            summary: No scheduler holds leadership
+            description: >-
+              farm_scheduler_leader sums to {{ `{{ $value }}` }} and must be
+              exactly 1. With no leader, queued jobs are never placed. Running
+              jobs are untouched and no lease is affected.
+            runbook_url: {{ $rb }}/reaper-not-leading.md
+
+        # Deliberately coarse. This says "jobs are failing", and it CANNOT say
+        # whether that is a job problem or a device problem, because the metric
+        # carries no job_id and no device_id — those are unbounded label
+        # dimensions and internal/obs refuses them on purpose. farm.job_attempts
+        # is the table that tells the two apart, and the runbook carries the
+        # query: one job failing on many devices is the job; many jobs failing on
+        # one device is the device.
+        - alert: DeviceFarmerJobsFailing
+          expr: |-
+            sum(rate(farm_jobrunner_outcomes_total{state="failed"}[30m]))
+              /
+            clamp_min(sum(rate(farm_jobrunner_outcomes_total[30m])), 0.001)
+              > {{ $t.jobFailureRatio }}
+          for: 30m
+          labels:
+            severity: warning
+            component: jobs
+          annotations:
+            summary: >-
+              {{ `{{ $value | humanizePercentage }}` }} of job attempts are
+              failing
+            description: >-
+              Sustained job failures. This metric cannot tell you whether it is
+              one bad build failing everywhere or one bad phone failing
+              everything; farm.job_attempts can, and the runbook has the query.
+            runbook_url: {{ $rb }}/jobs-failing.md
+{{- end }}
+{{- end }}

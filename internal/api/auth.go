@@ -139,6 +139,12 @@ type AllowAll struct {
 	subject string
 }
 
+// allowAllName is the scheme name AllowAll reports. Two other places
+// branch on it — the startup banner and the farm_api_auth_open gauge that
+// a page reads — and a literal in each of them is a string that can drift
+// away from the method that produces it without any test noticing.
+const allowAllName = "allow-all"
+
 // NewAllowAll builds the demo authenticator and says so, loudly, once.
 func NewAllowAll(log *slog.Logger, subject string) *AllowAll {
 	if log == nil {
@@ -161,7 +167,7 @@ func (a *AllowAll) Authenticate(*http.Request) (Identity, error) {
 }
 
 // Name identifies the scheme.
-func (a *AllowAll) Name() string { return "allow-all" }
+func (a *AllowAll) Name() string { return allowAllName }
 
 // ---------------------------------------------------------------------------
 // StaticBearer

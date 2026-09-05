@@ -302,6 +302,7 @@ type httpMetrics struct {
 	execs            *prometheus.CounterVec
 	operatorActions  *prometheus.CounterVec
 	bulkTargets      *prometheus.CounterVec
+	authOpen         *prometheus.GaugeVec
 }
 
 func (s *Server) registerMetrics(ownRegistry bool) error {
@@ -343,11 +344,30 @@ func (s *Server) registerMetrics(ownRegistry bool) error {
 			Namespace: "farm", Subsystem: "api", Name: "bulk_targets_total",
 			Help: "Bulk execution targets completed, by outcome.",
 		}, []string{"outcome"}),
+
+		// authOpen is the only way an alerting rule can see that this
+		// listener authenticates nobody. AuthenticatorFor already refuses
+		// the accidental cases — a network listener with no tokens does
+		// not start — so a 1 here is always a deliberate choice somebody
+		// made, in FARM_API_AUTH or FARM_API_ALLOW_ANONYMOUS, and then
+		// stopped thinking about. The startup WARN it was announced with
+		// scrolled out of the log the same afternoon; a gauge does not.
+		//
+		// It matters because the operator role this hands to every caller
+		// can revoke a lease, drain a host and cut power to a USB port
+		// with a live job on it. That is the one configuration in this
+		// system where an anonymous stranger can destroy work.
+		authOpen: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: "farm", Subsystem: "api", Name: "auth_open",
+			Help: "1 when the installed authenticator authenticates nothing and grants every " +
+				"caller the operator role, 0 when credentials are required.",
+		}, []string{"authenticator"}),
 	}
 
 	own := []prometheus.Collector{
 		m.requests, m.duration, m.inFlight, m.streamClients,
 		m.streamDropped, m.streamPollErrors, m.execs, m.operatorActions, m.bulkTargets,
+		m.authOpen,
 	}
 	for _, c := range own {
 		if err := register(s.reg, c); err != nil {
@@ -372,6 +392,18 @@ func (s *Server) registerMetrics(ownRegistry bool) error {
 			}
 		}
 	}
+
+	// Published once, here, because it describes a decision made at
+	// construction and never revisited: New is the only place s.auth is
+	// read into a metric, and nothing can change the authenticator on a
+	// running server. Exactly one child is created — the authenticator
+	// this process actually installed — so `farm_api_auth_open == 1`
+	// names it in the alert rather than making an operator go and look.
+	open := 0.0
+	if s.auth.Name() == allowAllName {
+		open = 1
+	}
+	m.authOpen.WithLabelValues(s.auth.Name()).Set(open)
 
 	s.metrics = m
 	return nil
@@ -423,7 +455,7 @@ func (s *Server) Run(ctx context.Context) error {
 		"component", s.cfg.Component,
 		"authenticator", s.auth.Name(),
 		"ui_mounted", s.uiHandler() != nil)
-	if s.auth.Name() == "allow-all" {
+	if s.auth.Name() == allowAllName {
 		s.log.Warn("AUTHENTICATION IS DISABLED on this listener: every caller is an operator")
 	}
 

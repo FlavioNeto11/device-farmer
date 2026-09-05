@@ -503,6 +503,138 @@ serviceMonitor:
   metricRelabelings: []
 
 # -----------------------------------------------------------------------------
+# Alerting rules.
+#
+# Also requires the Prometheus Operator CRDs, and gated separately from
+# serviceMonitor so a cluster that scrapes device-farmer some other way can take
+# the rules without the ServiceMonitor, and a cluster with neither CRD still
+# installs the chart.
+#
+# READ templates/prometheusrule.yaml BEFORE ENABLING. It documents which farmd
+# role publishes each series these rules read, and the fact that in this chart's
+# default split deployment only the api Service is scraped — which leaves the
+# lease, device-health and recovery gauges at their zero-filled seed values and
+# the pages over them unable to fire. DeviceFarmerAlertingBlind exists to say so
+# out loud rather than let the silence read as good news, and
+# docs/runbooks/alerting-blind.md is what to do about it.
+# -----------------------------------------------------------------------------
+prometheusRule:
+  enabled: false
+  namespace: ""
+  # Extra labels on the PrometheusRule object. Most Prometheus Operator
+  # installations select rule objects by label — kube-prometheus-stack's default
+  # is `release: <its release name>` — and a PrometheusRule that no Prometheus
+  # selects is a file in the cluster that alerts nobody.
+  labels: {}
+  annotations: {}
+
+  # Where the runbook_url annotations point. The runbooks live in docs/runbooks
+  # in this repository; point this at your own copy if you fork them, or at a
+  # wiki. Every alert names a file that exists there.
+  runbookBaseURL: https://github.com/flaviopadilha/device-farmer/blob/main/docs/runbooks
+
+  # The `job` label DeviceFarmerAPIDown matches on. Empty means the api Service
+  # name, which is what the Prometheus Operator uses by default when a
+  # ServiceMonitor sets no jobLabel. Override it if your scrape config assigns
+  # something else — and note that a WRONG value here makes DeviceFarmerAPIDown
+  # fire permanently rather than go quiet, which is deliberate.
+  apiJob: ""
+
+  # Rules over the per-role metrics (farm_reaper_*, farm_scheduler_*,
+  # farm_jobrunner_*). OFF, and it must stay off until the non-api roles both
+  # register their collectors and serve FARM_METRICS_ADDR somewhere Prometheus
+  # can reach. See the long comment above the roles group in
+  # templates/prometheusrule.yaml — enabling this early ships rules that return
+  # no data and therefore never fire, which reads as coverage and is not.
+  roleScrape: false
+
+  thresholds:
+    # How often the rules are evaluated. Independent of serviceMonitor.interval;
+    # evaluating faster than you scrape just re-reads the same sample.
+    evaluationInterval: 1m
+
+    # DeviceFarmerProtectedLeaseSuspect. Long enough that a supervisor restarting
+    # across a rolling deploy heals itself first — a heartbeat inside the grace
+    # band clears suspect at the same fence — and short enough that a job waiting
+    # on a human is not waiting all night.
+    protectedSuspectFor: 5m
+
+    # DeviceFarmerLeaseReclaimed / DeviceFarmerLeaseFenced. Both fire on any
+    # increase at all, so these windows only control how long the alert stays up
+    # and how much is summarised in one page, not whether it fires.
+    lostWorkWindow: 15m
+    fenceWindow: 10m
+
+    # DeviceFarmerAPIDown. Two scrape intervals plus slack, so a rolling deploy
+    # of the api does not page.
+    apiDownFor: 5m
+
+    # DeviceFarmerAPIAuthOpen. Not a blip — the value is decided once at process
+    # construction — so this only has to outlast a rollout.
+    authOpenFor: 10m
+
+    # DeviceFarmerControlPlaneGap. farm.reaper_arm records a gap on gain of
+    # leadership, so this window has to be wide enough to catch one that landed
+    # between evaluations.
+    gapWindow: 30m
+    # DeviceFarmerControlPlaneGapBudget, in seconds of refunded lease deadline
+    # per hour. 600 is ten minutes of control-plane downtime added back to every
+    # live lease in an hour: survivable once, a pattern worth a ticket.
+    gapBudgetSeconds: 600
+
+    # DeviceFarmerHubDown and DeviceFarmerHubDegraded. hubMinDevices is a strict
+    # `>`, so 1 means "more than one device on this hub": a single dead phone is
+    # the recovery ladder's problem, not a page. It also excludes the
+    # all-"unknown" seed series, whose device total is 0.
+    hubMinDevices: 1
+    # Long: a whole hub can legitimately go dark for a minute while devices
+    # reboot under their own tests, and a hub that is genuinely gone will still
+    # be gone in ten minutes.
+    hubDownFor: 10m
+    hubDegradedFor: 15m
+    # Which farm.device_runtime.health values count as "unhealthy together".
+    # A regex; the ten legal values are in internal/obs/metrics.go. 'recovering'
+    # is excluded on purpose — the ladder is already working on it — and so is
+    # 'booting', which is a device doing what it was asked to do.
+    hubUnhealthyStates: offline|unauthorized|missing|degraded
+    hubUnhealthyRatio: 0.5
+
+    # DeviceFarmerDevicesQuarantined (fleet) and DeviceFarmerHubQuarantined
+    # (one hub). Both strict `>`. Scale the fleet number with the fleet: it is
+    # capacity that will not come back until a human closes each quarantine.
+    quarantinedDevices: 3
+    quarantinedPerHub: 2
+    quarantinedFor: 15m
+
+    # The recovery ladder. Windows are long because these count deliberate,
+    # rate-limited actions — the ladder's own per-tier cooldowns cap a device at
+    # a handful of attempts an hour — so a short window would need a threshold
+    # of 1 to ever fire.
+    recoveryWindow: 1h
+    recoveryPolicyWindow: 6h
+    refusedGanged: 3
+    refusedPolicy: 5
+    recoveryFailures: 5
+    # Which obs tiers count for DeviceFarmerRecoveryFailing. NOT the full set:
+    # internal/recovery folds no_change onto obs's "failed", and observe,
+    # quarantine and host_drain all return no_change when they SUCCEED. Adding
+    # 'reprobe' or 'quarantine' here turns this rule into a permanent false
+    # alarm — see the comment above the recovery group in
+    # templates/prometheusrule.yaml.
+    recoveryActionTiers: adb_reconnect|soft_reset|port_power_cycle
+
+    # DeviceFarmerAlertingBlind. An hour, because the legitimate false alarm is
+    # a farm that has been installed but has no devices enrolled yet, and an
+    # hour is long enough for the first enrollment cycle and short enough that a
+    # genuinely blind farm is found the same day.
+    blindFor: 1h
+
+    # DeviceFarmerJobsFailing, in the roles group. A fraction of all attempt
+    # outcomes, not a rate, so it does not fire on a quiet farm where two
+    # failures are 100% of the traffic.
+    jobFailureRatio: 0.25
+
+# -----------------------------------------------------------------------------
 # Pod hardening. The image is distroless/static:nonroot — no shell, no package
 # manager, nothing to exec into at 3am instead of fixing the image.
 # -----------------------------------------------------------------------------

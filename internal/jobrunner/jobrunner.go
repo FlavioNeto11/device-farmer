@@ -1672,6 +1672,21 @@ var (
 // Collectors returns this package's metrics for registration alongside the
 // other loops'.
 func Collectors() []prometheus.Collector {
+	// A CounterVec with no children exports NOTHING — not a zero, nothing at
+	// all — and an alerting rule written over a series that does not exist
+	// yields no result and therefore never fires. DeviceFarmerJobsFailing is
+	// written over outcomesTotal{state="failed"}, so on a farm where no job has
+	// ended yet the rule is silently unarmed, which is the failure mode the
+	// alerting-blind runbook is about. The four states are the whole domain of
+	// runner.State's terminal values; touching each one puts the series on the
+	// first scrape.
+	for _, st := range []runner.State{
+		runner.StateSucceeded, runner.StateFailed,
+		runner.StateCancelled, runner.StateAbandoned,
+	} {
+		outcomesTotal.WithLabelValues(string(st))
+	}
+
 	return []prometheus.Collector{
 		cyclesTotal, claimedTotal, contendedTotal, reattachedTotal,
 		outcomesTotal, releasesTotal, fencedTotal, orphansTotal,

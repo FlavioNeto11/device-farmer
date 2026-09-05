@@ -1,132 +1,157 @@
 # Estado da sessão — retomar daqui
 
-Atualizado em 2026-09-04, depois de fechar tudo o que a pausa anterior deixou
-aberto. Este arquivo é o único lugar que reúne o estado; leia-o antes de
-qualquer coisa.
+Atualizado em 2026-09-05, depois de mergear as trinta branches abertas e
+reverificar o registro contra a árvore resultante. Este arquivo é o único lugar
+que reúne o estado; leia-o antes de qualquer coisa.
 
 ## Onde o repositório está
 
-- `main` = `4af645d`, **empurrado para o origin**. Árvore limpa, sem worktrees.
+- `main` = `82ecdbc`, **empurrado para o origin**. Árvore limpa.
 - Remote: `https://github.com/FlavioNeto11/device-farmer`
-- Schema **v11**, contígua (`00001`…`00011`). 121 arquivos Go, ~90k linhas,
-  **493 testes**, **5 suítes de asserção SQL**.
-- Registro de requisitos: `REQUIREMENTS.md` e aba **Docs → Requirements**.
+- **Nenhum PR aberto.** Trinta mergeados no total; os vinte e um desta rodada
+  foram `--no-ff`, então o histórico mostra o que cada um trouxe.
+- Schema **v17**, contígua (`00001`…`00017`). 184 arquivos Go, **1 575 testes de
+  topo em 21 pacotes**, **11 suítes de asserção SQL**.
+- Nove papéis: `api`, `scheduler`, `reaper`, `recovery`, `jobrunner`, `janitor`,
+  `chargepolicy`, `watchdog`, `node` — mais `all` e `demo`, que multiplexam.
 
-### Verificado nesta sessão, de ponta a ponta
+### Verificado de ponta a ponta nesta sessão
 
 ```
-go build ./... && go vet ./... && gofmt -l .     # limpos
-go test -count=1 ./...                           # 493 PASS
-farmd migrate up  (banco vazio → v11)            # 11 migrations
-test/assertions*.sql                             # 5 suítes, todas PASSED
+go build ./... && go vet ./... && gofmt -l .      # limpos
+go test -count=1 ./...                            # 21 pacotes ok
+farmd migrate up  (banco vazio → v17)             # 17 migrations
+test/assertions*.sql                              # 11 suítes, todas PASSED
 ```
 
-Contra um farm vivo (56 devices simulados, schema v11): `healthz` 200,
-`/api/v1/capabilities` **401 sem credencial e 200 com**, `/api/v1/reaper` 200,
-aba Docs 200 em todas as 7 áreas, dashboard 200, **99 nomes de métrica** em
-`/metrics` (eram 15).
+Contra um farm vivo (56 devices simulados, schema v17): `healthz` 200,
+`/api/v1/capabilities` **401 sem credencial e 200 com**, todas as rotas de
+leitura 200 para operator, **`/api/v1/reaper` e `/api/v1/bulk` 403 para
+tenant**, as 7 áreas do Docs 200 com as contagens batendo, `/metrics` 200 com
+1 031 linhas e todas as séries que alguma regra de alerta nomeia presentes.
 
-## O que foi fechado desde a pausa
+Três provas vivas que valem mais que a suíte:
 
-**Os 9 PRs foram mergeados** (`gh pr view` reporta MERGED em todos), com a
-numeração de migration renumerada para contígua antes de cada merge — `farmd
-migrate up` chama goose sem `WithAllowMissing`, então um buraco trava migrações
-futuras.
+1. **A testemunha escreve.** Job de 100 s com `FARM_LEASE_WITNESS_INTERVAL=30s`:
+   lease colocado às 17:19:08, `farm.leases.witness_at` gravado às 17:19:38 com
+   `witness_extensions=1` e `reclaimable_at` empurrado para 18:04:08;
+   `farm_jobrunner_witness_total{outcome="accepted"} 1`. Era `LEASE-09`, a linha
+   mais importante do registro, e era a última metade não ligada do
+   contramedida do #663.
+2. **O reaper se recusa a armar num componente que nunca bateu.**
+   `farm.reaper_arm(ARRAY['reaper','api','ghost_component'], '60s')` devolve
+   `f | 00:00:00 | {ghost_component}` e `reaper_state.last_refusal` diz por quê.
+3. **Fechar quarentena termina na própria chamada.** Quarentena de hub sobre 7
+   devices: `devices_released: 7`, `devices_reenabled: 7`, e o banco lê
+   `unknown|enabled|7` no instante seguinte — sem ciclo de recovery no meio.
 
-**As 8 worktrees interrompidas foram recuperadas**, todas com os gates rodados
-contra o HEAD atual e não contra a base defasada delas:
+## O que mudou nesta rodada
 
-| Unidade | O que entrou |
-|---------|--------------|
-| 23 | Testes de `reaper` e `scheduler` — 3.562 linhas, 128 casos |
-| 24 | Testes de `runner` e `jobrunner` — 3.904 linhas, mais o seam `leaseHolder` |
-| 18 | Kill switch do reaper (HTTP + `ctl` + audit) e exit code do `shell_detached` |
-| 22 | 19 alertas, 16 runbooks, `farm_api_auth_open` |
-| 12 | `resolve_device` → `ambiguous` (00011), bulk exclui doente/quarentenado, `holder_instance` retido |
-| 5 | Charge gate no agente — set-point de VBUS com dead-man's switch |
-| 27 | Proxy de fence — desenho e esqueleto inertes, 24 testes |
-| 2 | Inventário de gaps reverificado |
+Vinte e uma branches, na ordem registrada em `<scratchpad>/merge-order.md`, com
+`go build && go vet && gofmt -l && go test` limpo entre cada uma. Sete
+precisaram de reconciliação de verdade, e essas são as que importam:
 
-**`internal/api/capabilities.go` foi corrigido** — as três sondas devolvem erro,
-um relatório que não pôde ser tirado é 503 dizendo o que não pôde observar, e a
-rota passou a ser gated em `tenant`.
+- **`internal/recovery`: dois classificadores viraram um.** #19 deu ao
+  `classifyHostFault` do atuador um terceiro retorno (o *kind* da recusa) e #24
+  extraiu a MESMA decisão para um `ClassifyHostFault` exportado, para a rota de
+  slot power do operador escrever linhas indistinguíveis das da escada.
+  Mergeados, sobravam duas implementações de uma decisão. `HostFault` carrega
+  `RefusalKind`, e o método do atuador é aquela função com a identidade do
+  degrau amarrada.
+- **`config.Fence` colidiu.** #18 é o proxy que o *host* SERVE
+  (`FARM_FENCE_TLS_*`); #21 é o que um processo do plano de controle
+  APRESENTA (`FARM_FENCE_CLIENT_*`). Os dois se chamavam `Fence` e um sombreava
+  o outro sem o compilador reclamar. O lado cliente virou `Config.FenceClient`.
+- **`deviceLease.ID/Holder/JobID` viraram ponteiros** (#12, mascaramento por
+  tenant) e quatro superfícies novas de `ctl` formatavam com `%s`. `go vet`
+  pegou todas.
+- **A linha do marcador no `Summary()`** que #23 adicionou foi perdida numa
+  resolução de conflito dois merges depois e restaurada — o teste do próprio #23
+  a encontrou.
+- **`assertions_v15.sql`** arma o reaper pela assinatura nova do `00012`.
+- **`TestEveryTenantReadableRouteIsScoped`** (#12) reprovou o build por causa do
+  `GET /api/v1/slots` que #16 tinha acabado de adicionar. É o único tipo de
+  evidência que um teste desses consegue oferecer, e o resultado foi uma entrada
+  na allowlist com a razão escrita: `slotView` não carrega lease, job nem tenant.
 
-**O registro de requisitos foi reverificado**: 36 das 101 linhas estavam
-erradas, porque ele foi escrito sobre `ca91c1c` e a migration `00005` mais nove
-branches entraram por baixo. 43 linhas em `met` (eram 30).
+Um defeito real apareceu na verificação final e foi corrigido:
 
-**O inventário de gaps caiu de 88 para 46**, em duas passadas.
+- **`internal/demo` roubava jobs submetidos pela API.** `runDemo` sobe o
+  scheduler e o jobrunner REAIS ao lado do simulador, e o `schedulableJobs` do
+  simulador pegava todo job na fila. O modelo dele de duração é a CONTAGEM de
+  steps, então ele soltava o lease em quatro segundos enquanto o runner estava a
+  um segundo de cem, e o step do operador ficava `running` para sempre sob uma
+  linha de log dizendo "job complete". Agora o simulador só agenda o que ele
+  mesmo enfileirou (`farm.jobs.created_by = 'demo-feeder'`). Dois testes novos,
+  ambos falsificados.
+
+## Estado do registro
+
+`REQUIREMENTS.md` e a aba **Docs → Requirements** estão sincronizados
+célula-a-célula (68 linhas divergiam; agora o JSON é gerado do Markdown).
+
+- **69 de 101** linhas em `met`, mais **8** em `met` numa dimensão e abertas em
+  outra, mais **3** `decided`.
+- **21 abertas**, e a separação delas é a informação:
+  - **precisam de rack** (6): `DEV-04`, `DEV-05`, `REC-03`, `OPS-04`, `HW-05`,
+    `JOB-04`. Nada nesta árvore jamais encostou num aparelho.
+  - **são relato** (9): `LEASE-14`, `JOB-08`, `JOB-10`, `API-06`, `API-07`,
+    `SEC-03`, `OBS-10`, `TEST-02`, `TEST-03`. Dá para descobrir o que aconteceu,
+    às vezes só pelo `psql`.
+  - **nomeadas e deliberadamente não feitas** (6): `LEASE-10`, `LEASE-13`,
+    `DEV-02`, `DEV-07`, `JOB-03`, `SEC-05`.
+- Os gaps das seis áreas caíram de **88 para 20**. Vinte e nove foram movidos
+  para a tabela "Gaps closed" de cada página — registrados, não apagados, porque
+  quem lembra de um gap precisa distinguir **corrigido** de **nunca existiu**.
 
 ## O que fazer ao retomar, nesta ordem
 
-A lista vem do próprio registro (`REQUIREMENTS.md` → "What the register argues
-for next"), ordenada por desbloqueio-por-unidade-de-trabalho:
-
-1. **`LEASE-09` — dar partida no witness loop.** O loop está escrito, o marcador
-   no device está escrito, a função SQL está escrita, a config é validada, e
-   **todo call site de `StartWitness` na árvore é teste**. É a última metade não
-   ligada da contramedida ao #663: sem ela, uma queda de control plane maior que
-   TTL+grace ainda tira o device de um job que está funcionando. Um call site no
-   jobrunner.
-2. **`LEASE-11` — kill switch alcançável para o `max_runtime`.** O do reaper
-   ficou pronto (unidade 18); `lease_expire_max_runtime` continua sem responder
-   a ele nem ao quiesce. Se DEVE responder é pergunta de desenho ainda não
-   respondida por escrito: `max_runtime` é prazo que o usuário escreveu.
-3. **`REC-12` — já fechado**; o que sobrou é `farm.quarantines.scope` aceitar
-   `slot` e `power_domain` sem nenhum escritor.
-4. **A malha de charge policy (`HW-03`, `DEV-09`).** As duas peças que faltavam
-   existem — o leitor de bateria e o estado `parked` — e o gate do agente também.
-   Falta **o loop entre eles** (`internal/chargepolicy`, unidade 6, nunca
-   disparada). É a única linha do registro em que uma mitigação física de
-   segurança espera software.
-5. **`SEC-04` — integrar o proxy de fence** (unidade 28, nunca disparada). O
-   desenho e o esqueleto estão em `docs/design/fence-proxy.md` e
-   `internal/fenceproxy`; nada constrói nenhum dos dois.
-6. **`JOB-06`/`JOB-07` — `profile_id` e os três irmãos, escritos pela API.**
-7. **`OPS-07` — Deployment do `janitor` no chart.** É o único papel sem um, e é o
-   único que fecha `farm.job_steps` de processo morto: um deploy Kubernetes a
-   partir deste chart acumula linhas órfãs que envenenam o claim do jobrunner.
-8. **`SEC-07` — escopar as seis superfícies de leitura ainda sem tenant.**
-   `/events` foi fechado; `/fleet`, `/topology`, `/hosts`, `/recovery`, `/bulk`
-   e `/stream` não. O stream precisa de um poller por tenant.
-9. **`TEST-04`/`TEST-05` — testes para `isRetryable` e `planResume`.**
-
-Unidades do plano nunca disparadas: 6 (política de carga 40–80%), 7 (saúde e
-inchaço de bateria), 20 (knobs do `topo`), 21 (superfície de operador para
-slots), 28 (integração do proxy de fence).
+1. **Rodar contra um rack.** É o item 1 do registro e seis linhas esperam por
+   ele. `farmd node` lê `/sys` e para na descoberta USB fora do Linux; reset USB,
+   corte de VBUS por `uhubctl` e a metade-host do proxy de fence estão escritos e
+   testados contra `fstest.MapFS` e `test/fakeadb`, e nada disso é um telefone.
+2. **`JOB-08`** — mostrar qual step falhou e o que ele imprimiu. As linhas estão
+   em `farm.job_steps`; falta a rota e o painel.
+3. **`JOB-10`** — reconciliar o estado do job com as linhas de step. O caso que
+   produzia a divergência no demo foi corrigido; a reconciliação que a tornaria
+   impossível não existe.
+4. O resto está ordenado em `REQUIREMENTS.md` → *What the register argues for
+   next*.
 
 ## Defeitos conhecidos e ainda abertos em `main`
 
-- **`internal/enroll` e `internal/topo` não têm nenhum teste.** São o caminho
-  pelo qual um aparelho entra na frota.
-- **`Disposition.Escalate()` não tem chamador em produção** — o veredito do
-  atuador existe e não governa a escalada da escada.
-- **`obs.OutcomeRefusedGanged` nunca é emitido na prática**, então uma recusa
-  por hub ganged é indistinguível de recusa por política nas métricas.
-- **O corpo do revoke ainda diz "refused at the host proxy"** e o proxy não está
-  no caminho de nada. É a última das três "mensagens de remédio errado".
-- **`farm.quarantines.scope` aceita `slot` e `power_domain`** e nenhum código
-  escreve qualquer um dos dois.
-- **Sem GC de blob**: a varredura está escrita (`BlobGC`) e nada a roda.
+- **Nunca rodou contra hardware.** Não afirmar o contrário em lugar nenhum.
+- **`-race` nunca rodou nesta máquina** (não há compilador C).
+- **`.env` é versionado** (veio com o `--profile` do compose) e o `.gitignore`
+  não o cobre. Não tem segredo nenhum hoje e o comentário no topo diz que o
+  farmd nunca o lê, mas é o arquivo onde alguém vai colar um `DATABASE_URL` com
+  senha.
+- Uma mensagem de commit (`a832121`) perdeu a palavra "armed" para uma expansão
+  de crase do shell. O conteúdo está certo; a frase ficou com um buraco.
 
 ## Armadilhas do ambiente
 
 - **`make` não existe** nesta máquina. Comandos crus.
-- **`DATABASE_URL` precisa ficar VAZIO** durante `go test ./...`. `internal/lease`,
-  `internal/janitor`, `internal/reaper`, `internal/scheduler` e `internal/api`
-  pulam os testes SQL sem ela e a suíte passa; **setada e quebrada, o `TestMain`
+- **`DATABASE_URL` precisa ficar VAZIO** durante `go test ./...`. Os pacotes com
+  teste SQL pulam sem ela e a suíte passa; **setada e quebrada, o `TestMain`
   derruba o pacote inteiro**.
 - **Asserções precisam de banco de rascunho.** Criar, migrar, rodar, derrubar —
   um banco com seed de demo mata as asserções em chave duplicada.
 - Postgres de desenvolvimento: `postgres://farm@127.0.0.1:55432/...` (trust,
-  `farm` é superusuário). Subir com `scripts\dev-up.ps1`.
-- **Escolher porta livre para demo**: 8420 e 9090 costumam estar ocupadas, e o
-  listener de métricas agora **falha o startup** numa porta tomada (de
-  propósito). Usar `FARM_API_ADDR` e `FARM_METRICS_ADDR` juntos.
-- `/.claude/` está no `.gitignore` — `gofmt -l .` da raiz voltou a ser confiável.
+  `farm` é superusuário — asserções de GRANT têm que passar por `SET ROLE`).
+  Subir com `scripts\dev-up.ps1`.
+- **Escolher porta livre para demo**: 8420 e 9090 costumam estar ocupadas.
+  Usar `FARM_API_ADDR` e `FARM_METRICS_ADDR` juntos. Um listener de métricas que
+  não consegue fazer bind **não derruba mais o papel** — ele loga e exporta
+  `farm_metrics_listener_up 0`.
+- `/.claude/` está no `.gitignore` — `gofmt -l .` da raiz é confiável.
 - Heredoc `python - <<'PY'` nesta máquina **come `\n` dentro de strings**
-  ocasionalmente. Para editar arquivo, escrever o script com a ferramenta Write e
-  chamá-lo, ou usar `sed`.
+  ocasionalmente, e crases dentro de heredoc `<<'MSG'` do `git commit -F -`
+  **são expandidas pelo shell**. Para editar arquivo, escrever o script com a
+  ferramenta Write e chamá-lo, ou usar `sed`.
+- `farm.jobs` exige tenant e queue que existam: no demo são `acme` e `ci`, não
+  `default`. O pool é `default`. Um spec precisa de `"version": 1` e o payload
+  vai numa chave com o nome do kind (`{"kind":"sleep","sleep":{"duration":"..."}}`).
 
 ## Contexto que não está no código
 
@@ -143,14 +168,17 @@ Três pesquisas profundas estabeleceram, com fonte primária:
    falhou em suprimir **e** em impedir propagação; em nitrogênio puro, sem
    oxigênio e sem chama, propagou mesmo assim. Mitigação é contenção,
    espaçamento, limitação de carga e detecção precoce — as duas primeiras estão
-   em `docs/siting.md`, a terceira espera o loop de política, a quarta chegou com
-   o leitor de bateria.
+   em `docs/siting.md`, e as duas últimas chegaram nesta rodada
+   (`internal/chargepolicy` segura a banda 40–80%, `internal/watchdog/swell.go`
+   levanta `battery_anomaly` com `rack_slot`, e `DeviceFarmerBatteryAnomaly`
+   pagina em cima).
 3. **Código de incêndio não é o obstáculo.** IFC Tabela 1207.1.1 dispara em
    20 kWh; 60 aparelhos somam ~1 kWh. O obstáculo é política do operador de
    datacenter, e **isso não foi estabelecido em nenhuma direção** — é pergunta
    para resolver por escrito antes de comprar hardware.
 
-Nunca verificado, e não deve ser afirmado como pronto: `internal/node` e
-`internal/topo` **nunca rodaram contra hardware real** (são Linux por natureza —
-o `farmd node` hoje sobe, bate heartbeat e para na descoberta USB), e `-race`
-nunca rodou nesta máquina (não há compilador C).
+O invariante, para quem chegar sem contexto: **um lease termina quando o job
+diz, quando um prazo que o usuário escreveu vence, ou quando um humano o toma de
+volta. Nada mais.** Há testes que reprovam o build se vocabulário de alocação
+aparecer em `internal/adbwire`, em `internal/recovery/adbactuator.go` ou em
+`internal/fenceproxy`. Leia o teste do pacote antes de escrever nele.

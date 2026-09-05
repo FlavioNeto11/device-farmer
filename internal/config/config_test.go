@@ -41,6 +41,7 @@ var allEnv = []string{
 	EnvTopoMinPorts, EnvTopoAdoptEmpty, EnvTopoIncludeRootHubs,
 	EnvTopoInclude, EnvTopoExclude, EnvTopoInterval, EnvTopoCallTimeout,
 	EnvBatteryTempRise, EnvBatteryTempMax, EnvBatteryDrain,
+	EnvChargeMinPct, EnvChargeMaxPct, EnvChargeInterval,
 }
 
 const testDSN = "postgres://farm@127.0.0.1:5432/farm?sslmode=disable"
@@ -385,6 +386,30 @@ func TestPreflightRefusals(t *testing.T) {
 		envs: map[string]string{EnvComponent: "api"},
 		want: []string{EnvComponent, "stand in for"},
 	}, {
+		// U8 — an inverted band would park every idle phone on sight and
+		// release none of them.
+		name: "charge band inverted",
+		role: "chargepolicy",
+		envs: map[string]string{EnvChargeMinPct: "80", EnvChargeMaxPct: "40"},
+		want: []string{EnvChargeMinPct, EnvChargeMaxPct, "0 < min < max <= 100"},
+	}, {
+		name: "charge max above one hundred",
+		role: "chargepolicy",
+		envs: map[string]string{EnvChargeMaxPct: "101"},
+		want: []string{EnvChargeMaxPct, "0 < min < max <= 100"},
+	}, {
+		// A hold is two intervals, and the agent restores power at its cap:
+		// an interval above half the cap leaves no missed cycle to lose.
+		name: "charge interval above half the agent's hold cap",
+		role: "chargepolicy",
+		envs: map[string]string{EnvChargeInterval: "16m"},
+		want: []string{EnvChargeInterval, "half", "restore power"},
+	}, {
+		name: "charge interval not positive",
+		role: "chargepolicy",
+		envs: map[string]string{EnvChargeInterval: "0s"},
+		want: []string{EnvChargeInterval, "must be positive"},
+	}, {
 		// The knob that was read, validated and applied to nothing.
 		name: "FARM_COMPONENT on a multiplexed role",
 		role: "demo",
@@ -692,6 +717,9 @@ func TestEveryVariableIsRead(t *testing.T) {
 		EnvBatteryTempRise:       "35",
 		EnvBatteryTempMax:        "500",
 		EnvBatteryDrain:          "25",
+		EnvChargeMinPct:          "35",
+		EnvChargeMaxPct:          "75",
+		EnvChargeInterval:        "3m",
 	})
 	cfg, err := Load("scheduler")
 	if err != nil {
@@ -745,6 +773,9 @@ func TestEveryVariableIsRead(t *testing.T) {
 		{EnvBatteryTempRise, cfg.Battery.TempRiseDCPerMin, 35},
 		{EnvBatteryTempMax, cfg.Battery.TempMaxDC, 500},
 		{EnvBatteryDrain, cfg.Battery.DrainPctPerHour, 25},
+		{EnvChargeMinPct, cfg.Charge.MinPct, 35},
+		{EnvChargeMaxPct, cfg.Charge.MaxPct, 75},
+		{EnvChargeInterval, cfg.Charge.Interval, 3 * time.Minute},
 	}
 	for _, c := range checks {
 		if c.got != c.want {
@@ -1113,6 +1144,8 @@ func TestSummaryShowsWhatTheProcessDecided(t *testing.T) {
 		// U9: the battery thresholds, in the degrees a human reads, and the
 		// statement that they end nothing.
 		"2.0 C/min", "45.0 C", "15 %/h", "ends nothing",
+		// U8: the charge band, and the one sentence that keeps it honest.
+		"above 80%", "release at 40%", "2m0s", "a lease is never touched",
 	} {
 		if !strings.Contains(s, want) {
 			t.Errorf("summary omits %q:\n%s", want, s)

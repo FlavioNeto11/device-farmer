@@ -67,6 +67,11 @@ func newSSEEvent(name string, payload any) *sseEvent {
 type streamClient struct {
 	ch   chan *sseEvent
 	done chan struct{}
+	// scope is the tenant this client is confined to, "" for an operator.
+	// Every frame it receives is rendered in this scope: the same poll reads
+	// differently to a tenant, which sees its own leases and a masked outline
+	// of everyone else's, and to an operator, which sees the farm.
+	scope string
 	// needInit is true until the client has received a full snapshot. Guarded
 	// by streamHub.mu.
 	needInit bool
@@ -74,10 +79,9 @@ type streamClient struct {
 }
 
 type streamHub struct {
-	mu       sync.Mutex
-	clients  map[*streamClient]struct{}
-	snapshot []*sseEvent
-	closed   bool
+	mu      sync.Mutex
+	clients map[*streamClient]struct{}
+	closed  bool
 
 	// kick asks the poller for an immediate read, so a client that has just
 	// connected does not wait a whole interval for its first frame.
@@ -96,10 +100,21 @@ func newStreamHub(log *slog.Logger, m *httpMetrics) *streamHub {
 	}
 }
 
-func (h *streamHub) subscribe() *streamClient {
+// subscribe registers a client confined to scope ("" for an operator).
+//
+// Its first frame comes from the next poll, rendered in its own scope; the
+// kick makes that poll happen now rather than at the next tick. There is no
+// cached snapshot to hand it: a cache would have to be kept per scope, be
+// invalidated for the scopes that have no client, and after an idle period —
+// when the poller has deliberately stopped reading — the frame it served
+// would predate it. Rendering only at publish time means every frame a client
+// ever receives was rendered from the poll that just happened, for the price
+// of one poll's latency on connect.
+func (h *streamHub) subscribe(scope string) *streamClient {
 	c := &streamClient{
 		ch:       make(chan *sseEvent, streamBuffer),
 		done:     make(chan struct{}),
+		scope:    scope,
 		needInit: true,
 	}
 
@@ -111,27 +126,11 @@ func (h *streamHub) subscribe() *streamClient {
 		return c
 	}
 	h.clients[c] = struct{}{}
-	snapshot := h.snapshot
 	n := len(h.clients)
 	h.mu.Unlock()
 
 	h.metrics.streamClients.Set(float64(n))
 
-	// Serve the cached snapshot immediately when the poller has one; otherwise
-	// ask it to read now.
-	if len(snapshot) > 0 {
-		h.mu.Lock()
-		if !c.closed {
-			for _, ev := range snapshot {
-				select {
-				case c.ch <- ev:
-				default:
-				}
-			}
-			c.needInit = false
-		}
-		h.mu.Unlock()
-	}
 	select {
 	case h.kick <- struct{}{}:
 	default:
@@ -159,18 +158,43 @@ func (h *streamHub) clientCount() int {
 	return len(h.clients)
 }
 
-// publish hands the poller's result to the clients: full to anyone who has not
-// had a snapshot yet (or to everyone on a resync), delta to the rest.
-func (h *streamHub) publish(full, delta []*sseEvent, resync bool) {
+// publish hands one poll's result to the clients, each rendered in its own
+// scope: a full snapshot to anyone who has not had one yet (or to everyone on
+// a resync), the delta since prev to the rest.
+//
+// One poll, one state, rendered at most once per scope that has a client
+// right now — ten operator dashboards share one render, and a tenant's
+// dashboard costs one more. The render runs under the lock so that a client
+// subscribing mid-publish is either served this poll or waits for the next;
+// it is a JSON encode of the fleet, not a database read.
+func (h *streamHub) publish(prev, cur streamState, havePrev, resync bool) {
 	var dropped []*streamClient
 
-	h.mu.Lock()
-	h.snapshot = full
-	for c := range h.clients {
-		events := delta
+	fulls := map[string][]*sseEvent{}
+	deltas := map[string][]*sseEvent{}
+	render := func(c *streamClient) []*sseEvent {
 		if c.needInit || resync {
-			events = full
+			events, ok := fulls[c.scope]
+			if !ok {
+				events = fullEvents(cur, c.scope)
+				fulls[c.scope] = events
+			}
+			return events
 		}
+		if !havePrev {
+			return nil
+		}
+		events, ok := deltas[c.scope]
+		if !ok {
+			events = deltaEvents(prev, cur, c.scope)
+			deltas[c.scope] = events
+		}
+		return events
+	}
+
+	h.mu.Lock()
+	for c := range h.clients {
+		events := render(c)
 		if len(events) == 0 {
 			continue
 		}
@@ -264,7 +288,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	client := s.stream.subscribe()
+	client := s.stream.subscribe(tenantScope(r.Context()))
 	defer s.stream.unsubscribe(client)
 
 	beat := time.NewTicker(streamHeartbeat)
@@ -319,7 +343,20 @@ type fleetDigest struct {
 	LeaseState  string `json:"lease_state"`
 	JobID       string `json:"job_id"`
 	Holder      string `json:"holder"`
+	TenantID    string `json:"tenant_id"`
 	Quarantined bool   `json:"quarantined"`
+}
+
+// forTenant is the digest as a caller confined to scope may see it: the
+// lease's identity withheld unless the caller owns it, its state kept. An
+// empty string is the digest's own spelling of "none", so a masked row reads
+// as "held by somebody" rather than as free.
+func (d fleetDigest) forTenant(scope string) fleetDigest {
+	if d.LeaseID == "" || leaseVisible(scope, d.TenantID) {
+		return d
+	}
+	d.LeaseID, d.JobID, d.Holder, d.TenantID = "", "", "", ""
+	return d
 }
 
 type leaseDigest struct {
@@ -432,19 +469,13 @@ func (s *Server) runStream(ctx context.Context) {
 			continue
 		}
 
-		full := fullEvents(cur)
-		var delta []*sseEvent
-		if havePrev {
-			delta = deltaEvents(prev, cur)
-		}
 		resync := time.Since(lastResync) >= streamResync
 		if resync {
 			lastResync = time.Now()
 		}
-		// Published on every poll even when the delta is empty: clients that
-		// have not had a snapshot yet are waiting for one, and the cached
-		// snapshot has to stay current for whoever connects next.
-		s.stream.publish(full, delta, resync)
+		// Published on every poll even when nothing changed: clients that
+		// have not had a snapshot yet are waiting for one.
+		s.stream.publish(prev, cur, havePrev, resync)
 
 		prev, havePrev = cur, true
 	}
@@ -471,7 +502,7 @@ SELECT f.device_id::text, f.farm_uid, coalesce(f.rack_slot,''), coalesce(f.host_
        coalesce(f.hub_path,''), coalesce(f.health,'unknown'), coalesce(f.adb_state,'unknown'),
        f.admin_state, coalesce(f.slot_state,''), coalesce(f.lease_id::text,''),
        coalesce(f.lease_state,''), coalesce(f.job_id::text,''), coalesce(f.holder,''),
-       (f.quarantine_id IS NOT NULL)
+       coalesce(f.tenant_id,''), (f.quarantine_id IS NOT NULL)
   FROM farm.v_fleet f`
 
 	rows, err := s.pool.Query(ctx, fleetQuery)
@@ -482,7 +513,7 @@ SELECT f.device_id::text, f.farm_uid, coalesce(f.rack_slot,''), coalesce(f.host_
 		var d fleetDigest
 		if err := rows.Scan(&d.DeviceID, &d.FarmUID, &d.RackSlot, &d.HostID, &d.HubPath,
 			&d.Health, &d.ADBState, &d.AdminState, &d.SlotState, &d.LeaseID, &d.LeaseState,
-			&d.JobID, &d.Holder, &d.Quarantined); err != nil {
+			&d.JobID, &d.Holder, &d.TenantID, &d.Quarantined); err != nil {
 			rows.Close()
 			return streamState{}, fmt.Errorf("poll fleet: %w", err)
 		}
@@ -651,14 +682,20 @@ func derefInt64(p *int64) int64 {
 	return *p
 }
 
-// fullEvents renders a complete snapshot, sent to a client on connect and to
-// everyone on the periodic resync.
-func fullEvents(st streamState) []*sseEvent {
+// fullEvents renders a complete snapshot in the caller's scope, sent to a
+// client on connect and to everyone on the periodic resync.
+//
+// The cut is the one every read route makes. Fleet rows are all there, with
+// another tenant's lease reduced to "held"; leases and jobs are only the
+// caller's own; recovery attempts, quarantines and hub health pass whole,
+// because they describe the hardware and name nobody's work. The counts are
+// taken before the mask: how many devices are busy is a fact about the farm.
+func fullEvents(st streamState, scope string) []*sseEvent {
 	fleet := make([]fleetDigest, 0, len(st.fleet))
 	health := map[string]int{}
 	leasedCount := 0
 	for _, d := range st.fleet {
-		fleet = append(fleet, d)
+		fleet = append(fleet, d.forTenant(scope))
 		health[d.Health]++
 		if d.LeaseID != "" {
 			leasedCount++
@@ -666,11 +703,15 @@ func fullEvents(st streamState) []*sseEvent {
 	}
 	leases := make([]leaseDigest, 0, len(st.leases))
 	for _, d := range st.leases {
-		leases = append(leases, d)
+		if leaseVisible(scope, d.TenantID) {
+			leases = append(leases, d)
+		}
 	}
 	jobs := make([]jobDigest, 0, len(st.jobs))
 	for _, d := range st.jobs {
-		jobs = append(jobs, d)
+		if leaseVisible(scope, d.TenantID) {
+			jobs = append(jobs, d)
+		}
 	}
 	attempts := make([]recoveryDigest, 0, len(st.recovery))
 	for _, d := range st.recovery {
@@ -699,7 +740,7 @@ func fullEvents(st streamState) []*sseEvent {
 		}),
 	}
 
-	if alerts := snapshotAlerts(st); len(alerts) > 0 {
+	if alerts := snapshotAlerts(st, scope); len(alerts) > 0 {
 		events = append(events, newSSEEvent("alert", map[string]any{
 			"snapshot": true, "alerts": alerts,
 		}))
@@ -710,8 +751,10 @@ func fullEvents(st streamState) []*sseEvent {
 // snapshotAlerts derives the standing alerts from current state: hubs where
 // more than one device is unhealthy (a hub, cable or power-domain fault rather
 // than N phone faults), and protected leases sitting in suspect, which the
-// reaper will never take back on its own — they are waiting for a human.
-func snapshotAlerts(st streamState) []map[string]any {
+// reaper will never take back on its own — they are waiting for a human. The
+// hub alerts go to everyone; a lease alert names a lease, and goes only to
+// the scope that owns it.
+func snapshotAlerts(st streamState, scope string) []map[string]any {
 	var alerts []map[string]any
 	for _, h := range st.hubs {
 		if h.Unhealthy > 1 {
@@ -728,7 +771,7 @@ func snapshotAlerts(st streamState) []map[string]any {
 		}
 	}
 	for _, l := range st.leases {
-		if l.State == "suspect" && l.Protected {
+		if l.State == "suspect" && l.Protected && leaseVisible(scope, l.TenantID) {
 			alerts = append(alerts, map[string]any{
 				"kind":      "protected_lease_suspect",
 				"lease_id":  l.LeaseID,
@@ -743,13 +786,22 @@ func snapshotAlerts(st streamState) []map[string]any {
 	return alerts
 }
 
-// deltaEvents renders only what changed since the previous poll.
-func deltaEvents(prev, cur streamState) []*sseEvent {
+// deltaEvents renders only what changed since the previous poll, in the
+// caller's scope: the same cut as fullEvents, applied to the changed rows.
+//
+// The diff itself is taken on the unmasked state, so a change that the mask
+// then hides — another tenant's holder renamed — still arrives as a changed
+// fleet row. That is harmless: a dashboard treats a changed row as "refresh
+// this", and the refresh is served through the same mask.
+func deltaEvents(prev, cur streamState, scope string) []*sseEvent {
 	var events []*sseEvent
 
 	if changed, removed := diffFleet(prev.fleet, cur.fleet); len(changed) > 0 || len(removed) > 0 {
 		payload := map[string]any{}
 		if len(changed) > 0 {
+			for i := range changed {
+				changed[i] = changed[i].forTenant(scope)
+			}
 			payload["changed"] = changed
 		}
 		if len(removed) > 0 {
@@ -763,6 +815,9 @@ func deltaEvents(prev, cur streamState) []*sseEvent {
 		alerts       []map[string]any
 	)
 	for id, cd := range cur.leases {
+		if !leaseVisible(scope, cd.TenantID) {
+			continue
+		}
 		pd, existed := prev.leases[id]
 		if existed && pd.digestKey() == cd.digestKey() {
 			continue
@@ -819,6 +874,9 @@ func deltaEvents(prev, cur streamState) []*sseEvent {
 
 	var jobChanges []jobDigest
 	for id, cd := range cur.jobs {
+		if !leaseVisible(scope, cd.TenantID) {
+			continue
+		}
 		if pd, ok := prev.jobs[id]; !ok || pd != cd {
 			jobChanges = append(jobChanges, cd)
 		}

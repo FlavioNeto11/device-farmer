@@ -126,6 +126,17 @@ type topologySlot struct {
 	ExpiresAt     *time.Time `json:"lease_expires_at,omitempty"`
 }
 
+// maskForTenant withholds the identity of a lease the caller does not own, the
+// same cut GET /fleet makes. The slot's lease_state, protection and disruption
+// policy stay: which recovery rungs a live lease has taken off the table is a
+// fact about the slot, and a tenant deciding where its job may land needs it.
+func (sl *topologySlot) maskForTenant(scope string) {
+	if sl.LeaseID == nil || leaseVisible(scope, derefString(sl.TenantID)) {
+		return
+	}
+	sl.LeaseID, sl.JobID, sl.TenantID = nil, nil, nil
+}
+
 type topologyHub struct {
 	HubID          int64          `json:"hub_id"`
 	USBPath        string         `json:"usb_path"`
@@ -162,6 +173,7 @@ type topologyHost struct {
 // serial.
 func (s *Server) handleTopology(w http.ResponseWriter, r *http.Request) {
 	host := queryString(r, "host")
+	scope := tenantScope(r.Context())
 
 	hosts, err := s.readHosts(r.Context(), host)
 	if err != nil {
@@ -248,6 +260,7 @@ SELECT s.id, s.hub_id, s.port_number, s.usb_path, s.adb_devpath, s.rack_slot, s.
 			s.fail(w, r, "topology: scan slot", err)
 			return
 		}
+		sl.maskForTenant(scope)
 		if hub, ok := hubIndex[hubID]; ok {
 			hub.Slots = append(hub.Slots, sl)
 		}
@@ -300,6 +313,10 @@ SELECT h.id, h.rack_id, h.rack_unit, h.host_epoch, h.adb_endpoint, h.admin_state
 // draining one: how many devices are on it, how many are healthy, and how many
 // live leases would have to be waited out.
 func (s *Server) handleHosts(w http.ResponseWriter, r *http.Request) {
+	// The lease counts are the caller's own for a tenant: "how many of MY
+	// runs would a drain of this host wait on" is the question it can act
+	// on, and the farm-wide number would tell it how busy every other tenant
+	// is. Devices and health stay whole; they describe the hardware.
 	const q = `
 SELECT h.id, h.rack_id, h.rack_unit, h.host_epoch, h.adb_endpoint, h.admin_state,
        h.kernel_release, h.agent_version, h.last_seen_at,
@@ -314,8 +331,10 @@ SELECT h.id, h.rack_id, h.rack_unit, h.host_epoch, h.adb_endpoint, h.admin_state
        -- farm.v_hub_health.unhealthy is narrower (fault evidence only, the
        -- ladder's quorum predicate) and is meant to be.
        count(*) FILTER (WHERE r.health IS NOT NULL AND r.health NOT IN ('healthy','retired','parked')) AS unhealthy,
-       count(*) FILTER (WHERE l.state IN ('held','suspect')) AS live_leases,
-       count(*) FILTER (WHERE l.state IN ('held','suspect') AND l.protected) AS protected_leases
+       count(*) FILTER (WHERE l.state IN ('held','suspect')
+                          AND ($1 = '' OR l.tenant_id = $1)) AS live_leases,
+       count(*) FILTER (WHERE l.state IN ('held','suspect') AND l.protected
+                          AND ($1 = '' OR l.tenant_id = $1)) AS protected_leases
   FROM farm.hosts h
   LEFT JOIN farm.devices d        ON d.host_id = h.id
   LEFT JOIN farm.device_runtime r ON r.device_id = d.id
@@ -323,7 +342,7 @@ SELECT h.id, h.rack_id, h.rack_unit, h.host_epoch, h.adb_endpoint, h.admin_state
  GROUP BY h.id
  ORDER BY h.rack_id NULLS LAST, h.rack_unit NULLS LAST, h.id`
 
-	rows, err := s.pool.Query(r.Context(), q)
+	rows, err := s.pool.Query(r.Context(), q, tenantScope(r.Context()))
 	if err != nil {
 		s.fail(w, r, "list hosts", err)
 		return
@@ -1211,7 +1230,15 @@ type recoveryFilter struct {
 	// the server's, never this process's.
 	sinceAt  *time.Time
 	sinceFor *string
-	limit    int
+	// tenant, when set, keeps only attempts on devices whose live lease the
+	// tenant owns — the attempts that can disturb its runs. The ladder acting
+	// on somebody else's device, or on a free one, is the operator's business.
+	//
+	// It does not come from the query string. parseRecoveryFilter never sets
+	// it; the handler takes it from the request's identity, so a tenant cannot
+	// widen its own scope by asking.
+	tenant string
+	limit  int
 }
 
 // recoveryOutcomes mirrors the CHECK constraint on farm.recovery_attempts.outcome
@@ -1311,11 +1338,14 @@ SELECT a.id, a.device_id::text, d.farm_uid, a.slot_id, s.rack_slot, a.hub_id, a.
    AND ($5 = '' OR a.hub_id::text = $5 OR h.usb_path = $5)
    AND ($6::timestamptz IS NULL OR a.started_at >= $6::timestamptz)
    AND ($7::interval IS NULL OR a.started_at >= now() - $7::interval)
+   AND ($9 = '' OR EXISTS (SELECT 1 FROM farm.devices cd
+                             JOIN farm.leases cl ON cl.id = cd.current_lease_id
+                            WHERE cd.id = a.device_id AND cl.tenant_id = $9))
  ORDER BY a.started_at DESC
  LIMIT $8`
 
 	rows, err := s.pool.Query(ctx, q, f.deviceID, f.hostID, f.outcome, f.tier, f.hub,
-		f.sinceAt, f.sinceFor, f.limit)
+		f.sinceAt, f.sinceFor, f.limit, f.tenant)
 	if err != nil {
 		return nil, err
 	}
@@ -1369,6 +1399,14 @@ func (s *Server) handleRecovery(w http.ResponseWriter, r *http.Request) {
 		badRequest(w, msg, nil)
 		return
 	}
+
+	// Set here rather than in parseRecoveryFilter, which reads the query
+	// string: this one comes from who is asking. An operator's scope is empty
+	// and sees the fleet.
+	//
+	// Quarantines and the tier table below are not scoped: they describe the
+	// hardware and the ladder, and a tenant choosing where to run needs both.
+	filter.tenant = tenantScope(r.Context())
 
 	attempts, err := s.recoveryAttempts(r.Context(), filter)
 	if err != nil {

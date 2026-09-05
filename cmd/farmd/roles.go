@@ -954,11 +954,54 @@ func runNode(ctx context.Context, cfg *config.Config, log *slog.Logger, pool *pg
 		// token, and a non-empty one needs this.
 		Token:  cfg.Node.Token,
 		Logger: log,
+		// U10: the fence proxy, host side. Zero unless the TLS knobs are set.
+		Fence: nodeFenceConfig(cfg),
 	})
 	if err != nil {
 		return err
 	}
 	return agent.Run(ctx)
+}
+
+// ---------------------------------------------------------------------------
+// U10 — the fence proxy, host side
+// ---------------------------------------------------------------------------
+
+// nodeFenceConfig carries the fence proxy's configuration into the agent. The
+// proxy's lifecycle — the listener, its restarts, the floor poller — belongs
+// to Agent.Run, next to the other loops that share the agent's context, so
+// this helper decides only WHAT the agent serves and never starts anything.
+//
+// It is opt-in by TLS material. With FARM_FENCE_TLS_CERT, _KEY and _CA unset
+// the result is the zero FenceConfig and the agent behaves exactly as it did
+// before the proxy existed: it advertises the adb server itself and nothing
+// enforces the fence at the device. With all three set — config refuses one
+// or two — the agent serves an mTLS listener on FARM_FENCE_LISTEN in front of
+// FARM_ADB_ENDPOINT, advertises FARM_FENCE_ADVERTISE (or an address derived
+// from the listener; see node.AdvertiseAddr) as farm.hosts.adb_endpoint, and
+// admits a connection only while the fence it presents is at or above the
+// device's floor.
+//
+// FARM_NODE_SELF_FENCE_TIMEOUT is consumed here and nowhere else: it becomes
+// the proxy's staleness budget, the age past which its last successful read
+// of this host's floors may no longer admit a NEW connection. It tears nothing
+// down — a live connection ends only on a fencing fact — and config.Validate
+// keeps FARM_SLOT_REARM above it plus FARM_FENCE_SAFETY_MARGIN, so a proxy
+// serving from a view that old can only be admitting the previous holder to a
+// device nobody has been given yet.
+func nodeFenceConfig(cfg *config.Config) node.FenceConfig {
+	if !cfg.Fence.Enabled() {
+		return node.FenceConfig{}
+	}
+	return node.FenceConfig{
+		CertFile:     cfg.Fence.CertFile,
+		KeyFile:      cfg.Fence.KeyFile,
+		CAFile:       cfg.Fence.CAFile,
+		Listen:       cfg.Fence.Listen,
+		Advertise:    cfg.Fence.Advertise,
+		PollInterval: cfg.Fence.PollInterval,
+		MaxStaleness: cfg.Node.SelfFenceTimeout,
+	}
 }
 
 func runCtl(ctx context.Context, cfg *config.Config, args []string, stdout, stderr io.Writer) int {

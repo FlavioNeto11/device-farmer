@@ -42,6 +42,8 @@ var allEnv = []string{
 	EnvTopoInclude, EnvTopoExclude, EnvTopoInterval, EnvTopoCallTimeout,
 	EnvBatteryTempRise, EnvBatteryTempMax, EnvBatteryDrain,
 	EnvChargeMinPct, EnvChargeMaxPct, EnvChargeInterval,
+	EnvFenceTLSCert, EnvFenceTLSKey, EnvFenceTLSCA, EnvFenceListen, EnvFenceAdvertise,
+	EnvFencePollInterval,
 }
 
 const testDSN = "postgres://farm@127.0.0.1:5432/farm?sslmode=disable"
@@ -156,6 +158,9 @@ func TestDefaultValues(t *testing.T) {
 		{EnvBatteryTempRise, cfg.Battery.TempRiseDCPerMin, DefaultBatteryTempRiseDCPerMin},
 		{EnvBatteryTempMax, cfg.Battery.TempMaxDC, DefaultBatteryTempMaxDC},
 		{EnvBatteryDrain, cfg.Battery.DrainPctPerHour, DefaultBatteryDrainPctPerHour},
+		{EnvFenceListen, cfg.Fence.Listen, DefaultFenceListen},
+		{EnvFencePollInterval, cfg.Fence.PollInterval, DefaultFencePollInterval},
+		{"fence proxy off by default", cfg.Fence.Enabled(), false},
 	}
 	for _, c := range checks {
 		if c.got != c.want {
@@ -670,6 +675,7 @@ func TestWithoutDatabase(t *testing.T) {
 // characteristic bug: a knob that is named, parsed, validated, and then not
 // carried anywhere.
 func TestEveryVariableIsRead(t *testing.T) {
+	pems := testPEMs(t)
 	env(t, map[string]string{
 		EnvDatabaseURL:           "postgres://farm:hunter2@db.internal:6432/farm",
 		EnvDBMaxConns:            "17",
@@ -720,6 +726,12 @@ func TestEveryVariableIsRead(t *testing.T) {
 		EnvChargeMinPct:          "35",
 		EnvChargeMaxPct:          "75",
 		EnvChargeInterval:        "3m",
+		EnvFenceTLSCert:          pems.cert,
+		EnvFenceTLSKey:           pems.key,
+		EnvFenceTLSCA:            pems.ca,
+		EnvFenceListen:           "0.0.0.0:5138",
+		EnvFenceAdvertise:        "h07.lab.example:5138",
+		EnvFencePollInterval:     "3s",
 	})
 	cfg, err := Load("scheduler")
 	if err != nil {
@@ -776,6 +788,13 @@ func TestEveryVariableIsRead(t *testing.T) {
 		{EnvChargeMinPct, cfg.Charge.MinPct, 35},
 		{EnvChargeMaxPct, cfg.Charge.MaxPct, 75},
 		{EnvChargeInterval, cfg.Charge.Interval, 3 * time.Minute},
+		{EnvFenceTLSCert, cfg.Fence.CertFile, pems.cert},
+		{EnvFenceTLSKey, cfg.Fence.KeyFile, pems.key},
+		{EnvFenceTLSCA, cfg.Fence.CAFile, pems.ca},
+		{EnvFenceListen, cfg.Fence.Listen, "0.0.0.0:5138"},
+		{EnvFenceAdvertise, cfg.Fence.Advertise, "h07.lab.example:5138"},
+		{EnvFencePollInterval, cfg.Fence.PollInterval, 3 * time.Second},
+		{"fence proxy on", cfg.Fence.Enabled(), true},
 	}
 	for _, c := range checks {
 		if c.got != c.want {

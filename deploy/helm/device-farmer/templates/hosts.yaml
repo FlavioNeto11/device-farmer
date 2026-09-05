@@ -98,3 +98,37 @@ endpoints:
 {{- end }}
 {{- end }}
 {{- end }}
+{{/*
+The cluster's fence-proxy material (U10).
+
+The proxy itself runs on each device host inside `farmd node`, turned on there
+by FARM_FENCE_TLS_CERT/KEY/CA; when it is on, the agent registers the PROXY as
+farm.hosts.adb_endpoint and every client in this cluster dials that. What the
+cluster needs to be admitted is one client certificate and the CA that signed
+the hosts' — the three conventional keys, in one Secret, mounted at
+fenceProxy.mountPath through extraVolumes/extraVolumeMounts. checkFence has
+already refused a partial set, a switched-off set, and a Secret nothing
+mounts, so this renders only a complete one.
+*/}}
+{{- $fp := .Values.fenceProxy }}
+{{- if and $fp.enabled $fp.ca $fp.cert $fp.key }}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ include "device-farmer.fenceSecretName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "device-farmer.labels" (dict "ctx" $ "component" "fence") | nindent 4 }}
+type: kubernetes.io/tls
+stringData:
+  # The farm CA: what verifies that a proxy is the host it claims to be.
+  ca.crt: |
+    {{- $fp.ca | trim | nindent 4 }}
+  # This cluster's client certificate. Its farm://<class>/<service> URI SAN is
+  # the class every proxy holds it to.
+  tls.crt: |
+    {{- $fp.cert | trim | nindent 4 }}
+  tls.key: |
+    {{- $fp.key | trim | nindent 4 }}
+{{- end }}

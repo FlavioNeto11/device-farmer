@@ -137,6 +137,17 @@ FARM_ADB_ENDPOINT=10.20.0.11:5037
 # ADB sockets. farmd refuses to start if the numbers disagree.
 FARM_NODE_SELF_FENCE_TIMEOUT=20s
 FARM_SLOT_REARM=35s
+
+# Optional: the fence proxy (docs/design/fence-proxy.md, section 14). With all
+# three PEMs set — one or two refuses to start — this agent serves an mTLS
+# listener in front of the adb server and registers THE PROXY as
+# farm.hosts.adb_endpoint: FARM_FENCE_ADVERTISE, or FARM_ADB_ENDPOINT's host on
+# the proxy's port. The self-fence timeout above becomes its staleness budget.
+#FARM_FENCE_TLS_CERT=/etc/device-farmer/fence/tls.crt
+#FARM_FENCE_TLS_KEY=/etc/device-farmer/fence/tls.key
+#FARM_FENCE_TLS_CA=/etc/device-farmer/fence/ca.crt
+#FARM_FENCE_LISTEN=:5038
+#FARM_FENCE_ADVERTISE=10.20.0.11:5038
 ```
 
 The agent needs a route to **Postgres**, not to the API: it upserts its own

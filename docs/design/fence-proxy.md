@@ -1,9 +1,11 @@
 # The mTLS fence proxy
 
-Status: **designed, skeleton landed, not wired.**
-Code: `internal/fenceproxy/proxy.go`, `internal/fenceproxy/proxy_test.go`.
-Nothing in `cmd/farmd` or `internal/node` calls it yet; that integration is a
-separate change.
+Status: **designed; integrated on the host; the client half is a separate
+change.**
+Code: `internal/fenceproxy/proxy.go`, `internal/fenceproxy/proxy_test.go`
+(the proxy); `internal/node/fence.go`, `internal/node/fencesource.go` (the
+host integration: `farmd node` serves it when given TLS material). Section 14
+states exactly what is enforced today and what is not.
 
 ---
 
@@ -714,10 +716,12 @@ units.
 socket carrying a stale fence *is* refused at the host proxy — within one poll
 interval in the normal case, and immediately for any new connection.
 
-**Needs one clause — `internal/config/config.go:313-340`.** The startup
-assertion's prose says the proxy "only discovers that its fence is stale after
-its self-fence timeout elapses; until then it is still holding open ADB sockets
-and still forwarding the old job's commands to the phone." Two corrections:
+**Needed one clause — `internal/config/config.go`, the `FARM_SLOT_REARM`
+assertion** (done with the host integration; the prose now says what section
+14 says). The assertion's prose said the proxy "only discovers that its fence is
+stale after its self-fence timeout elapses; until then it is still holding open
+ADB sockets and still forwarding the old job's commands to the phone." Two
+corrections:
 
 * In the normal case, discovery takes one `PollInterval` (2s), not
   `SelfFenceTimeout` (20s). The 20s is the budget for *new* admissions while
@@ -782,14 +786,167 @@ one that says `not_built`.
   `adbwire.Client` driven through the proxy via a sidecar, and a `SEND` cut
   mid-transfer by a fence bump.
 
-**Deliberately not built here**, because it belongs to integration:
+**Built since, in the host integration** (section 14):
 
-* The Postgres-backed `FenceSource`. The interface is one read method and the
-  query is in section 4; the implementation belongs with the node agent that
-  already owns a pool.
-* Wiring into `cmd/farmd` and `internal/node`.
+* The Postgres-backed `FenceSource` — `node.hostFloors`, the section 4 query
+  through the pool the node agent already owns.
+* Wiring into `cmd/farmd` and `internal/node`: `farmd node` serves the proxy
+  when given TLS material and advertises it as the host's endpoint.
+
+**Deliberately not built here**, because it belongs elsewhere:
+
 * The client-side preamble sender, which needs section 11's `adbwire` dial seam.
 * Certificate issuance machinery. Section 9 specifies it; no CA is invented in Go
   here.
 * The three companion changes flagged above: 5.4's allocation predicate, 6.4's
   scratch-directory clear, and section 12's `lease_expire_max_runtime` fix.
+
+---
+
+## 14. Status: integrated on the host
+
+`farmd node` serves this proxy. Everything below is what the tree does today,
+not what it is meant to do, and the last subsection is the list of what it
+still does not do.
+
+### 14.1 What turns it on, and what it refuses
+
+Three environment variables on the device host, read by `internal/config` and
+served by the node role alone:
+
+| Variable | Meaning | Default |
+|---|---|---|
+| `FARM_FENCE_TLS_CERT` | the proxy's certificate (PEM) | unset |
+| `FARM_FENCE_TLS_KEY` | its private key | unset |
+| `FARM_FENCE_TLS_CA` | the roots a client certificate must chain to | unset |
+| `FARM_FENCE_LISTEN` | the proxy's bind address | `:5038` |
+| `FARM_FENCE_ADVERTISE` | what is written to `farm.hosts.adb_endpoint` | derived, see 14.2 |
+| `FARM_FENCE_POLL_INTERVAL` | section 4's poll | `2s` |
+
+The three PEM paths are **all or none**. One or two is refused at config
+validation, naming the variables: a proxy with a certificate and no client CA
+would admit anyone, and one with a CA and no certificate cannot listen. All
+three are **opened and parsed at startup**, by every role that carries them,
+so a bad path or a corrupt file fails the rollout rather than the first
+handshake on a host that is already advertising the proxy. The node agent
+loads them a second time into its reloader (14.5) before it registers anything.
+
+With the three unset, **nothing changes**: the agent advertises
+`FARM_ADB_ENDPOINT` as it always did, logs one WARN at startup saying that no
+proxy is configured and the fence is not enforced at the device, and the
+config summary of every role prints
+
+    fence proxy      = off (FARM_FENCE_TLS_CERT/FARM_FENCE_TLS_KEY/FARM_FENCE_TLS_CA unset) — the fence is NOT enforced at the device; …
+
+so that the self-fence timeout and margin printed just above it cannot be read
+as a fence enforced on a farm that has no proxy.
+
+### 14.2 What it advertises — no new column
+
+When the proxy is on, the agent writes **the proxy's address**, not the ADB
+server's, to `farm.hosts.adb_endpoint` on every registration. There is no
+second column and no flag: the endpoint column already means "what the cluster
+dials to reach this host's devices", and every reader of it — the jobrunner's
+`Placement`, the watchdog, the recovery ladder, the API — dials whatever is
+there. That is the whole integration on the reading side.
+
+The address is `FARM_FENCE_ADVERTISE` when set, and otherwise derived by
+`node.AdvertiseAddr` from the listen address: a listener bound to a specific
+host advertises exactly that (loopback included — an operator who bound
+`127.0.0.1` has a single-box farm and meant it); a wildcard listener takes the
+host part of `FARM_ADB_ENDPOINT` when it is routable, else the first
+global-unicast address of a local interface, and **never infers loopback**,
+because `127.0.0.1:5038` written into `farm.hosts` by inference is an endpoint
+no other machine can dial on a row that reads as healthy. When nothing
+qualifies the agent refuses to start and says to set the variable.
+
+The advertised endpoint **stays the proxy's while the proxy is down** (14.4).
+The endpoint is a promise about where the fence is enforced, not a liveness
+report, and the one thing it must never do is point at the unfenced server
+because the fenced one stopped.
+
+### 14.3 How it learns the floors — `FARM_NODE_SELF_FENCE_TIMEOUT` finds its consumer
+
+`node.hostFloors` is the `FenceSource`: the section 4 query, once per host per
+`FARM_FENCE_POLL_INTERVAL`, through the pool the agent already owns for
+registration and enrolment. It is the interface's one method and nothing else
+— the node package still imports neither `internal/lease` nor anything that
+ends one. A host with no positions reads as an empty snapshot, not an error,
+because an error is blindness and, past the budget, blindness refuses every
+new connection to a host that simply has nothing plugged in yet. The snapshot
+carries no timestamp; `Cache` stamps the read with the proxy's own clock.
+
+`Policy.MaxStaleness` is **`FARM_NODE_SELF_FENCE_TIMEOUT`**, which until this
+integration was validated against `FARM_SLOT_REARM` in every process and
+consumed by none. It now means exactly what 4.1 says: the age past which the
+proxy's last successful read may no longer admit a *new* connection. It tears
+nothing down. `config.Validate` keeps `FARM_SLOT_REARM` above it plus
+`FARM_FENCE_SAFETY_MARGIN`, and refuses a poll interval at or above it, since a
+poll that lands less often than the view is allowed to age refuses every new
+connection on a perfectly healthy farm.
+
+### 14.4 How it fails
+
+The listener is one goroutine beside the poller. When it dies — a bind
+failure, an accept error — the agent logs at ERROR, counts
+`farm_node_fence_proxy_restarts_total`, and binds again after a backoff that
+doubles from 1s to 30s and resets after a minute of health. Sessions already
+spliced through the dead listener drain behind the new one; shutdown waits
+five seconds for them and then leaves them to end with the process, which
+affects no lease.
+
+While the listener is down, **nothing on the host is reachable**, and that is
+the intended failure: the advertised endpoint is the proxy's, clients fail
+closed and retry, and the alternative — falling back to the unfenced server —
+would mean the thing that enforces the fence can be removed by making it
+crash. `farm_node_fence_proxy_up` is 0 for the duration; on a host with no
+material configured it is also 0, and the distinction is the WARN in 14.1.
+
+### 14.5 Certificates
+
+The proxy's certificate and key are re-read from disk when either file's
+modification time changes, checked at most once a second on the handshake
+path. A rotation is a file write; the next handshake serves it; no restart, no
+severed connection (9.2). A rotation that does not parse is logged and the
+previous certificate stays in service, because a broken file on disk must not
+take a working listener down and the operator who wrote it is the one who
+needs to hear about it.
+
+The client's class comes from its certificate's `farm://<class>/` URI SAN and
+never from its preamble (7.1); the node package adds nothing to that.
+
+### 14.6 The proof
+
+In `internal/node`, against a real `fenceproxy.Server`, real mTLS on both
+sides from an in-test CA, and `test/fakeadb` behind it:
+
+* a lease-class client presenting a fence **below** the floor gets a readable
+  `FAIL` on `host:transport:` and never reaches the adb server; **at** the
+  floor it is switched through and gets the server's `OKAY`;
+* a lease certificate whose preamble claims `maintenance` is held to the lease
+  rules; a maintenance certificate opens `host:devices-l` and is refused
+  `host:kill`;
+* a client certificate from a foreign CA does not complete the handshake, and
+  its request — one the fence alone would admit — reaches nothing;
+* a listener whose `Accept` fails is replaced, with the advertised endpoint
+  unchanged throughout;
+* a rotated certificate is served on the next handshake and a broken rotation
+  keeps the previous one;
+* against a scratch Postgres, `hostFloors` reads every position on the host
+  and no other host's, an empty host is an empty snapshot, and
+  `farm.hosts.adb_endpoint` carries the proxy's address when the proxy is on
+  and the adb server's when it is not.
+
+### 14.7 What is still not enforced
+
+* **The client half.** Nothing in the tree yet presents a certificate or writes
+  the `fence:v1` preamble: `adbwire` has no TLS dial seam and no preamble
+  option. Turning the proxy on today therefore makes a host unreachable to
+  every existing client — the jobrunner, the watchdog, the recovery ladder,
+  `ctl` — which is the fail-closed property working as designed, and the
+  reason the capability report keeps `"Fence enforcement at the resource"` at
+  `not_built` until the client half lands and can say `enabled` truthfully.
+* **Certificate issuance.** Section 9 specifies it; the chart carries the
+  cluster's client material in one Secret (`fenceProxy` in `values.yaml`) and
+  refuses to render it half-set or unmounted, but no CA is minted anywhere.
+* **The three companion changes** of section 13, unchanged.

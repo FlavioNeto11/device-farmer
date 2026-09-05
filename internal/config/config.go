@@ -21,6 +21,8 @@
 package config
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"maps"
@@ -216,6 +218,32 @@ const (
 	// on VBUS should gain charge or hold it; one that loses a sixth of its
 	// capacity an hour while plugged in cannot hold what it is given.
 	DefaultBatteryDrainPctPerHour = 15
+)
+
+// U10 — fence proxy (host side).
+//
+// The three TLS paths turn the proxy on, together or not at all. The rest
+// only mean something once it is on. They are read by every role and served
+// by the node role alone; see Fence.
+const (
+	EnvFenceTLSCert      = "FARM_FENCE_TLS_CERT"
+	EnvFenceTLSKey       = "FARM_FENCE_TLS_KEY"
+	EnvFenceTLSCA        = "FARM_FENCE_TLS_CA"
+	EnvFenceListen       = "FARM_FENCE_LISTEN"
+	EnvFenceAdvertise    = "FARM_FENCE_ADVERTISE"
+	EnvFencePollInterval = "FARM_FENCE_POLL_INTERVAL"
+
+	// DefaultFenceListen is where the proxy binds. 5038 is the ADB server's
+	// own port plus one: the proxy stands directly in front of 127.0.0.1:5037,
+	// and an operator who reads "10.20.0.11:5038" in farm.hosts.adb_endpoint
+	// can tell at a glance that it is adb, fronted. It sits outside 5554-5587,
+	// which the Android emulator claims in console/adbd pairs on any machine
+	// that runs one, and nothing else in the adb tool chain uses it.
+	DefaultFenceListen = ":5038"
+
+	// DefaultFencePollInterval is how often the proxy re-reads this host's
+	// fence floors: one query per host per interval, never per connection.
+	DefaultFencePollInterval = 2 * time.Second
 )
 
 // Mirrors of CHECK constraints in migrations/00001_core.sql. Duplicated on
@@ -485,10 +513,16 @@ type Charge struct {
 	Interval time.Duration
 }
 
-// Node holds the host-side proxy's knobs.
+// Node holds the host agent's knobs, and the two numbers the fence proxy it
+// serves is sized by.
 type Node struct {
-	// SelfFenceTimeout is how long the node proxy may go without a
-	// successful fence check before it tears down every ADB socket it holds.
+	// SelfFenceTimeout is the proxy's staleness budget: how old its last
+	// successful read of this host's fence floors may be and still admit a
+	// NEW connection. It reaches the proxy as fenceproxy.Policy.MaxStaleness.
+	// It tears nothing down — a live connection ends only on a fencing fact,
+	// never on blindness — and it is validated against Lease.SlotRearm whether
+	// or not the proxy is on, because the rearm window is what makes serving
+	// from a view this old safe.
 	SelfFenceTimeout time.Duration
 	// FenceSafetyMargin is the slack required between SelfFenceTimeout and
 	// Lease.SlotRearm. Zero reduces the assertion to "strictly greater".
@@ -569,6 +603,41 @@ type Battery struct {
 	DrainPctPerHour int
 }
 
+// Fence is the host-side fence proxy (U10): the mTLS listener a node agent
+// puts in front of its ADB server so that a connection is admitted only while
+// the fence it presents is at or above farm.devices.fence_floor.
+//
+// It is opt-in by TLS material. With CertFile, KeyFile and CAFile all unset
+// nothing changes: the agent advertises its ADB server directly and no fence
+// is enforced at the device. With all three set, the node role serves the
+// proxy and advertises IT as farm.hosts.adb_endpoint, so every process that
+// dials a host dials the proxy — and keeps dialling it while it is down,
+// because the alternative is a farm that silently falls back to the unfenced
+// server the moment the thing fencing it stops. One or two of the three is
+// refused: a proxy with a certificate and no client CA would admit anyone,
+// and one with a CA and no certificate cannot listen at all.
+type Fence struct {
+	CertFile string
+	KeyFile  string
+	CAFile   string
+	// Listen is the proxy's bind address.
+	Listen string
+	// Advertise is what the agent writes to farm.hosts.adb_endpoint while the
+	// proxy is on. Empty means the node agent derives it from Listen and the
+	// address it already knows for this machine; see node.AdvertiseAddr.
+	Advertise string
+	// PollInterval is how often the proxy re-reads this host's floors. It
+	// must be shorter than Node.SelfFenceTimeout, or the view is stale before
+	// it is refreshed.
+	PollInterval time.Duration
+}
+
+// Enabled reports whether the TLS material that turns the proxy on is
+// present. Load has already refused a partial set by the time this is asked.
+func (f Fence) Enabled() bool {
+	return f.CertFile != "" && f.KeyFile != "" && f.CAFile != ""
+}
+
 // Config is the whole of farmd's environment-derived configuration.
 type Config struct {
 	// Component is the name written by farm.component_beat. It must match the
@@ -606,6 +675,7 @@ type Config struct {
 	Topo    Topo
 	Battery Battery
 	Charge  Charge
+	Fence   Fence
 
 	WatchdogInterval time.Duration
 	MigrationsTable  string
@@ -696,6 +766,14 @@ func Load(component string, opts ...Option) (*Config, error) {
 			MinPct:   l.num(EnvChargeMinPct, DefaultChargeMinPct),
 			MaxPct:   l.num(EnvChargeMaxPct, DefaultChargeMaxPct),
 			Interval: l.dur(EnvChargeInterval, DefaultChargeInterval),
+		},
+		Fence: Fence{
+			CertFile:     l.str(EnvFenceTLSCert, ""),
+			KeyFile:      l.str(EnvFenceTLSKey, ""),
+			CAFile:       l.str(EnvFenceTLSCA, ""),
+			Listen:       l.str(EnvFenceListen, DefaultFenceListen),
+			Advertise:    l.str(EnvFenceAdvertise, ""),
+			PollInterval: l.dur(EnvFencePollInterval, DefaultFencePollInterval),
 		},
 
 		Battery: Battery{
@@ -884,23 +962,28 @@ func (c *Config) problems() []error {
 	//
 	// farm.lease_reclaim sets slots.rearm_at = now() + p_rearm and
 	// farm.lease_release does the same. That window is not decoration: it is
-	// the only thing standing between a reclaimed slot and the previous
-	// holder's still-open ADB sockets.
+	// what makes it safe for the host's fence proxy to admit a connection
+	// from a view of the floors that is up to SelfFenceTimeout old.
 	// -----------------------------------------------------------------
 	minRearm := c.Node.SelfFenceTimeout + c.Node.FenceSafetyMargin
 	if c.Lease.SlotRearm <= c.Node.SelfFenceTimeout || c.Lease.SlotRearm < minRearm {
 		fail(`%s (%s) must exceed %s (%s) by at least %s (%s), and is not.
 
 When a lease is reclaimed the device gets a new fence floor and the slot is
-parked for the rearm interval. The node proxy only discovers that its fence is
-stale after its self-fence timeout elapses; until then it is still holding open
-ADB sockets and still forwarding the old job's commands to the phone.
+parked for the rearm interval. The host's fence proxy learns the new floor on
+its next poll and refuses the old holder from then on. While it cannot reach
+this database it keeps admitting connections against the floors it last read,
+for as long as that view is younger than the self-fence timeout, and refuses
+new ones after that. For the length of the rearm window the device belongs to
+nobody, so a blind proxy admitting the previous holder inside it costs nothing.
 
-If the slot becomes schedulable again before that teardown finishes, the
-scheduler hands the same physical device to a new job while the previous job is
-still driving it. Two tenants then share one phone: shell commands interleave,
-installs land in the wrong session, and neither side sees an error. Nothing
-downstream can detect this, which is why it is refused here.
+If the slot became schedulable again before that view is guaranteed to have
+aged out, the scheduler could hand the same physical device to a new job while
+a blind proxy still forwards the previous job's commands to it.
+
+Two tenants then share one phone: shell commands interleave, installs land in
+the wrong session, and neither side sees an error. Nothing downstream can
+detect this, which is why it is refused here.
 
 Fix by raising %s above %s + %s, or by lowering the proxy's self-fence timeout.`,
 			EnvSlotRearm, c.Lease.SlotRearm,
@@ -914,6 +997,54 @@ Fix by raising %s above %s + %s, or by lowering the proxy's self-fence timeout.`
 	}
 	if c.Node.FenceSafetyMargin < 0 {
 		fail("%s must not be negative", EnvFenceMargin)
+	}
+
+	// ---- fence proxy (U10) -------------------------------------------
+	// The PEMs are opened here, at startup, rather than at the first
+	// handshake: a proxy that starts, advertises itself as the host's
+	// endpoint and then fails every handshake has made the host unreachable
+	// while looking healthy. Refusing to boot is the visible failure.
+	set := 0
+	for _, p := range []string{c.Fence.CertFile, c.Fence.KeyFile, c.Fence.CAFile} {
+		if p != "" {
+			set++
+		}
+	}
+	switch {
+	case set == 0:
+	case set < 3:
+		fail("%s, %s and %s turn the host-side fence proxy on together, and only %d of the "+
+			"three %s set. A proxy with a certificate and no client CA would admit anyone; "+
+			"one with a CA and no certificate cannot listen. Set all three or none",
+			EnvFenceTLSCert, EnvFenceTLSKey, EnvFenceTLSCA, set, plural(set, "is", "are"))
+	default:
+		if _, err := tls.LoadX509KeyPair(c.Fence.CertFile, c.Fence.KeyFile); err != nil {
+			fail("%s (%q) and %s (%q) do not load as a certificate and its private key: %v",
+				EnvFenceTLSCert, c.Fence.CertFile, EnvFenceTLSKey, c.Fence.KeyFile, err)
+		}
+		if pem, err := os.ReadFile(c.Fence.CAFile); err != nil {
+			fail("%s: %v", EnvFenceTLSCA, err)
+		} else if !x509.NewCertPool().AppendCertsFromPEM(pem) {
+			fail("%s (%q) holds no PEM-encoded certificate; the proxy would trust no client "+
+				"and refuse every connection to this host", EnvFenceTLSCA, c.Fence.CAFile)
+		}
+	}
+	if err := checkListenAddr(c.Fence.Listen); err != nil {
+		fail("%s (%q): %v", EnvFenceListen, c.Fence.Listen, err)
+	}
+	if c.Fence.Advertise != "" {
+		if err := checkAdvertiseAddr(c.Fence.Advertise); err != nil {
+			fail("%s (%q): %v", EnvFenceAdvertise, c.Fence.Advertise, err)
+		}
+	}
+	if c.Fence.PollInterval <= 0 {
+		fail("%s must be positive", EnvFencePollInterval)
+	} else if c.Node.SelfFenceTimeout > 0 && c.Fence.PollInterval >= c.Node.SelfFenceTimeout {
+		fail("%s (%s) must be shorter than %s (%s). The proxy admits a new connection only "+
+			"against a floor observation younger than the self-fence timeout, so a poll "+
+			"that lands less often than that leaves the view stale before it is refreshed "+
+			"and refuses every new connection on a perfectly healthy farm",
+			EnvFencePollInterval, c.Fence.PollInterval, EnvNodeSelfFence, c.Node.SelfFenceTimeout)
 	}
 
 	// ---- lease liveness ---------------------------------------------
@@ -1301,8 +1432,28 @@ func (c *Config) Summary() string {
 	fmt.Fprintf(&b, "marker           = rewritten on the device every %s; evidence presented "+
 		"while younger than %s (derived: %d writes per witness tick, window of %d)\n",
 		c.Lease.MarkerInterval(), c.Lease.MaxEvidenceAge(), MarkersPerWitnessTick, EvidenceWindow)
-	fmt.Fprintf(&b, "slot rearm       = %s (node self-fence %s + margin %s)\n",
+	fmt.Fprintf(&b, "slot rearm       = %s (must exceed node self-fence %s + margin %s)\n",
 		c.Lease.SlotRearm, c.Node.SelfFenceTimeout, c.Node.FenceSafetyMargin)
+	// The self-fence timeout and the margin are validated whether or not the
+	// proxy is on. Printing them without saying which is the case would read
+	// as a fence enforced at the device on a farm that has no proxy at all.
+	if c.Fence.Enabled() {
+		advertise := c.Fence.Advertise
+		if advertise == "" {
+			advertise = "(derived from the listener by the node agent)"
+		}
+		served := ""
+		if c.role != "node" {
+			served = " — served by the node role only"
+		}
+		fmt.Fprintf(&b, "fence proxy      = on: %s, advertised as %s, floors polled every %s, "+
+			"new connections refused once the view is older than %s%s\n",
+			c.Fence.Listen, advertise, c.Fence.PollInterval, c.Node.SelfFenceTimeout, served)
+	} else {
+		fmt.Fprintf(&b, "fence proxy      = off (%s/%s/%s unset) — the fence is NOT enforced at "+
+			"the device; the self-fence timeout and margin above only bound the slot rearm\n",
+			EnvFenceTLSCert, EnvFenceTLSKey, EnvFenceTLSCA)
+	}
 	fmt.Fprintf(&b, "reaper           = every %s, batch %d, gap floor %s, watching %s\n",
 		c.Reaper.Interval, c.Reaper.Batch, c.Reaper.GapFloor,
 		strings.Join(c.Reaper.Components, ","))
@@ -1559,6 +1710,29 @@ func checkListenAddr(addr string) error {
 		}
 	}
 	return nil
+}
+
+// checkAdvertiseAddr rejects an advertised address that names no host. It is
+// dialled by other machines, so unlike a listen address it cannot leave the
+// host part empty or unspecified: ":5038" written into farm.hosts is an
+// endpoint nothing can reach, on a row that looks healthy.
+func checkAdvertiseAddr(addr string) error {
+	if err := checkListenAddr(addr); err != nil {
+		return err
+	}
+	host, _, _ := net.SplitHostPort(addr)
+	if isWildcardHost(host) {
+		return errors.New("names no host; an advertised address is what other machines " +
+			"dial, so it needs the address they reach this one at")
+	}
+	return nil
+}
+
+func plural(n int, one, many string) string {
+	if n == 1 {
+		return one
+	}
+	return many
 }
 
 // sameListenAddr reports whether two listen addresses would contend for the

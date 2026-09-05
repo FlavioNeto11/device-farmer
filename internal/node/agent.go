@@ -261,6 +261,11 @@ type Config struct {
 	Addr  string
 	Token string
 
+	// Fence, when it carries TLS material, serves the fence proxy in front of
+	// ADBEndpoint and advertises the proxy as farm.hosts.adb_endpoint in its
+	// place. The zero value changes nothing. See fence.go.
+	Fence FenceConfig
+
 	Logger *slog.Logger
 }
 
@@ -303,6 +308,9 @@ type Agent struct {
 	log *slog.Logger
 	adb *adbwire.Client
 	ops opsConfig
+
+	// fence is the proxy's state, nil while the proxy is off.
+	fence *fenceState
 
 	// registered closes after the first successful farm.hosts upsert. Slots,
 	// devices and observations all reference the host row, so discovery and
@@ -373,10 +381,18 @@ func New(cfg Config) (*Agent, error) {
 	cfg.applyDefaults()
 
 	log := cfg.Logger.With("component", cfg.Component, "host", cfg.HostID)
+	// The proxy's material is opened here, before anything is registered: an
+	// agent that advertised the proxy and then found its certificate did not
+	// load would have made the host unreachable while looking healthy.
+	fence, err := newFenceState(cfg, log)
+	if err != nil {
+		return nil, err
+	}
 	return &Agent{
-		cfg: cfg,
-		log: log,
-		adb: adbwire.New(cfg.ADBEndpoint, adbwire.WithLogger(log)),
+		cfg:   cfg,
+		log:   log,
+		adb:   adbwire.New(cfg.ADBEndpoint, adbwire.WithLogger(log)),
+		fence: fence,
 		ops: opsConfig{
 			uhubctl:       cfg.UhubctlPath,
 			offSettle:     cfg.PowerOffSettle,
@@ -426,9 +442,16 @@ func (a *Agent) Run(ctx context.Context) error {
 
 	a.log.Info("farmd-node starting",
 		"adb_endpoint", a.cfg.ADBEndpoint,
+		"advertising", a.advertisedEndpoint(),
+		"fence_proxy", a.fence != nil,
 		"platform", fmt.Sprintf("%s/%s", runtime.GOOS, runtime.GOARCH),
 		"discover_every", a.cfg.DiscoverInterval,
 		"serving", a.cfg.Addr != "")
+	if a.fence == nil {
+		a.log.Warn("no fence proxy is configured on this host (FARM_FENCE_TLS_CERT/KEY/CA " +
+			"unset); the adb server is advertised directly and nothing enforces the " +
+			"lease fence at the device")
+	}
 
 	if a.cfg.Discover == nil {
 		a.log.Warn("no topology discovery is wired into this agent; farm.slots will " +
@@ -446,7 +469,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	}
 
 	var wg sync.WaitGroup
-	errs := make(chan error, 6)
+	errs := make(chan error, 7)
 	start := func(name string, fn func(context.Context) error) {
 		wg.Add(1)
 		go func() {
@@ -468,6 +491,9 @@ func (a *Agent) Run(ctx context.Context) error {
 	start("chargegate", a.chargeGateLoop)
 	if a.cfg.Addr != "" {
 		start("serve", a.serve)
+	}
+	if a.fence != nil {
+		start("fence", a.fenceLoop)
 	}
 
 	wg.Wait()
@@ -554,10 +580,13 @@ RETURNING host_epoch, admin_state`
 		kernel = &k
 	}
 
+	// The endpoint is what the cluster should DIAL, which is the fence proxy
+	// whenever one is configured — not the adb server behind it, and not the
+	// adb server as a fallback while the proxy is down. See advertisedEndpoint.
 	var epoch int64
 	var adminState string
 	if err := a.cfg.Pool.QueryRow(cctx, q,
-		a.cfg.HostID, a.cfg.ADBEndpoint, kernel, a.cfg.AgentVersion, bumpEpoch,
+		a.cfg.HostID, a.advertisedEndpoint(), kernel, a.cfg.AgentVersion, bumpEpoch,
 	).Scan(&epoch, &adminState); err != nil {
 		return fmt.Errorf("node: register host %s: %w", a.cfg.HostID, err)
 	}
@@ -1269,5 +1298,6 @@ func Collectors() []prometheus.Collector {
 		hostRegistrations, epochBumps, adbServerUp, usbResets, portPowers,
 		discoveries, enrollRestarts, beatFailures,
 		chargeGateSets, chargeGateExpiries, chargeGatesHeld,
+		fenceProxyUp, fenceProxyRestarts, fenceProxyConnections, fencePositions,
 	}
 }

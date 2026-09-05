@@ -1,1 +1,77 @@
-{"areas":[{"area":"lease","label":"Leases","blurb":"The invariant this system exists to protect","title":"Leases and the failure this system exists to prevent","summary":"A lease ends when the job says so, when a deadline the user wrote down elapses, or when a human takes it back. Nothing else — not a socket error, not a probe timeout, not a device going offline, not a pod dying. The invariant is enforced in four independent places: a CHECK constraint with no word for connectivity, four guard-trigger rules, a Postgres role with SELECT revoked on the health table, and a one-way package dependency with a test behind it. All fifteen assertions in test/assertions.sql pass against a database migrated from this tree, and every example below was run against the live farm or a scratch database migrated from it. What is NOT enforced is named in Gaps: there is no host-side fence proxy, the max_runtime SWEEP ends a lease without fencing it, nothing produces a witness, farm.events is not a ledger of endings, and the API is open no matter what you set in the environment.","sections":16,"examples":39,"gaps":16},{"area":"jobs","label":"Jobs","blurb":"The step vocabulary, execution, checkpoint and resume","title":"Jobs: the step vocabulary, execution, checkpoint and resume","summary":"A job is an ordered list of steps drawn from a closed ten-kind vocabulary the database owns (farm.step_kinds), run against one leased device by internal/runner. Only three things end a step badly: its own timeout, an error nothing can retry, or the job's max_runtime. A dropped ADB socket is none of those — it is retried inside the lease with no attempt cap, bounded only by a deadline the job's author wrote down. Long work belongs in a shell_detached step, because that is the only kind whose result lives on the device instead of in a socket the control plane happens to be holding.","sections":14,"examples":38,"gaps":11},{"area":"devices","label":"Devices","blurb":"Enrollment, identity, topology and health","title":"Devices: enrollment, identity, topology and health","summary":"A device in this farm is identified by where it is plugged in, not by what it calls itself: OEM serials collide, and this rack has a clone pair (0123456789ABCDEF at usb:3-1.1 and usb:3-1.2) to prove it. Identity is observed, then resolved against a four-rung ladder — branded uid, hardware fingerprint, serial-plus-slot, adopt — and then branded back onto the phone so the strongest rung exists next time. Health is a third clock kept strictly apart from leases: the watchdog writes one table, has no privilege on farm.leases at all, and a device going offline never takes it away from a running job. Read the Gaps before you rely on any of the enrollment or topology machinery: on PostgreSQL 17 the fingerprint rung cannot execute, and neither enrollment nor topology discovery runs anywhere except the farmd node role on Linux.","sections":16,"examples":37,"gaps":15},{"area":"recovery","label":"Recovery","blurb":"The ladder, blast radius, quarantine and bulk","title":"Recovery, quarantine, blast radius and bulk operations","summary":"The recovery ladder repairs devices underneath live leases. It reads farm.leases in exactly one function, only to decide whether it is allowed to act, and no code path in internal/recovery writes one. Every rung declares a blast radius and the minimum disruption_policy a live lease in that radius must carry; a rung that would reach a lease forbidding it is refused outright, recorded in farm.recovery_attempts.refusal, and the device stays broken until the work on it ends. Three things will cost you a night if you do not read the gaps first: host drain is not enforced by the allocator, tiers 3 and 4 cannot execute in any shipped deployment, and closing a quarantine does nothing unless the recovery loop is running.","sections":14,"examples":25,"gaps":18},{"area":"surface","label":"Interfaces","blurb":"HTTP API, the ctl CLI and artifacts","title":"The API, the CLI and artifacts","summary":"Thirty-eight routes hang off one net/http pattern mux; the role each needs is chosen at registration in internal/api/router.go, not inside the handler, so no endpoint can exist without a level. Every non-2xx body is the same envelope, and two of its codes are load-bearing: 410 fenced means the lease is gone and the job must abort, 503 transient means the database did not answer and the lease is untouched — conflating them is STF #663. On this deployment none of that authorisation is in force: cmd/farmd/roles.go:148 installs AllowAll unconditionally, so every caller is an operator, 401 and 403 are unreachable, and the fence the API bumps on a revoke is honoured only by cooperating clients — the proxy that would enforce it at the ADB socket is not written.","sections":12,"examples":50,"gaps":12},{"area":"operate","label":"Operating","blurb":"Roles, configuration, deployment and gaps","title":"Running it: roles, configuration, deployment, and what is not built","summary":"farmd is one static binary with twelve subcommands; every role is a subcommand so a reaper can never run a different commit than the scheduler it races with. This page is the authoritative configuration reference — 28 variables in internal/config plus 5 read elsewhere, four of which are validated at boot and then ignored — and the honest inventory of what is not wired: authentication runs open because cmd/farmd hardcodes AllowAll, `farmd node` cannot start at all, recovery tiers 3 and 4 have no path to a host agent, dynamic enrollment cannot run in any deployable shape, and /metrics is missing every role's own series. The one thing to carry away: SIGTERM drains work and releases nothing, deliberately.","sections":11,"examples":23,"gaps":16},{"area":"requirements","label":"Requirements","blurb":"Every requirement, its origin, and whether it holds","sections":15,"examples":8,"gaps":22}],"built":{"examples_run":304,"examples_fixed":108,"claims_corrected":98}}
+{
+  "areas": [
+    {
+      "area": "lease",
+      "label": "Leases",
+      "blurb": "The invariant this system exists to protect",
+      "title": "Leases and the failure this system exists to prevent",
+      "summary": "A lease ends when the job says so, when a deadline the user wrote down elapses, or when a human takes it back. Nothing else — not a socket error, not a probe timeout, not a device going offline, not a pod dying. The invariant is enforced in four independent places: a CHECK constraint with no word for connectivity, four guard-trigger rules, a Postgres role with SELECT revoked on the health table, and a one-way package dependency with a test behind it. All fifteen assertions in test/assertions.sql pass against a database migrated from this tree, and every example below was run against the live farm or a scratch database migrated from it. What is NOT enforced is named in Gaps: there is no host-side fence proxy, the max_runtime SWEEP ends a lease without fencing it, nothing produces a witness, farm.events is not a ledger of endings, and the API is open no matter what you set in the environment.",
+      "sections": 16,
+      "examples": 39,
+      "gaps": 16
+    },
+    {
+      "area": "jobs",
+      "label": "Jobs",
+      "blurb": "The step vocabulary, execution, checkpoint and resume",
+      "title": "Jobs: the step vocabulary, execution, checkpoint and resume",
+      "summary": "A job is an ordered list of steps drawn from a closed ten-kind vocabulary the database owns (farm.step_kinds), run against one leased device by internal/runner. Only three things end a step badly: its own timeout, an error nothing can retry, or the job's max_runtime. A dropped ADB socket is none of those — it is retried inside the lease with no attempt cap, bounded only by a deadline the job's author wrote down. Long work belongs in a shell_detached step, because that is the only kind whose result lives on the device instead of in a socket the control plane happens to be holding.",
+      "sections": 14,
+      "examples": 38,
+      "gaps": 11
+    },
+    {
+      "area": "devices",
+      "label": "Devices",
+      "blurb": "Enrollment, identity, topology and health",
+      "title": "Devices: enrollment, identity, topology and health",
+      "summary": "A device in this farm is identified by where it is plugged in, not by what it calls itself: OEM serials collide, and this rack has a clone pair (0123456789ABCDEF at usb:3-1.1 and usb:3-1.2) to prove it. Identity is observed, then resolved against a four-rung ladder — branded uid, hardware fingerprint, serial-plus-slot, adopt — and then branded back onto the phone so the strongest rung exists next time. Health is a third clock kept strictly apart from leases: the watchdog writes one table, has no privilege on farm.leases at all, and a device going offline never takes it away from a running job. Read the Gaps before you rely on any of the enrollment or topology machinery: on PostgreSQL 17 the fingerprint rung cannot execute, and neither enrollment nor topology discovery runs anywhere except the farmd node role on Linux.",
+      "sections": 16,
+      "examples": 37,
+      "gaps": 15
+    },
+    {
+      "area": "recovery",
+      "label": "Recovery",
+      "blurb": "The ladder, blast radius, quarantine and bulk",
+      "title": "Recovery, quarantine, blast radius and bulk operations",
+      "summary": "The recovery ladder repairs devices underneath live leases. It reads farm.leases in exactly one function, only to decide whether it is allowed to act, and no code path in internal/recovery writes one. Every rung declares a blast radius and the minimum disruption_policy a live lease in that radius must carry; a rung that would reach a lease forbidding it is refused outright, recorded in farm.recovery_attempts.refusal, and the device stays broken until the work on it ends. Three things will cost you a night if you do not read the gaps first: host drain is not enforced by the allocator, tiers 3 and 4 cannot execute in any shipped deployment, and closing a quarantine does nothing unless the recovery loop is running.",
+      "sections": 14,
+      "examples": 25,
+      "gaps": 18
+    },
+    {
+      "area": "surface",
+      "label": "Interfaces",
+      "blurb": "HTTP API, the ctl CLI and artifacts",
+      "title": "The API, the CLI and artifacts",
+      "summary": "Thirty-eight routes hang off one net/http pattern mux; the role each needs is chosen at registration in internal/api/router.go, not inside the handler, so no endpoint can exist without a level. Every non-2xx body is the same envelope, and two of its codes are load-bearing: 410 fenced means the lease is gone and the job must abort, 503 transient means the database did not answer and the lease is untouched — conflating them is STF #663. On this deployment none of that authorisation is in force: cmd/farmd/roles.go:148 installs AllowAll unconditionally, so every caller is an operator, 401 and 403 are unreachable, and the fence the API bumps on a revoke is honoured only by cooperating clients — the proxy that would enforce it at the ADB socket is not written.",
+      "sections": 12,
+      "examples": 50,
+      "gaps": 12
+    },
+    {
+      "area": "operate",
+      "label": "Operating",
+      "blurb": "Roles, configuration, deployment and gaps",
+      "title": "Running it: roles, configuration, deployment, and what is not built",
+      "summary": "farmd is one static binary with twelve subcommands; every role is a subcommand so a reaper can never run a different commit than the scheduler it races with. This page is the authoritative configuration reference — 28 variables in internal/config plus 5 read elsewhere, four of which are validated at boot and then ignored — and the honest inventory of what is not wired: authentication runs open because cmd/farmd hardcodes AllowAll, `farmd node` cannot start at all, recovery tiers 3 and 4 have no path to a host agent, dynamic enrollment cannot run in any deployable shape, and /metrics is missing every role's own series. The one thing to carry away: SIGTERM drains work and releases nothing, deliberately.",
+      "sections": 11,
+      "examples": 23,
+      "gaps": 16
+    },
+    {
+      "area": "requirements",
+      "label": "Requirements",
+      "blurb": "Every requirement, its origin, and whether it holds — re-verified against HEAD",
+      "sections": 16,
+      "examples": 8,
+      "gaps": 22
+    }
+  ],
+  "built": {
+    "examples_run": 304,
+    "examples_fixed": 108,
+    "claims_corrected": 98
+  }
+}

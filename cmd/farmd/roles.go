@@ -386,7 +386,7 @@ func runReaper(ctx context.Context, cfg *config.Config, log *slog.Logger, pool *
 func runJanitor(ctx context.Context, cfg *config.Config, log *slog.Logger, pool *pgxpool.Pool) error {
 	j, err := janitor.New(janitor.Config{
 		Pool:      pool,
-		Component: "janitor",
+		Component: cfg.ComponentFor("janitor"),
 		Logger:    log,
 	})
 	if err != nil {
@@ -714,7 +714,7 @@ func runNode(ctx context.Context, cfg *config.Config, log *slog.Logger, pool *pg
 
 	enr, err := enroll.New(enroll.Config{
 		Pool:        pool,
-		Component:   "enroll",
+		Component:   cfg.ComponentFor("enroll"),
 		HostID:      hostID,
 		ADBEndpoint: cfg.Node.ADBEndpoint,
 		Connect: func(endpoint string) (enroll.Host, error) {

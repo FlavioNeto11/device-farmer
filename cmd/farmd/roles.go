@@ -148,32 +148,6 @@ func newRegistry(log *slog.Logger) (*prometheus.Registry, error) {
 		}
 	}
 
-	// The runtime and the process itself. internal/obs deliberately leaves
-	// these to the binary — they describe a PROCESS, not the farm — and the
-	// binary is here, so this is where they go.
-	//
-	// They are what tells "the reaper is quiet because nothing is reclaimable"
-	// from "the reaper is quiet because it is wedged on a goroutine leak", and
-	// what puts a number on an OOM before the pod restarts and takes its
-	// evidence with it. Registered on the same registry as everything else, so
-	// they arrive through the same scrape and carry the same role label.
-	//
-	// Errors are logged rather than returned, for the reason the whole function
-	// gives: a metrics fault must not stop a control plane.
-	for _, c := range []prometheus.Collector{
-		collectors.NewGoCollector(),
-		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
-	} {
-		if err := reg.Register(c); err != nil {
-			var dup prometheus.AlreadyRegisteredError
-			if !errors.As(err, &dup) {
-				log.Error("could not register a runtime collector; this process is "+
-					"scrapeable but its own goroutines, heap and file descriptors are not",
-					"err", err)
-			}
-		}
-	}
-
 	if err := obs.RegisterAll(reg, log,
 		adbwire.Collectors(),
 		chargepolicy.Collectors(),
@@ -194,9 +168,37 @@ func newRegistry(log *slog.Logger) (*prometheus.Registry, error) {
 
 	// The process and Go runtime collectors are the binary's decision, not
 	// obs's: a library that registers them makes two roles in one process
-	// collide over them.
-	reg.MustRegister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
-	reg.MustRegister(collectors.NewGoCollector())
+	// collide over them. They are what tells "the reaper is quiet because
+	// nothing is reclaimable" from "the reaper is wedged on a goroutine leak",
+	// and what puts a number on an OOM before the pod restarts and takes its
+	// evidence with it.
+	//
+	// Register, not MustRegister. This function opens by saying a metric
+	// collision must not take down a control plane, and MustRegister was the
+	// one line in it that could: for a while these two were registered HERE and
+	// again at the top of this function, and every role panicked at startup
+	// with "duplicate metrics collector registration attempted". The Go build,
+	// go vet and the whole test suite were green throughout, because nothing
+	// called this function — TestEveryCollectorGroupIsRegistered reads the
+	// SOURCE. TestNewRegistryBuilds now calls it.
+	//
+	// Windows hid it for a different reason worth knowing: NewProcessCollector
+	// describes nothing off Linux, so half the collision does not exist there.
+	// A metrics decision that behaves differently per GOOS has to be exercised
+	// on the GOOS that runs it.
+	for _, c := range []prometheus.Collector{
+		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
+		collectors.NewGoCollector(),
+	} {
+		if err := reg.Register(c); err != nil {
+			var dup prometheus.AlreadyRegisteredError
+			if !errors.As(err, &dup) {
+				log.Error("could not register a runtime collector; this process is "+
+					"scrapeable but its own goroutines, heap and file descriptors are not",
+					"err", err)
+			}
+		}
+	}
 	return reg, nil
 }
 

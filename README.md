@@ -266,6 +266,12 @@ It does not prove there is a phone. The ADB servers are `test/fakeadb` and the
 USB tree is written by a script, so `USBDEVFS_RESET` and `uhubctl` against real
 hardware stay open — `REC-03` and `HW-05` in `REQUIREMENTS.md`.
 
+The two are complements, not alternatives: `test/e2e` proves that `cmd/farmd`
+wires the packages together correctly, on whatever platform you are on;
+`make linux-acceptance` proves that the result runs on the platform it ships
+for. Between them they cover the gap that no in-process test can reach — and
+each of them has already found a defect the other could not have.
+
 `test/assertions.sql` is the protocol's specification in executable form. It
 proves, against a real PostgreSQL, that a connectivity release reason is
 rejected, that a pod eviction re-attaches at the same fence, that a device going

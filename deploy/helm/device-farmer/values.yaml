@@ -580,10 +580,22 @@ fenceProxy:
 # -----------------------------------------------------------------------------
 # Metrics
 # -----------------------------------------------------------------------------
+# A headless Service across every role, for scraping only. It carries no
+# traffic: FARM_METRICS_ADDR is set in the ConfigMap, every role binds it, and
+# this is what lets something reach them. Turning it off leaves the listeners
+# running and unscraped, which is the state that made the api publish every
+# other role's counters at a permanent 0.
+metricsService:
+  enabled: true
+  port: 9090
+  labels: {}
+  annotations: {}
+
 serviceMonitor:
-  # Requires the Prometheus Operator CRDs. Scrapes the api Service; see the
-  # comment in templates/servicemonitor.yaml for what that does and does not
-  # cover.
+  # Requires the Prometheus Operator CRDs. Scrapes the headless metrics Service,
+  # which covers EVERY role — one target per pod, each series labelled with the
+  # role that produced it. See the comment in templates/servicemonitor.yaml.
+  # Needs metricsService.enabled.
   enabled: false
   namespace: ""
   interval: 30s

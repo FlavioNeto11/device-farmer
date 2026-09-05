@@ -38,6 +38,10 @@ x-farmd: &farmd
     FARM_SLOT_REARM: ${FARM_SLOT_REARM:-35s}
     FARM_NODE_SELF_FENCE_TIMEOUT: ${FARM_NODE_SELF_FENCE_TIMEOUT:-20s}
     FARM_FENCE_SAFETY_MARGIN: ${FARM_FENCE_SAFETY_MARGIN:-5s}
+    # Every role serves its own /metrics here, not just the api. Set it to
+    # "off" for a role you do not want scraped; a bind failure is logged and
+    # exported as farm_metrics_listener_up 0, and never stops the role.
+    FARM_METRICS_ADDR: "0.0.0.0:9090"
   depends_on:
     migrate:
       condition: service_completed_successfully
@@ -91,6 +95,7 @@ services:
     command: ["demo", "-hosts", "2", "-devices", "56"]
     ports:
       - "${FARM_PORT:-8420}:8080"
+      - "${FARM_METRICS_PORT:-9420}:9090"
 
   # ---------------------------------------------------------------------
   # Real farm. Each role scales and fails independently.
@@ -111,6 +116,7 @@ services:
     command: ["api"]
     ports:
       - "${FARM_PORT:-8420}:8080"
+      - "${FARM_METRICS_PORT:-9420}:9090"
 
   scheduler:
     <<: *farmd
@@ -153,5 +159,32 @@ services:
     profiles: ["farm"]
     command: ["recovery"]
 
+  # ---------------------------------------------------------------------
+  # Scraping. Every farmd role serves /metrics on 9090 inside this network,
+  # so the scrape config addresses them by service name and nothing needs a
+  # published port.
+  #
+  #   docker compose --profile farm --profile metrics up -d
+  #   open http://localhost:9090
+  #
+  # Without this, the per-role listeners bind and nobody reads them — which is
+  # the state this file was in while the api process published every other
+  # role's counters at a permanent 0, because it registers their collectors
+  # and runs none of their loops. A dead scheduler read as an idle one.
+  # ---------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    profiles: ["metrics"]
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=7d
+    volumes:
+      - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - promdata:/prometheus
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    restart: unless-stopped
+
 volumes:
   pgdata:
+  promdata:

@@ -1,0 +1,51 @@
+{{- if .Values.metricsService.enabled }}
+{{/*
+One headless Service across EVERY farmd role, for scraping only.
+
+Why one Service and not one per role: a ServiceMonitor addresses a Service's
+port by NAME, and every role in this chart serves the same port name on the
+same number, so a single selector — name + instance, deliberately without
+app.kubernetes.io/component — reaches all of them. The per-role identity is not
+lost: the ServiceMonitor lifts app.kubernetes.io/component off each pod, so
+every series arrives labelled with the role that produced it.
+
+Why headless (clusterIP: None): scraping wants one target per POD, not one
+load-balanced address. jobrunner runs two replicas by default and its counters
+are per process, so an ordinary ClusterIP would hand Prometheus whichever
+replica the round robin picked and silently halve the fleet's numbers.
+
+publishNotReadyAddresses is on for the same reason the roles have no readiness
+probe: a role whose database is unreachable is exactly the one worth scraping,
+and dropping it from the endpoint list at that moment is how a farm loses its
+telemetry precisely when an operator needs it.
+
+The port is the container's, not a Service-level rename: FARM_METRICS_ADDR is
+set to :9090 in the ConfigMap and every role binds it from internal/config, so
+there is one number here and one place it comes from.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "device-farmer.componentName" (dict "ctx" $ "component" "metrics") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "device-farmer.labels" (dict "ctx" $ "component" "metrics") | nindent 4 }}
+    {{- with .Values.metricsService.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with .Values.metricsService.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: ClusterIP
+  clusterIP: None
+  publishNotReadyAddresses: true
+  ports:
+    - name: metrics
+      port: {{ .Values.metricsService.port }}
+      targetPort: {{ .Values.metricsService.port }}
+      protocol: TCP
+  selector:
+    {{- include "device-farmer.selectorLabels" (dict "ctx" $) | nindent 4 }}
+{{- end }}

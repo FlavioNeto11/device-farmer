@@ -1,30 +1,48 @@
 {{- if .Values.serviceMonitor.enabled }}
 {{/*
-Prometheus Operator scrape config for the api Service.
+Prometheus Operator scrape config for EVERY farmd role.
 
-WHAT THIS COVERS: everything the api process exposes on /metrics — request
-rates and latencies, the lease protocol counters it serves, and the Go runtime.
-It is served on the same port as the API itself, unauthenticated, for the same
-reason /healthz is: an operator debugging a farm whose auth is the broken thing
-still needs to see its state. If that port is reachable from outside the
-cluster, put the scrape behind a NetworkPolicy rather than behind a token.
-
-WHAT THIS DOES NOT COVER: the roles that serve no HTTP. scheduler, reaper,
+It used to select the api Service alone, and said so: "scheduler, reaper,
 recovery, jobrunner and watchdog register their collectors in-process and
-nothing listens, so their metrics — including the reaper's leader gauge, whose
-sum across replicas must be exactly 1 — are not scrapeable from here today.
-Their liveness is observable instead through the API: GET
-/api/v1/capabilities reports every component that has ever written
-farm.component_heartbeat, with how long ago. Alert on that until the non-api
-roles serve FARM_METRICS_ADDR.
+nothing listens". That is no longer true — internal/config's FARM_METRICS_ADDR
+is set in this chart's ConfigMap and cmd/farmd wraps every role in a listener
+that serves the same registry — so this now selects the headless metrics
+Service, which reaches all of them.
+
+WHY THAT MATTERED, and not only as a gap: cmd/farmd/roles.go registers EVERY
+package's Collectors() in EVERY process, because a counter that is registered
+and never touched exports a zero and a rule written over a series that does not
+exist yields no result and never fires. The consequence, while the api was the
+only scrape target, was the inverse of the intent: the api published
+farm_scheduler_*, farm_reaper_*, farm_recovery_*, farm_watchdog_* and
+farm_jobrunner_* at a permanent 0 while running none of those loops. A dead
+scheduler read as an idle one, and absent() over those series could not fire
+because the series were present. Scraping the roles themselves is what makes
+those numbers mean what they say.
+
+WHAT IT COVERS NOW: one target per POD — the Service is headless for that
+reason, since jobrunner's counters are per process and it runs two replicas by
+default. podTargetLabels lifts app.kubernetes.io/component onto every series,
+so `farm_reaper_leader{component="reaper"}` is addressable without a join, and
+the leader gauge whose sum across replicas must be exactly 1 is finally
+summable across the pods that actually hold it.
+
+WHAT IT STILL DOES NOT COVER: `farmd node`, which runs on the physical hosts
+and is not deployed by this chart. Its liveness is observable through
+farm.component_heartbeat, which GET /api/v1/capabilities reports.
+
+The api's own request metrics are in the same registry, so they arrive here
+too; there is deliberately no second ServiceMonitor on the api's HTTP port,
+because scraping one registry twice under two job names double-counts every
+counter in it.
 */}}
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
-  name: {{ include "device-farmer.componentName" (dict "ctx" $ "component" "api") }}
+  name: {{ include "device-farmer.componentName" (dict "ctx" $ "component" "metrics") }}
   namespace: {{ default .Release.Namespace .Values.serviceMonitor.namespace }}
   labels:
-    {{- include "device-farmer.labels" (dict "ctx" $ "component" "api") | nindent 4 }}
+    {{- include "device-farmer.labels" (dict "ctx" $ "component" "metrics") | nindent 4 }}
     {{- with .Values.serviceMonitor.labels }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
@@ -38,16 +56,24 @@ spec:
       - {{ .Release.Namespace }}
   selector:
     matchLabels:
-      {{- include "device-farmer.selectorLabels" (dict "ctx" $ "component" "api") | nindent 6 }}
+      {{- include "device-farmer.selectorLabels" (dict "ctx" $ "component" "metrics") | nindent 6 }}
+  # The role each series came from, taken off the pod rather than guessed from
+  # the target's address.
+  podTargetLabels:
+    - app.kubernetes.io/component
   endpoints:
-    - port: http
+    - port: metrics
       path: /metrics
       interval: {{ .Values.serviceMonitor.interval }}
       scrapeTimeout: {{ .Values.serviceMonitor.scrapeTimeout }}
-      {{- with .Values.serviceMonitor.relabelings }}
       relabelings:
+        # A short, stable `role` beside the verbose Kubernetes label, so alert
+        # expressions and runbooks can say role="reaper".
+        - sourceLabels: [__meta_kubernetes_pod_label_app_kubernetes_io_component]
+          targetLabel: role
+        {{- with .Values.serviceMonitor.relabelings }}
         {{- toYaml . | nindent 8 }}
-      {{- end }}
+        {{- end }}
       {{- with .Values.serviceMonitor.metricRelabelings }}
       metricRelabelings:
         {{- toYaml . | nindent 8 }}

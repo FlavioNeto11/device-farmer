@@ -1,0 +1,72 @@
+# Scrape config for the split-role compose deployment.
+#
+# Every farmd role serves /metrics on 9090 inside the compose network — not
+# only the api. Before that was true, the api process was the only scrape
+# target, and because cmd/farmd/roles.go registers EVERY package's Collectors()
+# in every process, the api published farm_scheduler_*, farm_reaper_*,
+# farm_recovery_*, farm_watchdog_*, farm_jobrunner_* and farm_janitor_* at a
+# permanent 0 while running none of those loops. A dead scheduler read as an
+# idle one, and absent() over those series never fired because the series were
+# present.
+#
+# The roles are listed one job each rather than one job with six targets, so a
+# rule can say "the reaper" without a label matcher, and so a role that is not
+# deployed is a missing job rather than a target that never comes up.
+
+global:
+  scrape_interval: 15s
+  scrape_timeout: 10s
+
+scrape_configs:
+  - job_name: farmd-api
+    static_configs:
+      - targets: ["api:9090"]
+        labels: { role: api }
+
+  - job_name: farmd-scheduler
+    static_configs:
+      - targets: ["scheduler:9090"]
+        labels: { role: scheduler }
+
+  - job_name: farmd-reaper
+    static_configs:
+      - targets: ["reaper:9090"]
+        labels: { role: reaper }
+
+  - job_name: farmd-recovery
+    static_configs:
+      - targets: ["recovery:9090"]
+        labels: { role: recovery }
+
+  - job_name: farmd-watchdog
+    static_configs:
+      - targets: ["watchdog:9090"]
+        labels: { role: watchdog }
+
+  # Scaled to two replicas in docker-compose.yml. Compose's DNS returns every
+  # container behind the service name, and dns_sd_configs follows all of them,
+  # so both jobrunners are scraped rather than whichever one the round robin
+  # happened to answer with. That matters for farm_jobrunner_* counters, which
+  # are per process.
+  - job_name: farmd-jobrunner
+    dns_sd_configs:
+      - names: ["jobrunner"]
+        type: A
+        port: 9090
+    relabel_configs:
+      - target_label: role
+        replacement: jobrunner
+
+  # Present in the compose file only when the janitor service is deployed; a
+  # missing job here is louder than a target that never answers.
+  - job_name: farmd-janitor
+    static_configs:
+      - targets: ["janitor:9090"]
+        labels: { role: janitor }
+
+  # The laptop path: one process running every loop. Scraped under its own job
+  # so a demo's numbers are never mistaken for a farm's.
+  - job_name: farmd-demo
+    static_configs:
+      - targets: ["demo:9090"]
+        labels: { role: demo }

@@ -1,0 +1,116 @@
+{{/*
+janitor — closes the rows whose process died, and can NEVER end a lease.
+
+farm.job_steps and farm.job_attempts have exactly one writer, internal/runner,
+and it only writes while it is running. A jobrunner evicted mid-step leaves its
+step 'running' and its attempt open, and internal/jobrunner only ever claims
+jobs that still hold a LIVE lease, so a job whose lease has ended is polled by
+nothing and shows a step executing that no process is executing. This role is
+the only thing in the system that closes those rows — and the bulk-run targets
+and recovery attempts a dead control plane leaves open the same way. Without it
+a farm deployed from this chart accumulates them forever: the dashboard reports
+work in progress that stopped hours ago, and an open recovery attempt refuses
+every further rung on its device.
+
+KEYED ON THE LEASE, NEVER ON THE CLOCK. A step is an orphan when its job has no
+live lease, or when its own attempt's lease is terminal — not because it has
+been running a long time. A six-hour shell_detached step is exactly what this
+system is for, and a sweep that closed it for looking stale would be
+DeviceFarmer/STF #663 wearing a different hat. A lease in 'held' or 'suspect'
+is live: suspect releases nothing and one heartbeat heals it. The two row kinds
+that carry no lease are judged by their own deadlines instead — a bulk target
+by the timeout its run was submitted with, a recovery attempt by the ladder's
+own stale threshold — and neither judgement can reach a lease.
+
+The barrier is structural rather than promised: internal/janitor does not
+import internal/lease, and farm.leases appears in its SQL only inside SELECT
+and EXISTS. Ending a lease stays the reaper's alone.
+
+SINGLE WRITER BY ELECTION, NOT BY REPLICA COUNT. The same Postgres session
+advisory lock as the scheduler and the reaper: a second replica idles and
+keeps beating, so janitor.replicaCount may be raised for a warm standby. There
+is no arming step on gain of leadership because there is nothing to refund —
+a row closed late costs a stale dashboard, never a device.
+
+FARM_DB_MAX_CONNS must be at least 2: one connection is pinned for the
+leadership lock.
+*/}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "device-farmer.componentName" (dict "ctx" $ "component" "janitor") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "device-farmer.labels" (dict "ctx" $ "component" "janitor") | nindent 4 }}
+spec:
+  replicas: {{ .Values.janitor.replicaCount }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      {{- include "device-farmer.selectorLabels" (dict "ctx" $ "component" "janitor") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "device-farmer.labels" (dict "ctx" $ "component" "janitor") | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        {{- include "device-farmer.configChecksums" . | nindent 8 }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- include "device-farmer.podPreamble" . | nindent 6 }}
+      # SIGTERM drains; it never releases. A janitor that goes away mid-sweep
+      # leaves an orphan open a little longer, and the next leader closes it
+      # on its first sweep. No row it closes is one a live process could
+      # still be writing — that is the lease test above, not the grace period.
+      terminationGracePeriodSeconds: {{ .Values.janitor.terminationGracePeriodSeconds }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- with .Values.janitor.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.janitor.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.janitor.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: janitor
+          image: {{ include "device-farmer.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["janitor"]
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          # No probes: this role serves no HTTP. Its liveness is
+          # farm.component_heartbeat, and "janitor" is deliberately NOT in
+          # FARM_REAPER_COMPONENTS: it is not on the lease renewal path, so
+          # its downtime refunds nothing to anyone — an orphan simply waits
+          # for the next leader.
+          envFrom:
+            {{- include "device-farmer.envFrom" . | nindent 12 }}
+          env:
+            {{- include "device-farmer.databaseEnv" (dict "ctx" $) | nindent 12 }}
+            {{- with .Values.janitor.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          resources:
+            {{- toYaml .Values.janitor.resources | nindent 12 }}
+          {{- with .Values.extraVolumeMounts }}
+          volumeMounts:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      {{- with .Values.extraVolumes }}
+      volumes:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

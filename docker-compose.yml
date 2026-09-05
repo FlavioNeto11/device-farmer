@@ -7,10 +7,14 @@
 # devices across two in-process fake ADB servers, driven by the REAL scheduler,
 # lease store, reaper and recovery ladder. No phone is attached.
 #
-# For a real farm, drop the `demo` service and use the per-role services at the
-# bottom instead, then run one `farmd node` per host that has devices plugged
-# into it — that one cannot run in this compose file, because it needs
-# /dev/bus/usb on the physical machine.
+# For a real farm, use the farm profile instead:
+#
+#   docker compose --profile farm up -d
+#
+# That starts the per-role services at the bottom and leaves the demo out —
+# the two are exclusive, see .env. Then run one `farmd node` per host that
+# has devices plugged into it; that one cannot run in this compose file,
+# because it needs /dev/bus/usb on the physical machine.
 
 name: device-farmer
 
@@ -60,10 +64,16 @@ services:
 
   # ---------------------------------------------------------------------
   # Laptop / evaluation: simulated hardware plus the real control plane.
-  # Comment this out and uncomment the per-role services for a real farm.
+  #
+  # Behind its own profile, and .env activates that profile by default, so a
+  # bare `docker compose up -d` is the demo and `--profile farm up -d` is
+  # not. Before the profile existed the farm command started this service
+  # too: simulated hardware writing into the same database as the real
+  # control plane, and a second bind of ${FARM_PORT} that failed.
   # ---------------------------------------------------------------------
   demo:
     <<: *farmd
+    profiles: ["demo"]
     environment:
       <<: *farmd-env
       FARM_API_ADDR: "0.0.0.0:8080"
@@ -112,6 +122,15 @@ services:
     # design: it elects itself with a Postgres advisory lock, so a second
     # replica idles rather than duplicating reclaims.
     command: ["reaper"]
+
+  janitor:
+    <<: *farmd
+    profiles: ["farm"]
+    # The only thing that closes a job step, attempt, bulk target or recovery
+    # attempt whose process died. A step is an orphan when its LEASE is dead,
+    # never when it is slow, and nothing here can end a lease. The same
+    # advisory-lock singleton as the reaper: a second replica idles.
+    command: ["janitor"]
 
   watchdog:
     <<: *farmd

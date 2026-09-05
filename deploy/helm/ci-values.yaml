@@ -1,0 +1,50 @@
+# The values CI renders the chart with (.github/workflows/ci.yml, `make ci-helm`).
+#
+# The chart refuses to render without a database, so this is the smallest file
+# the guards in templates/_helpers.tpl admit — plus every optional object
+# switched ON. A template that only renders behind a flag is a template a
+# default render never compiles, and it would break unnoticed until somebody
+# enabled it in production. Nothing here is a real credential or a real host.
+database:
+  dsn: postgres://farm:ci@postgres.ci.svc:5432/device_farmer?sslmode=disable
+
+auth:
+  tokens: "ci-token:operator:ci,ci-dash:tenant:dashboard"
+
+# One host of each address kind, so both the EndpointSlice and the
+# ExternalName branches of templates/hosts.yaml are rendered.
+hosts:
+  - id: h01
+    adbEndpoint: ci-device-farmer-h01-adb:5037
+    service:
+      enabled: true
+      address: 10.20.0.11
+      port: 5037
+  - id: h02
+    adbEndpoint: h02.lab.example.com:5037
+    service:
+      enabled: true
+      address: h02.lab.example.com
+
+api:
+  ingress:
+    enabled: true
+    hosts:
+      - host: device-farmer.ci.example.com
+        paths:
+          - path: /
+            pathType: Prefix
+
+artifacts:
+  persistence:
+    enabled: true
+    existingClaim: device-farmer-artifacts
+
+serviceMonitor:
+  enabled: true
+
+prometheusRule:
+  enabled: true
+  # Off by default for a reason documented in values.yaml; on here only so the
+  # roles group is compiled.
+  roleScrape: true

@@ -1,0 +1,140 @@
+# Three jobs, one per way this tree can rot without anyone noticing.
+#
+#   go     build, vet, gofmt, and the suite with NO database. The SQL-backed
+#          tests skip themselves when DATABASE_URL is unset, and that skip
+#          path has to stay green or the suite stops being run on laptops.
+#   sql    the schema applied from empty, every test/assertions*.sql run to
+#          its PASSED notice, and the suite again WITH a database. The second
+#          run is the one that matters: deploy/helm/README.md shows which
+#          lease-fencing regressions only that run can catch.
+#   helm   lint and render the chart, and prove the render-time guards still
+#          refuse a release that names no database.
+#
+# The Makefile's `ci` target runs the same three locally.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  go:
+    name: go — no database
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go build ./...
+      - run: go vet ./...
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          test -z "$unformatted" || { echo "gofmt would rewrite:"; echo "$unformatted"; exit 1; }
+      - name: go test with DATABASE_URL unset
+        # Unset explicitly rather than assumed. This job proves the skip path,
+        # and a DATABASE_URL inherited from the runner would test something
+        # else while reporting the same green.
+        run: |
+          unset DATABASE_URL
+          go test -count=1 ./...
+
+  sql:
+    name: sql — schema, assertions, database-backed tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: farm
+          POSTGRES_PASSWORD: farm
+          POSTGRES_DB: device_farmer
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U farm -d device_farmer"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+    env:
+      # The Go tests create and drop a scratch database per package from this
+      # DSN and never touch device_farmer itself; the assertion files run
+      # inside a transaction they roll back. farm is the image's superuser, so
+      # CREATEDB needs no separate grant.
+      DATABASE_URL: postgres://farm:farm@127.0.0.1:5432/device_farmer?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: psql
+        run: command -v psql >/dev/null || sudo apt-get install -y --no-install-recommends postgresql-client
+      - name: migrate up, from empty
+        run: go run ./cmd/farmd migrate up
+      - name: assertions
+        # Globbed, not listed, for the reason the Makefile gives: a proof no
+        # job invokes is a proof nobody checks. ON_ERROR_STOP turns a failed
+        # assertion into a nonzero exit; the PASSED check catches a file that
+        # stopped short of its own last assertion without erroring.
+        run: |
+          for f in test/assertions*.sql; do
+            echo "== $f"
+            out="$(psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$f" 2>&1)" || { echo "$out"; exit 1; }
+            echo "$out" | grep -E 'ok |PASSED' || true
+            echo "$out" | grep -q 'PASSED' || { echo "$f ran without error but never reported PASSED"; echo "$out"; exit 1; }
+          done
+      - name: go test with DATABASE_URL set
+        run: go test -count=1 ./...
+
+  helm:
+    name: helm — lint, render, guards
+    runs-on: ubuntu-latest
+    env:
+      CHART: deploy/helm/device-farmer
+      VALUES: deploy/helm/ci-values.yaml
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - name: lint
+        # With the values file, not bare. Helm 4 logs a template `fail` at INFO
+        # and reports 0 failed, so a bare lint of this chart passes while the
+        # chart refuses to install. Lint the way it is installed.
+        run: helm lint "$CHART" -f "$VALUES"
+      - name: render with everything switched on
+        run: helm template ci "$CHART" -n device-farmer -f "$VALUES" > /dev/null
+      - name: render with defaults and a DSN only
+        run: helm template ci "$CHART" -n device-farmer --set database.dsn=postgres://farm@pg:5432/device_farmer > /dev/null
+      - name: render with both credentials from existing Secrets
+        run: |
+          helm template ci "$CHART" -n device-farmer -f "$VALUES" \
+            --set database.dsn="" --set database.existingSecret=farm-postgres \
+            --set auth.tokens=""   --set auth.existingSecret=farm-api-tokens > /dev/null
+      - name: every control-plane role renders a Deployment
+        # The binary had the janitor role long before the chart deployed it,
+        # and nothing said so. A role added to cmd/farmd and not here fails
+        # this step instead of surfacing as orphaned rows in production.
+        run: |
+          for role in api scheduler reaper recovery jobrunner janitor watchdog; do
+            helm template ci "$CHART" -n device-farmer -f "$VALUES" -s "templates/$role.yaml" \
+              | grep -q '^kind: Deployment$' || { echo "templates/$role.yaml renders no Deployment"; exit 1; }
+          done
+      - name: the guards still refuse
+        run: |
+          if helm template ci "$CHART" -n device-farmer > /dev/null 2>&1; then
+            echo "rendered with no database configured"; exit 1
+          fi
+          if helm template ci "$CHART" -n device-farmer -f "$VALUES" --set database.existingSecret=farm-postgres > /dev/null 2>&1; then
+            echo "rendered with database.dsn AND database.existingSecret"; exit 1
+          fi
+          if helm template ci "$CHART" -n device-farmer -f "$VALUES" --set config.db.maxConns=1 > /dev/null 2>&1; then
+            echo "rendered with config.db.maxConns=1"; exit 1
+          fi

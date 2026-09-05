@@ -123,6 +123,22 @@ const (
 	demoGrace = 5 * time.Minute
 )
 
+// feederCreatedBy is farm.jobs.created_by on every job this simulation queues,
+// and the whole of what tells its own traffic from somebody else's.
+//
+// The simulation is a holder: it acquires through farm.lease_acquire, renews,
+// and releases when ITS model of the work is done — a model built from the
+// step COUNT, not from what the steps say. That is fine for the jobs it wrote.
+// It is wrong for a job an operator submitted through the API, which the real
+// scheduler and the real jobrunner in this same process are there to run: both
+// drivers would take it, the simulation would release the lease on its own
+// four-second timetable, and the operator's steps would be abandoned in
+// farm.job_steps still marked running, under a log line saying "job complete".
+//
+// So the simulation schedules only what it fed. Everything else goes to the
+// real scheduler beside it, which is the honest demonstration anyway.
+const feederCreatedBy = "demo-feeder"
+
 // The flap damper has no parameters of its own here. observeSQL is handed
 // watchdog.DefaultFlapCap, DefaultFlapRefill, DefaultMinBad and DefaultMinGood
 // — the values the real watchdog running beside this simulation uses — because
@@ -934,10 +950,8 @@ func (r *Runner) feederLoop(ctx context.Context) {
 		case <-tick.C:
 		}
 
-		var queued int
-		if err := r.pool.QueryRow(ctx,
-			`SELECT count(*) FROM farm.jobs WHERE state = 'queued' AND pool_id = $1`,
-			r.poolID()).Scan(&queued); err != nil {
+		queued, err := r.feederBacklog(ctx)
+		if err != nil {
 			if !errors.Is(err, context.Canceled) {
 				r.log.Warn("demo: counting queued jobs", "err", err)
 			}
@@ -1077,7 +1091,7 @@ RETURNING id::text`
 	var id string
 	if err := r.pool.QueryRow(ctx, q,
 		DefaultTenant, DefaultQueue, r.poolID(), string(spec),
-		iv(expected), maxRuntime, iv(demoTTL), iv(demoGrace), policy, "demo-feeder",
+		iv(expected), maxRuntime, iv(demoTTL), iv(demoGrace), policy, feederCreatedBy,
 	).Scan(&id); err != nil {
 		return fmt.Errorf("demo: insert job: %w", err)
 	}
@@ -1129,13 +1143,17 @@ SELECT j.id::text, j.state,
        COALESCE(jsonb_array_length(j.spec->'steps'), 8)
   FROM farm.jobs j
  WHERE j.pool_id = $1
+   -- Only this simulation's own traffic; see feederCreatedBy. A job somebody
+   -- submitted through the API belongs to the real scheduler and the real
+   -- jobrunner, which run in this same process.
+   AND j.created_by = $2
    AND (j.state = 'queued'
         OR (j.state = 'running'
             AND EXISTS (SELECT 1 FROM farm.leases l
                          WHERE l.job_id = j.id AND l.state IN ('held','suspect'))))
  ORDER BY j.state DESC, j.created_at
  LIMIT 20`
-	rows, err := r.pool.Query(ctx, q, r.poolID())
+	rows, err := r.pool.Query(ctx, q, r.poolID(), feederCreatedBy)
 	if err != nil {
 		return nil, err
 	}
@@ -2398,6 +2416,22 @@ func (r *Runner) sleep(ctx context.Context, d time.Duration) bool {
 	case <-t.C:
 		return true
 	}
+}
+
+// feederBacklog is how many of the SIMULATION'S OWN jobs are waiting.
+//
+// Its own, for the same reason schedulableJobs reads only its own rows: the
+// feeder stops generating traffic at five queued jobs, so counting jobs it did
+// not queue means five submissions parked behind a stopped scheduler silence
+// the simulation, and the demo looks idle for a reason nothing on screen
+// explains.
+func (r *Runner) feederBacklog(ctx context.Context) (int, error) {
+	var n int
+	err := r.pool.QueryRow(ctx,
+		`SELECT count(*) FROM farm.jobs
+          WHERE state = 'queued' AND pool_id = $1 AND created_by = $2`,
+		r.poolID(), feederCreatedBy).Scan(&n)
+	return n, err
 }
 
 func (r *Runner) poolID() string {

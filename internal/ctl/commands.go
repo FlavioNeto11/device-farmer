@@ -1756,11 +1756,28 @@ func cmdRecovery(ctx context.Context, s *session, args []string) error {
 	g.bind(fs)
 	dev := fs.String("device", "", "only attempts against this device")
 	host := fs.String("host", "", "only attempts on this host")
+	// Server-side filters. They are sent as query parameters and applied by
+	// the API; a server that predates them answers with the unfiltered newest
+	// --limit rows, which is caught below rather than shown as though it were
+	// the filtered set.
+	outcome := fs.String("outcome", "", "server-side filter: only attempts with this outcome "+
+		"(recovered, no_change, failed, refused, aborted)")
+	tier := fs.Int("tier", 0, "server-side filter: only attempts at this tier")
+	hubFlag := fs.String("hub", "", "server-side filter: only attempts on this hub id")
+	since := fs.String("since", "", "server-side filter: only attempts started within this long ago, e.g. 24h")
 	limit := fs.Int("limit", 100, "maximum attempts to return")
 	if rest, err := parseArgs(fs, args); err != nil {
 		return err
 	} else if len(rest) > 0 {
 		return usageErrf("recovery takes no arguments")
+	}
+	if *tier < 0 {
+		return usageErrf("--tier must be a tier number from the ladder, not %d", *tier)
+	}
+	if *since != "" {
+		if _, err := time.ParseDuration(*since); err != nil {
+			return usageErrf("--since %q is not a duration (want e.g. 30m, 24h)", *since)
+		}
 	}
 	e, err := s.open(&g)
 	if err != nil {
@@ -1770,11 +1787,30 @@ func cmdRecovery(ctx context.Context, s *session, args []string) error {
 	q := url.Values{}
 	setIf(q, "device", *dev)
 	setIf(q, "host", *host)
+	setIf(q, "outcome", *outcome)
+	if *tier > 0 {
+		q.Set("tier", strconv.Itoa(*tier))
+	}
+	setIf(q, "hub", *hubFlag)
+	setIf(q, "since", *since)
 	q.Set("limit", strconv.Itoa(*limit))
 
 	resp, raw, err := fetch[recoveryResponse](ctx, e.client, apiPrefix+"/recovery", q)
 	if err != nil {
 		return err
+	}
+	if kept, dropped := recoveryFilterLocally(resp.Attempts, *outcome, *tier, *hubFlag); dropped > 0 {
+		// The server ignored a filter it does not know. Showing its answer
+		// as though it were the filtered set would let "no refused attempts
+		// in the last hundred" read as "no refused attempts". The JSON view
+		// still carries the server's own bytes, so the warning is the only
+		// thing a pipeline gets — which is why it is on stderr, where a
+		// pipeline cannot swallow it.
+		e.warnf("this server does not filter recovery attempts by outcome, tier or hub: %d of the "+
+			"%d newest attempts it returned did not match. Attempts older than those %d were not "+
+			"searched; raise --limit to reach further back.",
+			dropped, len(resp.Attempts), len(resp.Attempts))
+		resp.Attempts = kept
 	}
 	if e.format == FormatJSON {
 		return e.out.RawJSON(raw)
@@ -1822,6 +1858,35 @@ func cmdRecovery(ctx context.Context, s *session, args []string) error {
 	e.out.Text("a REFUSAL is the ladder declining to act because a live lease's disruption " +
 		"policy forbids that blast radius. It is the system working, not a fault.")
 	return nil
+}
+
+// recoveryFilterLocally applies the exact-match recovery filters to what the
+// server sent back, and reports how many rows did not satisfy them.
+//
+// On a server that honours the filters every row matches and this is a no-op.
+// On one that does not, the rows it drops are the evidence that the filter was
+// ignored, which is what lets the caller say so instead of silently showing
+// the wrong set. --since is not re-applied: its meaning depends on the server's
+// clock, and a local re-derivation would decide it against this machine's.
+func recoveryFilterLocally(attempts []recoveryAttempt, outcome string, tier int, hub string) (kept []recoveryAttempt, dropped int) {
+	outcome = strings.TrimSpace(outcome)
+	hub = strings.TrimSpace(hub)
+	if outcome == "" && tier <= 0 && hub == "" {
+		return attempts, 0
+	}
+	kept = make([]recoveryAttempt, 0, len(attempts))
+	for _, a := range attempts {
+		switch {
+		case outcome != "" && (a.Outcome == nil || *a.Outcome != outcome):
+		case tier > 0 && a.Tier != tier:
+		case hub != "" && (a.HubID == nil || strconv.FormatInt(*a.HubID, 10) != hub):
+		default:
+			kept = append(kept, a)
+			continue
+		}
+		dropped++
+	}
+	return kept, dropped
 }
 
 // quarantineWhere renders a quarantine's position.
@@ -2097,11 +2162,17 @@ func (e *env) renderBulkRun(resp bulkGetResponse) error {
 // format. A target's failure is a command or transport failure on one phone
 // and never an allocation event: the run's own rows record which, and nothing
 // about a failed target releases that device.
+//
+// It is ErrPartial rather than a bare error so the exit code says which kind
+// of failure this was. The run completed and the server holds every target's
+// row; a script that treated this like "could not reach the API" would re-run
+// the whole wave to recover from nine phones that were already recorded.
 func bulkOutcome(r bulkRun) error {
 	if r.Errors == 0 {
 		return nil
 	}
-	return fmt.Errorf("%d of %d targets failed", r.Errors, r.Targets)
+	return fmt.Errorf("%w: %d of %d targets failed; the run completed and its rows are on the server",
+		ErrPartial, r.Errors, r.Targets)
 }
 
 func bulkTargetDetail(t bulkTarget) string {
@@ -2282,6 +2353,14 @@ func (e *env) previewSelector(ctx context.Context, sel bulkSelector) (racks []st
 // ---------------------------------------------------------------------------
 
 func cmdArtifacts(ctx context.Context, s *session, args []string) error {
+	if len(args) > 0 {
+		switch args[0] {
+		case "gc":
+			return cmdArtifactsGC(ctx, s, args[1:])
+		case "delete":
+			return cmdArtifactsDelete(ctx, s, args[1:])
+		}
+	}
 	fs := newFlags("artifacts", s.err)
 	var g globals
 	g.bind(fs)
@@ -2291,7 +2370,7 @@ func cmdArtifacts(ctx context.Context, s *session, args []string) error {
 	if rest, err := parseArgs(fs, args); err != nil {
 		return err
 	} else if len(rest) > 0 {
-		return usageErrf("artifacts takes no arguments; did you mean `ctl push %s`?", rest[0])
+		return usageErrf("artifacts takes gc or delete, not %q; to upload a file use `ctl push %s`", rest[0], rest[0])
 	}
 	e, err := s.open(&g)
 	if err != nil {

@@ -71,6 +71,21 @@ const (
 	EnvMigrationsDir    = "FARM_MIGRATIONS_DIR"
 )
 
+// U15 — artifact GC.
+//
+// The blob sweep behind POST /api/v1/artifacts/gc only considers a blob older
+// than this. artifacts.Store.Put commits the bytes and THEN writes the row
+// that names them, so a blob with no row is either garbage or an upload in
+// flight, and age is the only thing that tells the two apart. The floor
+// mirrors api.MinBlobGCGrace the way the lease floors mirror the schema's
+// CHECK constraints: the api package refuses a shorter grace at construction,
+// and a process that would inevitably be refused should not finish booting.
+const (
+	EnvArtifactGCGrace     = "FARM_ARTIFACT_GC_GRACE"
+	DefaultArtifactGCGrace = time.Hour
+	MinArtifactGCGrace     = time.Minute
+)
+
 // Mirrors of CHECK constraints in migrations/00001_core.sql. Duplicated on
 // purpose: the database is the authority, but a process that would inevitably
 // violate the authority should never finish booting.
@@ -280,6 +295,10 @@ type Config struct {
 	MigrationsTable  string
 	MigrationsDir    string
 
+	// ArtifactGCGrace is how old a blob must be before the artifact sweep
+	// will consider it. See EnvArtifactGCGrace.
+	ArtifactGCGrace time.Duration
+
 	// role is the subcommand this process was started as. It is kept apart
 	// from Component because Component is operator-overridable via
 	// FARM_COMPONENT, and the BLOCKER 8 assertion in Validate has to key on
@@ -345,6 +364,7 @@ func Load(component string, opts ...Option) (*Config, error) {
 		WatchdogInterval: l.dur(EnvWatchdogInterval, DefaultWatchdogEvery),
 		MigrationsTable:  l.str(EnvMigrationsTable, DefaultMigrationsTable),
 		MigrationsDir:    l.str(EnvMigrationsDir, ""),
+		ArtifactGCGrace:  l.dur(EnvArtifactGCGrace, DefaultArtifactGCGrace),
 	}
 
 	// Parse errors first: validating a value we failed to parse produces
@@ -647,6 +667,12 @@ Fix by raising %s above %s + %s, or by lowering the proxy's self-fence timeout.`
 	if c.WatchdogInterval <= 0 {
 		fail("%s must be positive", EnvWatchdogInterval)
 	}
+	if c.ArtifactGCGrace < MinArtifactGCGrace {
+		fail("%s (%s) is below %s. The artifact sweep treats a blob with no row as garbage "+
+			"once it is this old, and artifacts.Store.Put commits the bytes before it writes "+
+			"the row; a shorter grace deletes content whose row is being written right now",
+			EnvArtifactGCGrace, c.ArtifactGCGrace, MinArtifactGCGrace)
+	}
 	// The metrics address is a listener now, so a malformed one is a bind
 	// failure at startup rather than a string nobody reads.
 	if c.bindsMetrics() {
@@ -737,6 +763,8 @@ func (c *Config) Summary() string {
 		c.Reaper.Interval, c.Reaper.Batch, c.Reaper.GapFloor,
 		strings.Join(c.Reaper.Components, ","))
 	fmt.Fprintf(&b, "shutdown grace   = %s (drains requests; releases nothing)\n", c.ShutdownGrace)
+	fmt.Fprintf(&b, "artifact gc      = grace %s; a blob younger than this is never swept, "+
+		"and nothing sweeps unless an operator asks\n", c.ArtifactGCGrace)
 	return b.String()
 }
 

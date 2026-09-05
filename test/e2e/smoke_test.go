@@ -50,7 +50,7 @@ func TestFarmComesUpAndPlacesAJob(t *testing.T) {
 	// The operator command line, against the same API and over the same
 	// socket. `ctl` opens no database connection, so a ctl that works is
 	// evidence the API works.
-	out, code := f.Ctl(t, "fleet")
+	out, _, code := f.Ctl(t, "fleet")
 	if code != 0 {
 		t.Fatalf("ctl fleet exited %d, want 0", code)
 	}

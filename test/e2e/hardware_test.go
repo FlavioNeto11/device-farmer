@@ -48,10 +48,18 @@ func (f *farm) startHardware(t *testing.T) {
 	}
 
 	for _, host := range f.seed.Hosts {
+		// EVERY seeded host gets a server, including one the seeder left
+		// empty. Skipping it used to leave farm.hosts.adb_endpoint at the
+		// seeder's placeholder 127.0.0.1:5037 — which is the default port of
+		// a REAL adb daemon. A developer with a phone plugged in, or with
+		// Android Studio running, would have had the watchdog and the
+		// jobrunner dial their actual hardware from a test, and the failure
+		// would have read as a farm bug.
+		//
+		// An empty host is not a hypothetical: Devices caps how many slots are
+		// occupied, so any scenario that seeds fewer devices than positions
+		// gets one, and that is what a half-built rack looks like.
 		devs := byHost[host]
-		if len(devs) == 0 {
-			continue
-		}
 		srv, err := fakeadb.New()
 		if err != nil {
 			t.Fatalf("starting the fake adb server for %s: %v", host, err)

@@ -28,10 +28,24 @@ import (
 // runs beside a control plane that is doing real work on a real database.
 const httpTimeout = 30 * time.Second
 
-// maxBody bounds what a failure message may quote. The fleet listing of a
+// maxBody bounds what a FAILURE MESSAGE may quote. It is not a limit on what
+// may be read: the cap used to sit on the read, so a valid answer larger than
+// it was decoded from a truncation and every accessor then reported that the
+// API had not returned JSON. Measured on this package's own default seed, GET
+// /api/v1/fleet is 15,588 bytes against this 16 KiB — less than one more
+// device row of headroom.
+//
+// readCeiling is the separate, generous guard against a runaway response. It
+// exists so a bug cannot hang a scenario on an endless body, and exceeding it
+// is reported as the harness's doing rather than the API's.
+//
+// The fleet listing of a
 // seeded farm is a few kilobytes; anything much larger is not evidence, it is
 // scrollback.
-const maxBody = 16 << 10
+const (
+	maxBody     = 16 << 10
+	readCeiling = 8 << 20
+)
 
 // apiResponse is one answer from the API, kept whole so that any assertion
 // about it can quote it.
@@ -104,9 +118,17 @@ func (f *farm) request(t *testing.T, method, as, path string, body any) apiRespo
 	defer func() { _ = hres.Body.Close() }()
 
 	res.Status = hres.StatusCode
-	res.Body, err = io.ReadAll(io.LimitReader(hres.Body, maxBody))
+	// Read one byte past the ceiling so a body AT the ceiling can be told from
+	// one over it, and say which happened. A silent cut here is the worst of
+	// both worlds: the scenario fails, and it fails accusing the wrong party.
+	res.Body, err = io.ReadAll(io.LimitReader(hres.Body, readCeiling+1))
 	if err != nil {
 		t.Fatalf("%s: reading the response: %v", res.Request, err)
+	}
+	if len(res.Body) > readCeiling {
+		t.Fatalf("%s answered more than %d bytes. The harness stopped reading; the API did "+
+			"not stop writing. Either the endpoint has a runaway response or this scenario "+
+			"asked for far more than it meant to.", res.Request, readCeiling)
 	}
 	var obj map[string]any
 	if json.Unmarshal(res.Body, &obj) == nil {
@@ -129,6 +151,12 @@ func (r apiResponse) text() string {
 	s := strings.TrimSpace(string(r.Body))
 	if s == "" {
 		return "<empty>"
+	}
+	if len(s) > maxBody {
+		// Say who did the cutting. A failure message that ends mid-token
+		// invites the reader to debug a response that was never malformed.
+		return s[:maxBody] + fmt.Sprintf("\n… (%d more bytes elided by the test harness, "+
+			"not by the API)", len(s)-maxBody)
 	}
 	return s
 }
@@ -179,13 +207,13 @@ func (r apiResponse) str(t *testing.T, path ...string) string {
 // ctl's exit codes are part of its contract — 3 is "the remote refused", 4 is
 // "the run completed and some targets failed" — and a harness that swallowed
 // them would make the two cases scripts care most about untestable.
-func (f *farm) Ctl(t *testing.T, args ...string) (string, int) {
+func (f *farm) Ctl(t *testing.T, args ...string) (stdout, stderr string, exit int) {
 	t.Helper()
 	return f.CtlAs(t, "operator", args...)
 }
 
 // CtlAs is Ctl with a chosen credential, for asserting what a tenant may not do.
-func (f *farm) CtlAs(t *testing.T, as string, args ...string) (string, int) {
+func (f *farm) CtlAs(t *testing.T, as string, args ...string) (stdout, stderr string, exit int) {
 	t.Helper()
 	token, ok := f.tokens[as]
 	if !ok {
@@ -199,12 +227,16 @@ func (f *farm) CtlAs(t *testing.T, as string, args ...string) (string, int) {
 		config.EnvAPIBaseURL+"="+f.apiURL,
 		ctl.EnvAPIToken+"="+token,
 	)
-	out, code, err := runBinary(t, httpTimeout, env, append([]string{"ctl"}, args...)...)
+	stdout, stderr, code, err := runBinary(t, httpTimeout, env, append([]string{"ctl"}, args...)...)
 	if err != nil {
-		t.Fatalf("running farmd ctl %s: %v", strings.Join(args, " "), err)
+		t.Fatalf("running farmd ctl %s: %v\nstderr: %s",
+			strings.Join(args, " "), err, strings.TrimRight(stderr, "\r\n"))
 	}
-	t.Logf("ctl %s -> exit %d\n%s", strings.Join(args, " "), code, strings.TrimRight(out, "\r\n"))
-	return out, code
+	// Both streams are logged, because a scenario that fails on the parsed
+	// stdout usually needs the warning ctl put on stderr to understand why.
+	t.Logf("ctl %s -> exit %d\nstdout:\n%s\nstderr:\n%s", strings.Join(args, " "), code,
+		strings.TrimRight(stdout, "\r\n"), strings.TrimRight(stderr, "\r\n"))
+	return stdout, stderr, code
 }
 
 // Metrics scrapes one role's own /metrics listener and returns the exposition
@@ -246,6 +278,52 @@ func (f *farm) Metrics(t *testing.T, role string) string {
 // does not pay for it, slow enough that a condition running a query does not
 // become load on the same database the farm is using.
 const pollInterval = 250 * time.Millisecond
+
+// Consistently holds cond TRUE for the whole window, and fails the moment it
+// stops being true, naming how long it lasted.
+//
+// This is the shape most of this package's assertions actually need, and it is
+// not Eventually with the condition negated. Nearly every claim the system
+// makes about a lease is negative — the device went offline and the lease did
+// NOT end, the api was killed and the lease was NOT reclaimed, the ladder ran
+// and the holder did NOT change — and a negative checked once, at a moment the
+// test chose, passes on a farm where the wrong thing is about to happen. What
+// has to be shown is that it did not happen across the window where it could
+// have.
+//
+// It gives up early for the same reason Eventually does: if a role that should
+// be running has exited, nothing after that is evidence about anything, and
+// saying "held for 30s" would be a lie about a farm that was not running.
+func (f *farm) Consistently(t *testing.T, window time.Duration, desc string, cond func() error) {
+	t.Helper()
+
+	started := time.Now()
+	deadline := started.Add(window)
+	checks := 0
+
+	for {
+		checks++
+		if err := cond(); err != nil {
+			t.Fatalf("%s stopped holding after %s (%d checks): %v",
+				desc, time.Since(started).Round(time.Millisecond), checks, err)
+		}
+		if dead := f.deadRole(); dead != "" {
+			t.Fatalf("while holding %s: %s. Nothing after that is evidence, so this "+
+				"window (%s so far) proves nothing.",
+				desc, dead, time.Since(started).Round(time.Millisecond))
+		}
+		if time.Now().After(deadline) {
+			t.Logf("held %s for %s (%d checks)", desc,
+				time.Since(started).Round(time.Millisecond), checks)
+			return
+		}
+		select {
+		case <-t.Context().Done():
+			t.Fatalf("the test ended while holding %s: %v", desc, t.Context().Err())
+		case <-time.After(pollInterval):
+		}
+	}
+}
 
 // Eventually polls cond until it returns nil, and fails with the LAST error it
 // got — never with a bare "condition not met". desc completes the sentence

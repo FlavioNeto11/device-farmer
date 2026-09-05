@@ -6,6 +6,7 @@ package e2e
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -16,6 +17,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -99,6 +101,22 @@ func runSuite(m *testing.M) (code int) {
 	}
 	farmdBinary = bin
 
+	// Sweep what a PREVIOUS run could not clean up before starting this one.
+	//
+	// t.Cleanup does not run when the process does not get to finish: `go test
+	// -timeout` kills the binary, and so does Ctrl-C. Every scenario that was
+	// in flight then leaves a migrated scratch database behind, and there is no
+	// later moment at which that run can tidy up — the only process that will
+	// ever be in a position to do it is the next one. Without this the cluster
+	// accumulates df_e2e_* databases until somebody notices, and each one
+	// holds a full schema.
+	//
+	// Only this package's own names, only ones old enough that no concurrent
+	// run could own them, and failures are reported rather than fatal: a
+	// cluster that will not let us drop a stale database is not a reason to
+	// refuse to test the farm.
+	sweepStaleDatabases()
+
 	return m.Run()
 }
 
@@ -127,7 +145,23 @@ type farmOpts struct {
 	// everything the harness decided. This is the escape hatch for a scenario
 	// that needs a lease TTL, a reaper interval or a witness cadence other
 	// than the shipped defaults.
+	//
+	// The names the harness owns — the two addresses, the database, the
+	// component name and the token spec — are REFUSED here rather than
+	// applied, because overriding them does not fail, it desynchronises. See
+	// envFor, which names each one and what to use instead.
 	Env map[string]string
+
+	// Tenants are extra tenant credentials, keyed by the name a scenario will
+	// pass to f.get/f.post/f.Ctl, valued by the farm.tenants row each may see.
+	//
+	// The harness always mints "operator" and "tenant"; the second is scoped
+	// to the seeded tenant. A scenario about SCOPE needs two tenants that must
+	// not see each other, and a single credential cannot express that — which
+	// is why this is a field and not a constant. The tenant rows are created
+	// if they do not exist, because farm.jobs will not reference one that does
+	// not.
+	Tenants map[string]string
 }
 
 // farm is one scenario's whole world.
@@ -259,14 +293,17 @@ func newFarm(t *testing.T, opts farmOpts) *farm {
 // missing fails here, in a test, instead of in an init container.
 func (f *farm) migrate(t *testing.T) error {
 	t.Helper()
-	out, code, err := runBinary(t, 3*time.Minute, cleanEnv(), "migrate", "up", "-dsn", f.dsn)
+	out, errOut, code, err := runBinary(t, 3*time.Minute, cleanEnv(), "migrate", "up", "-dsn", f.dsn)
 	if err != nil {
-		return fmt.Errorf("farmd migrate up: %w", err)
+		return fmt.Errorf("farmd migrate up: %w\n%s", err, strings.TrimSpace(errOut))
 	}
 	if code != 0 {
-		return fmt.Errorf("farmd migrate up exited %d:\n%s", code, out)
+		// goose names the failing migration on stderr; without it this error
+		// says only that the schema is not there.
+		return fmt.Errorf("farmd migrate up exited %d:\n%s\n%s", code,
+			strings.TrimSpace(out), strings.TrimSpace(errOut))
 	}
-	t.Logf("migrated %s: %s", f.dbName, strings.TrimSpace(lastLine(out)))
+	t.Logf("migrated %s: %s", f.dbName, strings.TrimSpace(lastLine(out+errOut)))
 	return nil
 }
 
@@ -378,8 +415,21 @@ func (f *farm) startRoles(t *testing.T) {
 		f.apiAddr = fmt.Sprintf("127.0.0.1:%d", freePort(t))
 		f.apiURL = "http://" + f.apiAddr
 	}
-	f.tokenSpec = fmt.Sprintf("%s:operator:e2e-operator,%s:tenant:e2e-tenant:%s",
-		f.tokens["operator"], f.tokens["tenant"], f.seed.Tenant)
+	specs := []string{
+		fmt.Sprintf("%s:operator:e2e-operator", f.tokens["operator"]),
+		fmt.Sprintf("%s:tenant:e2e-tenant:%s", f.tokens["tenant"], f.seed.Tenant),
+	}
+	for _, name := range sortedKeys(f.opts.Tenants) {
+		tenant := f.opts.Tenants[name]
+		if name == "operator" || name == "tenant" {
+			t.Fatalf("farmOpts.Tenants may not redefine %q, which every scenario relies on; "+
+				"pick another name", name)
+		}
+		f.ensureTenant(t, tenant)
+		f.tokens[name] = "e2e-" + name + "-" + randomish()
+		specs = append(specs, fmt.Sprintf("%s:tenant:e2e-%s:%s", f.tokens[name], name, tenant))
+	}
+	f.tokenSpec = strings.Join(specs, ",")
 
 	for _, name := range f.opts.Roles {
 		f.metricsAddr[name] = fmt.Sprintf("127.0.0.1:%d", freePort(t))
@@ -480,7 +530,39 @@ func (f *farm) envFor(role string) []string {
 	}
 	env[api.EnvAuthTokens] = f.tokenSpec
 
+	// A scenario may set anything EXCEPT what the harness has already told
+	// itself. It records the addresses it chose, the database it created and
+	// the credentials it minted, and then probes readiness, scrapes /metrics,
+	// signs requests and drops the database against those recorded values. An
+	// override here does not fail — it desynchronises: the role comes up
+	// perfectly on the address the scenario asked for, and the harness spends
+	// ninety seconds probing the one it remembers, then fails naming the role.
+	//
+	// The one that is not merely confusing is DATABASE_URL. Pointing a role at
+	// another farm's database defeats the single thing one-database-per-
+	// scenario exists to guarantee, and the damage lands in a scenario that
+	// did nothing wrong.
+	//
+	// So they are refused by name, with the reason and the way to get what was
+	// wanted. Everything else — timings, thresholds, knobs under test — is
+	// applied last and wins, which is the point of the field.
+	reserved := map[string]string{
+		config.EnvDatabaseURL: "each scenario gets its own database; pointing a role at " +
+			"another one puts a farm-wide sweep into somebody else's fixtures. Seed what " +
+			"you need with farmOpts.Seed instead",
+		config.EnvAPIAddr:    "the harness chose this port and probes it; use f.API(t)",
+		config.EnvAPIBaseURL: "derived from the port the harness chose; use f.API(t)",
+		config.EnvMetricsAddr: "the harness chose this port and reads readiness and /metrics " +
+			"from it; use f.Metrics(t, role)",
+		config.EnvComponent: "each role heartbeats under its own name and " +
+			"FARM_REAPER_COMPONENTS is derived from it; renaming one disarms the reaper",
+		api.EnvAuthTokens: "the harness mints the credentials f.get/f.post/f.Ctl sign with; " +
+			"add to farmOpts.Tokens instead",
+	}
 	for k, v := range f.opts.Env {
+		if why, no := reserved[k]; no {
+			f.t.Fatalf("farmOpts.Env sets %s, which the harness owns: %s", k, why)
+		}
 		env[k] = v
 	}
 
@@ -488,6 +570,33 @@ func (f *farm) envFor(role string) []string {
 	for k, v := range env {
 		out = append(out, k+"="+v)
 	}
+	return out
+}
+
+// ensureTenant creates a farm.tenants row if the scenario named one the seed
+// did not write. A token scoped to a tenant that does not exist authenticates
+// and then cannot file a job, which reads as an authorisation bug.
+func (f *farm) ensureTenant(t *testing.T, tenant string) {
+	t.Helper()
+	if tenant == "" {
+		t.Fatal("farmOpts.Tenants has an empty tenant id; a scoped token needs a row to scope to")
+	}
+	_, err := f.pool.Exec(t.Context(),
+		`INSERT INTO farm.tenants (id, name) VALUES ($1, $1) ON CONFLICT (id) DO NOTHING`, tenant)
+	if err != nil {
+		t.Fatalf("creating tenant %q for a scenario credential: %v", tenant, err)
+	}
+}
+
+// sortedKeys keeps the token spec, and so every role's environment, stable
+// across runs. Map order would make two identical runs differ in a way that is
+// invisible until something logs the spec.
+func sortedKeys(m map[string]string) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
 	return out
 }
 
@@ -714,21 +823,39 @@ func cleanEnv() []string {
 // combined output and the exit code; err is non-nil only when the process
 // could not be run at all, because an exit code is an answer and this suite
 // asserts on several of them.
-func runBinary(t *testing.T, timeout time.Duration, env []string, args ...string) (string, int, error) {
+func runBinary(t *testing.T, timeout time.Duration, env []string, args ...string) (stdout, stderr string, exit int, err error) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), timeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, farmdBinary, args...)
 	cmd.Env = env
-	out, err := cmd.CombinedOutput()
+	// Separate buffers, not CombinedOutput. ctl keeps the two streams apart on
+	// purpose — internal/ctl/ctl.go puts warnings and the blast-radius block on
+	// stderr so a listing stays machine-readable when it is piped into jq — and
+	// merging them here would hand a scenario a stdout that parses until the
+	// first run in which ctl warns about something.
+	var outBuf, errBuf bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &outBuf, &errBuf
+	runErr := cmd.Run()
+
+	// A timeout is the HARNESS killing the process, not the process choosing an
+	// exit code, and the two must not read the same. A ctl verb that legitimately
+	// exits 3 or 4 is part of its contract; a ctl verb that was killed at 30s is
+	// a hung API, and a scenario that cannot tell them apart will assert on the
+	// wrong one.
+	if ctx.Err() != nil {
+		return outBuf.String(), errBuf.String(), -1, fmt.Errorf(
+			"the harness killed `farmd %s` after %s: %w",
+			strings.Join(args, " "), timeout, ctx.Err())
+	}
 	switch {
-	case err == nil:
-		return string(out), 0, nil
+	case runErr == nil:
+		return outBuf.String(), errBuf.String(), 0, nil
 	case cmd.ProcessState != nil:
-		return string(out), cmd.ProcessState.ExitCode(), nil
+		return outBuf.String(), errBuf.String(), cmd.ProcessState.ExitCode(), nil
 	default:
-		return string(out), -1, err
+		return outBuf.String(), errBuf.String(), -1, runErr
 	}
 }
 
@@ -749,6 +876,57 @@ func scratchName(t *testing.T) string {
 	}
 	// Postgres identifiers stop at 63 bytes; this is comfortably inside.
 	return fmt.Sprintf("df_e2e_%s_%d_%d", safe, os.Getpid(), farmSeq.Add(1))
+}
+
+// sweepStaleDatabases drops scratch databases a killed run left behind.
+//
+// What makes this safe to run while other copies of this suite are running is
+// the connection test, not a clock: every live scenario holds a pgxpool
+// connection to its own database for its whole length, so a df_e2e_ database
+// with nothing connected is one nobody is using. Dropping a live one WITH
+// (FORCE) would take a working run down, which is why the query asks
+// pg_stat_activity rather than assuming from the name.
+//
+// The one window it cannot see is between another run's CREATE DATABASE and
+// its first connection — microseconds, and the loser gets a clear error from
+// its own migrate step rather than a corrupt run.
+func sweepStaleDatabases() {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	admin, err := pgxpool.New(ctx, adminDSN)
+	if err != nil {
+		return
+	}
+	defer admin.Close()
+
+	rows, err := admin.Query(ctx, `
+SELECT d.datname
+  FROM pg_database d
+  LEFT JOIN pg_stat_activity a ON a.datname = d.datname
+ WHERE d.datname LIKE 'df_e2e_%'
+ GROUP BY d.datname
+HAVING count(a.pid) = 0`)
+	if err != nil {
+		return
+	}
+	var stale []string
+	for rows.Next() {
+		var name string
+		if rows.Scan(&name) == nil {
+			stale = append(stale, name)
+		}
+	}
+	rows.Close()
+
+	for _, name := range stale {
+		if _, err := admin.Exec(ctx, "DROP DATABASE IF EXISTS "+quoteIdent(name)+" WITH (FORCE)"); err != nil {
+			fmt.Fprintf(os.Stderr, "e2e: a previous run left %s behind and it could not be "+
+				"dropped: %v\n", name, err)
+			continue
+		}
+		fmt.Fprintf(os.Stderr, "e2e: dropped %s, left behind by a run that did not finish\n", name)
+	}
 }
 
 // dsnFor rewrites the database name in the admin DSN, keeping every other

@@ -277,6 +277,17 @@ func (c *Client) PortPowerWithDomain(ctx context.Context, hostID, devpath string
 		OpRequest{HostID: hostID, Devpath: devpath, Acknowledged: acknowledged}, c.power)
 }
 
+// PowerBudget is how long this client gives one port power cycle, end to end:
+// resolving the host's address, dialling, the retries a dial-phase failure
+// earns, and the agent's own work all run under it.
+//
+// A caller that bounds a cycle with a context of its own needs this figure, and
+// needs to bound it no tighter: a caller whose deadline fires first learns only
+// that ITS clock ran out, while this client's would have come back with what
+// the agent said. The route that cycles a port for an operator sets its context
+// to this plus a grace for exactly that reason.
+func (c *Client) PowerBudget() time.Duration { return c.power }
+
 // Health reads GET /node/v1/health.
 //
 // An agent that answers with a different host_id than the one asked for is a

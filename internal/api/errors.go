@@ -79,6 +79,13 @@ const (
 	// reached or spoke nonsense. It says nothing about any lease.
 	CodeADBError = "adb_error"
 
+	// CodeHostAgent accompanies 502 when the farmd-node agent on a host could
+	// not be reached, or was reached and the hardware rung it attempted did
+	// not bring the device back. The detail says which. Like CodeADBError it
+	// says nothing about any lease: every lease in the power domain keeps its
+	// device, its fence and its deadline.
+	CodeHostAgent = "host_agent"
+
 	// CodeUINotMounted accompanies 404 at "/" when the binary was built or
 	// wired without the dashboard handler.
 	CodeUINotMounted = "ui_not_mounted"

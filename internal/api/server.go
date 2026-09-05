@@ -45,6 +45,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"reflect"
 	"sync"
 	"time"
 
@@ -56,6 +57,7 @@ import (
 	"github.com/flaviopadilha/device-farmer/internal/config"
 	"github.com/flaviopadilha/device-farmer/internal/lease"
 	"github.com/flaviopadilha/device-farmer/internal/obs"
+	"github.com/flaviopadilha/device-farmer/internal/recovery"
 )
 
 // Tuning constants that are not worth an environment variable.
@@ -126,6 +128,12 @@ type Server struct {
 
 	newExecutor   ExecutorFactory
 	execMaxOutput int
+
+	// hostRunner reaches the farmd-node agents, for the one operator action
+	// that needs hardware only a process on the device host can touch:
+	// POST /slots/{id}/power. Nil means this farm has no host agent, and that
+	// route answers 503 rather than opening an attempt nobody will close.
+	hostRunner recovery.HostRunner
 
 	uiMu sync.RWMutex
 	ui   http.Handler
@@ -222,6 +230,32 @@ func WithExecutorFactory(f ExecutorFactory) Option {
 		if f != nil {
 			s.newExecutor = f
 		}
+	}
+}
+
+// WithHostRunner supplies the farmd-node client through which
+// POST /api/v1/slots/{id}/power performs its VBUS cycle. It is the same
+// [recovery.HostRunner] the recovery ladder holds, and for the same reason: a
+// port power cycle happens on the device host, and the control plane can only
+// ask for it.
+//
+// A nil runner, typed or not, leaves the server as it was: the route then
+// answers 503 saying no agent is configured, which is what a nil *node.Client
+// means. The route also needs farm.hosts.node_endpoint for the slot's host —
+// that column is how the client cmd/farmd builds finds the agent — and a host
+// without one is answered 503 before any runner is asked.
+func WithHostRunner(r recovery.HostRunner) Option {
+	return func(s *Server) {
+		if r == nil {
+			return
+		}
+		// A typed nil — (*node.Client)(nil) in the interface — is not == nil,
+		// and stored it would have the route call methods on a nil client
+		// instead of saying that no agent is configured.
+		if v := reflect.ValueOf(r); v.Kind() == reflect.Pointer && v.IsNil() {
+			return
+		}
+		s.hostRunner = r
 	}
 }
 

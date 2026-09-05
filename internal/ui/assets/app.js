@@ -1768,10 +1768,16 @@ function wireConfirm() {
       return;
     }
     const ok = $('#confirm-ok'), cancel = $('#confirm-cancel');
+    const label = ok.textContent;
     ok.disabled = true; cancel.disabled = true;
+    // An action that blocks on hardware says so on the button while it waits,
+    // rather than looking like a click that did nothing.
+    if (pendingConfirm.busyLabel) ok.textContent = pendingConfirm.busyLabel;
     try {
-      await pendingConfirm.run(reason);
-      const done = pendingConfirm.done;
+      const res = await pendingConfirm.run(reason);
+      // done is a sentence, or a function of the server's answer for actions
+      // whose outcome is only known once the server has acted.
+      const done = typeof pendingConfirm.done === 'function' ? pendingConfirm.done(res) : pendingConfirm.done;
       $('#dlg-confirm').close();
       pendingConfirm = null;
       banner('ok', done);
@@ -1779,7 +1785,7 @@ function wireConfirm() {
     } catch (e) {
       showConfirmError(e);
     } finally {
-      ok.disabled = false; cancel.disabled = false;
+      ok.disabled = false; cancel.disabled = false; ok.textContent = label;
     }
   });
   $('#confirm-cancel').addEventListener('click', () => { $('#dlg-confirm').close(); pendingConfirm = null; });
@@ -1879,12 +1885,32 @@ function powerSlot(d) {
       'If this hub switches power per port, only this device is disturbed. If the domain is ganged, every device in it goes down with it.',
       'Worst case on this hub: ' + sameHub.length + ' other device' + (sameHub.length === 1 ? '' : 's') +
       ', of which ' + liveOnHub.length + ' currently hold a live lease.',
-      'The server checks the real power domain and refuses this if any live lease in it forbids the disruption. If it refuses, the reason appears here.'
+      'The server checks the real power domain and refuses this if any live lease in it forbids the disruption. If it refuses, the reason appears here.',
+      'The cycle happens while you wait: the host agent cuts VBUS, lets the port settle, restores it and waits for the port to enumerate again, which can take a couple of minutes. The answer is the agent’s outcome, written on the recovery attempt it closes.'
     ]),
     confirmLabel: 'Cut power to this slot',
-    done: 'Power cycle requested for slot ' + (d.rackSlot || d.slotID) + '.',
+    busyLabel: 'Cycling power — waiting for the host agent…',
+    done: (res) => powerCycleOutcome(d, res),
     run: (reason) => api.post('slots/' + encodeURIComponent(d.slotID) + '/power', { reason })
   });
+}
+
+/* The 200 body of POST /slots/{id}/power is the outcome of a cycle that has
+ * already happened, not an acknowledgement of a request, and the banner says
+ * what the server said: which attempt closed, as what, and how long the port
+ * took. A row the janitor had already closed is called out rather than
+ * claimed. */
+function powerCycleOutcome(d, res) {
+  const r = res || {};
+  const where = d.rackSlot || d.usbPath || ('slot ' + d.slotID);
+  const secs = r.elapsed_ms !== undefined ? Math.round(r.elapsed_ms / 1000) + 's' : null;
+  const port = 'VBUS was cut and restored for ' + where + (secs ? ' in ' + secs : '') +
+    '; the agent saw the port enumerate again. ADB health is the watchdog’s to confirm.';
+  if (r.attempt_id === undefined) return port;
+  const row = r.closed === false
+    ? ' Recovery attempt ' + r.attempt_id + ' had already been closed before this outcome arrived; the audit log carries it.'
+    : ' Recovery attempt ' + r.attempt_id + ' is closed as ' + (r.outcome || 'recovered') + '.';
+  return port + row;
 }
 
 function closeQuarantine(q) {

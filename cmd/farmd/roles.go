@@ -334,6 +334,28 @@ func runAPI(ctx context.Context, cfg *config.Config, log *slog.Logger, pool *pgx
 	}
 	opts = append(opts, api.WithAuthenticator(auth))
 
+	// POST /slots/{id}/power performs its VBUS cycle through the same node
+	// client the recovery ladder uses, resolved per host from
+	// farm.hosts.node_endpoint. Without the token the route answers 503 and
+	// records nothing, which is what a farm with no host agent can honestly
+	// say; it must not open an attempt row that nothing will ever close.
+	if token := os.Getenv("FARM_NODE_TOKEN"); token == "" {
+		log.Warn("no FARM_NODE_TOKEN set, so operator slot power cycles are unavailable",
+			"consequence", "POST /api/v1/slots/{id}/power answers 503 on every slot, "+
+				"and a port that needs its VBUS cut has to be cycled by hand",
+			"fix", "set FARM_NODE_TOKEN to the same value the farmd node agents use")
+	} else {
+		c, cerr := node.NewClient(node.ClientConfig{
+			Resolver: node.NewDBResolver(pool),
+			Token:    token,
+			Logger:   log.With("component", "node-client"),
+		})
+		if cerr != nil {
+			return fmt.Errorf("node client: %w", cerr)
+		}
+		opts = append(opts, api.WithHostRunner(c))
+	}
+
 	srv, err := api.New(cfg, pool, opts...)
 	if err != nil {
 		return err

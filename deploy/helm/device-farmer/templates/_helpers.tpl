@@ -192,18 +192,18 @@ internal/config accepts FARM_DB_MAX_CONNS >= 1, and it is right to: it does not
 know which roles this pool will serve. This chart does, and one connection is a
 deadlock it can see coming.
 
-The scheduler and the reaper each pin ONE connection for the whole life of the
-process — the session that holds their pg_try_advisory_lock leadership. With a
-pool of one, the winner holds the only connection and its own sweep can never
-get a second: the role comes up, logs that it acquired leadership, and then
-allocates or reclaims nothing, forever, without an error anywhere. That is the
-worst shape a failure can take in this system, so it is refused here rather
-than discovered from a queue that stopped moving.
+The scheduler, the reaper and the janitor each pin ONE connection for the whole
+life of the process — the session that holds their pg_try_advisory_lock
+leadership. With a pool of one, the winner holds the only connection and its
+own sweep can never get a second: the role comes up, logs that it acquired
+leadership, and then allocates, reclaims or closes nothing, forever, without an
+error anywhere. That is the worst shape a failure can take in this system, so
+it is refused here rather than discovered from a queue that stopped moving.
 */}}
 {{- define "device-farmer.checkPool" -}}
 {{- $max := .Values.config.db.maxConns | int -}}
 {{- if lt $max 2 -}}
-{{- fail (printf "\ndevice-farmer: config.db.maxConns is %d, and the minimum is 2.\n\nThe scheduler and the reaper each hold one connection for the entire life of\nthe process — the session carrying their leader-election advisory lock. A pool\nof one leaves the elected leader with nothing to work on: it reports that it\ntook leadership and then places no job and reclaims no lease, with no error to\nread. farmd accepts 1 because internal/config cannot know which role it is\nconfiguring; this chart deploys both roles from this one value.\n\nUse at least 2, and see the comment on config.db.maxConns in values.yaml for\nthe number the jobrunner wants.\n" $max) -}}
+{{- fail (printf "\ndevice-farmer: config.db.maxConns is %d, and the minimum is 2.\n\nThe scheduler, the reaper and the janitor each hold one connection for the\nentire life of the process — the session carrying their leader-election\nadvisory lock. A pool of one leaves the elected leader with nothing to work on:\nit reports that it took leadership and then places no job, reclaims no lease\nand closes no orphan, with no error to read. farmd accepts 1 because\ninternal/config cannot know which role it is configuring; this chart deploys\nall three roles from this one value.\n\nUse at least 2, and see the comment on config.db.maxConns in values.yaml for\nthe number the jobrunner wants.\n" $max) -}}
 {{- end -}}
 {{- end -}}
 

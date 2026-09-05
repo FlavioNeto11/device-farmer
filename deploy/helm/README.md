@@ -2,11 +2,11 @@
 
 The control plane belongs in a cluster. The thing it controls does not.
 
-This directory holds a Helm chart for the six control-plane roles — `api`,
-`scheduler`, `reaper`, `recovery`, `jobrunner`, `watchdog` — plus the schema
-migration that has to succeed before any of them start. It deliberately does
-not deploy the seventh role, `node`, and the first section below explains why
-that split cannot be helped.
+This directory holds a Helm chart for the seven control-plane roles — `api`,
+`scheduler`, `reaper`, `recovery`, `jobrunner`, `janitor`, `watchdog` — plus
+the schema migration that has to succeed before any of them start. It
+deliberately does not deploy the eighth role, `node`, and the first section
+below explains why that split cannot be helped.
 
 ```
 helm upgrade --install farm ./device-farmer \
@@ -181,6 +181,7 @@ that variable and `hosts[].adbEndpoint` should name the same endpoint.
 | Deployment + Service + PDB | `api` | `/healthz` liveness (no database), `/readyz` readiness (pings Postgres), `/metrics`, and the dashboard at `/`. Spread across nodes; `maxUnavailable: 0`. |
 | Deployment | `scheduler` | Single writer by **advisory-lock election**, not by replica count. Extra replicas idle. |
 | Deployment | `reaper` | Same election. The only automatic release path in the system. On every gain of leadership it calls `farm.reaper_arm` before its first sweep, which is what makes rolling it safe. |
+| Deployment | `janitor` | Same election. The only thing that closes a `farm.job_steps`, `job_attempts`, `bulk_targets` or `recovery_attempts` row whose process died. A step is an orphan when its **lease** is dead, never when it is slow; the two row kinds that carry no lease go by the run's own timeout and the ladder's own stale threshold. It cannot end a lease: the package does not import `internal/lease`. |
 | Deployment | `recovery` | Serialised per device by a transaction-scoped advisory lock. |
 | Deployment | `jobrunner` | **Scales.** Jobs are claimed with `SKIP LOCKED` plus a per-job advisory lock, and a lease is re-attached by `job_id`, so two replicas never fight over one device. |
 | Deployment ×N | `watchdog` | One per entry in `hosts[]`, replicas pinned at 1: there is no election, and a second replica would only double the probe rate against that host's single ADB server. |
@@ -239,7 +240,7 @@ migration hook runs and before anything exists in the cluster.
 | Neither `database.dsn` nor `database.existingSecret` | There is no default DSN. A control plane silently pointed at the wrong database is worse than one that will not start. |
 | **Both** of them | `existingSecret` wins and `dsn` renders nowhere. Every pod would read a database the operator did not name, while the one they typed appears in no object. |
 | **Both** `auth.tokens` and `auth.existingSecret` | Same shape, worse direction: editing `auth.tokens` to *revoke* a leaked credential would look like a clean upgrade and change nothing. |
-| `config.db.maxConns` < 2 | The scheduler and reaper each pin one connection for their leader-election lock. A pool of one leaves the elected leader with nothing to work with: it reports leadership, then places no job and reclaims no lease, forever, silently. |
+| `config.db.maxConns` < 2 | The scheduler, reaper and janitor each pin one connection for their leader-election lock. A pool of one leaves the elected leader with nothing to work with: it reports leadership, then places no job, reclaims no lease and closes no orphan, forever, silently. |
 | `api.terminationGracePeriodSeconds` ≤ `config.shutdownGrace` | The kubelet would SIGKILL the api mid-drain. On every rolling deploy the request most likely to be cut off is a renewal one round trip from success. |
 | A `hosts[].id` that is not a DNS-1123 label, or repeated | It becomes a Deployment name and a Service name. `farm.hosts.id` is unconstrained `text` in the schema, so an id that is legal in Postgres and illegal in Kubernetes is ordinary — and a repeated id means one machine silently loses its watchdog. |
 | A `hosts[].service.address` carrying a port or a scheme | It becomes an EndpointSlice address or an `ExternalName`, and neither accepts one. |
@@ -359,6 +360,12 @@ is more forgiving — Helm 4 logs the guard as `funcMap fail` at INFO and still
 reports `0 chart(s) failed` — so lint the way you install it, with the values
 you will actually use.
 
+`.github/workflows/ci.yml` does exactly that on every push, with
+[`ci-values.yaml`](ci-values.yaml) — every optional object switched on — then
+renders the chart three ways, checks that each role's template still produces
+a Deployment, and checks that the refusals above still refuse. `make ci-helm`
+is the same run locally.
+
 A stronger check than either, because it uses the real binary rather than a
 schema: feed the rendered ConfigMap to `farmd` and see whether every role
 accepts it. The cross-field assertions in `internal/config` — `FARM_SLOT_REARM`
@@ -375,7 +382,7 @@ for d in yaml.safe_load_all(sys.stdin):
         for k, v in d["data"].items(): print(f"{k}={v}")' > /tmp/cm.env
 
 set -a; . /tmp/cm.env; set +a
-for role in api scheduler reaper recovery jobrunner; do farmd $role & sleep 2; kill %1; done
+for role in api scheduler reaper recovery jobrunner janitor; do farmd $role & sleep 2; kill %1; done
 ```
 
 ### Export `DATABASE_URL` when you run the test suite

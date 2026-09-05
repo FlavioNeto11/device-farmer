@@ -58,11 +58,52 @@ assertions:
 		out=$$(psql "$(DATABASE_URL)" -v ON_ERROR_STOP=1 -f "$$f" 2>&1) || \
 			{ echo "$$out" | grep -E 'ERROR|FATAL' || echo "$$out"; exit 1; }; \
 		echo "$$out" | grep -E 'ok |PASSED' || true; \
+		echo "$$out" | grep -q 'PASSED' || \
+			{ echo "$$f ran without error but never reported PASSED"; exit 1; }; \
 	done
 
 ## migrate: apply the schema to DATABASE_URL
 migrate: build
 	$(BIN)/farmd$(EXE) migrate up
+
+## ci: the three jobs in .github/workflows/ci.yml, locally — go, sql, helm
+ci: ci-go ci-sql ci-helm
+
+## ci-go: build, vet, gofmt, and the suite WITHOUT a database
+#
+# DATABASE_URL is exported above for every other target, so it is removed
+# here on purpose: the SQL-backed tests must keep skipping cleanly when there
+# is no database, or the suite stops being run on laptops at all.
+ci-go:
+	go build ./...
+	go vet ./...
+	@test -z "$$(gofmt -l . | grep -v '^$$')" || { echo "gofmt:"; gofmt -l .; exit 1; }
+	env -u DATABASE_URL go test -count=1 ./...
+
+## ci-sql: schema, every assertion suite, and the suite WITH DATABASE_URL
+ci-sql: migrate assertions
+	go test -count=1 ./...
+
+## ci-helm: lint and render the chart, and prove its guards still refuse
+ci-helm:
+	helm lint deploy/helm/device-farmer -f deploy/helm/ci-values.yaml
+	helm template ci deploy/helm/device-farmer -n device-farmer -f deploy/helm/ci-values.yaml > /dev/null
+	helm template ci deploy/helm/device-farmer -n device-farmer --set database.dsn=postgres://farm@pg:5432/device_farmer > /dev/null
+	helm template ci deploy/helm/device-farmer -n device-farmer -f deploy/helm/ci-values.yaml \
+		--set database.dsn="" --set database.existingSecret=farm-postgres \
+		--set auth.tokens="" --set auth.existingSecret=farm-api-tokens > /dev/null
+	@for role in api scheduler reaper recovery jobrunner janitor watchdog; do \
+		helm template ci deploy/helm/device-farmer -n device-farmer -f deploy/helm/ci-values.yaml -s "templates/$$role.yaml" \
+			| grep -q '^kind: Deployment$$' || { echo "templates/$$role.yaml renders no Deployment"; exit 1; }; \
+	done
+	@! helm template ci deploy/helm/device-farmer -n device-farmer > /dev/null 2>&1 || \
+		{ echo "the chart rendered with no database configured"; exit 1; }
+	@! helm template ci deploy/helm/device-farmer -n device-farmer -f deploy/helm/ci-values.yaml \
+		--set database.existingSecret=farm-postgres > /dev/null 2>&1 || \
+		{ echo "the chart rendered with database.dsn AND database.existingSecret"; exit 1; }
+	@! helm template ci deploy/helm/device-farmer -n device-farmer -f deploy/helm/ci-values.yaml \
+		--set config.db.maxConns=1 > /dev/null 2>&1 || \
+		{ echo "the chart rendered with config.db.maxConns=1"; exit 1; }
 
 ## demo: 56 simulated devices and the real control plane, no hardware
 demo: build migrate
@@ -91,4 +132,4 @@ down:
 clean:
 	rm -rf $(BIN)
 
-.PHONY: help build build-linux test assertions migrate demo all docker up down clean
+.PHONY: help build build-linux test assertions migrate ci ci-go ci-sql ci-helm demo all docker up down clean

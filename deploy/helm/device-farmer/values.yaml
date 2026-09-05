@@ -115,8 +115,8 @@ config:
     # FARM_DB_MAX_CONNS, per pod. Two floors, and the chart treats them
     # differently because their failure modes differ:
     #
-    #   2  REFUSED BELOW THIS. The scheduler and the reaper each pin one
-    #      connection for the life of the process — the session holding their
+    #   2  REFUSED BELOW THIS. The scheduler, the reaper and the janitor each
+    #      pin one connection for the life of the process — the session holding their
     #      leader-election advisory lock. With a pool of one, the elected
     #      leader has nothing left to work with: it logs that it took
     #      leadership and then places no job and reclaims no lease, forever,
@@ -368,6 +368,28 @@ reaper:
   # winner calls farm.reaper_arm BEFORE its first sweep, so a reaper that was
   # just blind refunds the outage instead of mass-revoking at the moment of
   # restoration.
+  replicaCount: 1
+  terminationGracePeriodSeconds: 60
+  resources:
+    requests:
+      cpu: 50m
+      memory: 96Mi
+    limits:
+      memory: 256Mi
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  extraEnv: []
+
+# -----------------------------------------------------------------------------
+# janitor — closes the rows whose process died. It can never end a lease.
+# -----------------------------------------------------------------------------
+janitor:
+  # Same advisory-lock election as the scheduler and the reaper: a second
+  # replica idles and keeps beating. One is the right number — orphans are
+  # produced by crashes, not by throughput — and a warm standby is harmless.
+  # Deliberately absent from config.reaper.components: this role is not on
+  # the lease renewal path, so its downtime refunds nothing to a lease.
   replicaCount: 1
   terminationGracePeriodSeconds: 60
   resources:

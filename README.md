@@ -229,10 +229,42 @@ independently — the dashboard says so in as many words:
 ## Development
 
 ```bash
-make test         # vet, gofmt, and the Go suite
-make assertions   # the lease-protocol assertions against a live Postgres
-make build-linux  # the static binaries the images ship
+make test              # vet, gofmt, and the Go suite
+make assertions        # the lease-protocol assertions against a live Postgres
+make build-linux       # the static binaries the images ship
+make linux-acceptance  # the whole control plane, on Linux, end to end
 ```
+
+`make linux-acceptance` is the one check that has to run somewhere other than a
+developer's laptop, and it exists because three things cannot be seen from here:
+
+- **The binary starts.** Every role builds a metrics registry at startup, and
+  nothing in the Go suite calls that function. A duplicate registration once
+  made every role panic before serving anything while `go build`, `go vet`,
+  `gofmt` and the whole suite stayed green — and only on Linux, because
+  prometheus's process collector describes nothing on other platforms.
+- **`topo.Sysfs` reads the USB tree.** All eighteen tests in `internal/topo`
+  hand `FromFS` an `fstest.MapFS`. The shipped binary calls `Sysfs`, which
+  refuses on any GOOS but Linux and then reads through `os.DirFS`, and it takes
+  a hub's VBUS switchability from the file MODE on each port's `disable` — a
+  fact a MapFS can only assert into being.
+- **The schema runs on the server you deploy**, not the one on the laptop.
+
+It migrates an empty database, runs every assertion suite, starts the control
+plane, checks the routes and the authorisation, asserts the founding invariant
+against the leases the run actually produced, and then runs `farmd node` against
+a generated sysfs tree and checks what discovery wrote. From Windows:
+
+```bash
+wsl -d Ubuntu -- bash -c 'cd /mnt/c/git/device-farmer && make linux-acceptance'
+```
+
+On a farm host with no Go toolchain, hand it the binary instead:
+`FARMD=/usr/local/bin/farmd scripts/linux-acceptance.sh`.
+
+It does not prove there is a phone. The ADB servers are `test/fakeadb` and the
+USB tree is written by a script, so `USBDEVFS_RESET` and `uhubctl` against real
+hardware stay open — `REC-03` and `HW-05` in `REQUIREMENTS.md`.
 
 `test/assertions.sql` is the protocol's specification in executable form. It
 proves, against a real PostgreSQL, that a connectivity release reason is

@@ -62,6 +62,34 @@ assertions:
 			{ echo "$$f ran without error but never reported PASSED"; exit 1; }; \
 	done
 
+## linux-acceptance: run the whole control plane on Linux, where it ships
+#
+# Not part of `test` or `ci`, because it needs a Linux host with a PostgreSQL of
+# its own and it takes two minutes. It is the only check that touches three
+# things a `go test` on a developer's machine cannot:
+#
+#   the binary STARTS       — every role builds a metrics registry, and nothing
+#                             in the Go suite calls that function. A duplicate
+#                             registration once made every role panic at startup
+#                             with the whole suite green, and only on Linux,
+#                             because prometheus's process collector describes
+#                             nothing on other platforms.
+#   topo.Sysfs READS        — all eighteen topology tests hand FromFS an
+#                             fstest.MapFS. The binary calls Sysfs, which
+#                             refuses off Linux and reads through os.DirFS, and
+#                             takes a hub's VBUS switchability from the file
+#                             MODE on each port's `disable` — a fact a MapFS can
+#                             only assert into being.
+#   the SCHEMA runs there   — the assertion suites against the PostgreSQL major
+#                             you deploy, not the one on the laptop.
+#
+# From Windows:
+#   wsl -d Ubuntu -- bash -c 'cd /mnt/c/git/device-farmer && make linux-acceptance'
+# On a host with no Go toolchain, hand it the binary:
+#   FARMD=/usr/local/bin/farmd scripts/linux-acceptance.sh
+linux-acceptance:
+	@bash scripts/linux-acceptance.sh
+
 ## migrate: apply the schema to DATABASE_URL
 migrate: build
 	$(BIN)/farmd$(EXE) migrate up

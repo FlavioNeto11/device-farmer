@@ -31,6 +31,7 @@ var allEnv = []string{
 	EnvHeartbeatEvery,
 	EnvNodeSelfFence, EnvFenceMargin, EnvNodeADBEndpoint, EnvNodeHostID,
 	EnvWatchdogInterval, EnvMigrationsTable, EnvMigrationsDir,
+	EnvChargeMinPct, EnvChargeMaxPct, EnvChargeInterval,
 }
 
 const testDSN = "postgres://farm@127.0.0.1:5432/farm?sslmode=disable"
@@ -294,6 +295,30 @@ func TestPreflightRefusals(t *testing.T) {
 		envs: map[string]string{EnvComponent: "api"},
 		want: []string{EnvComponent, "stand in for"},
 	}, {
+		// U8 — an inverted band would park every idle phone on sight and
+		// release none of them.
+		name: "charge band inverted",
+		role: "chargepolicy",
+		envs: map[string]string{EnvChargeMinPct: "80", EnvChargeMaxPct: "40"},
+		want: []string{EnvChargeMinPct, EnvChargeMaxPct, "0 < min < max <= 100"},
+	}, {
+		name: "charge max above one hundred",
+		role: "chargepolicy",
+		envs: map[string]string{EnvChargeMaxPct: "101"},
+		want: []string{EnvChargeMaxPct, "0 < min < max <= 100"},
+	}, {
+		// A hold is two intervals, and the agent restores power at its cap:
+		// an interval above half the cap leaves no missed cycle to lose.
+		name: "charge interval above half the agent's hold cap",
+		role: "chargepolicy",
+		envs: map[string]string{EnvChargeInterval: "16m"},
+		want: []string{EnvChargeInterval, "half", "restore power"},
+	}, {
+		name: "charge interval not positive",
+		role: "chargepolicy",
+		envs: map[string]string{EnvChargeInterval: "0s"},
+		want: []string{EnvChargeInterval, "must be positive"},
+	}, {
 		// The knob that was read, validated and applied to nothing.
 		name: "FARM_COMPONENT on a multiplexed role",
 		role: "demo",
@@ -470,6 +495,9 @@ func TestEveryVariableIsRead(t *testing.T) {
 		EnvWatchdogInterval:     "6s",
 		EnvMigrationsTable:      "farm.schema_version",
 		EnvMigrationsDir:        "/srv/migrations",
+		EnvChargeMinPct:         "35",
+		EnvChargeMaxPct:         "75",
+		EnvChargeInterval:       "3m",
 	})
 	cfg, err := Load("scheduler")
 	if err != nil {
@@ -507,6 +535,9 @@ func TestEveryVariableIsRead(t *testing.T) {
 		{EnvWatchdogInterval, cfg.WatchdogInterval, 6 * time.Second},
 		{EnvMigrationsTable, cfg.MigrationsTable, "farm.schema_version"},
 		{EnvMigrationsDir, cfg.MigrationsDir, "/srv/migrations"},
+		{EnvChargeMinPct, cfg.Charge.MinPct, 35},
+		{EnvChargeMaxPct, cfg.Charge.MaxPct, 75},
+		{EnvChargeInterval, cfg.Charge.Interval, 3 * time.Minute},
 	}
 	for _, c := range checks {
 		if c.got != c.want {
@@ -770,6 +801,8 @@ func TestSummaryShowsWhatTheProcessDecided(t *testing.T) {
 		"9090",  // the metrics listener that now exists
 		"40",    // 30m/45s renewal attempts
 		"xxxxx", // the password, gone
+		// U8: the charge band, and the one sentence that keeps it honest.
+		"above 80%", "release at 40%", "2m0s", "a lease is never touched",
 	} {
 		if !strings.Contains(s, want) {
 			t.Errorf("summary omits %q:\n%s", want, s)

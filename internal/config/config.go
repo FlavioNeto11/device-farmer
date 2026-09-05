@@ -69,6 +69,12 @@ const (
 	EnvWatchdogInterval = "FARM_WATCHDOG_INTERVAL"
 	EnvMigrationsTable  = "FARM_MIGRATIONS_TABLE"
 	EnvMigrationsDir    = "FARM_MIGRATIONS_DIR"
+
+	// U8 — charge policy. The band an idle device is held inside, and the
+	// cadence of the loop that holds it there.
+	EnvChargeMinPct   = "FARM_CHARGE_MIN_PCT"
+	EnvChargeMaxPct   = "FARM_CHARGE_MAX_PCT"
+	EnvChargeInterval = "FARM_CHARGE_INTERVAL"
 )
 
 // Mirrors of CHECK constraints in migrations/00001_core.sql. Duplicated on
@@ -85,6 +91,20 @@ const (
 // A holder has to survive losing two consecutive renewals — a rolling API
 // deploy, a Postgres failover, a GC pause — without its lease going suspect.
 const MinRenewAttempts = 3
+
+// U8 — charge policy.
+//
+// MaxChargeGateHold mirrors node.MaxChargeGateHold, the longest the host agent
+// will keep a port dark on one assertion before restoring power by itself. It
+// is duplicated here rather than imported because this package is a leaf and
+// must stay one; internal/chargepolicy asserts the two are equal, so a change
+// to either without the other fails a test rather than a rack.
+//
+// The policy loop asserts each gate for TWO of its intervals, so that a single
+// missed cycle — a rolling deploy, a slow database — does not let the agent
+// hand power back to a phone the policy still means to hold. That is why the
+// interval is bounded at half the cap and not at the cap itself.
+const MaxChargeGateHold = 30 * time.Minute
 
 // Defaults. Chosen so that an operator who sets only DATABASE_URL gets a
 // configuration that satisfies every assertion below.
@@ -116,6 +136,16 @@ const (
 	DefaultDBConnectTimeout = 10 * time.Second
 
 	DefaultMigrationsTable = "public.goose_db_version"
+
+	// U8 — charge policy. 40–80% is the band the lithium research in
+	// REQUIREMENTS.md (HW-03) points at: a cell at 80% stores materially less
+	// energy than one at 100%, and 40% keeps an idle handset far from the flat
+	// state that costs a device outright. Two minutes is well inside the
+	// agent's hold cap and coarse enough that the loop is one listing per host
+	// and a handful of renewals, not a load.
+	DefaultChargeMinPct   = 40
+	DefaultChargeMaxPct   = 80
+	DefaultChargeInterval = 2 * time.Minute
 
 	// MetricsOff is the value of FARM_METRICS_ADDR that means "serve no
 	// metrics listener". An empty string cannot mean it: an empty environment
@@ -158,18 +188,19 @@ var DefaultReaperComponents = []string{"reaper", "api", "scheduler", "jobrunner"
 // name stands for it here. internal/node documents the same intent for the
 // node agent, though cmd/farmd does not yet pass a per-host name through.
 var roleComponents = map[string][]string{
-	"api":       {"api"},
-	"scheduler": {"scheduler"},
-	"reaper":    {"reaper"},
-	"recovery":  {"recovery"},
-	"jobrunner": {"jobrunner"},
-	"janitor":   {"janitor"},
-	"watchdog":  {"watchdog"},
-	"node":      {"node", "enroll"},
-	"all":       {"api", "scheduler", "reaper", "recovery", "jobrunner", "janitor", "watchdog"},
-	"demo":      {"api", "scheduler", "reaper", "recovery", "jobrunner", "janitor", "watchdog"},
-	"ctl":       {},
-	"migrate":   {},
+	"api":          {"api"},
+	"scheduler":    {"scheduler"},
+	"reaper":       {"reaper"},
+	"recovery":     {"recovery"},
+	"jobrunner":    {"jobrunner"},
+	"janitor":      {"janitor"},
+	"chargepolicy": {"chargepolicy"},
+	"watchdog":     {"watchdog"},
+	"node":         {"node", "enroll"},
+	"all":          {"api", "scheduler", "reaper", "recovery", "jobrunner", "janitor", "chargepolicy", "watchdog"},
+	"demo":         {"api", "scheduler", "reaper", "recovery", "jobrunner", "janitor", "chargepolicy", "watchdog"},
+	"ctl":          {},
+	"migrate":      {},
 }
 
 // Lease holds the only clock that may end a lease on a timer: lease liveness.
@@ -218,6 +249,26 @@ type Reaper struct {
 	HeartbeatInterval time.Duration
 }
 
+// Charge holds the charge policy's knobs: the band an idle device is held
+// inside, and how often the loop re-asserts the gates that hold it there.
+//
+// The policy acts ONLY on devices with no live lease. These values decide
+// which idle phones are parked and held off VBUS; none of them can shorten,
+// end, or otherwise touch a lease, and the loop that reads them does not
+// import the lease package.
+type Charge struct {
+	// MinPct is the state of charge at or below which a held device is
+	// released and returned to service.
+	MinPct int
+	// MaxPct is the state of charge above which an idle device is parked and
+	// its port held dark.
+	MaxPct int
+	// Interval is the loop period. Every held gate is re-asserted once per
+	// interval for a hold of two intervals, so one missed cycle costs nothing
+	// and two hand the port back to the agent's dead-man's switch.
+	Interval time.Duration
+}
+
 // Node holds the host-side proxy's knobs.
 type Node struct {
 	// SelfFenceTimeout is how long the node proxy may go without a
@@ -261,6 +312,7 @@ type Config struct {
 	Lease  Lease
 	Reaper Reaper
 	Node   Node
+	Charge Charge
 
 	WatchdogInterval time.Duration
 	MigrationsTable  string
@@ -326,6 +378,11 @@ func Load(component string, opts ...Option) (*Config, error) {
 			FenceSafetyMargin: l.dur(EnvFenceMargin, DefaultFenceMargin),
 			ADBEndpoint:       l.str(EnvNodeADBEndpoint, DefaultADBEndpoint),
 			HostID:            l.str(EnvNodeHostID, ""),
+		},
+		Charge: Charge{
+			MinPct:   l.num(EnvChargeMinPct, DefaultChargeMinPct),
+			MaxPct:   l.num(EnvChargeMaxPct, DefaultChargeMaxPct),
+			Interval: l.dur(EnvChargeInterval, DefaultChargeInterval),
 		},
 
 		WatchdogInterval: l.dur(EnvWatchdogInterval, DefaultWatchdogEvery),
@@ -633,6 +690,27 @@ Fix by raising %s above %s + %s, or by lowering the proxy's self-fence timeout.`
 	if c.WatchdogInterval <= 0 {
 		fail("%s must be positive", EnvWatchdogInterval)
 	}
+
+	// ---- U8 — charge policy ------------------------------------------
+	// An inverted or degenerate band is refused rather than clamped: a loop
+	// that parks at 40% and releases at 80% would hold every idle phone dark
+	// the moment it was observed and never let one go.
+	if c.Charge.MinPct <= 0 || c.Charge.MaxPct > 100 || c.Charge.MinPct >= c.Charge.MaxPct {
+		fail("%s (%d) and %s (%d) must satisfy 0 < min < max <= 100; the policy parks an "+
+			"idle device above max and releases it at or below min, and any other order "+
+			"is a band nothing can be held inside",
+			EnvChargeMinPct, c.Charge.MinPct, EnvChargeMaxPct, c.Charge.MaxPct)
+	}
+	if c.Charge.Interval <= 0 {
+		fail("%s must be positive", EnvChargeInterval)
+	} else if c.Charge.Interval*2 > MaxChargeGateHold {
+		fail("%s (%s) must be at most half of the host agent's charge-gate cap (%s). Every "+
+			"off-gate is asserted for two intervals so that one missed cycle — a rolling "+
+			"deploy, a slow database — does not let the agent restore power to a phone the "+
+			"policy still means to hold; above half the cap there is no room for that cycle",
+			EnvChargeInterval, c.Charge.Interval, MaxChargeGateHold)
+	}
+
 	// The metrics address is a listener now, so a malformed one is a bind
 	// failure at startup rather than a string nobody reads.
 	if c.bindsMetrics() {
@@ -722,6 +800,9 @@ func (c *Config) Summary() string {
 	fmt.Fprintf(&b, "reaper           = every %s, batch %d, gap floor %s, watching %s\n",
 		c.Reaper.Interval, c.Reaper.Batch, c.Reaper.GapFloor,
 		strings.Join(c.Reaper.Components, ","))
+	fmt.Fprintf(&b, "charge policy    = park idle devices above %d%%, release at %d%%, every %s "+
+		"(idle means no live lease; a lease is never touched)\n",
+		c.Charge.MaxPct, c.Charge.MinPct, c.Charge.Interval)
 	fmt.Fprintf(&b, "shutdown grace   = %s (drains requests; releases nothing)\n", c.ShutdownGrace)
 	return b.String()
 }

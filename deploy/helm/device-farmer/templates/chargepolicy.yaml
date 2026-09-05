@@ -1,0 +1,115 @@
+{{/*
+chargepolicy — holds idle devices inside a band of state of charge.
+
+A rack of lithium cells sitting at 100% is the fire hazard REQUIREMENTS.md
+calls HW-03, and charge limiting is the one mitigation software can reach. The
+loop reads battery_pct off farm.device_runtime; an idle device above the
+ceiling is parked (farm.device_park, auto => true) and its port's VBUS held
+off through the host agent's charge gate; at the floor the gate is released
+and the park closed. The gate is a dead-man's switch that fails towards ON:
+every cycle re-asserts it, and if this Deployment stops, the agents restore
+power by themselves within node.MaxChargeGateHold.
+
+IT ACTS ONLY ON DEVICES WITH NO LIVE LEASE, and it never touches one. A lease
+ends when the job says so, when a user-written deadline elapses, or when a
+human takes it back — never because a battery was full. The package does not
+import internal/lease; the assertion is structural.
+
+Automation reverses only its own decision: a park a human opened is never
+closed here, and a human closing this loop's park ends the hold.
+
+SINGLE WRITER BY ELECTION, the same Postgres advisory lock as the scheduler and
+the reaper, so replicaCount may be raised for a warm standby. FARM_DB_MAX_CONNS
+must be at least 2: one connection is pinned for the lock.
+
+The gate lives on the host agent, reached with FARM_NODE_TOKEN — the same
+token the `farmd node` agents were started with. Without it the loop still
+runs: it beats, scans, and counts every device it would have held under
+farm_chargepolicy_skipped_total{reason="no_client"}, but holds nothing. Hand
+the token in through chargepolicy.extraEnv, from a Secret.
+*/}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "device-farmer.componentName" (dict "ctx" $ "component" "chargepolicy") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "device-farmer.labels" (dict "ctx" $ "component" "chargepolicy") | nindent 4 }}
+spec:
+  replicas: {{ .Values.chargepolicy.replicaCount }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      {{- include "device-farmer.selectorLabels" (dict "ctx" $ "component" "chargepolicy") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "device-farmer.labels" (dict "ctx" $ "component" "chargepolicy") | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        {{- include "device-farmer.configChecksums" . | nindent 8 }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- include "device-farmer.podPreamble" . | nindent 6 }}
+      # SIGTERM drains; it releases NOTHING — not a lease, and not a gate
+      # either. A held gate outlives this pod by at most one hold, after which
+      # the agent restores power on its own, and the replacement re-asserts
+      # whatever still deserves holding on its first cycle. Releasing on the
+      # way out would turn every rolling deploy into a fleet-wide charging
+      # window.
+      terminationGracePeriodSeconds: {{ .Values.chargepolicy.terminationGracePeriodSeconds }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- with .Values.chargepolicy.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.chargepolicy.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.chargepolicy.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: chargepolicy
+          image: {{ include "device-farmer.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["chargepolicy"]
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          # No probes: this role serves no HTTP. It beats as "chargepolicy",
+          # and that name must NOT be added to FARM_REAPER_COMPONENTS — a
+          # charge limiter's downtime may not move a lease deadline.
+          envFrom:
+            {{- include "device-farmer.envFrom" . | nindent 12 }}
+          env:
+            {{- include "device-farmer.databaseEnv" (dict "ctx" $) | nindent 12 }}
+            - name: FARM_CHARGE_MIN_PCT
+              value: {{ .Values.chargepolicy.band.minPct | quote }}
+            - name: FARM_CHARGE_MAX_PCT
+              value: {{ .Values.chargepolicy.band.maxPct | quote }}
+            - name: FARM_CHARGE_INTERVAL
+              value: {{ .Values.chargepolicy.band.interval | quote }}
+            {{- with .Values.chargepolicy.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          resources:
+            {{- toYaml .Values.chargepolicy.resources | nindent 12 }}
+          {{- with .Values.extraVolumeMounts }}
+          volumeMounts:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      {{- with .Values.extraVolumes }}
+      volumes:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

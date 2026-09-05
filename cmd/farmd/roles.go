@@ -21,6 +21,7 @@ import (
 	"github.com/flaviopadilha/device-farmer/internal/adbwire"
 	"github.com/flaviopadilha/device-farmer/internal/api"
 	"github.com/flaviopadilha/device-farmer/internal/artifacts"
+	"github.com/flaviopadilha/device-farmer/internal/chargepolicy"
 	"github.com/flaviopadilha/device-farmer/internal/config"
 	"github.com/flaviopadilha/device-farmer/internal/ctl"
 	"github.com/flaviopadilha/device-farmer/internal/demo"
@@ -107,6 +108,7 @@ func newRegistry(log *slog.Logger) (*prometheus.Registry, error) {
 	// lease it would have protected is one it does not. Log it and carry on.
 	if err := obs.RegisterAll(reg, log,
 		adbwire.Collectors(),
+		chargepolicy.Collectors(),
 		enroll.Collectors(),
 		fenceproxy.Collectors(),
 		janitor.Collectors(),
@@ -405,6 +407,50 @@ func runJanitor(ctx context.Context, cfg *config.Config, log *slog.Logger, pool 
 	return j.Run(ctx)
 }
 
+// runChargePolicy holds idle devices inside the charge band: above the
+// ceiling a device with no live lease is parked and its port held dark; at the
+// floor it is released. It acts ONLY on devices with no lease and never
+// touches one — a full battery is not on the list of things that end a lease.
+func runChargePolicy(ctx context.Context, cfg *config.Config, log *slog.Logger, pool *pgxpool.Pool) error {
+	// The gate lives on the host agent, reached the same way the recovery
+	// ladder reaches tiers 3 and 4. Without a token the loop still runs — it
+	// beats, scans, and counts every device it would have held under
+	// farm_chargepolicy_skipped_total{reason="no_client"} — because a refusal
+	// to start here would take `all` and `demo` down with it, and a policy
+	// that says out loud what it is missing is better than one that is absent.
+	var gates chargepolicy.GateClient
+	token := os.Getenv("FARM_NODE_TOKEN")
+	if token == "" {
+		log.Warn("no FARM_NODE_TOKEN set, so the charge policy can observe but not hold a port",
+			"consequence", "every idle device charges to 100% and stays there",
+			"fix", "set FARM_NODE_TOKEN to the same value the farmd node agents use")
+	} else {
+		c, cerr := node.NewClient(node.ClientConfig{
+			Resolver: node.NewDBResolver(pool),
+			Token:    token,
+			Logger:   log.With("component", "node-client"),
+		})
+		if cerr != nil {
+			return fmt.Errorf("node client: %w", cerr)
+		}
+		gates = c
+	}
+
+	p, err := chargepolicy.New(chargepolicy.Config{
+		Pool:      pool,
+		Gates:     gates,
+		Component: cfg.ComponentFor("chargepolicy"),
+		MinPct:    cfg.Charge.MinPct,
+		MaxPct:    cfg.Charge.MaxPct,
+		Interval:  cfg.Charge.Interval,
+		Logger:    log,
+	})
+	if err != nil {
+		return err
+	}
+	return p.Run(ctx)
+}
+
 func runRecovery(ctx context.Context, cfg *config.Config, log *slog.Logger, pool *pgxpool.Pool) error {
 	// The two rungs ADB cannot perform — a USB device reset and a VBUS power
 	// cycle — happen on the physical machine, so the ladder drives them
@@ -528,6 +574,9 @@ func runAll(ctx context.Context, cfg *config.Config, log *slog.Logger, pool *pgx
 		// them: jobs sit in 'running' forever holding a phone each.
 		"jobrunner": func(c context.Context) error { return runJobRunner(c, cfg, log, pool) },
 		"janitor":   func(c context.Context) error { return runJanitor(c, cfg, log, pool) },
+		// Charge limiting is the one fire mitigation software can reach; it
+		// acts only on idle devices and can never end a lease.
+		"chargepolicy": func(c context.Context) error { return runChargePolicy(c, cfg, log, pool) },
 	}
 	wds, err := watchdogsForHosts(ctx, cfg, log, pool)
 	if err != nil {
@@ -580,6 +629,10 @@ func runDemo(ctx context.Context, cfg *config.Config, log *slog.Logger, pool *pg
 		"recovery":  func(c context.Context) error { return runRecovery(c, cfg, log, pool) },
 		"jobrunner": func(c context.Context) error { return runJobRunner(c, cfg, log, pool) },
 		"janitor":   func(c context.Context) error { return runJanitor(c, cfg, log, pool) },
+		// The simulated hosts record no node agent, so in the demo this loop
+		// beats, warns once per host that it cannot reach one, and holds
+		// nothing — which is the honest shape of a farm without agents.
+		"chargepolicy": func(c context.Context) error { return runChargePolicy(c, cfg, log, pool) },
 	}
 
 	// Watchdogs are started after the simulation has registered its hosts, so

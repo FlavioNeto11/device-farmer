@@ -657,3 +657,46 @@ containerSecurityContext:
 # sslmode=verify-full DSN.
 extraVolumes: []
 extraVolumeMounts: []
+
+# -----------------------------------------------------------------------------
+# chargepolicy — holds idle devices inside a charge band. It can never end a
+# lease: it acts only on devices with no live lease, and it does not import
+# the lease package. See templates/chargepolicy.yaml.
+# -----------------------------------------------------------------------------
+chargepolicy:
+  # Same advisory-lock election as the scheduler and the reaper: a second
+  # replica idles as a warm standby rather than telling the agents two stories
+  # about one port.
+  replicaCount: 1
+  terminationGracePeriodSeconds: 30
+  band:
+    # FARM_CHARGE_MIN_PCT — a held device is released at or below this.
+    minPct: 40
+    # FARM_CHARGE_MAX_PCT — an idle device above this is parked and its port
+    # held dark. 40–80% is the band the lithium research behind HW-03 points
+    # at: a cell at 80% stores materially less energy than one at 100%.
+    maxPct: 80
+    # FARM_CHARGE_INTERVAL — loop period. Every held gate is re-asserted once
+    # per interval for a hold of two intervals, so one missed cycle costs
+    # nothing and two hand the port back to the agent's dead-man's switch.
+    # farmd refuses anything above half the agent's 30m hold cap.
+    interval: 2m
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      memory: 192Mi
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  # FARM_NODE_TOKEN goes here, from a Secret — the same token the `farmd node`
+  # agents were started with. Without it the loop runs but holds nothing, and
+  # says so under farm_chargepolicy_skipped_total{reason="no_client"}.
+  #
+  #   - name: FARM_NODE_TOKEN
+  #     valueFrom:
+  #       secretKeyRef:
+  #         name: device-farmer-node
+  #         key: FARM_NODE_TOKEN
+  extraEnv: []

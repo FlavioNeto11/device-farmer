@@ -575,7 +575,7 @@ spec:
         - alert: DeviceFarmerComponentBeatFailing
           expr: |-
             sum by (job, instance) (
-              rate({__name__=~"farm_(reaper|scheduler|jobrunner|recovery|watchdog|janitor|node)_heartbeat_failures_total"}[10m])
+              rate({__name__=~"farm_(reaper|scheduler|jobrunner|recovery|watchdog|janitor|chargepolicy|node)_heartbeat_failures_total"}[10m])
             ) > 0
           for: 10m
           labels:

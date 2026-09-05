@@ -130,7 +130,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	case "migrate":
 		err = runMigrate(ctx, rest, stdout, stderr)
 	case "api", "scheduler", "reaper", "watchdog", "recovery",
-		"jobrunner", "janitor", "node", "all", "demo":
+		"jobrunner", "janitor", "chargepolicy", "node", "all", "demo":
 		err = runRole(ctx, role, rest, stderr)
 	case "ctl":
 		// ctl talks to the API over HTTP and never to the database, so it needs
@@ -213,6 +213,8 @@ func runRole(ctx context.Context, role string, args []string, stderr io.Writer) 
 		fn = func(c context.Context) error { return runJobRunner(c, cfg, log, pool) }
 	case "janitor":
 		fn = func(c context.Context) error { return runJanitor(c, cfg, log, pool) }
+	case "chargepolicy":
+		fn = func(c context.Context) error { return runChargePolicy(c, cfg, log, pool) }
 	case "node":
 		fn = func(c context.Context) error { return runNode(c, cfg, log, pool) }
 	case "all":
@@ -272,19 +274,20 @@ func usage(w io.Writer) {
 Usage: farmd <role> [flags]
 
 Roles:
-  migrate     apply, roll back, or inspect the database schema
-  api         tenant-facing HTTP API; job submission and lease renewal
-  scheduler   matches queued jobs to free devices via farm.lease_acquire
-  reaper      suspect sweep and the single automatic release path
-  watchdog    device health only; it can never touch a lease
-  jobrunner   runs job specs on leased devices; re-attaches after an eviction
-  janitor     closes rows whose process died; it can never end a lease
-  recovery    the recovery ladder; acts for a holder that keeps its device
-  all         every control-plane role in one process (laptop / single node)
-  demo        simulated hardware plus the real control plane; needs no phones
-  node        host agent: USB discovery, enrollment, and the hardware rungs
-  ctl         operator CLI against the API
-  version     build information
+  migrate       apply, roll back, or inspect the database schema
+  api           tenant-facing HTTP API; job submission and lease renewal
+  scheduler     matches queued jobs to free devices via farm.lease_acquire
+  reaper        suspect sweep and the single automatic release path
+  watchdog      device health only; it can never touch a lease
+  jobrunner     runs job specs on leased devices; re-attaches after an eviction
+  janitor       closes rows whose process died; it can never end a lease
+  recovery      the recovery ladder; acts for a holder that keeps its device
+  chargepolicy  holds idle devices inside a charge band; it can never end a lease
+  all           every control-plane role in one process (laptop / single node)
+  demo          simulated hardware plus the real control plane; needs no phones
+  node          host agent: USB discovery, enrollment, and the hardware rungs
+  ctl           operator CLI against the API
+  version       build information
 
 Every role reads its configuration from the environment; DATABASE_URL is
 required by all of them except ctl. Run "farmd migrate -h" for its flags.

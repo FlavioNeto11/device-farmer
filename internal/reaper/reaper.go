@@ -55,6 +55,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
+	"slices"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -116,6 +117,11 @@ type Config struct {
 	// their heartbeats are for operators to see a stalled loop — but a health
 	// plane outage moving lease deadlines is the very fusion of clocks this
 	// system exists to prevent.
+	//
+	// And it must name nothing that will not beat. A watched component with no
+	// heartbeat row makes farm.reaper_arm REFUSE: the loop stays unarmed,
+	// reclaims nothing, says so at WARN and on farm_reaper_unbeaten_components,
+	// and retries every cycle until the component has beaten.
 	Components []string
 
 	// Rearm is passed as p_rearm to farm.lease_reclaim: how long a slot stays
@@ -169,6 +175,16 @@ type Reaper struct {
 
 	lead       leadership
 	nextCensus time.Time
+
+	// armed is true once farm.reaper_arm has succeeded for the current tenure
+	// of leadership. It is cleared on every gain of leadership, and stays
+	// false across a refusal so the next cycle tries again instead of
+	// sweeping unarmed.
+	armed bool
+
+	// unbeaten is the last refusal this loop reported, so a refusal that
+	// persists across cycles is said once and a change of it is said again.
+	unbeaten []string
 }
 
 // New validates cfg and returns a Reaper.
@@ -228,7 +244,7 @@ func (r *Reaper) cycle(ctx context.Context) {
 		r.nextCensus = time.Now().Add(r.cfg.CensusEvery)
 	}
 
-	gained, leader, err := r.lead.ensure(ctx, r.cfg.CallTimeout)
+	gained, leader, refused, err := r.lead.ensure(ctx, r.cfg.CallTimeout)
 	if err != nil {
 		r.log.Warn("reaper leadership check failed; not sweeping this cycle", "err", err)
 		leaderGauge.Set(0)
@@ -240,12 +256,24 @@ func (r *Reaper) cycle(ctx context.Context) {
 	}
 	leaderGauge.Set(1)
 
-	if gained {
+	if gained || refused {
+		// gained: a fresh tenure arms before it sweeps, always.
+		//
+		// refused: somebody else's arm refused since ours succeeded — the
+		// API's enable with a watched name nothing writes, or a heartbeat row
+		// deleted by hand. farm.lease_reclaim is gated shut by that refusal,
+		// and a loop that kept sweeping would report "nothing reclaimable"
+		// forever while the farm quietly filled with dead holders. Re-arm,
+		// and let the outcome be said out loud either way.
+		r.armed = false
+	}
+	if !r.armed {
 		// ARM BEFORE SWEEPING. Not a nicety and not reorderable: until this
 		// returns, every live lease is still carrying the deadline it had
 		// before our outage, and the quiesce gate that stops a restored control
 		// plane from mass-reclaiming is not yet set.
-		if err := r.arm(ctx); err != nil {
+		armed, err := r.arm(ctx)
+		if err != nil {
 			r.log.Error("reaper could not arm; refusing to sweep", "err", err)
 			// Stand down rather than sweep unarmed. A reaper that sweeps
 			// without a refund charges tenants for our downtime, and the
@@ -255,6 +283,16 @@ func (r *Reaper) cycle(ctx context.Context) {
 			leaderGauge.Set(0)
 			return
 		}
+		if !armed {
+			// A refusal is a fact about the deployment — a name in the watch
+			// list that nothing writes — not about this replica, so leadership
+			// is kept: handing the lock to a replica with the same list would
+			// only add a leadership line to the log every cycle. Nothing is
+			// swept, and the next cycle tries again, so the reaper arms by
+			// itself the moment the component beats.
+			return
+		}
+		r.armed = true
 	}
 
 	r.sweepSuspect(ctx)
@@ -262,31 +300,58 @@ func (r *Reaper) cycle(ctx context.Context) {
 	r.sweepReclaim(ctx)
 }
 
-// arm calls farm.reaper_arm and records the refund.
-func (r *Reaper) arm(ctx context.Context) error {
+// arm calls farm.reaper_arm and records the outcome: the refund on success,
+// the unbeaten components on a refusal.
+//
+// It returns false, nil on a refusal. That is deliberately not an error: an
+// error stands the loop down and hands leadership away, whereas a refusal is
+// retried every cycle from the same seat until the watched component beats.
+func (r *Reaper) arm(ctx context.Context) (bool, error) {
 	cctx, cancel := context.WithTimeout(ctx, r.cfg.CallTimeout)
 	defer cancel()
 
-	gap, err := r.cfg.Store.ReaperArm(cctx, r.cfg.Components, r.cfg.GapFloor)
+	res, err := r.cfg.Store.ReaperArm(cctx, r.cfg.Components, r.cfg.GapFloor)
 	if err != nil {
 		armFailures.Inc()
-		return fmt.Errorf("reaper: arm: %w", err)
+		return false, fmt.Errorf("reaper: arm: %w", err)
+	}
+
+	if !res.Armed {
+		armRefusals.Inc()
+		unbeatenGauge.Set(float64(len(res.Unbeaten)))
+		// Once per change, not once per cycle: a refusal that stands for an
+		// hour is one fact, and a WARN every ten seconds teaches the operator
+		// to stop reading this log — which is how the one line that matters
+		// gets missed.
+		if !slices.Equal(res.Unbeaten, r.unbeaten) {
+			r.log.Warn("reaper REFUSED to arm: a watched component has never beaten; "+
+				"nothing is reclaimed until it does and the reaper re-arms",
+				"unbeaten", res.Unbeaten, "components", r.cfg.Components)
+			r.unbeaten = slices.Clone(res.Unbeaten)
+		}
+		return false, nil
 	}
 	armsTotal.Inc()
+	unbeatenGauge.Set(0)
+	if r.unbeaten != nil {
+		r.log.Info("reaper armed; every watched component has now beaten",
+			"previously_unbeaten", r.unbeaten)
+		r.unbeaten = nil
+	}
 
-	if gap <= 0 {
+	if res.Gap <= 0 {
 		r.log.Info("reaper armed; no control-plane gap to refund", "components", r.cfg.Components)
-		return nil
+		return true, nil
 	}
 
 	// Label the histogram with the component that was actually oldest, which is
 	// the one farm.reaper_arm recorded. Guessing "reaper" here would hide the
 	// case the gap accounting exists for: a dead API next to a healthy reaper.
 	component := r.lastGapComponent(ctx)
-	obs.ControlPlaneGap(component, gap)
+	obs.ControlPlaneGap(component, res.Gap)
 	r.log.Warn("control-plane gap refunded to every live lease",
-		"gap", gap, "oldest_component", string(component))
-	return nil
+		"gap", res.Gap, "oldest_component", string(component))
+	return true, nil
 }
 
 // lastGapComponent reads back the row farm.reaper_arm just inserted. On any
@@ -567,32 +632,50 @@ type leadership struct {
 	held bool
 }
 
-// ensure reports whether this process holds the reaper lock, and whether it
-// gained it on THIS call — the signal that farm.reaper_arm must run before any
-// sweep.
-func (l *leadership) ensure(ctx context.Context, timeout time.Duration) (gained, leader bool, err error) {
+// leaderProbeSQL is the liveness probe of a held leadership session, and it is
+// deliberately a query rather than a Ping. The scheduler pings; the reaper has
+// one more fact to learn every cycle it leads — whether farm.reaper_state
+// carries a refusal to arm, recorded by ANY caller of farm.reaper_arm — and
+// the probe is a round trip through the same session that already happens.
+// Reading it here rather than in a query of its own costs nothing, and a
+// failure is not ignored: it is the session dying, and the leader stands down.
+//
+// EXISTS rather than a bare column read so the probe always yields exactly
+// one row: a missing singleton is a schema that never ran 00001, and that
+// surfaces from the arm, not from here.
+const leaderProbeSQL = `
+SELECT EXISTS (SELECT 1 FROM farm.reaper_state WHERE singleton AND last_refusal_at IS NOT NULL)`
+
+// ensure reports whether this process holds the reaper lock, whether it gained
+// it on THIS call — the signal that farm.reaper_arm must run before any sweep —
+// and, for a lock it already held, whether farm.reaper_state carries a
+// standing refusal to arm, which is the other reason to arm again.
+//
+// refused is only ever read on a held lock. A fresh gain arms regardless, so
+// the flag is left false there rather than spent on a round trip.
+func (l *leadership) ensure(ctx context.Context, timeout time.Duration) (gained, leader, refused bool, err error) {
 	cctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	if l.conn != nil {
-		if perr := l.conn.Ping(cctx); perr != nil {
+		if perr := l.conn.QueryRow(cctx, leaderProbeSQL).Scan(&refused); perr != nil {
 			// The session is gone, so the lock is gone with it. Standing down
 			// here is what makes the next successful ensure report gained=true
 			// and re-arm: a reaper that lost the database was blind, and a
 			// blind reaper must refund before it acts.
 			l.log.Warn("reaper leadership connection died; standing down", "err", perr)
 			l.drop()
-			return false, false, nil
+			return false, false, false, nil
 		}
 		if l.held {
-			return false, true, nil
+			return false, true, refused, nil
 		}
 	}
 
 	if l.conn == nil {
 		c, aerr := l.pool.Acquire(cctx)
 		if aerr != nil {
-			return false, false, fmt.Errorf("reaper: acquire leadership connection: %w", aerr)
+			return false, false, false, fmt.Errorf("reaper: acquire leadership connection: %w", aerr)
 		}
 		l.conn = c
 	}
@@ -600,15 +683,15 @@ func (l *leadership) ensure(ctx context.Context, timeout time.Duration) (gained,
 	var ok bool
 	if qerr := l.conn.QueryRow(cctx, `SELECT pg_try_advisory_lock($1)`, l.key).Scan(&ok); qerr != nil {
 		l.drop()
-		return false, false, fmt.Errorf("reaper: try advisory lock: %w", qerr)
+		return false, false, false, fmt.Errorf("reaper: try advisory lock: %w", qerr)
 	}
 	if !ok {
 		l.drop()
-		return false, false, nil
+		return false, false, false, nil
 	}
 	l.held = true
 	l.log.Info("reaper acquired leadership", "lock_key", l.key)
-	return true, true, nil
+	return true, true, false, nil
 }
 
 func (l *leadership) release(ctx context.Context) {
@@ -651,6 +734,20 @@ var (
 	armFailures = prometheus.NewCounter(prometheus.CounterOpts{
 		Namespace: "farm", Subsystem: "reaper", Name: "arm_failures_total",
 		Help: "Failed farm.reaper_arm calls. The reaper stands down rather than sweep unarmed.",
+	})
+
+	armRefusals = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: "farm", Subsystem: "reaper", Name: "arm_refusals_total",
+		Help: "farm.reaper_arm calls that refused because a watched component has never beaten. " +
+			"One per cycle while the refusal stands; nothing is reclaimed during it.",
+	})
+
+	// unbeatenGauge is the operator's signal for a reaper that is alive, is
+	// leading, and is reclaiming nothing on purpose.
+	unbeatenGauge = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: "farm", Subsystem: "reaper", Name: "unbeaten_components",
+		Help: "Components in FARM_REAPER_COMPONENTS with no farm.component_heartbeat row. " +
+			"Above zero the reaper refuses to arm and reclaims nothing; it clears when they beat.",
 	})
 
 	// suspectTotal is an ALERTING signal only. Nothing was released.
@@ -703,8 +800,11 @@ func Collectors() []prometheus.Collector {
 	for _, s := range []string{"suspect", "max_runtime", "reclaim"} {
 		sweepErrors.WithLabelValues(s)
 	}
+	// Zero from the first scrape, so `farm_reaper_unbeaten_components > 0`
+	// is a rule that can fire rather than one waiting for its first sample.
+	unbeatenGauge.Set(0)
 	return []prometheus.Collector{
-		cyclesTotal, armsTotal, armFailures, suspectTotal, endedTotal,
-		sweepErrors, auditFailures, beatFailures, leaderGauge,
+		cyclesTotal, armsTotal, armFailures, armRefusals, unbeatenGauge,
+		suspectTotal, endedTotal, sweepErrors, auditFailures, beatFailures, leaderGauge,
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -31,6 +32,14 @@ type reaperStateResponse struct {
 	QuiesceRemaining float64    `json:"quiesce_remaining_seconds"`
 	ArmedAt          *time.Time `json:"armed_at"`
 	Now              *time.Time `json:"now"`
+
+	// Refusal stands while the last farm.reaper_arm found a watched component
+	// that had never beaten; nothing is reclaimed until it clears.
+	Refusal   *string    `json:"refusal"`
+	RefusedAt *time.Time `json:"refused_at"`
+
+	WatchedComponents  []string `json:"watched_components"`
+	UnbeatenComponents []string `json:"unbeaten_components"`
 
 	HeartbeatAt      *time.Time `json:"reaper_heartbeat_at"`
 	HeartbeatAgeSecs *float64   `json:"reaper_heartbeat_age_seconds"`
@@ -116,13 +125,26 @@ func reaperFields(v *reaperStateResponse) *Fields {
 	switch {
 	case !v.Enabled:
 		f.Add("armed", "no — the switch is off, nothing is reclaimed")
+	case v.Refusal != nil:
+		f.Add("armed", "no — REFUSED TO ARM, nothing is reclaimed until every watched component has beaten")
 	case v.QuiesceRemaining > 0:
 		f.Addf("armed", "no — quiesced for another %s", duration(int64(v.QuiesceRemaining)))
 	default:
 		f.Add("armed", "YES — the next sweep can reclaim")
 	}
+	if v.Refusal != nil {
+		f.Addf("refusal", "%s (since %s)", *v.Refusal, stamp(v.RefusedAt))
+	}
 	f.Add("quiesce until", stamp(v.QuiesceUntil))
 	f.Add("last armed", stamp(v.ArmedAt))
+	f.Add("watching", strings.Join(v.WatchedComponents, ", "))
+	if len(v.UnbeatenComponents) > 0 {
+		// Its own line even when no refusal stands yet: this is the list the
+		// NEXT arm will refuse on, and the operator reading it is usually
+		// about to type `ctl reaper enable`.
+		f.Addf("never beaten", "%s — the reaper refuses to arm while any of these has no heartbeat row",
+			strings.Join(v.UnbeatenComponents, ", "))
+	}
 
 	if v.HeartbeatAt == nil {
 		// Worth a line of its own: an enabled reaper that is not running is a
@@ -229,6 +251,9 @@ func reaperSet(ctx context.Context, s *session, action string, args []string) er
 		out.Addf("gap refunded", "%s added to every live lease", duration(int64(*res.GapRefundSecs)))
 	}
 	if res.ArmedNote != "" {
+		// The same key carries a refusal: the server's sentence says which,
+		// and the line above ("armed: no — REFUSED TO ARM") has already
+		// said the part that matters.
 		out.Add("armed", res.ArmedNote)
 	}
 	if res.DisabledNote != "" {

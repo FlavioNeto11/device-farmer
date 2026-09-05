@@ -1526,11 +1526,15 @@ func TestReclaimTakesOnlyAnAbandonedLeaseAndEveryGuardHolds(t *testing.T) {
 		}
 		backdateHeartbeats(t, f.pool, 10*time.Minute)
 
-		gap, err := f.store.ReaperArm(ctx, ReaperComponents, DefaultGapFloor)
+		armed, err := f.store.ReaperArm(ctx, ReaperComponents, DefaultGapFloor)
 		if err != nil {
 			t.Fatalf("reaper arm: %v", err)
 		}
-		if gap < 9*time.Minute {
+		if !armed.Armed {
+			t.Fatalf("reaper arm refused with every component beating (unbeaten=%v); the refund below "+
+				"would prove nothing", armed.Unbeaten)
+		}
+		if gap := armed.Gap; gap < 9*time.Minute {
 			t.Fatalf("reaper arm reported a %s outage after ten minutes of silence across every component; "+
 				"an unrecorded gap is a farm-wide reclaim at the moment of recovery", gap)
 		}
@@ -1687,7 +1691,8 @@ func isolateReaperGlobals(t *testing.T, pool *pgxpool.Pool) {
 		// snapshotted instant, because no timestamp this process invented has
 		// any business reaching the database.
 		if _, err := pool.Exec(cctx,
-			`UPDATE farm.reaper_state SET quiesce_until = now(), armed_at = now()`); err != nil {
+			`UPDATE farm.reaper_state SET quiesce_until = now(), armed_at = now(),
+			        last_refusal = NULL, last_refusal_at = NULL`); err != nil {
 			t.Errorf("restore farm.reaper_state: %v; every reclaim test later in this run is now gated shut", err)
 		}
 		if _, err := pool.Exec(cctx,

@@ -127,9 +127,9 @@ const (
 // DefaultReaperComponents lists every component whose downtime must be
 // refunded to live leases. A component on the renewal path that is missing
 // from this list is a blind spot: farm.reaper_arm takes min(beat_at) over the
-// components it is given, a component with no row is simply absent from that
-// minimum, and so its outage is invisible to gap accounting — the failure mode
-// called out as BLOCKER 8 in migrations/00002_lease.sql.
+// components it is given, so an outage in a component it is not given is
+// invisible to gap accounting — the failure mode called out as BLOCKER 8 in
+// migrations/00002_lease.sql.
 //
 // It deliberately carries one name more than farm.reaper_arm's own SQL default
 // of ('reaper','api','scheduler'): the jobrunner holds the leases whose
@@ -137,11 +137,25 @@ const (
 // the refund exists for. The SQL default is only reachable by a hand-typed
 // psql call; every farmd process passes this list explicitly.
 //
-// The list is what a farm RUNS, not what it could run. farm.reaper_arm refunds
-// now()-min(beat_at) across the rows that exist, so a component that beat once
-// and was then scaled to zero leaves a stale row that refunds every second
-// since it left to every live lease, on every arm. Remove a component from
-// this list when you remove it from the farm — and delete its heartbeat row.
+// The janitor is NOT here, and that is a decision rather than an omission. It
+// beats (see roleComponents), and it looks like one more control-plane loop
+// worth watching — but it is not on the renewal path. It closes step rows
+// whose lease is already gone; it cannot extend a lease, so its being down
+// never stops a holder from renewing. Refunding its downtime would hand every
+// live lease an extension for an outage in a plane that cannot touch a lease
+// clock — the same fusion of clocks that keeps the watchdog and the recovery
+// ladder off this list, arriving through housekeeping instead of health. The
+// test for a name here is "can this component's silence prevent a renewal",
+// and the janitor's cannot.
+//
+// The list is what a farm RUNS, not what it could run. Since migration 00012 a
+// name here with no farm.component_heartbeat row makes farm.reaper_arm REFUSE
+// to arm: the reaper reclaims nothing, says so at WARN, on GET /api/v1/reaper
+// and on farm_reaper_unbeaten_components, and arms by itself once the
+// component beats. The mirror case is quieter: a component that beat once and
+// was then scaled to zero leaves a stale row that refunds every second since it
+// left to every live lease, on every arm. Remove a component from this list
+// when you remove it from the farm — and delete its heartbeat row.
 var DefaultReaperComponents = []string{"reaper", "api", "scheduler", "jobrunner"}
 
 // roleComponents is what each farmd role actually writes to

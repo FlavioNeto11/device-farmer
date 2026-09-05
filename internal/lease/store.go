@@ -447,20 +447,31 @@ func (s *Store) Release(ctx context.Context, leaseID string, fence int64, reason
 // ReaperArm performs cold-start quiescence and the control-plane gap refund,
 // and must be called by the reaper before its first sweep after any restart.
 //
-// It returns the gap that was refunded (zero when there was none). Every live
-// lease has its deadlines pushed out by exactly the outage, because our
-// downtime is refunded to tenants and never charged to them as lease budget,
-// and the reaper is then held quiet for the longest TTL it could have missed so
-// that a restored control plane does not mass-revoke at the moment of recovery.
+// On success it reports the gap that was refunded (zero when there was none).
+// Every live lease has its deadlines pushed out by exactly the outage, because
+// our downtime is refunded to tenants and never charged to them as lease
+// budget, and the reaper is then held quiet for the longest TTL it could have
+// missed so that a restored control plane does not mass-revoke at the moment
+// of recovery.
+//
+// It REFUSES — Armed false, Unbeaten naming the components — when a watched
+// component has never written a heartbeat row. That component's silence is
+// indistinguishable from an outage the refund exists for, so the reaper is left
+// unarmed and farm.lease_reclaim reclaims nothing until an arm succeeds. A
+// refusal is not an error: the caller should say so loudly and try again.
 //
 // components should normally be ReaperComponents: keying the gap on the
 // reaper's own heartbeat alone is how a healthy reaper next to a dead API
 // reclaims the entire farm.
-func (s *Store) ReaperArm(ctx context.Context, components []string, gapFloor time.Duration) (time.Duration, error) {
+func (s *Store) ReaperArm(ctx context.Context, components []string, gapFloor time.Duration) (ArmResult, error) {
 	// EXTRACT yields numeric seconds; scale to microseconds server-side so no
-	// float ever touches a deadline.
+	// float ever touches a deadline. The unbeaten list is coalesced so a
+	// refusal and a success differ in content, never in nullness.
 	const q = `
-SELECT (EXTRACT(EPOCH FROM farm.reaper_arm($1::text[], $2::interval)) * 1000000)::bigint`
+SELECT a.armed,
+       (EXTRACT(EPOCH FROM a.gap) * 1000000)::bigint,
+       COALESCE(a.unbeaten, '{}'::text[])
+  FROM farm.reaper_arm($1::text[], $2::interval) AS a`
 
 	if len(components) == 0 {
 		components = ReaperComponents
@@ -468,11 +479,18 @@ SELECT (EXTRACT(EPOCH FROM farm.reaper_arm($1::text[], $2::interval)) * 1000000)
 	if gapFloor <= 0 {
 		gapFloor = DefaultGapFloor
 	}
-	var us int64
-	if err := s.pool.QueryRow(ctx, q, components, intervalArg(gapFloor)).Scan(&us); err != nil {
-		return 0, fmt.Errorf("lease: reaper arm: %w", err)
+	var (
+		res ArmResult
+		us  int64
+	)
+	if err := s.pool.QueryRow(ctx, q, components, intervalArg(gapFloor)).Scan(&res.Armed, &us, &res.Unbeaten); err != nil {
+		return ArmResult{}, fmt.Errorf("lease: reaper arm: %w", err)
 	}
-	return time.Duration(us) * time.Microsecond, nil
+	res.Gap = time.Duration(us) * time.Microsecond
+	if len(res.Unbeaten) == 0 {
+		res.Unbeaten = nil
+	}
+	return res, nil
 }
 
 // MarkSuspect moves leases whose heartbeat is overdue from held to suspect and

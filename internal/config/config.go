@@ -71,6 +71,67 @@ const (
 	EnvMigrationsDir    = "FARM_MIGRATIONS_DIR"
 )
 
+// U12 — node agent and topology discovery.
+//
+// These reach `farmd node` and, for the token, the recovery ladder. They were
+// previously either read raw from the environment in cmd/farmd (the token) or
+// not read at all: topo.Config has thirteen fields and the node role filled
+// five, which left removal reconciliation, the hub filter, the naming map and
+// the dry-run switch unreachable from any manifest.
+const (
+	// EnvNodeToken is the shared secret between the recovery ladder and
+	// every node agent's HTTP surface. It is a secret: Summary reports whether
+	// it is set and never its value.
+	EnvNodeToken = "FARM_NODE_TOKEN"
+
+	// EnvSysfsRoot is the directory the USB tree is read from. It is the bus
+	// device directory itself, not the top of sysfs: the reader lists it and
+	// expects entries named "usb3", "3-1.4" and so on.
+	EnvSysfsRoot = "FARM_SYSFS_ROOT"
+
+	// EnvTopoOverrides is the path of a JSON file holding topo.Overrides: hub
+	// USB paths to the token printed after "H", and slot USB paths to whole
+	// labels. Empty means no overrides.
+	EnvTopoOverrides = "FARM_TOPO_OVERRIDES"
+
+	EnvTopoRetireVanished    = "FARM_TOPO_RETIRE_VANISHED"
+	EnvTopoMaxRetireFraction = "FARM_TOPO_MAX_RETIRE_FRACTION"
+	EnvTopoDryRun            = "FARM_TOPO_DRY_RUN"
+	EnvTopoMinPorts          = "FARM_TOPO_MIN_PORTS"
+	EnvTopoAdoptEmpty        = "FARM_TOPO_ADOPT_EMPTY"
+	EnvTopoIncludeRootHubs   = "FARM_TOPO_INCLUDE_ROOT_HUBS"
+	EnvTopoInclude           = "FARM_TOPO_INCLUDE"
+	EnvTopoExclude           = "FARM_TOPO_EXCLUDE"
+	EnvTopoInterval          = "FARM_TOPO_INTERVAL"
+	EnvTopoCallTimeout       = "FARM_TOPO_CALL_TIMEOUT"
+)
+
+// Defaults for the U12 knobs. Each mirrors the constant the consuming package
+// would apply on its own for a zero value; they are restated here so that
+// Summary prints the number the node will actually run with, and a test in
+// this package holds the two copies together.
+const (
+	// DefaultSysfsRoot mirrors topo.DefaultSysfsRoot. The old node role passed
+	// "/sys", which lists block/, bus/, class/ … and finds no USB device in any
+	// of them — an empty host, reported as a successful scan.
+	DefaultSysfsRoot = "/sys/bus/usb/devices"
+
+	// DefaultTopoMaxRetireFraction mirrors topo.DefaultMaxRetireFraction.
+	DefaultTopoMaxRetireFraction = 0.25
+	// DefaultTopoMinPorts mirrors topo.DefaultMinHubPorts.
+	DefaultTopoMinPorts = 3
+	// DefaultTopoInterval mirrors both topo.DefaultInterval and
+	// node.DefaultDiscoverInterval, which must agree: the node agent paces
+	// discovery and budgets one pass at this interval.
+	DefaultTopoInterval = 5 * time.Minute
+	// DefaultTopoCallTimeout mirrors topo.DefaultCallTimeout.
+	DefaultTopoCallTimeout = 30 * time.Second
+
+	// MaxHubPorts mirrors CHECK (port_count BETWEEN 1 AND 32) on farm.hubs. A
+	// port floor above it would let no hub through, ever, and say nothing.
+	MaxHubPorts = 32
+)
+
 // Mirrors of CHECK constraints in migrations/00001_core.sql. Duplicated on
 // purpose: the database is the authority, but a process that would inevitably
 // violate the authority should never finish booting.
@@ -228,6 +289,64 @@ type Node struct {
 	FenceSafetyMargin time.Duration
 	ADBEndpoint       string
 	HostID            string
+	// Token authenticates the recovery ladder to the node agent's HTTP
+	// surface, which can cut power to a port holding a live lease. It is
+	// never printed: RedactedDatabaseURL has a shape it can blank, this has
+	// none, so Summary says only whether it is set.
+	Token string
+}
+
+// Topo holds the node agent's USB discovery knobs, one per topo.Config field
+// the role can set. Values here decide which hubs become slots and whether a
+// port the kernel stopped reporting is marked 'maintenance'. None of them can
+// reach a lease: discovery does not read farm.leases, and a retired slot only
+// stops being scheduled for the NEXT allocation.
+type Topo struct {
+	// SysfsRoot is the directory listed for USB devices. See EnvSysfsRoot.
+	SysfsRoot string
+	// OverridesPath names a JSON file of topo.Overrides, or is empty.
+	OverridesPath string
+
+	// RetireVanished turns removal reconciliation on: a port the kernel no
+	// longer reports is marked 'maintenance', and one it reports again is
+	// restored.
+	//
+	// Off by default, and the default must stay off. The first pass a new
+	// deployment runs is against a host whose slots were seeded by hand or by
+	// an earlier tool, with USB paths that may not match what this scan sees;
+	// with reconciliation on, that pass would find every seeded slot missing
+	// and retire the lot. The mass-removal bound catches most of that, but a
+	// host with one seeded slot is under it. Turn this on once one pass has
+	// been read and the slots it registered are the slots the host has.
+	RetireVanished bool
+	// MaxRetireFraction is the share of a host's active slots one pass may
+	// retire before it refuses and asks for a human. In (0, 1].
+	MaxRetireFraction float64
+	// DryRun plans every slot and label and writes nothing.
+	DryRun bool
+
+	// MinPorts ignores hubs with fewer ports: the two-port hub inside a
+	// monitor is not a rack position.
+	MinPorts int
+	// AdoptEmpty adopts a hub that carries nothing at all, for a rack cabled
+	// before it is populated. Without it a hub joins the farm only once a
+	// phone is in it.
+	AdoptEmpty bool
+	// IncludeRootHubs lets motherboard ports that currently hold an Android
+	// device become slots. Never the other root ports: those are the host's
+	// own keyboard, NIC and BMC.
+	IncludeRootHubs bool
+	// Include and Exclude are hub USB paths ("3-1.4") always or never
+	// adopted. A path may not be in both.
+	Include []string
+	Exclude []string
+
+	// Interval paces discovery passes and is also the budget for one pass:
+	// the node agent cancels a pass that has not finished by the time the
+	// next is due.
+	Interval time.Duration
+	// CallTimeout bounds one database statement inside a pass.
+	CallTimeout time.Duration
 }
 
 // Config is the whole of farmd's environment-derived configuration.
@@ -261,6 +380,7 @@ type Config struct {
 	Lease  Lease
 	Reaper Reaper
 	Node   Node
+	Topo   Topo
 
 	WatchdogInterval time.Duration
 	MigrationsTable  string
@@ -326,6 +446,21 @@ func Load(component string, opts ...Option) (*Config, error) {
 			FenceSafetyMargin: l.dur(EnvFenceMargin, DefaultFenceMargin),
 			ADBEndpoint:       l.str(EnvNodeADBEndpoint, DefaultADBEndpoint),
 			HostID:            l.str(EnvNodeHostID, ""),
+			Token:             l.str(EnvNodeToken, ""),
+		},
+		Topo: Topo{
+			SysfsRoot:         l.str(EnvSysfsRoot, DefaultSysfsRoot),
+			OverridesPath:     l.str(EnvTopoOverrides, ""),
+			RetireVanished:    l.boolean(EnvTopoRetireVanished, false),
+			MaxRetireFraction: l.float(EnvTopoMaxRetireFraction, DefaultTopoMaxRetireFraction),
+			DryRun:            l.boolean(EnvTopoDryRun, false),
+			MinPorts:          l.num(EnvTopoMinPorts, DefaultTopoMinPorts),
+			AdoptEmpty:        l.boolean(EnvTopoAdoptEmpty, false),
+			IncludeRootHubs:   l.boolean(EnvTopoIncludeRootHubs, false),
+			Include:           l.list(EnvTopoInclude, nil),
+			Exclude:           l.list(EnvTopoExclude, nil),
+			Interval:          l.dur(EnvTopoInterval, DefaultTopoInterval),
+			CallTimeout:       l.dur(EnvTopoCallTimeout, DefaultTopoCallTimeout),
 		},
 
 		WatchdogInterval: l.dur(EnvWatchdogInterval, DefaultWatchdogEvery),
@@ -652,7 +787,96 @@ Fix by raising %s above %s + %s, or by lowering the proxy's self-fence timeout.`
 			EnvAPIBaseURL, c.APIBaseURL, u.Scheme)
 	}
 
+	// ---- topology discovery ------------------------------------------
+	//
+	// Values are checked for every role: a fraction of 1.5 is a typo wherever
+	// it is set, and the "report everything at once" rule wants it in the
+	// same report as the rest. The overrides FILE is checked only where it is
+	// read, because a shared manifest points every role at a path that exists
+	// on the device host alone.
+	if !strings.HasPrefix(c.Topo.SysfsRoot, "/") {
+		fail("%s (%q) must be an absolute path on the Linux host, normally %s; "+
+			"it is the USB bus device directory itself, the one holding entries "+
+			"named like \"usb3\" and \"3-1.4\"", EnvSysfsRoot, c.Topo.SysfsRoot, DefaultSysfsRoot)
+	}
+	if c.Topo.OverridesPath != "" && c.scansUSB() {
+		if st, err := os.Stat(c.Topo.OverridesPath); err != nil {
+			fail("%s (%q): %v", EnvTopoOverrides, c.Topo.OverridesPath, err)
+		} else if st.IsDir() {
+			fail("%s (%q) is a directory, and must be a JSON file holding "+
+				"{\"hub_tokens\": {...}, \"slot_labels\": {...}}", EnvTopoOverrides, c.Topo.OverridesPath)
+		}
+	}
+	// Written as the negation of the accepted range so that NaN, which
+	// strconv.ParseFloat accepts, fails rather than slipping past both bounds.
+	if f := c.Topo.MaxRetireFraction; !(f > 0 && f <= 1) {
+		fail("%s (%g) must be greater than 0 and at most 1; it is the share of a host's "+
+			"active slots one discovery pass may mark 'maintenance' before refusing. "+
+			"1 means \"retire everything the scan says is gone\", which is what a lost "+
+			"/sys bind mount looks like", EnvTopoMaxRetireFraction, f)
+	}
+	if c.Topo.MinPorts < 1 || c.Topo.MinPorts > MaxHubPorts {
+		fail("%s (%d) must be between 1 and %d: farm.hubs.port_count is CHECK-constrained "+
+			"to that range, so a floor above it lets no hub become slots and says nothing",
+			EnvTopoMinPorts, c.Topo.MinPorts, MaxHubPorts)
+	}
+	if c.Topo.Interval <= 0 {
+		fail("%s must be positive", EnvTopoInterval)
+	}
+	if c.Topo.CallTimeout <= 0 {
+		fail("%s must be positive", EnvTopoCallTimeout)
+	} else if c.Topo.Interval > 0 && c.Topo.CallTimeout > c.Topo.Interval {
+		fail("%s (%s) exceeds %s (%s). The node agent cancels a discovery pass that has "+
+			"not finished by the time the next is due, so a single statement allowed to "+
+			"outlast the whole pass is a timeout that can never fire",
+			EnvTopoCallTimeout, c.Topo.CallTimeout, EnvTopoInterval, c.Topo.Interval)
+	}
+	for _, p := range c.Topo.Include {
+		if !isUSBPath(p) {
+			fail("%s entry %q is not a hub USB path; expected the kernel's bus-port chain "+
+				"such as \"3-1.4\", or \"3-0\" for a root hub", EnvTopoInclude, p)
+		}
+	}
+	for _, p := range c.Topo.Exclude {
+		if !isUSBPath(p) {
+			fail("%s entry %q is not a hub USB path; expected the kernel's bus-port chain "+
+				"such as \"3-1.4\", or \"3-0\" for a root hub", EnvTopoExclude, p)
+		}
+		// Excludes win over includes in topo.HubFilter, so the include would
+		// be read, kept and applied to nothing — the shape of mistake this
+		// package refuses rather than resolves.
+		if contains(c.Topo.Include, p) {
+			fail("hub %q is in both %s and %s; the exclude would win and the include "+
+				"would silently do nothing", p, EnvTopoInclude, EnvTopoExclude)
+		}
+	}
+
 	return errs
+}
+
+// scansUSB reports whether this role reads the USB tree, and so the files the
+// topo knobs point at. Only the node agent does; every other role carries the
+// values through a shared manifest and never opens them.
+func (c *Config) scansUSB() bool { return c.role == "node" }
+
+// isUSBPath accepts what topo.canonicalPath renders: "<bus>-<port>[.<port>…]",
+// with "<bus>-0" for a root hub. A hub named any other way ("usb3", "3-1:1.0",
+// a devpath with a leading slash) would never match a hub the scan reports,
+// so an include or exclude written that way is a filter that filters nothing.
+func isUSBPath(s string) bool {
+	bus, ports, ok := strings.Cut(s, "-")
+	if !ok || bus == "" || ports == "" {
+		return false
+	}
+	if _, err := strconv.Atoi(bus); err != nil {
+		return false
+	}
+	for _, p := range strings.Split(ports, ".") {
+		if n, err := strconv.Atoi(p); err != nil || n < 0 || p == "" {
+			return false
+		}
+	}
+	return true
 }
 
 // RedactedDatabaseURL renders the DSN safely for logs. Nothing in this binary
@@ -722,8 +946,47 @@ func (c *Config) Summary() string {
 	fmt.Fprintf(&b, "reaper           = every %s, batch %d, gap floor %s, watching %s\n",
 		c.Reaper.Interval, c.Reaper.Batch, c.Reaper.GapFloor,
 		strings.Join(c.Reaper.Components, ","))
+	// Set or unset is the whole of what may be said about the token. Its
+	// absence is worth a line because the consequence is silent otherwise:
+	// the ladder logs one warning at startup and then refuses tiers 3 and 4
+	// for the life of the process.
+	if c.Node.Token == "" {
+		fmt.Fprintf(&b, "node token       = (unset: the node HTTP endpoint cannot start and "+
+			"recovery tiers 3 and 4 stay refused)\n")
+	} else {
+		fmt.Fprintf(&b, "node token       = (set, never printed)\n")
+	}
+	overrides := "none"
+	if c.Topo.OverridesPath != "" {
+		overrides = c.Topo.OverridesPath
+	}
+	fmt.Fprintf(&b, "topo             = sysfs %s, every %s (call timeout %s), overrides %s\n",
+		c.Topo.SysfsRoot, c.Topo.Interval, c.Topo.CallTimeout, overrides)
+	fmt.Fprintf(&b, "topo hubs        = min %d ports, adopt empty %s, root hubs %s, include [%s], exclude [%s]\n",
+		c.Topo.MinPorts, onOff(c.Topo.AdoptEmpty), onOff(c.Topo.IncludeRootHubs),
+		strings.Join(c.Topo.Include, ","), strings.Join(c.Topo.Exclude, ","))
+	// A retirement policy that is off reads as though vanished ports are
+	// handled somehow. They are not: they stay active and never fill.
+	if c.Topo.RetireVanished {
+		fmt.Fprintf(&b, "topo removals    = retire vanished ports, at most %.0f%% of the host per pass",
+			c.Topo.MaxRetireFraction*100)
+	} else {
+		fmt.Fprintf(&b, "topo removals    = off (a port the kernel stops reporting stays an active, "+
+			"empty slot; bound %.0f%% if enabled)", c.Topo.MaxRetireFraction*100)
+	}
+	if c.Topo.DryRun {
+		b.WriteString(" — DRY RUN, nothing is written")
+	}
+	b.WriteString("\n")
 	fmt.Fprintf(&b, "shutdown grace   = %s (drains requests; releases nothing)\n", c.ShutdownGrace)
 	return b.String()
+}
+
+func onOff(v bool) string {
+	if v {
+		return "on"
+	}
+	return "off"
 }
 
 // renewAttempts is how many renewals fit inside one TTL, which is the number
@@ -802,6 +1065,35 @@ func (l *loader) num32(key string, def int32) int32 {
 		return def
 	}
 	return int32(n)
+}
+
+// boolean accepts what strconv.ParseBool does: 1, t, true, 0, f, false, in any
+// case. "yes" is refused rather than read as false, because a switch that
+// turns removal reconciliation on must not be silently left off by a spelling.
+func (l *loader) boolean(key string, def bool) bool {
+	v, ok := l.raw(key)
+	if !ok {
+		return def
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		l.errs = append(l.errs, fmt.Errorf("%s=%q is not a boolean (want true or false): %w", key, v, err))
+		return def
+	}
+	return b
+}
+
+func (l *loader) float(key string, def float64) float64 {
+	v, ok := l.raw(key)
+	if !ok {
+		return def
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil {
+		l.errs = append(l.errs, fmt.Errorf("%s=%q is not a number: %w", key, v, err))
+		return def
+	}
+	return f
 }
 
 func (l *loader) list(key string, def []string) []string {

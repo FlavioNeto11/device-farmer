@@ -420,12 +420,12 @@ func runRecovery(ctx context.Context, cfg *config.Config, log *slog.Logger, pool
 	// endpoint per call, and a host with node_endpoint NULL produces the same
 	// honest refusal as before — for that host only, rather than fleet-wide.
 	var runner recovery.HostRunner
-	token := os.Getenv("FARM_NODE_TOKEN")
+	token := cfg.Node.Token
 	if token == "" {
-		log.Warn("no FARM_NODE_TOKEN set, so recovery tiers 3 and 4 stay refused",
+		log.Warn("no "+config.EnvNodeToken+" set, so recovery tiers 3 and 4 stay refused",
 			"consequence", "a device that needs a USB reset or a port power cycle "+
 				"will climb to quarantine instead of being recovered",
-			"fix", "set FARM_NODE_TOKEN to the same value the farmd node agents use")
+			"fix", "set "+config.EnvNodeToken+" to the same value the farmd node agents use")
 	} else {
 		c, cerr := node.NewClient(node.ClientConfig{
 			Resolver: node.NewDBResolver(pool),
@@ -706,17 +706,42 @@ func runNode(ctx context.Context, cfg *config.Config, log *slog.Logger, pool *pg
 			"physical host, and guessing which one would attach a rack of phones to the wrong row")
 	}
 
-	src, err := topo.Sysfs("/sys")
+	// The naming map is checked before the bus is opened: a collision in it
+	// is a mistake in a file, and reporting it should not wait on hardware.
+	overrides, err := topo.LoadOverrides(cfg.Topo.OverridesPath)
+	if err != nil {
+		return fmt.Errorf("%s: %w", config.EnvTopoOverrides, err)
+	}
+	src, err := topo.Sysfs(cfg.Topo.SysfsRoot)
 	if err != nil {
 		return fmt.Errorf("read the USB tree: %w "+
 			"(a node agent must run on the Linux host the devices are plugged into)", err)
 	}
 	disco, err := topo.New(topo.Config{
-		Pool:   pool,
-		HostID: hostID,
-		Source: src,
-		Actor:  "farmd-node",
-		Logger: log.With("component", "topo"),
+		Pool:      pool,
+		HostID:    hostID,
+		Source:    src,
+		Overrides: overrides,
+		Filter: topo.HubFilter{
+			Include:         cfg.Topo.Include,
+			Exclude:         cfg.Topo.Exclude,
+			MinPorts:        cfg.Topo.MinPorts,
+			AdoptEmpty:      cfg.Topo.AdoptEmpty,
+			IncludeRootHubs: cfg.Topo.IncludeRootHubs,
+		},
+		Actor: "farmd-node",
+		// Off unless the manifest says otherwise. See config.Topo for why the
+		// default must stay off: the first pass against a hand-seeded host
+		// would otherwise retire every slot on it.
+		RetireVanished:    cfg.Topo.RetireVanished,
+		MaxRetireFraction: cfg.Topo.MaxRetireFraction,
+		DryRun:            cfg.Topo.DryRun,
+		// The node agent paces discovery through Discover below and never
+		// calls Discoverer.Run, so Interval reaches nothing here; it is set so
+		// the two intervals cannot disagree if that ever changes.
+		Interval:    cfg.Topo.Interval,
+		CallTimeout: cfg.Topo.CallTimeout,
+		Logger:      log.With("component", "topo"),
 	})
 	if err != nil {
 		return fmt.Errorf("topology discovery: %w", err)
@@ -752,6 +777,9 @@ func runNode(ctx context.Context, cfg *config.Config, log *slog.Logger, pool *pg
 			_, derr := disco.Once(c)
 			return derr
 		},
+		// One knob for both: this is the interval the agent ticks on, and the
+		// budget it gives each pass.
+		DiscoverInterval: cfg.Topo.Interval,
 		// Run, not EnrollOnce. node.EnrollFunc is a continuous job: a function
 		// that performs one pass and returns is read as a fault, restarted on a
 		// doubling backoff, and warned about every cycle — so a healthy farm
@@ -766,7 +794,7 @@ func runNode(ctx context.Context, cfg *config.Config, log *slog.Logger, pool *pg
 		// worse than no endpoint. Serving nothing is a legitimate deployment
 		// — discovery and enrollment still run — so an empty Addr needs no
 		// token, and a non-empty one needs this.
-		Token:  os.Getenv("FARM_NODE_TOKEN"),
+		Token:  cfg.Node.Token,
 		Logger: log,
 	})
 	if err != nil {

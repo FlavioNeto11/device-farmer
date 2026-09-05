@@ -68,6 +68,7 @@ not offer.
 | `DeviceFarmerRecoveryRefusedGanged` | [recovery-refused-ganged.md](recovery-refused-ganged.md) |
 | `DeviceFarmerRecoveryRefusedPolicy` | [recovery-refused-policy.md](recovery-refused-policy.md) |
 | `DeviceFarmerRecoveryFailing` | [recovery-failing.md](recovery-failing.md) |
+| `DeviceFarmerBatteryAnomaly` | [battery-anomaly.md](battery-anomaly.md) |
 
 ### Jobs and coverage
 

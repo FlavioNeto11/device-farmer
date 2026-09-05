@@ -40,6 +40,7 @@ var allEnv = []string{
 	EnvTopoRetireVanished, EnvTopoMaxRetireFraction, EnvTopoDryRun,
 	EnvTopoMinPorts, EnvTopoAdoptEmpty, EnvTopoIncludeRootHubs,
 	EnvTopoInclude, EnvTopoExclude, EnvTopoInterval, EnvTopoCallTimeout,
+	EnvBatteryTempRise, EnvBatteryTempMax, EnvBatteryDrain,
 }
 
 const testDSN = "postgres://farm@127.0.0.1:5432/farm?sslmode=disable"
@@ -151,6 +152,9 @@ func TestDefaultValues(t *testing.T) {
 		{EnvTopoIncludeRootHubs, cfg.Topo.IncludeRootHubs, false},
 		{EnvTopoInterval, cfg.Topo.Interval, DefaultTopoInterval},
 		{EnvTopoCallTimeout, cfg.Topo.CallTimeout, DefaultTopoCallTimeout},
+		{EnvBatteryTempRise, cfg.Battery.TempRiseDCPerMin, DefaultBatteryTempRiseDCPerMin},
+		{EnvBatteryTempMax, cfg.Battery.TempMaxDC, DefaultBatteryTempMaxDC},
+		{EnvBatteryDrain, cfg.Battery.DrainPctPerHour, DefaultBatteryDrainPctPerHour},
 	}
 	for _, c := range checks {
 		if c.got != c.want {
@@ -315,6 +319,24 @@ func TestPreflightRefusals(t *testing.T) {
 		role: "reaper",
 		envs: map[string]string{EnvHeartbeatEvery: "45s", EnvReaperGapFloor: "60s"},
 		want: []string{EnvHeartbeatEvery, EnvReaperGapFloor},
+	}, {
+		// U9 — battery health. A ceiling the column cannot hold is a rule
+		// that never fires, which is worse than no rule: somebody believes
+		// they are covered.
+		name: "battery ceiling above the column CHECK",
+		role: "watchdog",
+		envs: map[string]string{EnvBatteryTempMax: "1501"},
+		want: []string{EnvBatteryTempMax, "never fire"},
+	}, {
+		name: "battery rise rate of zero",
+		role: "watchdog",
+		envs: map[string]string{EnvBatteryTempRise: "0"},
+		want: []string{EnvBatteryTempRise, "at least 1"},
+	}, {
+		name: "battery drain above one hundred points an hour",
+		role: "watchdog",
+		envs: map[string]string{EnvBatteryDrain: "101"},
+		want: []string{EnvBatteryDrain, "1..100"},
 	}, {
 		name: "empty component watch list",
 		role: "reaper",
@@ -667,6 +689,9 @@ func TestEveryVariableIsRead(t *testing.T) {
 		EnvTopoInterval:          "2m",
 		EnvTopoCallTimeout:       "20s",
 		EnvDBRole:                "farm_scheduler",
+		EnvBatteryTempRise:       "35",
+		EnvBatteryTempMax:        "500",
+		EnvBatteryDrain:          "25",
 	})
 	cfg, err := Load("scheduler")
 	if err != nil {
@@ -717,6 +742,9 @@ func TestEveryVariableIsRead(t *testing.T) {
 		{EnvTopoIncludeRootHubs, cfg.Topo.IncludeRootHubs, true},
 		{EnvTopoInterval, cfg.Topo.Interval, 2 * time.Minute},
 		{EnvTopoCallTimeout, cfg.Topo.CallTimeout, 20 * time.Second},
+		{EnvBatteryTempRise, cfg.Battery.TempRiseDCPerMin, 35},
+		{EnvBatteryTempMax, cfg.Battery.TempMaxDC, 500},
+		{EnvBatteryDrain, cfg.Battery.DrainPctPerHour, 25},
 	}
 	for _, c := range checks {
 		if c.got != c.want {
@@ -1082,6 +1110,9 @@ func TestSummaryShowsWhatTheProcessDecided(t *testing.T) {
 		"xxxxx", // the password, gone
 		// the artifact sweep's fence, at its default
 		"artifact gc      = grace 1h0m0s",
+		// U9: the battery thresholds, in the degrees a human reads, and the
+		// statement that they end nothing.
+		"2.0 C/min", "45.0 C", "15 %/h", "ends nothing",
 	} {
 		if !strings.Contains(s, want) {
 			t.Errorf("summary omits %q:\n%s", want, s)

@@ -153,6 +153,10 @@ type Config struct {
 	MinBad     int
 	MinGood    int
 
+	// Battery is the swell detector's policy; see swell.go. Zero fields take
+	// the defaults, so a caller that has no opinion still gets a detector.
+	Battery BatteryThresholds
+
 	Logger *slog.Logger
 }
 
@@ -181,6 +185,7 @@ func (c *Config) applyDefaults() {
 	if c.MinGood < 1 {
 		c.MinGood = DefaultMinGood
 	}
+	c.Battery.applyDefaults()
 	if c.Logger == nil {
 		c.Logger = slog.Default()
 	}
@@ -225,7 +230,10 @@ func (w *Watchdog) Run(ctx context.Context) error {
 	w.log.Info("watchdog loop starting",
 		"host", orAll(w.cfg.HostID), "interval", w.cfg.Interval,
 		"flap_cap", w.cfg.FlapCap, "flap_refill_per_min", w.cfg.FlapRefill,
-		"min_bad", w.cfg.MinBad, "min_good", w.cfg.MinGood)
+		"min_bad", w.cfg.MinBad, "min_good", w.cfg.MinGood,
+		"battery_temp_rise_dc_per_min", w.cfg.Battery.TempRiseDCPerMin,
+		"battery_temp_max_dc", w.cfg.Battery.TempMaxDC,
+		"battery_drain_pct_per_hour", w.cfg.Battery.DrainPctPerHour)
 
 	defer func() {
 		for _, wk := range w.workers {

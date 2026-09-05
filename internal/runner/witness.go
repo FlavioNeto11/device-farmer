@@ -11,6 +11,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/flaviopadilha/device-farmer/internal/config"
 	"github.com/flaviopadilha/device-farmer/internal/lease"
 )
 
@@ -67,15 +68,27 @@ const (
 
 // Marker-loop defaults.
 const (
-	// DefaultMarkerInterval is how often the marker is rewritten. It is well
-	// under lease.DefaultWitnessInterval on purpose: the witness may only
-	// present evidence that is fresh, so the marker must be refreshed several
-	// times per witness tick for a single lost round trip to cost nothing.
-	DefaultMarkerInterval = 30 * time.Second
+	// DefaultMarkerInterval is how often the marker is rewritten when the
+	// caller sets no cadence: the default witness cadence divided by the
+	// number of writes a witness tick is entitled to. It is not a number of
+	// its own — the witness may only present evidence that is fresh, so the
+	// marker must be refreshed several times per witness tick for a single
+	// lost round trip to cost nothing, and config.MarkersPerWitnessTick is
+	// the one place that ratio is written down.
+	DefaultMarkerInterval = lease.DefaultWitnessInterval / config.MarkersPerWitnessTick
 
 	// DefaultMarkerTimeout bounds one refresh. A refresh that hangs must not
 	// consume the interval, or one wedged shell turns into no evidence at all.
 	DefaultMarkerTimeout = 20 * time.Second
+
+	// DefaultMarkerRemoveTimeout bounds Remove, separately and much more
+	// tightly. Remove sits between a job's verdict and the release of its
+	// device, so every second it spends is a second the device stays parked
+	// on a finished job — and it is buying nothing that matters: a marker
+	// that outlives its lease is detected by the fence written inside it, so
+	// a device that will not take the delete in a few seconds is left with a
+	// harmless leftover rather than allowed to hold up the release.
+	DefaultMarkerRemoveTimeout = 5 * time.Second
 
 	// maxMarkerBytes bounds what is read back from the marker path. A marker is
 	// a couple of hundred bytes; the slack exists so an operator can be shown
@@ -132,9 +145,19 @@ type MarkerState struct {
 
 // MarkerConfig configures a Marker. The zero value is valid.
 type MarkerConfig struct {
+	// Interval is the refresh cadence. The supervisor derives it from the
+	// witness cadence (config.MarkerIntervalFor) so the evidence window and
+	// the writes that fill it come from one rule.
 	Interval time.Duration
-	Timeout  time.Duration
-	Logger   *slog.Logger
+
+	// Timeout bounds one refresh round trip.
+	Timeout time.Duration
+
+	// RemoveTimeout bounds Remove. See DefaultMarkerRemoveTimeout for why it
+	// is a separate, shorter budget than Timeout.
+	RemoveTimeout time.Duration
+
+	Logger *slog.Logger
 }
 
 func (c *MarkerConfig) applyDefaults() {
@@ -143,6 +166,9 @@ func (c *MarkerConfig) applyDefaults() {
 	}
 	if c.Timeout <= 0 {
 		c.Timeout = DefaultMarkerTimeout
+	}
+	if c.RemoveTimeout <= 0 {
+		c.RemoveTimeout = DefaultMarkerRemoveTimeout
 	}
 	if c.Logger == nil {
 		c.Logger = slog.Default()
@@ -188,6 +214,9 @@ type Marker struct {
 	// field exists to prevent.
 	silent bool
 	stats  MarkerStats
+	// streak counts consecutive failed refreshes, for the log: the first one
+	// is worth a Warn, the rest of a reboot's worth are not.
+	streak uint64
 }
 
 var _ lease.Evidence = (*Marker)(nil)
@@ -280,6 +309,13 @@ func (m *Marker) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			// A tick and the cancellation can come due together, and select
+			// picks between ready cases at random. A refresh issued after the
+			// supervisor said stop is a round trip to a device it may be
+			// about to delete the marker from.
+			if ctx.Err() != nil {
+				return
+			}
 			if !m.refreshLogged(ctx) {
 				return
 			}
@@ -292,8 +328,21 @@ func (m *Marker) Run(ctx context.Context) {
 func (m *Marker) refreshLogged(ctx context.Context) (continueRefreshing bool) {
 	err := m.Refresh(ctx)
 	switch {
-	case err == nil, ctx.Err() != nil:
-		return ctx.Err() == nil
+	case ctx.Err() != nil:
+		// The supervisor ended the loop. Whatever the round trip returned is
+		// not a fact about the device, so nothing is logged and nothing was
+		// counted (see Refresh).
+		return false
+
+	case err == nil:
+		if n := m.recovered(); n > 0 {
+			// The counterpart of the Warn below, so an operator reading a
+			// device's log can see the outage close and how long it lasted
+			// without counting Info lines.
+			m.log.Info("the on-device lease marker is being refreshed again", "path", MarkerPath,
+				"failed_refreshes", n)
+		}
+		return true
 
 	case errors.Is(err, ErrMarkerSuperseded):
 		// Nothing to write and nothing to prove: this device is somebody
@@ -305,11 +354,20 @@ func (m *Marker) refreshLogged(ctx context.Context) (continueRefreshing bool) {
 		return false
 
 	default:
-		// Warn, never Error: the job is fine, the lease is fine, and the only
-		// consequence is that a witness will not be presented until this
-		// succeeds again.
-		m.log.Warn("could not refresh the on-device lease marker (the job and the lease are untouched)",
-			"path", MarkerPath, "err", err)
+		// Warn once, never Error, and Info for the repeats. The job is fine,
+		// the lease is fine, and the only consequence is that a witness will
+		// not be presented until this succeeds again. And the repeats are
+		// expected: every reset tier above 'none' reboots the phone, and for
+		// the length of that reboot every tick fails in exactly this way. One
+		// Warn per outage is the signal; a Warn per tick is a false alarm
+		// that fires on every clean reset in the farm.
+		level, streak := slog.LevelInfo, m.failStreak()
+		if streak == 1 {
+			level = slog.LevelWarn
+		}
+		m.log.Log(context.Background(), level,
+			"could not refresh the on-device lease marker (the job and the lease are untouched)",
+			"path", MarkerPath, "consecutive_failures", streak, "err", err)
 		return true
 	}
 }
@@ -322,31 +380,56 @@ func (m *Marker) refreshLogged(ctx context.Context) (continueRefreshing bool) {
 // different in one respect only — it clears the evidence immediately, because
 // a device that has been granted to a newer fence is one we can prove nothing
 // about.
+//
+// A refresh cut short because ctx ended is neither a success nor a failure. It
+// is returned as an error, since no write landed, but it is not counted: the
+// supervisor cancelling a refresh when the job finishes says nothing about
+// the device, and a placement that ended cleanly must not go on record as one
+// whose evidence failed.
 func (m *Marker) Refresh(ctx context.Context) error {
 	cctx, cancel := context.WithTimeout(ctx, m.cfg.Timeout)
 	defer cancel()
 
-	out, err := m.dev.Shell(cctx, m.writeCmd(false))
+	err := m.write(cctx)
+	switch {
+	case err == nil:
+		return m.refreshed()
+	case errors.Is(err, ErrMarkerSuperseded):
+		// Recorded by supersededBy, which is the only thing that produces it.
+		return err
+	case ctx.Err() != nil:
+		// The caller's context, not the timeout's: a refresh that ran out of
+		// its own budget is a wedged device and counts, a refresh the
+		// supervisor cancelled is nothing.
+		return err
+	default:
+		return m.failed(err)
+	}
+}
+
+// write is one refresh round trip, without the accounting.
+func (m *Marker) write(ctx context.Context) error {
+	out, err := m.dev.Shell(ctx, m.writeCmd(false))
 	if err != nil {
-		return m.failed(fmt.Errorf("runner: write %s: %w", MarkerPath, err))
+		return fmt.Errorf("runner: write %s: %w", MarkerPath, err)
 	}
 	if !out.Exited {
 		// The stream ended before the device said anything. Reading that as
 		// success would have us present a witness for a write that may never
 		// have landed.
-		return m.failed(fmt.Errorf("runner: write %s: the shell stream ended without an exit status", MarkerPath))
+		return fmt.Errorf("runner: write %s: the shell stream ended without an exit status", MarkerPath)
 	}
 
 	switch out.ExitCode {
 	case 0:
-		return m.refreshed()
+		return nil
 
 	case markerForeign:
-		return m.resolveForeign(cctx, out)
+		return m.resolveForeign(ctx, out)
 
 	default:
-		return m.failed(fmt.Errorf("runner: write %s: exit status %d%s",
-			MarkerPath, out.ExitCode, stderrHint(out)))
+		return fmt.Errorf("runner: write %s: exit status %d%s",
+			MarkerPath, out.ExitCode, stderrHint(out))
 	}
 }
 
@@ -384,15 +467,15 @@ func (m *Marker) resolveForeign(ctx context.Context, out ShellOutput) error {
 
 	forced, err := m.dev.Shell(ctx, m.writeCmd(true))
 	if err != nil {
-		return m.failed(fmt.Errorf("runner: replace %s: %w", MarkerPath, err))
+		return fmt.Errorf("runner: replace %s: %w", MarkerPath, err)
 	}
 	if !forced.Exited {
-		return m.failed(fmt.Errorf("runner: replace %s: the shell stream ended without an exit status", MarkerPath))
+		return fmt.Errorf("runner: replace %s: the shell stream ended without an exit status", MarkerPath)
 	}
 
 	switch forced.ExitCode {
 	case 0:
-		return m.refreshed()
+		return nil
 
 	case markerForeign:
 		// The file changed under us between the read above and the write, into
@@ -408,12 +491,12 @@ func (m *Marker) resolveForeign(ctx context.Context, out ShellOutput) error {
 		// a supersession: going permanently quiet would let anything that can
 		// write one line to /data/local/tmp disable this job's witness for the
 		// rest of its run.
-		return m.failed(fmt.Errorf("runner: replace %s: the device declined the write and shows %q",
-			MarkerPath, truncateMarker(now.Raw, 200)))
+		return fmt.Errorf("runner: replace %s: the device declined the write and shows %q",
+			MarkerPath, truncateMarker(now.Raw, 200))
 
 	default:
-		return m.failed(fmt.Errorf("runner: replace %s: exit status %d%s",
-			MarkerPath, forced.ExitCode, stderrHint(forced)))
+		return fmt.Errorf("runner: replace %s: exit status %d%s",
+			MarkerPath, forced.ExitCode, stderrHint(forced))
 	}
 }
 
@@ -489,8 +572,11 @@ func (m *Marker) Read(ctx context.Context) (MarkerState, error) {
 // tidies up after a fenced job would otherwise erase the evidence of whoever
 // was granted the device next, and "the device is ours to write to" is a
 // question this file never answers from its own memory.
+//
+// It is bounded by RemoveTimeout, not Timeout: the device's release waits
+// behind this call, and a leftover is harmless.
 func (m *Marker) Remove(ctx context.Context) error {
-	cctx, cancel := context.WithTimeout(ctx, m.cfg.Timeout)
+	cctx, cancel := context.WithTimeout(ctx, m.cfg.RemoveTimeout)
 	defer cancel()
 
 	m.hush() // stop presenting evidence before deleting the proof
@@ -681,7 +767,25 @@ func (m *Marker) failed(err error) error {
 	defer m.mu.Unlock()
 	m.stats.Failures++
 	m.stats.LastError = err
+	m.streak++
 	return err
+}
+
+// failStreak is how many refreshes in a row have failed, this one included.
+func (m *Marker) failStreak() uint64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.streak
+}
+
+// recovered closes a failure streak after a successful refresh and reports how
+// long it was; zero when there was none.
+func (m *Marker) recovered() uint64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := m.streak
+	m.streak = 0
+	return n
 }
 
 // superseded records that a newer fence owns this device and stops the marker

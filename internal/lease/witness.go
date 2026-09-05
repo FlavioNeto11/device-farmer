@@ -134,9 +134,12 @@ type WitnessConfig struct {
 	Timeout time.Duration
 
 	// MaxEvidenceAge is how old the on-device marker may be and still be worth
-	// presenting. Defaults to three intervals, which tolerates one missed
-	// refresh by the device-side agent; set it explicitly when the marker
-	// refreshes on a slower cadence than this loop ticks.
+	// presenting. The jobrunner, which starts every witness loop in a running
+	// farm, sets it from the MARKER's cadence (config.MaxEvidenceAgeFor: a
+	// few marker intervals, so a couple of lost writes are tolerated and a
+	// device nobody has reached since the last tick is not). The fallback
+	// here, three of this loop's own intervals, is only for a caller with no
+	// marker cadence to derive from.
 	//
 	// This is an elapsed-time measurement between two readings of our own
 	// clock, and it decides only whether we have something to say. It is not a

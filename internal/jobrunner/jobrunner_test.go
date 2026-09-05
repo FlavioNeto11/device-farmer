@@ -112,6 +112,41 @@ func (c *logCapture) attrs(substr string) (map[string]string, bool) {
 	return nil, false
 }
 
+// blindHolder is a real renewal loop over a database that is not there, which
+// is the situation the witness exists for and the one every "an outage is not
+// a verdict" assertion in this package is made about.
+func blindHolder(t *testing.T) *lease.Holder {
+	t.Helper()
+	l := lease.Lease{
+		ID: "11111111-1111-4111-8111-111111111111", DeviceID: "dev-1", JobID: "job-1",
+		Fence: 5, Holder: "farmd-0", HolderInstance: "22222222-2222-4222-8222-222222222222",
+	}
+	h := lease.NewHolder(context.Background(), lease.NewStore(unreachablePool(t)), l, lease.HolderConfig{
+		Interval:     2 * time.Millisecond,
+		RenewTimeout: time.Second,
+		RetryBase:    time.Millisecond,
+		RetryMax:     2 * time.Millisecond,
+		Logger:       quietLogger(),
+	})
+	t.Cleanup(h.Stop)
+	return h
+}
+
+// waitFor polls until cond holds, and fails the test if it never does. The
+// conditions are about accumulated state — "three renewals have failed" —
+// not about a single event, which is why it polls rather than listens.
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(200 * time.Microsecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
+}
+
 // unreachablePool is a real pool that will never connect. Every statement it is
 // handed fails with a dial error rather than a panic, which is what lets a test
 // see whether a statement was attempted at all — the difference between "this
@@ -474,27 +509,8 @@ func TestAnOrphanedPlacementIsReturnedToTheQueue(t *testing.T) {
 func TestADatabaseOutageNeitherFencesNorCancelsTheJob(t *testing.T) {
 	t.Parallel()
 
-	store := lease.NewStore(unreachablePool(t))
-	l := lease.Lease{
-		ID: "11111111-1111-4111-8111-111111111111", DeviceID: "dev-1", JobID: "job-1",
-		Fence: 5, Holder: "farmd-0", HolderInstance: "22222222-2222-4222-8222-222222222222",
-	}
-	h := lease.NewHolder(context.Background(), store, l, lease.HolderConfig{
-		Interval:     2 * time.Millisecond,
-		RenewTimeout: time.Second,
-		RetryBase:    time.Millisecond,
-		RetryMax:     2 * time.Millisecond,
-		Logger:       quietLogger(),
-	})
-	defer h.Stop()
-
-	deadline := time.Now().Add(10 * time.Second)
-	for h.Stats().ConsecutiveFailures < 3 && time.Now().Before(deadline) {
-		time.Sleep(2 * time.Millisecond)
-	}
-	if got := h.Stats().ConsecutiveFailures; got < 3 {
-		t.Fatalf("only %d renewals were attempted; the test proved nothing", got)
-	}
+	h := blindHolder(t)
+	waitFor(t, "three renewals to fail on the wire", func() bool { return h.Stats().ConsecutiveFailures >= 3 })
 	if h.Fenced() {
 		t.Fatal("a database outage was reported as fencing; every running job would be abandoned")
 	}

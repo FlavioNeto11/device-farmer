@@ -86,6 +86,56 @@ const (
 // deploy, a Postgres failover, a GC pause — without its lease going suspect.
 const MinRenewAttempts = 3
 
+// The witness cadence triple (U1, LEASE-09).
+//
+// Three cadences make the on-device witness worth anything, and they are
+// derived from one another HERE — the one package every consumer can import —
+// so that no role can set them apart:
+//
+//   - the witness interval (FARM_LEASE_WITNESS_INTERVAL) is how often a
+//     placement presents its evidence through farm.lease_witness;
+//   - the marker interval is how often the job rewrites the marker file on
+//     the device: MarkersPerWitnessTick times per witness tick, so a single
+//     lost write never leaves a tick without fresh evidence;
+//   - the evidence window (lease.WitnessConfig.MaxEvidenceAge) is how old the
+//     last acknowledged write may be and still be presented: EvidenceWindow
+//     marker intervals, which tolerates two consecutive lost writes and not a
+//     third.
+//
+// The window is measured in MARKER intervals, not witness intervals, because
+// it answers "when did this process last touch the device?", and the marker
+// is the thing that touches it. Measured in witness ticks — three of them, the
+// lease package's own fallback — it would tolerate eleven consecutive failed
+// writes at the default cadence and let a device nobody has reached for six
+// minutes read as demonstrably alive.
+const (
+	MarkersPerWitnessTick = 4
+	EvidenceWindow        = 3
+
+	// MinLeaseWitnessInterval is the floor on FARM_LEASE_WITNESS_INTERVAL.
+	//
+	// The marker cadence follows the witness cadence at one quarter, so an
+	// unbounded witness interval is an unbounded marker interval: at 1s the
+	// farm would run an ADB shell round trip against every leased device every
+	// 250ms — a host with fifty-six phones DoS-ing its own adb server — and
+	// issue one UPDATE per leased device per second on farm.leases for
+	// evidence no reaper would ever look at that closely. At 30s the marker
+	// lands every 7.5s, which is about the rate a busy step already talks to
+	// its device, and a witness lands ten times inside the smallest grace band
+	// the schema allows.
+	MinLeaseWitnessInterval = 30 * time.Second
+)
+
+// MarkerIntervalFor is the marker cadence for a witness cadence.
+func MarkerIntervalFor(witness time.Duration) time.Duration {
+	return witness / MarkersPerWitnessTick
+}
+
+// MaxEvidenceAgeFor is the evidence window for a marker cadence.
+func MaxEvidenceAgeFor(marker time.Duration) time.Duration {
+	return EvidenceWindow * marker
+}
+
 // Defaults. Chosen so that an operator who sets only DATABASE_URL gets a
 // configuration that satisfies every assertion below.
 const (
@@ -187,19 +237,19 @@ type Lease struct {
 	// a different wire from the ADB data path; that separation is the whole
 	// mechanism, so this value must never be derived from device traffic.
 	RenewInterval time.Duration
-	// WitnessInterval is the period of farm.lease_witness, the on-device
-	// proof that the holder is alive.
+	// WitnessInterval is the period of farm.lease_witness: how often a
+	// placement presents its on-device proof that the work is running. The
+	// jobrunner starts one witness loop per placement
+	// (internal/jobrunner/witness.go), fed by the marker runner.Marker keeps
+	// fresh on the device, and this value is that loop's cadence.
 	//
-	// The loop that would use it exists — lease.Holder.StartWitness, fed by
-	// runner.Marker — and NO ROLE STARTS ONE. Every StartWitness call site in
-	// the tree is a test, so this value paces nothing in a running farm.
-	//
-	// It is still validated against Grace, because that check is what makes
-	// wiring the loop up safe: a witness written less often than the lease can
-	// go reclaimable proves nothing, and an operator who widened this without
-	// widening Grace would be turning the witness off while believing it on.
-	// Summary says the same out loud, so that setting this is not mistaken for
-	// enabling it.
+	// It is validated against Grace because that relationship is what makes
+	// a witness worth anything: farm.lease_reclaim honours a witness only
+	// while it is younger than one grace period, so a witness written less
+	// often than that proves nothing, and an operator who widened this
+	// without widening Grace would be turning the witness off while
+	// believing it on. It has a floor as well, because the marker cadence
+	// follows it: see MinLeaseWitnessInterval.
 	WitnessInterval time.Duration
 	// MaxWitnessExtensions caps consecutive witness-only extensions so a
 	// wedged holder cannot hold a device forever on device-side evidence.
@@ -208,6 +258,14 @@ type Lease struct {
 	// farm.lease_reclaim. See Config.Validate.
 	SlotRearm time.Duration
 }
+
+// MarkerInterval is how often a placement rewrites its on-device marker under
+// this witness cadence. Derived, never set: see MarkersPerWitnessTick.
+func (l Lease) MarkerInterval() time.Duration { return MarkerIntervalFor(l.WitnessInterval) }
+
+// MaxEvidenceAge is how old the last acknowledged marker write may be and
+// still be presented as a witness. Derived, never set: see EvidenceWindow.
+func (l Lease) MaxEvidenceAge() time.Duration { return MaxEvidenceAgeFor(l.MarkerInterval()) }
 
 // Reaper holds the knobs of the only automatic release path in the system.
 type Reaper struct {
@@ -529,6 +587,12 @@ Fix by raising %s above %s + %s, or by lowering the proxy's self-fence timeout.`
 	}
 	if c.Lease.WitnessInterval <= 0 {
 		fail("%s must be positive", EnvLeaseWitnessInterval)
+	} else if c.Lease.WitnessInterval < MinLeaseWitnessInterval {
+		fail("%s (%s) is below the %s floor. The on-device marker is rewritten %d times per "+
+			"witness tick, so this would have every leased device answering a shell round "+
+			"trip every %s and every lease taking an UPDATE per tick, for evidence the reaper "+
+			"never reads that closely", EnvLeaseWitnessInterval, c.Lease.WitnessInterval,
+			MinLeaseWitnessInterval, MarkersPerWitnessTick, c.Lease.MarkerInterval())
 	} else if c.Lease.WitnessInterval*2 > c.Lease.Grace {
 		fail("%s (%s) is too coarse for %s (%s). farm.lease_reclaim ignores any witness "+
 			"older than one grace period, so a witness that lands less than twice per "+
@@ -714,9 +778,12 @@ func (c *Config) Summary() string {
 	fmt.Fprintf(&b, "lease ttl/grace  = %s / %s\n", c.Lease.TTL, c.Lease.Grace)
 	fmt.Fprintf(&b, "renew interval   = %s (%d renewal attempts inside one ttl)\n",
 		c.Lease.RenewInterval, c.renewAttempts())
-	fmt.Fprintf(&b, "witness          = every %s, at most %d extensions — NOT STARTED: "+
-		"lease.Holder.StartWitness exists and no role calls it\n",
+	fmt.Fprintf(&b, "witness          = every %s, at most %d consecutive extensions; "+
+		"one loop per placement, started by the jobrunner\n",
 		c.Lease.WitnessInterval, c.Lease.MaxWitnessExtensions)
+	fmt.Fprintf(&b, "marker           = rewritten on the device every %s; evidence presented "+
+		"while younger than %s (derived: %d writes per witness tick, window of %d)\n",
+		c.Lease.MarkerInterval(), c.Lease.MaxEvidenceAge(), MarkersPerWitnessTick, EvidenceWindow)
 	fmt.Fprintf(&b, "slot rearm       = %s (node self-fence %s + margin %s)\n",
 		c.Lease.SlotRearm, c.Node.SelfFenceTimeout, c.Node.FenceSafetyMargin)
 	fmt.Fprintf(&b, "reaper           = every %s, batch %d, gap floor %s, watching %s\n",

@@ -964,7 +964,7 @@ func TestRenewErrorsThatAreNotFencing(t *testing.T) {
 
 		// A pool of its own, so closing it cannot disturb the other tests. This
 		// stands in for a pod tearing its own connections down mid-flight.
-		doomed := clonePool(t, f.pool)
+		doomed := clonePool(t, f.pool, nil)
 		store := NewStore(doomed)
 		doomed.Close()
 
@@ -1730,10 +1730,14 @@ func mustInstance(t *testing.T) string {
 }
 
 // clonePool opens a second pool with the same configuration, for tests that
-// need to break a pool without breaking everyone else's.
-func clonePool(t *testing.T, src *pgxpool.Pool) *pgxpool.Pool {
+// need to break a pool without breaking everyone else's. mutate, if given,
+// edits the copied configuration before the pool is opened.
+func clonePool(t *testing.T, src *pgxpool.Pool, mutate func(*pgxpool.Config)) *pgxpool.Pool {
 	t.Helper()
 	cfg := src.Config().Copy()
+	if mutate != nil {
+		mutate(cfg)
+	}
 	p, err := pgxpool.NewWithConfig(t.Context(), cfg)
 	if err != nil {
 		t.Fatalf("clone pool: %v", err)

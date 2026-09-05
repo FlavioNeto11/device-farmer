@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+
+	"github.com/flaviopadilha/device-farmer/internal/runner"
 )
 
 // Capabilities reports what this deployment can actually do, read from the
@@ -321,6 +323,12 @@ func (s *Server) limits() map[string]string {
 		l["lease_ttl"] = s.cfg.Lease.TTL.String()
 		l["lease_grace"] = s.cfg.Lease.Grace.String()
 		l["renew_interval"] = s.cfg.Lease.RenewInterval.String()
+		l["witness_interval"] = s.cfg.Lease.WitnessInterval.String()
+		l["witness_max_extensions"] = itoa(s.cfg.Lease.MaxWitnessExtensions)
+		// Derived from the witness interval, never set: what the marker
+		// actually runs on, and how stale its evidence may be and still count.
+		l["marker_interval"] = s.cfg.Lease.MarkerInterval().String()
+		l["witness_max_evidence_age"] = s.cfg.Lease.MaxEvidenceAge().String()
 		l["slot_rearm"] = s.cfg.Lease.SlotRearm.String()
 		l["reaper_gap_floor"] = s.cfg.Reaper.GapFloor.String()
 	}
@@ -347,6 +355,21 @@ func (s *Server) featureStatuses(ctx context.Context, roles []RoleStatus) []Feat
 			Detail: ifElse(running["jobrunner"],
 				"Steps run against leased devices; a transport failure is retried inside the lease.",
 				"No jobrunner is beating, so allocated jobs will sit in 'running' holding a device each."),
+		},
+		{
+			// Enabled iff the jobrunner beats, because the jobrunner is the
+			// role that starts one witness loop per placement; the SQL
+			// function and the loop existing in the binary is not the same
+			// as a witness being presented for anything.
+			Name: "Witness extensions", State: stateIf(running["jobrunner"], "enabled", "unavailable"),
+			How: "runner.Marker rewrites " + runner.MarkerPath + " on the device; lease.WitnessLoop " +
+				"presents it through farm.lease_witness every FARM_LEASE_WITNESS_INTERVAL",
+			Detail: ifElse(running["jobrunner"],
+				"A job that can still touch its device keeps its lease through a control-plane outage "+
+					"longer than ttl+grace, for up to FARM_LEASE_WITNESS_MAX_EXTENSIONS consecutive "+
+					"extensions. A refused witness ends nothing; only farm.lease_renew can report fencing.",
+				"No jobrunner is beating, so no placement is producing on-device evidence: leases are "+
+					"protected by ttl+grace and the control-plane gap refund only."),
 		},
 		{
 			Name: "Automatic reclamation", State: stateIf(running["reaper"], "enabled", "unavailable"),

@@ -2,9 +2,17 @@ package lease
 
 import (
 	"fmt"
+	"io"
+	"net"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/flaviopadilha/device-farmer/internal/config"
 )
 
 // =====================================================================
@@ -605,5 +613,245 @@ func TestWitnessOnlyMovesTheHolderDeadlineOutward(t *testing.T) {
 	}
 	if err := h.Err(); err != nil {
 		t.Errorf("the holder ended on a witness outcome: %v", err)
+	}
+}
+
+// =====================================================================
+// Against Postgres: the outage the witness exists for
+// =====================================================================
+
+// pgRelay is a TCP relay in front of the scratch database that a test can cut
+// and restore, so a control-plane outage can be staged for ONE holder's
+// connections without touching the pool every other test is using.
+//
+// The listener stays open for the life of the relay. An outage severs every
+// relayed connection and refuses new ones at the door; it does not close the
+// listening socket, because a restore that has to bind the same port again is
+// a restore that races whatever else on the machine wanted a port in the
+// meantime.
+type pgRelay struct {
+	t      *testing.T
+	target string
+	addr   string
+	ln     net.Listener
+
+	mu    sync.Mutex
+	down  bool
+	conns map[net.Conn]struct{}
+	wg    sync.WaitGroup
+}
+
+func startRelay(t *testing.T, target string) *pgRelay {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen for the relay: %v", err)
+	}
+	r := &pgRelay{t: t, target: target, addr: ln.Addr().String(), ln: ln, conns: map[net.Conn]struct{}{}}
+	r.wg.Add(1)
+	go r.serve()
+	t.Cleanup(r.close)
+	return r
+}
+
+func (r *pgRelay) serve() {
+	defer r.wg.Done()
+	for {
+		c, err := r.ln.Accept()
+		if err != nil {
+			return
+		}
+		up, err := net.DialTimeout("tcp", r.target, 5*time.Second)
+		if err != nil || !r.track(c, up) {
+			c.Close()
+			if up != nil {
+				up.Close()
+			}
+			continue
+		}
+		go relay(up, c)
+		go relay(c, up)
+	}
+}
+
+func relay(dst, src net.Conn) {
+	_, _ = io.Copy(dst, src)
+	dst.Close()
+}
+
+// track registers a relayed pair, refusing it during an outage: a connection
+// accepted in the instant cut is severing the others would otherwise survive
+// it.
+func (r *pgRelay) track(c, up net.Conn) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.down {
+		return false
+	}
+	r.conns[c] = struct{}{}
+	r.conns[up] = struct{}{}
+	return true
+}
+
+// cut is the outage: every relayed connection is severed and nothing new gets
+// through, so the holder's next round trip fails on the wire and every
+// reconnect after it is turned away.
+func (r *pgRelay) cut() {
+	r.mu.Lock()
+	r.down = true
+	conns := r.conns
+	r.conns = map[net.Conn]struct{}{}
+	r.mu.Unlock()
+	for c := range conns {
+		c.Close()
+	}
+}
+
+// restore lets connections through again, on the same address, so the pool
+// that was pointed at it reconnects without being told anything.
+func (r *pgRelay) restore() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.down = false
+}
+
+func (r *pgRelay) close() {
+	r.ln.Close()
+	r.cut()
+	r.wg.Wait()
+}
+
+// relayedPool is a pool onto the scratch database that reaches it only
+// through the relay. Everything else about the connection — TLS included:
+// the relay forwards bytes and negotiates nothing, so a server that requires
+// TLS still gets it — is the fixture's own.
+func relayedPool(t *testing.T, src *pgxpool.Pool, relayAddr string) *pgxpool.Pool {
+	t.Helper()
+	host, port, err := net.SplitHostPort(relayAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, err := strconv.Atoi(port)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return clonePool(t, src, func(cfg *pgxpool.Config) {
+		cfg.ConnConfig.Host = host
+		cfg.ConnConfig.Port = uint16(n)
+		// No fallback hosts: a pool that could route around the relay would
+		// route around the outage.
+		cfg.ConnConfig.Fallbacks = nil
+		cfg.ConnConfig.ConnectTimeout = 2 * time.Second
+		cfg.MinConns = 0
+		cfg.MaxConns = 2
+	})
+}
+
+func (f *fixture) witnessAt(t *testing.T, leaseID string) *time.Time {
+	t.Helper()
+	var at *time.Time
+	if err := f.pool.QueryRow(t.Context(),
+		`SELECT witness_at FROM farm.leases WHERE id = $1::uuid`, leaseID).Scan(&at); err != nil {
+		t.Fatalf("read witness_at: %v", err)
+	}
+	return at
+}
+
+// TestWitnessKeepsTheDeviceThroughAControlPlaneOutage is the mechanism end to
+// end, against Postgres, in the order it happens at 3am:
+//
+//  1. The job runs. Renewals land, and so do witnesses — presented on every
+//     tick, because nobody knows which tick is the last one before the
+//     outage.
+//  2. The control plane goes away. Every renewal and every witness from this
+//     holder fails on the wire. The holder is not fenced and the job is not
+//     cancelled: a database that cannot be reached is not a verdict.
+//  3. TTL+grace elapses while it is away. The reaper sweeps and reclaims an
+//     identical lease that has no witness — the positive control — and passes
+//     over this one, because farm.lease_reclaim honours a witness younger
+//     than one grace period. This is the line that would otherwise be
+//     DeviceFarmer/STF #663 arriving through the control plane.
+//  4. The control plane comes back. The next renewal self-heals the lease at
+//     the same fence, and the job never noticed.
+//
+// The evidence here is the stub, because this package cannot import the
+// marker that produces it in a running farm; internal/jobrunner's own tests
+// cover that the marker is what the loop is handed.
+func TestWitnessKeepsTheDeviceThroughAControlPlaneOutage(t *testing.T) {
+	f := newFixture(t, 2)
+	requireReaperMayAct(t, f.pool)
+	ctx := t.Context()
+
+	cc := f.pool.Config().ConnConfig
+	if strings.HasPrefix(cc.Host, "/") {
+		t.Skipf("%s reaches Postgres over a unix socket; the relay needs TCP", config.EnvDatabaseURL)
+	}
+	rly := startRelay(t, net.JoinHostPort(cc.Host, strconv.Itoa(int(cc.Port))))
+	blind := NewStore(relayedPool(t, f.pool, rly.addr))
+
+	_, witnessed := f.acquire(t)
+	_, control := f.acquire(t)
+
+	// The holder and its witness loop are the only things that go through the
+	// relay. The fixture's own pool is the operator's view, and it stays up.
+	h := NewHolder(ctx, blind, witnessed, quietConfig(20*time.Millisecond))
+	t.Cleanup(h.Stop)
+	w := startWitness(t, h, &stubEvidence{}, quietWitness(20*time.Millisecond))
+
+	// 1. Healthy.
+	waitFor(t, "a renewal and a witness through the relay", func() bool {
+		return h.Stats().Renewals >= 1 && w.Stats().Accepted >= 1
+	})
+	if f.witnessAt(t, witnessed.ID) == nil {
+		t.Fatal("witness_at is NULL after the loop reported an accepted witness")
+	}
+
+	// 2. The outage.
+	rly.cut()
+	waitFor(t, "renewals to fail on the wire", func() bool { return h.Stats().ConsecutiveFailures >= 3 })
+	waitFor(t, "a witness to fail on the wire", func() bool { return w.Stats().Errors >= 1 })
+	if h.Fenced() || h.Context().Err() != nil {
+		t.Fatalf("the outage ended the job: fenced %v, cause %v", h.Fenced(), h.Err())
+	}
+
+	// 3. TTL+grace elapses while the control plane is away. Both leases are
+	// swept to suspect, which is an alert and releases nothing.
+	f.abandon(t, witnessed.ID)
+	f.abandon(t, control.ID)
+
+	got, err := f.store.Reclaim(ctx, DefaultReclaimBatch, time.Second)
+	if err != nil {
+		t.Fatalf("reclaim: %v", err)
+	}
+	if _, ok := findReclaimed(got, control.ID); !ok {
+		t.Fatalf("the unwitnessed control lease was not reclaimed, so this test proves nothing about "+
+			"the witness; the reaper took %+v", got)
+	}
+	if _, ok := findReclaimed(got, witnessed.ID); ok {
+		t.Fatal("the witnessed lease was reclaimed past ttl+grace; the job was demonstrably alive on the " +
+			"device and the whole mechanism exists for this moment")
+	}
+	if state, _ := f.leaseState(t, witnessed.ID); state != "suspect" {
+		t.Fatalf("witnessed lease is %q after the sweep, want suspect (held by the witness, awaiting its holder)", state)
+	}
+	if h.Fenced() || h.Context().Err() != nil {
+		t.Fatalf("the reaper's pass ended the job: fenced %v, cause %v", h.Fenced(), h.Err())
+	}
+
+	// 4. The control plane returns. The very next renewal that lands heals
+	// the lease at the same fence.
+	before := h.Stats().Renewals
+	rly.restore()
+	waitFor(t, "a renewal to land after the outage", func() bool { return h.Stats().Renewals > before })
+
+	if state, _ := f.leaseState(t, witnessed.ID); state != "held" {
+		t.Fatalf("witnessed lease is %q after the control plane returned, want held", state)
+	}
+	if h.Fenced() || h.Context().Err() != nil {
+		t.Fatalf("the job did not survive the outage: fenced %v, cause %v", h.Fenced(), h.Err())
+	}
+	if h.Lease().Fence != witnessed.Fence {
+		t.Fatalf("fence = %d after the outage, want the same %d; the job's detached work is still running "+
+			"under it", h.Lease().Fence, witnessed.Fence)
 	}
 }

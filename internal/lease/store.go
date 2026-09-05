@@ -406,9 +406,11 @@ func (s *Store) Witness(ctx context.Context, leaseID string, fence int64, maxExt
 
 // Release ends a lease deliberately. This is the normal end of a job.
 //
-// It also bumps the device's fence_floor and quarantines the slot for rearm, so
-// any socket still carrying the old fence is refused at the host proxy before
-// the device can be handed to the next job. rearm must exceed the node proxy's
+// It also bumps the device's fence_floor and quarantines the slot for rearm:
+// the database refuses every write at the old fence from here on; on a host
+// running the fence proxy the old fence is also refused at the ADB socket, and
+// on a host without one the holder is relied upon to honour it before the
+// device is handed to the next job. rearm must exceed the node proxy's
 // self-fence timeout; a non-positive value is replaced by DefaultRearm rather
 // than sent as zero.
 //

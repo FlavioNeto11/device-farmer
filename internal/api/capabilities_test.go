@@ -16,6 +16,7 @@ package api
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -27,7 +28,64 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/flaviopadilha/device-farmer/internal/config"
 )
+
+// TestFenceEnforcementReportsOnlyThisProcessSideOfTheWire. The row used to
+// say not_built. Now that the proxy and the client preamble exist, the honest
+// answer depends on a certificate this process may or may not have been
+// given, and even with one it is a statement about this process, not about
+// which hosts run a proxy. So: unavailable without the certificate, naming
+// both halves of the knob; enabled with it; and in both states the detail
+// says enforcement is per host.
+//
+// Falsify: return the enabled row unconditionally from fenceEnforcement, or
+// drop "per host" from its detail.
+func TestFenceEnforcementReportsOnlyThisProcessSideOfTheWire(t *testing.T) {
+	t.Parallel()
+
+	const name = "Fence enforcement at the resource"
+
+	for _, tc := range []struct {
+		name      string
+		cfg       *config.Config
+		wantState string
+	}{
+		{"no config at all", nil, "unavailable"},
+		{"config without a client certificate", &config.Config{}, "unavailable"},
+		{"config with a client certificate", &config.Config{
+			FenceClient: config.FenceClient{TLS: &tls.Config{MinVersion: tls.VersionTLS13}},
+		}, "enabled"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			s := &Server{cfg: tc.cfg}
+			got := s.fenceEnforcement()
+			if got.Name != name {
+				t.Fatalf("feature name = %q, want %q; the dashboard finds the row by name", got.Name, name)
+			}
+			if got.State != tc.wantState {
+				t.Fatalf("state = %q, want %q", got.State, tc.wantState)
+			}
+			text := got.How + " " + got.Detail
+			if !strings.Contains(text, "per host") {
+				t.Errorf("the row does not say enforcement is per host; a green row would then stand for the whole farm:\n%s", text)
+			}
+			if tc.wantState != "unavailable" {
+				return
+			}
+			for _, want := range []string{config.EnvFenceClientCert + "/KEY/CA", "FARM_FENCE_TLS_"} {
+				if !strings.Contains(text, want) {
+					t.Errorf("the unavailable row does not name %s, so an operator cannot tell which half to set:\n%s", want, text)
+				}
+			}
+			if !strings.Contains(got.Detail, "PostgreSQL only") {
+				t.Errorf("the unavailable row does not say where the fence IS enforced:\n%s", got.Detail)
+			}
+		})
+	}
+}
 
 // unreachableServer is a Server whose pool points at a port nothing listens on.
 // pgxpool connects lazily, so construction succeeds and every query fails —

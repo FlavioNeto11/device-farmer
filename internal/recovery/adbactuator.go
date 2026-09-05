@@ -277,6 +277,13 @@ type ADBActuator struct {
 	// ControlConfirm overrides [DefaultControlConfirm].
 	ControlConfirm time.Duration
 
+	// ADBOptions are applied to every client this actuator builds. They are
+	// how a deployment gives these connections their transport identity —
+	// a certificate and a maintenance-class announcement for a host behind
+	// the fence proxy — and the actuator has no opinion about them. Set them
+	// before the first rung runs; clients are built lazily and cached.
+	ADBOptions []adbwire.Option
+
 	mu      sync.Mutex
 	clients map[string]*adbwire.Client // keyed by ADB endpoint
 }
@@ -340,7 +347,7 @@ func (a *ADBActuator) client(endpoint string) (*adbwire.Client, error) {
 	if c, ok := a.clients[endpoint]; ok {
 		return c, nil
 	}
-	c := adbwire.New(endpoint)
+	c := adbwire.New(endpoint, a.ADBOptions...)
 	a.clients[endpoint] = c
 	return c, nil
 }

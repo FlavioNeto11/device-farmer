@@ -2,6 +2,7 @@ package fakeadb
 
 import (
 	"bufio"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -112,7 +113,23 @@ type Request struct {
 	Devpath string    // the device the request actually reached; empty if none did
 	Reply   string    // "OKAY", "FAIL: <msg>", "RESET" or "HANG"
 	Fault   FaultKind // the injected fault applied, if any
+
+	// Preamble is the fence-proxy admission frame that arrived on the same
+	// connection before this request, exactly as framed; empty when the
+	// client sent none. See PreamblePrefix.
+	Preamble string
 }
+
+// PreamblePrefix opens the admission frame a client sends to the fence proxy
+// before its first host request: "fence:v1 class=lease devpath=... fence=...".
+//
+// This fake stands in for the proxy and the ADB server together, so it does
+// what the proxy does with that frame — consumes it before the ordinary
+// protocol begins — and records it on the request that followed, where a test
+// can assert on it. A real ADB server would answer FAIL "unknown host service";
+// a fake that did the same could not tell a client that sends the preamble
+// correctly from one that does not send it at all.
+const PreamblePrefix = "fence:v1"
 
 // Stats are cheap counters a test can assert on.
 type Stats struct {
@@ -151,6 +168,36 @@ func New(fixtures ...Fixture) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("fakeadb: listen: %w", err)
 	}
+	return start(ln, fixtures...), nil
+}
+
+// NewTLS is New behind a TLS listener, standing in for the fence proxy that
+// fronts a host's ADB server. cfg decides what the client must present; a
+// config that requires and verifies a client certificate is how a test proves
+// the client handed one over.
+func NewTLS(cfg *tls.Config, fixtures ...Fixture) (*Server, error) {
+	if cfg == nil {
+		return nil, errors.New("fakeadb: NewTLS needs a TLS configuration")
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return nil, fmt.Errorf("fakeadb: listen: %w", err)
+	}
+	return start(tls.NewListener(ln, cfg), fixtures...), nil
+}
+
+// StartTLS is NewTLS for tests, with the same cleanup as Start.
+func StartTLS(tb testing.TB, cfg *tls.Config, fixtures ...Fixture) *Server {
+	tb.Helper()
+	s, err := NewTLS(cfg, fixtures...)
+	if err != nil {
+		tb.Fatalf("fakeadb: %v", err)
+	}
+	tb.Cleanup(func() { _ = s.Close() })
+	return s
+}
+
+func start(ln net.Listener, fixtures ...Fixture) *Server {
 	s := &Server{
 		ln:       ln,
 		done:     make(chan struct{}),
@@ -164,7 +211,7 @@ func New(fixtures ...Fixture) (*Server, error) {
 	s.wg.Add(1)
 	go s.accept()
 	s.Apply(fixtures...)
-	return s, nil
+	return s
 }
 
 // Start is New for tests: it fails the test on error and registers cleanup, so
@@ -594,14 +641,23 @@ func (s *Server) serve(c net.Conn) {
 	if err != nil {
 		return
 	}
-	s.route(c, br, svc)
+	// The admission frame, when there is one, is the first thing on the
+	// connection and is never answered; the request it protects follows it.
+	var pre string
+	if strings.HasPrefix(svc, PreamblePrefix) {
+		pre = svc
+		if svc, err = readFrame(br); err != nil {
+			return
+		}
+	}
+	s.route(c, br, svc, pre)
 }
 
-func (s *Server) route(c net.Conn, br *bufio.Reader, svc string) {
+func (s *Server) route(c net.Conn, br *bufio.Reader, svc, pre string) {
 	tgt, cmd, ok := splitService(svc)
 	// Published only once every field set outside the lock is set: after
 	// record, the entry belongs to s.mu and is edited through note.
-	rec := &Request{At: time.Now(), Service: svc, Target: tgt.String()}
+	rec := &Request{At: time.Now(), Service: svc, Target: tgt.String(), Preamble: pre}
 	s.record(rec)
 	if !ok {
 		s.finish(c, rec, failBytes("unknown host service "+svc), s.takeFault(svc, ""))

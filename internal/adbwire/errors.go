@@ -124,12 +124,27 @@ var (
 		Name:      "tracker_snapshots_total",
 		Help:      "Device-list snapshots received from the ADB server.",
 	})
+
+	admissionFramesTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "device_farmer",
+		Subsystem: "adbwire",
+		Name:      "admission_frames_total",
+		Help:      "Admission preambles announced to a host's proxy over TLS, by claimed class. Zero on a plain-TCP deployment.",
+	}, []string{"class"})
 )
 
 // Collectors returns this package's metrics for registration by whichever
 // package owns the process registry. Nothing here self-registers, so two
 // clients in one process cannot panic on a duplicate registration.
 func Collectors() []prometheus.Collector {
+	// A CounterVec with no children exports nothing, so the classes this
+	// package can name are pre-created: a plain-TCP deployment then shows the
+	// series at zero rather than showing no series, which is the difference
+	// between "off" and "not scraped". The class that carries a device token
+	// is named by the package that owns it and appears on its first frame.
+	for _, class := range []string{AdmissionClassMaintenance, AdmissionClassEnroll} {
+		admissionFramesTotal.WithLabelValues(class)
+	}
 	return []prometheus.Collector{
 		transportErrorsTotal,
 		protocolFailuresTotal,
@@ -137,6 +152,7 @@ func Collectors() []prometheus.Collector {
 		streamsOpenedTotal,
 		trackerReconnectsTotal,
 		trackerSnapshotsTotal,
+		admissionFramesTotal,
 	}
 }
 

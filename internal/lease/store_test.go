@@ -386,8 +386,9 @@ func (f *fixture) leaseState(t *testing.T, leaseID string) (state string, reason
 }
 
 // deviceBinding reads the two columns on farm.devices that decide whether a
-// previous holder's sockets are still accepted: which lease the device is bound
-// to, and the fence floor the host proxy compares against.
+// previous holder is still accepted: which lease the device is bound to, and
+// the fence floor the database — and, on a host running the fence proxy, the
+// proxy — compares against.
 func (f *fixture) deviceBinding(t *testing.T, deviceID string) (currentLease *string, fenceFloor int64) {
 	t.Helper()
 	err := f.pool.QueryRow(t.Context(),
@@ -1071,8 +1072,9 @@ func TestRenewSelfHealsSuspect(t *testing.T) {
 
 	// Entering suspect DOES NOTHING, and "nothing" is a claim about the device
 	// rather than about the lease row. The device is still bound to this lease
-	// and the fence floor has not moved, so the job's sockets are still accepted
-	// at the host proxy while the alert is outstanding.
+	// and the fence floor has not moved, so the job's writes are still accepted
+	// by the database — and its sockets by the fence proxy, on a host running
+	// one — while the alert is outstanding.
 	binding, floor := f.deviceBinding(t, l.DeviceID)
 	if binding == nil || *binding != l.ID {
 		t.Errorf("devices.current_lease_id = %v after the sweep, want %s; the sweep unbound a device it only had to alert on",
@@ -1182,8 +1184,10 @@ func TestReleaseEndsTheLeaseAndIsIdempotent(t *testing.T) {
 		t.Errorf("release_reason = %v, want %q", reason, ReasonCompleted)
 	}
 
-	// The fence floor is now above the fence we held, so a socket still
-	// carrying it is refused at the host proxy rather than merely here.
+	// The fence floor is now above the fence we held, so the database refuses
+	// every write at it; on a host running the fence proxy a socket still
+	// carrying it is refused at the ADB socket too, and on a host without one
+	// the holder is relied upon to honour this.
 	var floor int64
 	if err := f.pool.QueryRow(ctx,
 		`SELECT fence_floor FROM farm.devices WHERE id = $1::uuid`, l.DeviceID).Scan(&floor); err != nil {
@@ -1395,8 +1399,10 @@ func TestReclaimTakesOnlyAnAbandonedLeaseAndEveryGuardHolds(t *testing.T) {
 		if r.OldFence != l.Fence {
 			t.Errorf("OldFence = %d, want the fence the departed holder still believes it owns, %d", r.OldFence, l.Fence)
 		}
-		// The handover is only safe because the floor moved: a socket still
-		// carrying OldFence is refused at the host proxy, not merely here.
+		// The handover is only safe because the floor moved: the database
+		// refuses OldFence from here on, and on a host running the fence proxy
+		// so does the ADB socket; on a host without one the departed holder is
+		// relied upon to honour it.
 		if r.NewFloor <= r.OldFence {
 			t.Errorf("NewFloor = %d is not above OldFence = %d; the departed holder can still drive the device", r.NewFloor, r.OldFence)
 		}
@@ -1567,7 +1573,8 @@ func TestReclaimTakesOnlyAnAbandonedLeaseAndEveryGuardHolds(t *testing.T) {
 // It is an ending like any other, so it must fence like one: farm.lease_release
 // and farm.lease_reclaim both raise devices.fence_floor and quarantine the slot,
 // and a max_runtime expiry that skipped either would return a handset to the
-// pool while the previous holder's fence was still accepted at the host proxy.
+// pool while the previous holder's fence was still accepted by the database —
+// and, on a host running the fence proxy, at the ADB socket.
 func TestExpireMaxRuntimeEndsTheLeaseAndFencesLikeAnyOtherEnding(t *testing.T) {
 	f := newFixture(t, 2)
 	ctx := t.Context()
@@ -1624,7 +1631,8 @@ func TestExpireMaxRuntimeEndsTheLeaseAndFencesLikeAnyOtherEnding(t *testing.T) {
 	}
 	if floor <= floorBefore {
 		t.Errorf("fence_floor = %d, unchanged from %d; the device went back into the pool while the "+
-			"previous holder's fence was still accepted at the host proxy", floor, floorBefore)
+			"previous holder's fence was still accepted by the database (and, on a host running "+
+			"the fence proxy, at the ADB socket)", floor, floorBefore)
 	}
 	if _, err := f.store.Renew(ctx, l.ID, l.Fence, l.HolderInstance); !errors.Is(err, ErrFenced) {
 		t.Errorf("renew after a max_runtime expiry: err = %v, want ErrFenced", err)

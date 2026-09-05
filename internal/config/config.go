@@ -246,6 +246,35 @@ const (
 	DefaultFencePollInterval = 2 * time.Second
 )
 
+// U11 — fence proxy (client side).
+//
+// The three files that make every ADB client in this process dial each host's
+// fence proxy over mutual TLS instead of the ADB server's bare port. Unset,
+// nothing changes on the wire: plain TCP, no admission preamble, the fence
+// enforced in PostgreSQL and honoured by this client. Set, every connection
+// presents the certificate and announces its class — and, for a job, its
+// fence — so a host running the proxy (FARM_FENCE_TLS_*, the host half) can
+// refuse a stale fence at the socket. All three or none: a certificate
+// without a CA to verify the proxy, or a CA without a certificate to present,
+// is a deployment that would fail its first handshake with a message an
+// operator has to decode, so it is refused here with one that names the knob.
+//
+// The certificate's farm://<class>/<service> URI SAN is what the proxy takes
+// the credential class from; the class word in the preamble is advisory. One
+// certificate per process means one class per process, so a role that runs
+// several components (`all`) presents the same class for all of them.
+//
+// Set it on the processes that reach a host's ADB server across the network
+// — jobrunner, recovery, watchdog, api — and not on farmd node: the node's
+// own clients dial the ADB server on loopback, behind the proxy rather than
+// through it, and a certificate there would be presented to a server that
+// does not speak TLS.
+const (
+	EnvFenceClientCert = "FARM_FENCE_CLIENT_CERT"
+	EnvFenceClientKey  = "FARM_FENCE_CLIENT_KEY"
+	EnvFenceClientCA   = "FARM_FENCE_CLIENT_CA"
+)
+
 // Mirrors of CHECK constraints in migrations/00001_core.sql. Duplicated on
 // purpose: the database is the authority, but a process that would inevitably
 // violate the authority should never finish booting.
@@ -638,6 +667,101 @@ func (f Fence) Enabled() bool {
 	return f.CertFile != "" && f.KeyFile != "" && f.CAFile != ""
 }
 
+// FenceClient is the client half of the fence proxy: what this process
+// presents to a host's proxy, when it presents anything at all.
+type FenceClient struct {
+	CertFile string
+	KeyFile  string
+	CAFile   string
+
+	// TLS is the client configuration built from the three files, and nil
+	// when they are unset. Every adbwire client in the process takes it
+	// through adbwire.WithTLS; nil leaves the client on plain TCP.
+	TLS *tls.Config
+
+	// Leaf is the parsed client certificate, for the startup summary. Nil
+	// when TLS was supplied in code rather than loaded from files.
+	Leaf *x509.Certificate
+}
+
+// Enabled reports whether this process dials hosts through the fence proxy.
+func (f FenceClient) Enabled() bool { return f.TLS != nil }
+
+// problems is the all-or-none check plus a parse of whatever was set, so a
+// certificate that will not load is refused at boot and not at the first dial
+// an hour later, against a host that then reports an opaque handshake error.
+func (f FenceClient) problems() []error {
+	set := 0
+	for _, v := range []string{f.CertFile, f.KeyFile, f.CAFile} {
+		if v != "" {
+			set++
+		}
+	}
+	if set == 0 {
+		return nil
+	}
+	if set != 3 {
+		return []error{fmt.Errorf("%s, %s and %s must be set together or not at all; "+
+			"a certificate without a CA cannot verify the proxy, and a CA without a "+
+			"certificate has nothing to present to it",
+			EnvFenceClientCert, EnvFenceClientKey, EnvFenceClientCA)}
+	}
+	_, _, err := f.build()
+	if err != nil {
+		return []error{err}
+	}
+	return nil
+}
+
+// build loads the files into a TLS configuration. TLS 1.3 only: it is what
+// the proxy serves, and the choice is not the client's to negotiate down.
+func (f FenceClient) build() (*tls.Config, *x509.Certificate, error) {
+	cert, err := tls.LoadX509KeyPair(f.CertFile, f.KeyFile)
+	if err != nil {
+		return nil, nil, fmt.Errorf("%s / %s: %w", EnvFenceClientCert, EnvFenceClientKey, err)
+	}
+	leaf := cert.Leaf
+	if leaf == nil {
+		if leaf, err = x509.ParseCertificate(cert.Certificate[0]); err != nil {
+			return nil, nil, fmt.Errorf("%s: %w", EnvFenceClientCert, err)
+		}
+	}
+	caPEM, err := os.ReadFile(f.CAFile)
+	if err != nil {
+		return nil, nil, fmt.Errorf("%s: %w", EnvFenceClientCA, err)
+	}
+	roots := x509.NewCertPool()
+	if !roots.AppendCertsFromPEM(caPEM) {
+		return nil, nil, fmt.Errorf("%s (%s) holds no PEM certificate", EnvFenceClientCA, f.CAFile)
+	}
+	return &tls.Config{
+		MinVersion:   tls.VersionTLS13,
+		Certificates: []tls.Certificate{cert},
+		RootCAs:      roots,
+	}, leaf, nil
+}
+
+// describe is the Summary line's value.
+func (f FenceClient) describe() string {
+	switch {
+	case f.TLS == nil:
+		return fmt.Sprintf("off (%s/KEY/CA unset: ADB servers are dialed in the clear, no preamble is sent, "+
+			"and a revoked fence is refused in PostgreSQL only)", EnvFenceClientCert)
+	case f.Leaf == nil:
+		return "mTLS to each host's fence proxy (certificate supplied in code)"
+	}
+	uris := make([]string, 0, len(f.Leaf.URIs))
+	for _, u := range f.Leaf.URIs {
+		uris = append(uris, u.String())
+	}
+	san := "NONE — the proxy will refuse this certificate; it needs a farm://<class>/<service> URI SAN"
+	if len(uris) > 0 {
+		san = strings.Join(uris, ",")
+	}
+	return fmt.Sprintf("mTLS to each host's fence proxy (cert %s, subject %q, san %s, expires %s)",
+		f.CertFile, f.Leaf.Subject.CommonName, san, f.Leaf.NotAfter.UTC().Format(time.RFC3339))
+}
+
 // Config is the whole of farmd's environment-derived configuration.
 type Config struct {
 	// Component is the name written by farm.component_beat. It must match the
@@ -669,13 +793,14 @@ type Config struct {
 	NodeAddr    string
 	APIBaseURL  string
 
-	Lease   Lease
-	Reaper  Reaper
-	Node    Node
-	Topo    Topo
-	Battery Battery
-	Charge  Charge
-	Fence   Fence
+	Lease       Lease
+	Reaper      Reaper
+	Node        Node
+	Topo        Topo
+	Battery     Battery
+	Charge      Charge
+	Fence       Fence
+	FenceClient FenceClient
 
 	WatchdogInterval time.Duration
 	MigrationsTable  string
@@ -775,6 +900,11 @@ func Load(component string, opts ...Option) (*Config, error) {
 			Advertise:    l.str(EnvFenceAdvertise, ""),
 			PollInterval: l.dur(EnvFencePollInterval, DefaultFencePollInterval),
 		},
+		FenceClient: FenceClient{
+			CertFile: l.str(EnvFenceClientCert, ""),
+			KeyFile:  l.str(EnvFenceClientKey, ""),
+			CAFile:   l.str(EnvFenceClientCA, ""),
+		},
 
 		Battery: Battery{
 			TempRiseDCPerMin: l.num(EnvBatteryTempRise, DefaultBatteryTempRiseDCPerMin),
@@ -805,6 +935,14 @@ func Load(component string, opts ...Option) (*Config, error) {
 	}
 	if len(errs) > 0 {
 		return nil, fmt.Errorf("invalid configuration:\n%w", errors.Join(errs...))
+	}
+	if cfg.FenceClient.CertFile != "" {
+		// problems() already parsed the files; this is the same parse kept.
+		tlsCfg, leaf, err := cfg.FenceClient.build()
+		if err != nil {
+			return nil, fmt.Errorf("invalid configuration:\n%w", err)
+		}
+		cfg.FenceClient.TLS, cfg.FenceClient.Leaf = tlsCfg, leaf
 	}
 	return cfg, nil
 }
@@ -1332,6 +1470,9 @@ Fix by raising %s above %s + %s, or by lowering the proxy's self-fence timeout.`
 		}
 	}
 
+	// ---- fence proxy, client side ------------------------------------
+	errs = append(errs, c.FenceClient.problems()...)
+
 	return errs
 }
 
@@ -1497,6 +1638,7 @@ func (c *Config) Summary() string {
 		"(idle means no live lease; a lease is never touched)\n",
 		c.Charge.MaxPct, c.Charge.MinPct, c.Charge.Interval)
 	fmt.Fprintf(&b, "shutdown grace   = %s (drains requests; releases nothing)\n", c.ShutdownGrace)
+	fmt.Fprintf(&b, "fence client     = %s\n", c.FenceClient.describe())
 	fmt.Fprintf(&b, "artifact gc      = grace %s; a blob younger than this is never swept, "+
 		"and nothing sweeps unless an operator asks\n", c.ArtifactGCGrace)
 	return b.String()

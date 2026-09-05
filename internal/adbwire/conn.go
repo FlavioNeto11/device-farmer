@@ -3,6 +3,7 @@ package adbwire
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
@@ -54,10 +55,11 @@ type conn struct {
 	closeErr  error
 }
 
-// dialConn opens a socket to the ADB server. The context bounds the dial;
-// fallback bounds it when the context carries no deadline of its own, so a
-// wedged host cannot park a caller forever.
-func dialConn(ctx context.Context, d *net.Dialer, endpoint string, fallback time.Duration) (*conn, error) {
+// dialConn opens a socket to the ADB server, and completes a TLS handshake on
+// it when tlsCfg is set. The context bounds the dial and the handshake
+// together; fallback bounds them when the context carries no deadline of its
+// own, so a wedged host cannot park a caller forever.
+func dialConn(ctx context.Context, d *net.Dialer, endpoint string, fallback time.Duration, tlsCfg *tls.Config) (*conn, error) {
 	const op = "dial"
 
 	dialer := d
@@ -83,6 +85,20 @@ func dialConn(ctx context.Context, d *net.Dialer, endpoint string, fallback time
 		// loopback or rack-local server. Nagle buys nothing here and
 		// costs a round trip of latency on every call.
 		_ = tc.SetNoDelay(true)
+	}
+	if tlsCfg != nil {
+		// Explicit rather than lazy: a lazy handshake would surface on the
+		// first write as KindWrite, and a certificate the proxy will not
+		// accept would then be reported as a socket that failed mid-request.
+		tc := tls.Client(nc, tlsCfg)
+		if err := tc.HandshakeContext(dctx); err != nil {
+			_ = nc.Close()
+			if ce := contextError(ctx, op); ce != nil {
+				return nil, ce
+			}
+			return nil, newTransportError(op, endpoint, "", classify(err, KindDial), err)
+		}
+		nc = tc
 	}
 	dialsTotal.Inc()
 	return &conn{

@@ -86,8 +86,9 @@ func (r ReleaseReason) String() string { return string(r) }
 // matches on (id, fence), and renew additionally matches holder_instance. A
 // process that was paused for an hour and woke up after its lease was
 // reclaimed therefore cannot touch the lease that replaced it — it presents a
-// fence below the device's fence_floor and is refused at the database and
-// again at the host proxy.
+// fence below the device's fence_floor and is refused at the database. On a
+// host running the fence proxy it is refused at the ADB socket as well; on a
+// host without one it is relied upon to honour the database's answer.
 //
 // Deadlines here are a CACHED COPY of server state, refreshed by each renewal.
 // They are useful for reporting and for dashboards. They are not authoritative
@@ -114,9 +115,11 @@ type Lease struct {
 	JobID string
 
 	// Fence is monotonic and unique per lease. It is presented on every
-	// renew, witness and release, and is compared against devices.fence_floor
-	// at the host proxy so a stale socket is refused at the resource rather
-	// than merely in the database.
+	// renew, witness and release, and the database compares it against
+	// devices.fence_floor on each. On a host running the fence proxy the
+	// same comparison is made at the ADB socket, so a stale socket is refused
+	// at the resource too; on a host without one the holder is relied upon
+	// to honour the database's refusal.
 	Fence int64
 
 	// Holder is a pod name. AUDIT ONLY — it confers no ownership.
@@ -197,9 +200,13 @@ type ReclaimedLease struct {
 	// OldFence is the fence the departed holder still believes it owns.
 	OldFence int64
 
-	// NewFloor is the device's new fence_floor. Any socket still carrying
-	// OldFence is now refused at the host proxy, which is what makes the
-	// handover safe rather than merely hopeful.
+	// NewFloor is the device's new fence_floor. The database refuses every
+	// write at OldFence from here on; on a host running the fence proxy a
+	// socket still carrying OldFence is refused at the ADB socket too, and on
+	// a host without one the departed holder is relied upon to honour it.
+	// That, and the slot's rearm window, is what stands between the departed
+	// holder and the next job — and on a host without the proxy, the rearm
+	// window is the whole of it.
 	NewFloor int64
 }
 

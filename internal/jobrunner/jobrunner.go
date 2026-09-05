@@ -161,7 +161,21 @@ var _ Executor = (*runner.Runner)(nil)
 
 // Dialer builds the device connection for one placement. It is a field so a
 // test can drive the whole loop against a fake device.
-type Dialer func(endpoint, devpath string) (runner.Conn, error)
+//
+// admission is the placement's fence, and it is here so that the fence reaches
+// the wire: on a host whose ADB server sits behind the fence proxy, every
+// connection announces it in an admission preamble, and the proxy refuses a
+// fence below the device's floor at the socket rather than leaving the refusal
+// to the database alone. A Dialer that does not present it will find its
+// connections refused on such a host.
+type Dialer func(endpoint, devpath string, admission int64) (runner.Conn, error)
+
+// admissionClass is the credential class a job's connections announce to the
+// fence proxy: the one class that carries a fence and is bound to one device
+// (docs/design/fence-proxy.md, section 7). adbwire cannot name it — its
+// vocabulary barrier is what keeps a socket failure unable to reach a lease —
+// so the word lives here, beside the fence it accompanies.
+const admissionClass = "lease"
 
 // leaseHolder is the part of *lease.Holder that ENDING a lease uses.
 //
@@ -240,11 +254,12 @@ type Config struct {
 	// cadence; a zero Timeout is bounded by that interval; see applyDefaults.
 	MarkerConfig runner.MarkerConfig
 
-	// Dial builds the device connection. Defaults to a cached adbwire client
-	// per endpoint plus NewDeviceConn.
+	// Dial builds the device connection. Defaults to one adbwire client per
+	// placement, announcing the placement's fence, plus NewDeviceConn.
 	Dial Dialer
 
-	// ADBOptions are passed to every adbwire client this loop constructs.
+	// ADBOptions are passed to every adbwire client this loop constructs —
+	// adbwire.WithTLS is how a deployment points every job at the fence proxy.
 	// Ignored when Dial is supplied.
 	ADBOptions []adbwire.Option
 
@@ -376,12 +391,6 @@ type JobRunner struct {
 	busy     map[string]struct{}
 	deferred map[string]*deferral
 
-	// clients are per-endpoint adbwire clients. A client holds no connection —
-	// it opens one per call — so caching one per host is free and safe for
-	// concurrent use.
-	cmu     sync.Mutex
-	clients map[string]*adbwire.Client
-
 	wg sync.WaitGroup
 }
 
@@ -417,7 +426,6 @@ func New(cfg Config) (*JobRunner, error) {
 		log:      cfg.Logger.With("component", cfg.Component),
 		busy:     make(map[string]struct{}),
 		deferred: make(map[string]*deferral),
-		clients:  make(map[string]*adbwire.Client),
 	}
 	jr.claims = &claimLocks{
 		pool:    cfg.Pool,
@@ -762,7 +770,7 @@ func (jr *JobRunner) runJob(ctx context.Context, c claim) {
 		return
 	}
 
-	dev, err := jr.cfg.Dial(job.Endpoint, job.Devpath)
+	dev, err := jr.cfg.Dial(job.Endpoint, job.Devpath, l.Fence)
 	if err != nil {
 		// The default Dialer touches no wire — it validates the devpath and
 		// binds a client that opens a socket per call — so its only failure is
@@ -1297,23 +1305,23 @@ func (jr *JobRunner) recoverRun(log *slog.Logger) {
 		"panic", fmt.Sprint(r), "stack", string(debug.Stack()))
 }
 
-// dial is the default Dialer: one cached adbwire client per host endpoint.
-func (jr *JobRunner) dial(endpoint, devpath string) (runner.Conn, error) {
-	return NewDeviceConn(jr.client(endpoint), devpath)
-}
-
-func (jr *JobRunner) client(endpoint string) *adbwire.Client {
-	jr.cmu.Lock()
-	defer jr.cmu.Unlock()
-	if c, ok := jr.clients[endpoint]; ok {
-		return c
-	}
-	opts := make([]adbwire.Option, 0, len(jr.cfg.ADBOptions)+1)
+// dial is the default Dialer: one adbwire client per placement, announcing that
+// placement's fence on every connection it opens.
+//
+// Per placement rather than the per-endpoint cache this used to keep. The
+// preamble is a property of the placement — its fence — and a client is a
+// dialer, not a connection: building one costs a struct and no socket. A cache
+// keyed by (endpoint, fence) would have bought nothing and cost an eviction
+// policy tied to the lease's lifetime, which is exactly the kind of bookkeeping
+// that drifts from the truth it mirrors.
+func (jr *JobRunner) dial(endpoint, devpath string, admission int64) (runner.Conn, error) {
+	opts := make([]adbwire.Option, 0, len(jr.cfg.ADBOptions)+2)
 	opts = append(opts, adbwire.WithLogger(jr.log))
 	opts = append(opts, jr.cfg.ADBOptions...)
-	c := adbwire.New(endpoint, opts...)
-	jr.clients[endpoint] = c
-	return c
+	opts = append(opts, adbwire.WithAdmissionPreamble(func() (string, string, int64, bool) {
+		return admissionClass, devpath, admission, true
+	}))
+	return NewDeviceConn(adbwire.New(endpoint, opts...), devpath)
 }
 
 // ---------------------------------------------------------------------------

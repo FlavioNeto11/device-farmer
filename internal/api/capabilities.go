@@ -449,12 +449,7 @@ func (s *Server) featureStatuses(ctx context.Context, roles []RoleStatus) []Feat
 				"network you do not control; set FARM_API_TOKENS to close it. The seam for " +
 				"OIDC is documented in internal/api/auth.go.",
 		},
-		{
-			Name: "Fence enforcement at the resource", State: "not_built",
-			How: "the fence is enforced in PostgreSQL and honoured by the client",
-			Detail: "The mTLS proxy that would refuse a fenced connection at the ADB socket is not " +
-				"written, so a misbehaving client could still reach a device it has been fenced out of.",
-		},
+		s.fenceEnforcement(),
 		{
 			Name: "Helm chart", State: "enabled",
 			How: "deploy/helm/device-farmer, one Deployment per role; docker-compose's 'farm' " +
@@ -475,6 +470,36 @@ func (s *Server) featureStatuses(ctx context.Context, roles []RoleStatus) []Feat
 		}
 	}
 	return out
+}
+
+// fenceEnforcement reports the client half of the fence proxy as THIS process
+// sees it: whether every ADB connection it opens presents a certificate and
+// announces its fence.
+//
+// That is all it can see. Enforcement happens per host, in the proxy that
+// fronts that host's ADB server, and nothing here can observe which hosts run
+// one. So even "enabled" is a statement about this process's side of the
+// wire, and the detail says so rather than letting a green row stand for a
+// property of the whole farm.
+func (s *Server) fenceEnforcement() FeatureStatus {
+	const detail = "Enforcement is per host: a host running the proxy (FARM_FENCE_TLS_*) refuses a " +
+		"revoked fence at the ADB socket, and a host without one relies on the holder to honour " +
+		"the fence floor PostgreSQL raised. This process cannot see which hosts run the proxy."
+	if s.cfg == nil || !s.cfg.FenceClient.Enabled() {
+		return FeatureStatus{
+			Name: "Fence enforcement at the resource", State: "unavailable",
+			How: "built (internal/fenceproxy + the adbwire admission preamble), and switched off in " +
+				"this process: set FARM_FENCE_CLIENT_CERT/KEY/CA here and FARM_FENCE_TLS_* on each host",
+			Detail: "This process dials ADB servers in the clear and sends no fence, so " +
+				"the fence is enforced in PostgreSQL only and honoured by the client. " + detail,
+		}
+	}
+	return FeatureStatus{
+		Name: "Fence enforcement at the resource", State: "enabled",
+		How: "mutual TLS to each host's fence proxy (FARM_FENCE_CLIENT_CERT/KEY/CA), every " +
+			"connection announcing its class and, for a job, its fence",
+		Detail: detail,
+	}
 }
 
 func stateIf(cond bool, yes, no string) string {

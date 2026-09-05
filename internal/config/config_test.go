@@ -1166,6 +1166,18 @@ func TestSummaryShowsWhatTheProcessDecided(t *testing.T) {
 		"2.0 C/min", "45.0 C", "15 %/h", "ends nothing",
 		// U8: the charge band, and the one sentence that keeps it honest.
 		"above 80%", "release at 40%", "2m0s", "a lease is never touched",
+		// BOTH halves of the fence proxy, which are two different things
+		// under two sets of variables: the mTLS listener a host SERVES
+		// (Config.Fence, FARM_FENCE_TLS_*) and what this process PRESENTS to
+		// it (Config.FenceClient, FARM_FENCE_CLIENT_*).
+		//
+		// Asserted here because the compiler cannot: both groups were named
+		// Fence when their branches merged, so one silently shadowed the
+		// other and the struct still compiled. A summary missing a line is
+		// the cheapest observable form of that mistake, and an operator who
+		// reads only one of these lines concludes the fence is enforced on a
+		// wire where it is not.
+		"fence proxy      =", "fence client     =",
 	} {
 		if !strings.Contains(s, want) {
 			t.Errorf("summary omits %q:\n%s", want, s)

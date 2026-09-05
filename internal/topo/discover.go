@@ -321,7 +321,7 @@ func (d *Discoverer) Once(ctx context.Context) (rep Report, err error) {
 		return rep, err
 	}
 
-	hubs := d.selectHubs(tree, &rep)
+	hubs := selectHubs(&d.cfg.Filter, tree, &rep)
 	paths := make([]string, 0, len(hubs))
 	for _, h := range hubs {
 		paths = append(paths, h.Path)
@@ -333,7 +333,7 @@ func (d *Discoverer) Once(ctx context.Context) (rep Report, err error) {
 
 	rep.Hubs = len(hubs)
 	for _, h := range hubs {
-		rep.Planned = append(rep.Planned, d.planHub(h, labeler, &rep)...)
+		rep.Planned = append(rep.Planned, planHub(h, labeler, &rep)...)
 	}
 
 	// Checked on the finished plan, and before a dry run returns, because
@@ -473,11 +473,14 @@ func (d *Discoverer) logPass(rep Report) {
 // selectHubs applies the filter and records why each rejected hub was
 // rejected. The reasons end up in the Report because "discovery did not create
 // my slots" is otherwise an unanswerable question.
-func (d *Discoverer) selectHubs(t *Tree, rep *Report) []*Hub {
+//
+// It is a function of the filter and the tree alone — no pool, no host — so
+// the whole adoption policy can be exercised against a fixture tree.
+func selectHubs(f *HubFilter, t *Tree, rep *Report) []*Hub {
 	var out []*Hub
 	for _, h := range t.Hubs() {
 		switch {
-		case d.cfg.Filter.excluded(h.Path):
+		case f.excluded(h.Path):
 			rep.Skipped = append(rep.Skipped, Skip{h.Path, "excluded by configuration"})
 			continue
 		case h.MaxChild < 1 || h.MaxChild > schemaMaxPorts:
@@ -486,13 +489,13 @@ func (d *Discoverer) selectHubs(t *Tree, rep *Report) []*Hub {
 			continue
 		}
 
-		if d.cfg.Filter.included(h.Path) {
+		if f.included(h.Path) {
 			out = append(out, h)
 			continue
 		}
 
 		if h.IsRoot {
-			if !d.cfg.Filter.IncludeRootHubs {
+			if !f.IncludeRootHubs {
 				rep.Skipped = append(rep.Skipped, Skip{h.Path,
 					"root hub; set IncludeRootHubs to use motherboard ports as slots"})
 				continue
@@ -506,15 +509,15 @@ func (d *Discoverer) selectHubs(t *Tree, rep *Report) []*Hub {
 			continue
 		}
 
-		if h.MaxChild < d.cfg.Filter.MinPorts {
+		if h.MaxChild < f.MinPorts {
 			rep.Skipped = append(rep.Skipped, Skip{h.Path, fmt.Sprintf(
-				"%d ports, below the %d-port floor", h.MaxChild, d.cfg.Filter.MinPorts)})
+				"%d ports, below the %d-port floor", h.MaxChild, f.MinPorts)})
 			continue
 		}
 		switch {
 		case h.AndroidPorts() > 0:
 			out = append(out, h)
-		case d.cfg.Filter.AdoptEmpty && h.ForeignPorts() == 0:
+		case f.AdoptEmpty && h.ForeignPorts() == 0:
 			out = append(out, h)
 		default:
 			rep.Skipped = append(rep.Skipped, Skip{h.Path, fmt.Sprintf(
@@ -537,7 +540,7 @@ func (d *Discoverer) selectHubs(t *Tree, rep *Report) []*Hub {
 //
 //   - on a root hub, only ports that currently hold an Android device are
 //     registered. See HubFilter.IncludeRootHubs.
-func (d *Discoverer) planHub(h *Hub, l *Labeler, rep *Report) []PlannedSlot {
+func planHub(h *Hub, l *Labeler, rep *Report) []PlannedSlot {
 	model := h.Model()
 	out := make([]PlannedSlot, 0, len(h.Ports))
 	for _, p := range h.Ports {

@@ -163,9 +163,14 @@ func (s Snapshot) ByDevpath() map[string]Device {
 // currently reporting.
 //
 // This is the collision the whole devpath-addressing rule exists to survive,
-// and it is cheap to detect here, so the watchdog can set
-// farm.devices.serial_ambiguous instead of discovering the problem during a
-// recovery action.
+// and it is cheap to detect here, so a caller can say so in its logs and
+// metrics before a recovery action discovers it the hard way. It does NOT
+// feed farm.devices.serial_ambiguous: the watchdog reports the collision and
+// deliberately never writes it, because its role has no UPDATE on
+// farm.devices and widening that grant would put the health plane inside the
+// identity table. The only writer of that flag is farm.resolve_device, which
+// sets it on every row carrying a duplicated serial the moment enrollment
+// resolves one (migrations/00011_resolve_ambiguous.sql).
 func (s Snapshot) AmbiguousSerials() []string {
 	counts := make(map[string]int, len(s.Devices))
 	for _, d := range s.Devices {

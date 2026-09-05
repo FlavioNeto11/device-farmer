@@ -108,6 +108,16 @@ const (
 	// rung, so a "recovered" row can be audited against an observation rather
 	// than against a verb's reply.
 	DetailConfirmedState = "confirmed_state"
+	// DetailRefusalKind classifies a refusal when the actuator can. It is
+	// written only for the kinds the ladder acts on differently; today that
+	// is [RefusalKindGanged], and its absence means "a refusal, reason in
+	// DetailRefusal".
+	DetailRefusalKind = "refusal_kind"
+
+	// RefusalKindGanged is the DetailRefusalKind for [ErrRungRefusedGanged].
+	// The word is shared with the node API's reason vocabulary so the same
+	// string travels from uhubctl's answer to the metric label.
+	RefusalKindGanged = "ganged"
 )
 
 // DispositionOf reports the diagnosis an actuator recorded in a Result. An
@@ -136,6 +146,13 @@ func DispositionOf(r Result) Disposition {
 // unreachable, and "" when there is none.
 func RefusalOf(r Result) string {
 	s, _ := r.Detail[DetailRefusal].(string)
+	return s
+}
+
+// RefusalKindOf returns the classification an actuator attached to a refusal,
+// and "" when it attached none.
+func RefusalKindOf(r Result) string {
+	s, _ := r.Detail[DetailRefusalKind].(string)
 	return s
 }
 
@@ -200,6 +217,16 @@ var (
 	// something that cannot be attributed to it. Nothing was learned about the
 	// device.
 	ErrHostUnreachable = errors.New("recovery: the host agent could not be reached")
+
+	// ErrRungRefusedGanged is the one refusal the ladder needs to tell apart
+	// from every other: the agent declined a VBUS cycle because the port's
+	// power switch is shared with devices nobody authorised. It wraps
+	// ErrRungRefused, so a caller that only asks "was it refused?" still gets
+	// yes; a caller that asks this one learns that the rack, not the ladder,
+	// is what needs changing — a rising rate here means the hub needs per-port
+	// power switching, and that is a purchase order rather than a bug.
+	ErrRungRefusedGanged = fmt.Errorf(
+		"%w: the port shares one power domain with devices nobody authorised", ErrRungRefused)
 )
 
 // RungFault is the behavioural alternative to the sentinels above, for a
@@ -700,10 +727,14 @@ func (a *ADBActuator) hostLocal(r *rung, what string, extra map[string]any, run 
 	}
 
 	if err := run(r.ctx, r.act); err != nil {
-		d, reason := a.classifyHostFault(r, what, err)
+		d, reason, kind := a.classifyHostFault(r, what, err)
 		r.log.Log(r.ctx, levelFor(d), "host-local recovery rung did not complete",
-			"what", what, "disposition", string(d), "err", err)
-		return r.answer(d, reason, detail(map[string]any{"what": what, "error": err.Error()}))
+			"what", what, "disposition", string(d), "refusal_kind", kind, "err", err)
+		kv := map[string]any{"what": what, "error": err.Error()}
+		if kind != "" {
+			kv[DetailRefusalKind] = kind
+		}
+		return r.answer(d, reason, detail(kv))
 	}
 
 	// The agent reporting success is the agent's half of the story. Whether the
@@ -995,24 +1026,35 @@ func (a *ADBActuator) classifyWire(r *rung, op string, err error) (Disposition, 
 	return DispositionFailed, ""
 }
 
-// classifyHostFault turns a [HostRunner] error into one of the three answers.
+// classifyHostFault turns a [HostRunner] error into one of the three answers,
+// plus the refusal's kind when the error names one.
 //
 // The agent's own classification is consulted first and the caller's context
 // second, because an agent that says "unreachable" has told us something the
 // context cannot: that the round trip never got an answer it could attribute.
-func (a *ADBActuator) classifyHostFault(r *rung, what string, err error) (Disposition, string) {
-	unreachable := func() (Disposition, string) {
+//
+// The kind is read off the sentinel chain rather than off the prose: a ganged
+// refusal reaches here as [ErrRungRefusedGanged] whether the agent answered
+// in-process or over HTTP, and the same word then lands in the attempt row and
+// on the metric. A refusal recognised only by matching its sentence would stop
+// being recognised the day somebody rewords the sentence.
+func (a *ADBActuator) classifyHostFault(r *rung, what string, err error) (Disposition, string, string) {
+	unreachable := func() (Disposition, string, string) {
 		return DispositionUnreachable, fmt.Sprintf(
 			"tier %d (%s) needs %s on host %s and the farmd-node agent there could not be "+
 				"reached (%v); nothing was learned about the device, and no rung on this host "+
 				"will help until that agent answers again",
-			r.act.Tier, r.act.TierName, what, r.act.HostID, err)
+			r.act.Tier, r.act.TierName, what, r.act.HostID, err), ""
 	}
-	refused := func() (Disposition, string) {
+	refused := func() (Disposition, string, string) {
+		kind := ""
+		if errors.Is(err, ErrRungRefusedGanged) {
+			kind = RefusalKindGanged
+		}
 		return DispositionRefused, fmt.Sprintf(
 			"tier %d (%s) was refused by the farmd-node agent on host %s: %v; %s was not "+
 				"performed and the device is as it was",
-			r.act.Tier, r.act.TierName, r.act.HostID, err, what)
+			r.act.Tier, r.act.TierName, r.act.HostID, err, what), kind
 	}
 
 	var fault RungFault
@@ -1033,15 +1075,15 @@ func (a *ADBActuator) classifyHostFault(r *rung, what string, err error) (Dispos
 
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		if r.aborted() {
-			return DispositionAborted, ""
+			return DispositionAborted, "", ""
 		}
 		return DispositionUnreachable, fmt.Sprintf(
 			"tier %d (%s) ran out of its action budget waiting for the farmd-node agent on "+
 				"host %s to finish %s",
-			r.act.Tier, r.act.TierName, r.act.HostID, what)
+			r.act.Tier, r.act.TierName, r.act.HostID, what), ""
 	}
 
-	return DispositionFailed, ""
+	return DispositionFailed, "", ""
 }
 
 // windowClosed reports whether ctx has run out, including the moment where its

@@ -449,11 +449,14 @@ func checkBlastRadius(hubs []hubStatus, loc string, port int, target string, ack
 	// in farm.recovery_attempts.
 	sort.Strings(names)
 
+	// ErrGangedDomain rather than ErrRefused: this is the one refusal whose
+	// remedy is hardware, and the control plane counts it on its own so that
+	// a rising rate reads as "buy per-port hubs" instead of "leases said no".
 	return fmt.Errorf("node: %w: cycling port %d of hub %s shares one power domain with %d "+
 		"device(s) nobody authorised — %s. Every one of them may be holding a live lease. "+
 		"Either check lease policy for them and pass them as acknowledged, or move the "+
 		"devices to a hub with per-port power switching",
-		ErrRefused, port, loc, len(disturbed), strings.Join(names, ", "))
+		ErrGangedDomain, port, loc, len(disturbed), strings.Join(names, ", "))
 }
 
 // powerOn restores power to a port, retrying, because leaving it dark removes

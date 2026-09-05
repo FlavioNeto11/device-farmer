@@ -294,9 +294,14 @@ SELECT %s
 			h = *d.Health
 		}
 		counts.Health[h]++
-		// Same exclusion as the "unhealthy" filter above and as
-		// farm.v_hub_health. These three must agree, or one response reports
-		// four unhealthy devices in counts and zero on the hubs they sit on.
+		// Same exclusion as the "unhealthy" filter above: this is "not in
+		// service", and it deliberately includes unknown, recovering and
+		// quarantined devices, because an operator filtering the grid wants
+		// to see them. It is NOT the number on the hub banner beside it —
+		// farm.v_hub_health.unhealthy counts fault EVIDENCE only, the same
+		// predicate as the ladder's hub quorum (recovery.UnhealthyStates), so
+		// a quarantined hub reads 0 there and its devices still count here.
+		// The two answer different questions and are labelled as such.
 		if h != "healthy" && h != "retired" && h != "parked" {
 			counts.Unhealthy++
 		}

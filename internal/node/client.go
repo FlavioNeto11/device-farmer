@@ -408,7 +408,7 @@ func (c *Client) op(ctx context.Context, path, what string, req OpRequest, timeo
 	// that nothing is known — never a success this client cannot prove.
 	var out OpResponse
 	if err := json.Unmarshal(body, &out); err != nil || !out.OK {
-		reason, _ := agentReason(body)
+		reason, _, _ := agentReason(body)
 		return fmt.Errorf("node: %w: %s for %s on host %s got HTTP 200 from %s, but the "+
 			"answer does not confirm the operation, so something other than a farmd-node "+
 			"agent is very likely answering at that address; check what is listening there "+
@@ -593,7 +593,7 @@ func (c *Client) answerCutShort(callerCtx, callCtx context.Context, what, hostID
 //     healthy phone rebooted out from under a six-hour job.
 func (c *Client) statusError(what, hostID, devpath, base string, status int, body []byte) error {
 	where := subject(hostID, devpath)
-	detail, fromAgent := agentReason(body)
+	detail, reason, fromAgent := agentReason(body)
 
 	switch status {
 	case http.StatusUnauthorized:
@@ -617,6 +617,13 @@ func (c *Client) statusError(what, hostID, devpath, base string, status int, bod
 			ErrRefused, base, APIPrefix, hostID, detail)
 
 	case http.StatusConflict:
+		// The reason is compared as a word, never found in the prose: the
+		// agent's sentence is for the operator, and the one refusal the
+		// ladder counts on its own must survive that sentence being reworded.
+		if reason == ReasonGanged {
+			return fmt.Errorf("node: %w: the agent on host %s declined %s for %s: %s",
+				ErrGangedDomain, hostID, what, where, detail)
+		}
 		return fmt.Errorf("node: %w: the agent on host %s declined %s for %s: %s",
 			ErrRefused, hostID, what, where, detail)
 
@@ -668,23 +675,25 @@ func subject(hostID, devpath string) string {
 // operator actually reads at 3am; losing it to a decode error would leave them
 // with a status code and nothing else.
 //
-// The second return says whether the reply was this API's JSON carrying a
-// reason — that is, whether a farmd-node wrote it. [Client.statusError] turns
-// on that answer, because a 5xx from the agent and a 5xx from a proxy standing
-// where the agent should be are opposite verdicts about a device.
-func agentReason(body []byte) (string, bool) {
+// The second return is OpResponse.Reason — the one-word classification, "" when
+// the agent gave none or predates the field. The third says whether the reply
+// was this API's JSON carrying a reason — that is, whether a farmd-node wrote
+// it. [Client.statusError] turns on that answer, because a 5xx from the agent
+// and a 5xx from a proxy standing where the agent should be are opposite
+// verdicts about a device.
+func agentReason(body []byte) (detail, reason string, fromAgent bool) {
 	var out OpResponse
 	if err := json.Unmarshal(body, &out); err == nil && out.Error != "" {
-		return out.Error, true
+		return out.Error, out.Reason, true
 	}
 	snippet := strings.TrimSpace(string(body))
 	if snippet == "" {
-		return "the agent sent no reason", false
+		return "the agent sent no reason", "", false
 	}
 	if len(snippet) > 512 {
 		snippet = snippet[:512] + "…"
 	}
-	return snippet, false
+	return snippet, "", false
 }
 
 // normalizeEndpoint turns a recorded endpoint into a base URL.

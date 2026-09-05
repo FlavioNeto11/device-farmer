@@ -78,6 +78,8 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+
+	"github.com/flaviopadilha/device-farmer/internal/recovery"
 )
 
 // The routes. They are constants because two processes have to agree on them:
@@ -124,10 +126,53 @@ type OpRequest struct {
 // Refused restates in the body what the status code already says, so a client
 // behind a proxy that rewrites status codes can still tell a declined rung
 // from a failed one.
+//
+// Reason says WHICH refusal, in one word from the Reason* vocabulary, and it
+// exists for the one refusal the control plane treats differently: a ganged
+// power domain. Before it, the agent's ganged refusal was prose behind a
+// generic 409, the client wrapped every 409 the same way, and the ladder
+// counted "the rack needs per-port switching" under the same metric label as
+// "a lease's policy said no" — two answers whose fixes are a purchase order
+// and nothing, respectively. Empty on a 200, and empty from an agent older
+// than this field, which a client reads as an unclassified refusal.
 type OpResponse struct {
 	OK      bool   `json:"ok,omitempty"`
 	Error   string `json:"error,omitempty"`
 	Refused bool   `json:"refused,omitempty"`
+	Reason  string `json:"reason,omitempty"`
+}
+
+// The refusal vocabulary OpResponse.Reason is drawn from. [ReasonFor] is the
+// only writer; a client compares against these and never against the prose.
+const (
+	// ReasonGanged: the port's power switch is shared with devices the caller
+	// did not acknowledge. The agent did not touch the port. This is the one
+	// reason the ladder records and counts on its own, as refused_ganged.
+	ReasonGanged = "ganged"
+	// ReasonPolicy: the agent's own rules declined — a request for another
+	// host, a devpath that is not a USB position, a kernel that would undo
+	// the cycle behind uhubctl's back. Nothing was touched.
+	ReasonPolicy = "policy"
+	// ReasonUnsupported: this build of the agent cannot perform the rung at
+	// all (ErrNotSupported, HTTP 501).
+	ReasonUnsupported = "unsupported"
+)
+
+// ReasonFor classifies an error into OpResponse.Reason. It is the server half
+// of the vocabulary above; "" means the error is not a refusal.
+func ReasonFor(err error) string {
+	switch {
+	case err == nil:
+		return ""
+	case errors.Is(err, ErrGangedDomain):
+		return ReasonGanged
+	case errors.Is(err, ErrNotSupported):
+		return ReasonUnsupported
+	case errors.Is(err, ErrRefused):
+		return ReasonPolicy
+	default:
+		return ""
+	}
 }
 
 // HealthResponse is the answer to GET /node/v1/health.
@@ -142,6 +187,26 @@ type HealthResponse struct {
 	Platform    string `json:"platform"`
 }
 
+// vocabulary is one word of this package's error vocabulary that also answers
+// to the recovery ladder's.
+//
+// The ladder classifies a host runner's error with errors.Is against
+// [recovery.ErrRungRefused] and [recovery.ErrHostUnreachable], and takes an
+// error that matches neither at face value: a failed rung, which it answers
+// by escalating. This package's own words — ErrRefused, ErrNotSupported,
+// ErrUnreachable — matched neither, so every refusal the agent made and every
+// host it could not reach arrived at the ladder as broken hardware. Unwrap
+// returning the recovery sentinel is what makes the two vocabularies one
+// without either package importing the other's sentences: the message stays
+// this package's, and errors.Is finds the ladder's word behind it.
+type vocabulary struct {
+	text  string
+	means []error
+}
+
+func (v *vocabulary) Error() string   { return v.text }
+func (v *vocabulary) Unwrap() []error { return v.means }
+
 // Errors the contract adds to [ErrRefused] and [ErrNotSupported], which are
 // declared in agent.go because the agent raises them locally too.
 var (
@@ -150,7 +215,22 @@ var (
 	// NOT a statement about the hardware and never about a lease. An agent
 	// that is down leaves every device on its host leased, running, and
 	// exactly where it was.
-	ErrUnreachable = errors.New("the host agent could not be reached")
+	ErrUnreachable error = &vocabulary{
+		text:  "the host agent could not be reached",
+		means: []error{recovery.ErrHostUnreachable},
+	}
+
+	// ErrGangedDomain is the refusal for a VBUS cycle on a port whose power
+	// switch is shared with devices nobody acknowledged. It is a refusal —
+	// errors.Is(err, ErrRefused) holds — with one more word attached, because
+	// this is the refusal whose remedy is hardware: the rack needs per-port
+	// switching. The agent raises it in front of uhubctl; the client raises it
+	// again from a 409 whose reason is [ReasonGanged], so the ladder sees the
+	// same error whether the agent answered in-process or over HTTP.
+	ErrGangedDomain error = &vocabulary{
+		text:  "refused by the host agent: ganged power domain",
+		means: []error{ErrRefused, recovery.ErrRungRefusedGanged},
+	}
 
 	// ErrUnauthorized is a 401. It is a refusal — the rung is not permitted
 	// from here — and in practice it means a token was rotated on one side

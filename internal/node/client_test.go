@@ -68,7 +68,8 @@ func (s *nodeAPI) reply(w http.ResponseWriter, err error) {
 		return
 	}
 	w.WriteHeader(StatusFor(err))
-	_ = json.NewEncoder(w).Encode(OpResponse{Error: err.Error(), Refused: IsRefused(err)})
+	_ = json.NewEncoder(w).Encode(OpResponse{
+		Error: err.Error(), Refused: IsRefused(err), Reason: ReasonFor(err)})
 }
 
 func (s *nodeAPI) op(w http.ResponseWriter, r *http.Request) {

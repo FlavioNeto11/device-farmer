@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -303,7 +305,11 @@ SELECT h.id, h.rack_id, h.rack_unit, h.host_epoch, h.adb_endpoint, h.admin_state
        -- 'parked' is excluded with 'retired': both are decisions, not faults.
        -- This is the number an operator reads before draining a host, and a
        -- shelf of charge-limited handsets must not look like a host falling
-       -- apart. Same exclusion as farm.v_hub_health and the fleet counts.
+       -- apart. Same exclusion as the fleet counts: "not in service", which
+       -- includes quarantined and unknown devices on purpose — a host with
+       -- twelve quarantined phones is a host worth looking at before a drain.
+       -- farm.v_hub_health.unhealthy is narrower (fault evidence only, the
+       -- ladder's quorum predicate) and is meant to be.
        count(*) FILTER (WHERE r.health IS NOT NULL AND r.health NOT IN ('healthy','retired','parked')) AS unhealthy,
        count(*) FILTER (WHERE l.state IN ('held','suspect')) AS live_leases,
        count(*) FILTER (WHERE l.state IN ('held','suspect') AND l.protected) AS protected_leases
@@ -782,10 +788,103 @@ type recoveryAttempt struct {
 	Detail      json.RawMessage `json:"detail,omitempty"`
 }
 
+// recoveryFilter is what GET /api/v1/recovery narrows its attempts by. Every
+// field is optional; the zero value is "everything, newest first".
 type recoveryFilter struct {
 	deviceID string
 	hostID   string
+	// outcome is one of the five values farm.recovery_attempts.outcome admits.
+	outcome string
+	// tier is a resolved farm.recovery_tiers.tier; nil means any.
+	tier *int
+	// hub is a farm.hubs id or usb_path, matched against both because an
+	// operator reads "3-1" off the rack and the dashboard links by id.
+	hub string
+	// sinceAt and sinceFor are the two spellings of ?since=: an RFC3339
+	// instant, or a duration back from the database's now(). At most one is
+	// set; the interval is sent as a duration so the clock that anchors it is
+	// the server's, never this process's.
+	sinceAt  *time.Time
+	sinceFor *string
 	limit    int
+}
+
+// recoveryOutcomes mirrors the CHECK constraint on farm.recovery_attempts.outcome
+// (migrations/00003_ops.sql). A value outside it can match no row, so it is a
+// typo to report rather than a filter to run.
+var recoveryOutcomes = []string{"recovered", "no_change", "failed", "refused", "aborted"}
+
+// parseRecoveryFilter reads the query string. It returns a message naming the
+// parameter at fault when a value is garbage — one an operator can act on
+// from the 400 — and validates only what needs no database: the table-backed
+// checks (tier exists, hub exists) are resolveRecoveryFilter's.
+func parseRecoveryFilter(r *http.Request) (recoveryFilter, string) {
+	f := recoveryFilter{
+		deviceID: queryString(r, "device"),
+		hostID:   queryString(r, "host"),
+		hub:      queryString(r, "hub"),
+		limit:    queryInt(r, "limit", 100, 1, 1000),
+	}
+
+	if v := queryString(r, "outcome"); v != "" {
+		if !slices.Contains(recoveryOutcomes, v) {
+			return f, fmt.Sprintf("outcome must be one of %s; got %q",
+				strings.Join(recoveryOutcomes, ", "), v)
+		}
+		f.outcome = v
+	}
+
+	if v := queryString(r, "since"); v != "" {
+		switch at, err := time.Parse(time.RFC3339, v); {
+		case err == nil:
+			f.sinceAt = &at
+		default:
+			d, derr := time.ParseDuration(v)
+			if derr != nil {
+				return f, fmt.Sprintf("since must be an RFC3339 timestamp or a duration such as "+
+					"2h or 90m; got %q", v)
+			}
+			if d <= 0 {
+				return f, fmt.Sprintf("since must be a positive duration; got %q", v)
+			}
+			interval := strconv.FormatInt(int64(d/time.Microsecond), 10) + " microseconds"
+			f.sinceFor = &interval
+		}
+	}
+	return f, ""
+}
+
+// resolveRecoveryFilter checks the table-backed parameters. A tier may be
+// given by number or by name and comes back as its number; an unknown tier
+// or hub is a 400 because an empty list is what a typo looks like, and the
+// endpoint exists so an operator can find things at 3am rather than wonder
+// whether they asked the wrong question.
+func (s *Server) resolveRecoveryFilter(ctx context.Context, r *http.Request, f *recoveryFilter) (string, error) {
+	if v := queryString(r, "tier"); v != "" {
+		var tier int
+		err := s.pool.QueryRow(ctx, `
+SELECT t.tier FROM farm.recovery_tiers t
+ WHERE t.tier::text = $1 OR t.name = $1`, v).Scan(&tier)
+		switch {
+		case errors.Is(err, pgx.ErrNoRows):
+			return fmt.Sprintf("tier %q is not a tier number or name in farm.recovery_tiers", v), nil
+		case err != nil:
+			return "", err
+		}
+		f.tier = &tier
+	}
+	if f.hub != "" {
+		var known bool
+		if err := s.pool.QueryRow(ctx, `
+SELECT EXISTS (SELECT 1 FROM farm.hubs h WHERE h.id::text = $1 OR h.usb_path = $1)`,
+			f.hub).Scan(&known); err != nil {
+			return "", err
+		}
+		if !known {
+			return fmt.Sprintf("hub %q is neither a hub id nor a usb_path in farm.hubs", f.hub), nil
+		}
+	}
+	return "", nil
 }
 
 func (s *Server) recoveryAttempts(ctx context.Context, f recoveryFilter) ([]recoveryAttempt, error) {
@@ -799,12 +898,19 @@ SELECT a.id, a.device_id::text, d.farm_uid, a.slot_id, s.rack_slot, a.hub_id, a.
   JOIN farm.recovery_tiers t ON t.tier = a.tier
   LEFT JOIN farm.devices d ON d.id = a.device_id
   LEFT JOIN farm.slots   s ON s.id = a.slot_id
+  LEFT JOIN farm.hubs    h ON h.id = a.hub_id
  WHERE ($1 = '' OR a.device_id::text = $1)
    AND ($2 = '' OR a.host_id = $2)
+   AND ($3 = '' OR a.outcome = $3)
+   AND ($4::int IS NULL OR a.tier = $4::int)
+   AND ($5 = '' OR a.hub_id::text = $5 OR h.usb_path = $5)
+   AND ($6::timestamptz IS NULL OR a.started_at >= $6::timestamptz)
+   AND ($7::interval IS NULL OR a.started_at >= now() - $7::interval)
  ORDER BY a.started_at DESC
- LIMIT $3`
+ LIMIT $8`
 
-	rows, err := s.pool.Query(ctx, q, f.deviceID, f.hostID, f.limit)
+	rows, err := s.pool.Query(ctx, q, f.deviceID, f.hostID, f.outcome, f.tier, f.hub,
+		f.sinceAt, f.sinceFor, f.limit)
 	if err != nil {
 		return nil, err
 	}
@@ -832,18 +938,34 @@ SELECT a.id, a.device_id::text, d.farm_uid, a.slot_id, s.rack_slot, a.hub_id, a.
 // handleRecovery serves GET /api/v1/recovery: what the ladder tried recently,
 // what is still quarantined, and the ladder itself.
 //
+// The attempts narrow by device, host, outcome, tier (number or name), hub (id
+// or usb_path) and since (RFC3339 or a duration such as 2h) — the shape of the
+// question an operator actually asks, "every refusal at tier 4 in the last
+// hour", which until these filters existed could only be asked of psql. A
+// value that can match nothing is a 400 naming the parameter, not an empty
+// list.
+//
 // The tier table is part of the response on purpose: it lets the dashboard show
 // what the system WILL try before it tries it, including the disruption policy
 // each rung needs, so an operator can see in advance which rungs a given lease
 // has taken off the table.
 func (s *Server) handleRecovery(w http.ResponseWriter, r *http.Request) {
-	limit := queryInt(r, "limit", 100, 1, 1000)
+	filter, msg := parseRecoveryFilter(r)
+	if msg != "" {
+		badRequest(w, msg, nil)
+		return
+	}
+	msg, err := s.resolveRecoveryFilter(r.Context(), r, &filter)
+	if err != nil {
+		s.fail(w, r, "validate recovery filter", err)
+		return
+	}
+	if msg != "" {
+		badRequest(w, msg, nil)
+		return
+	}
 
-	attempts, err := s.recoveryAttempts(r.Context(), recoveryFilter{
-		deviceID: queryString(r, "device"),
-		hostID:   queryString(r, "host"),
-		limit:    limit,
-	})
+	attempts, err := s.recoveryAttempts(r.Context(), filter)
 	if err != nil {
 		s.fail(w, r, "list recovery attempts", err)
 		return

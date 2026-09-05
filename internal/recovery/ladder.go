@@ -46,6 +46,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -96,35 +97,6 @@ const (
 	DefaultHubWindow = 3 * time.Minute
 	DefaultLockClass = 26981 // 'r','e' — the advisory-lock class for this loop
 
-	// unhealthyPredicate is the numerator of the hub-fault quorum, and it
-	// counts ONLY states that are positive evidence of a device or hardware
-	// fault. Everything else is excluded because it is not evidence:
-	//
-	//	'unknown'      nobody has looked. reconcileQuarantines writes it to
-	//	               EVERY device on a hub, in one statement, the moment an
-	//	               operator closes that hub's quarantine — same health_since
-	//	               for all of them, so the spread is zero and the quorum is
-	//	               unanimous. Counting it re-opens the quarantine the
-	//	               operator just closed, about a debounce window later,
-	//	               forever.
-	//	'recovering'   this loop wrote it in begin. Reading our own induced
-	//	               state back as evidence of a hub fault is the same mistake
-	//	               suppress_until exists to prevent, one level up: two
-	//	               devices under active recovery on a three-device hub reach
-	//	               quorum and quarantine the healthy third.
-	//	'quarantined'  our own bookkeeping, not a new observation.
-	//	'parked'       out of service ON PURPOSE. Charge limiting parks whole
-	//	               shelves of handsets at a time and holds them off VBUS for
-	//	               hours; counting that as fault evidence would quarantine a
-	//	               hub for doing exactly what it was told.
-	//	'booting'      authorizing/connecting is transient and normal; a
-	//	               legitimate mass reboot would otherwise read as a hub fault.
-	//
-	// The denominator stays count(*) over the hub's devices: including
-	// retired and healthy ones only makes quorum harder, which is the safe
-	// direction for an action whose blast radius is a whole hub.
-	unhealthyPredicate = `r.health IN ('offline','unauthorized','missing','degraded')`
-
 	// coveredByQuarantine is the one definition of "an open quarantine covers
 	// this device", shared by the two places that ask. It expects a device `d`
 	// and its slot `s` in scope, and the whole of farm.quarantines as `q`.
@@ -155,6 +127,60 @@ const (
                AND (q.device_id = d.id OR q.slot_id = s.id
                     OR q.hub_id = s.hub_id OR q.host_id = s.host_id)) )`
 )
+
+// UnhealthyStates are the farm.device_runtime.health values that are positive
+// evidence of a device or hardware fault, and therefore the ONLY values the
+// hub-fault quorum counts. The list is exported because the operator-facing
+// view farm.v_hub_health (migrations/00013_hub_health_aligned.sql) and
+// test/assertions_v13.sql carry the same list in SQL, and a Go test pins all
+// three to this slice: a hub must not read 8/8 unhealthy on the fleet banner at
+// the same moment the quorum reads 0/8, which is exactly what happened while the
+// view kept a deny-list and this package kept an allow-list.
+//
+// Everything not listed is excluded because it is not evidence:
+//
+//	'unknown'      nobody has looked. reconcileQuarantines writes it to
+//	               EVERY device on a hub, in one statement, the moment an
+//	               operator closes that hub's quarantine — same health_since
+//	               for all of them, so the spread is zero and the quorum is
+//	               unanimous. Counting it re-opens the quarantine the
+//	               operator just closed, about a debounce window later,
+//	               forever.
+//	'recovering'   this loop wrote it in begin. Reading our own induced
+//	               state back as evidence of a hub fault is the same mistake
+//	               suppress_until exists to prevent, one level up: two
+//	               devices under active recovery on a three-device hub reach
+//	               quorum and quarantine the healthy third.
+//	'quarantined'  our own bookkeeping, not a new observation.
+//	'parked'       out of service ON PURPOSE. Charge limiting parks whole
+//	               shelves of handsets at a time and holds them off VBUS for
+//	               hours; counting that as fault evidence would quarantine a
+//	               hub for doing exactly what it was told.
+//	'booting'      authorizing/connecting is transient and normal; a
+//	               legitimate mass reboot would otherwise read as a hub fault.
+//	'retired'      a decision, not an observation.
+//
+// The denominator stays count(*) over the hub's devices: including retired and
+// healthy ones only makes quorum harder, which is the safe direction for an
+// action whose blast radius is a whole hub.
+var UnhealthyStates = []string{"offline", "unauthorized", "missing", "degraded"}
+
+// UnhealthySQL renders UnhealthyStates as the SQL list the predicate, the view
+// and the assertion file all spell it with: single-quoted, comma-separated, no
+// spaces. One formatter, so the string a test compares against a .sql file is
+// produced by the same code that produces the string the ladder sends.
+func UnhealthySQL() string {
+	quoted := make([]string, len(UnhealthyStates))
+	for i, s := range UnhealthyStates {
+		quoted[i] = "'" + s + "'"
+	}
+	return strings.Join(quoted, ",")
+}
+
+// unhealthyPredicate is the numerator of the hub-fault quorum, over a
+// farm.device_runtime row aliased r. See UnhealthyStates for what is counted
+// and why nothing else is.
+var unhealthyPredicate = "r.health IN (" + UnhealthySQL() + ")"
 
 // Outcome mirrors the CHECK constraint on farm.recovery_attempts.outcome.
 // There is no value here that means "gave up and took the device back": the
@@ -739,7 +765,7 @@ func (l *Ladder) hubStats(ctx context.Context, hubIDs []int64) ([]hubStat, error
 	if len(hubIDs) == 0 {
 		return nil, nil
 	}
-	const q = `
+	q := `
 SELECT s.hub_id, hb.host_id, COALESCE(hb.usb_path, ''),
        count(*),
        count(*) FILTER (WHERE ` + unhealthyPredicate + `),
@@ -967,9 +993,16 @@ func (l *Ladder) attempt(ctx context.Context, c candidate, tiers []tier) {
 	}
 
 	out, detail := l.perform(ctx, c, t, acknowledged, log)
-	l.finish(ctx, attemptID, out, detail, log)
+	l.finish(ctx, attemptID, c, t, out, detail, log)
 
-	obs.RecoveryAttempt(c.slot(), obsTier(t), obsOutcome(out))
+	kind := obsOutcome(out, detail)
+	if DispositionOf(Result{Outcome: out, Detail: detail}) == DispositionRefused {
+		// The same counter the blast-radius check feeds, so "how often is tier
+		// 4 refused, and by whom" is one query whether the refusal came from
+		// a lease's policy or from the agent standing in front of the hub.
+		refusalsTotal.WithLabelValues(t.Name, string(kind)).Inc()
+	}
+	obs.RecoveryAttempt(c.slot(), obsTier(t), kind)
 }
 
 // checkBlastRadius asks what the tier would disturb and whether every live
@@ -1242,6 +1275,11 @@ RETURNING id`,
 	// the lowest rung still unspent, which is what makes 0 — the column default,
 	// and the value every reset writes — mean "observe first" rather than
 	// "observe already happened". See next and rungAfter.
+	//
+	// "Spent" is provisional at this point. The rung is advanced here, under
+	// the lock, and handed back by finish if the verdict turns out not to be
+	// evidence about the hardware — a refusal, an unreachable host. See
+	// rungSpent.
 	if _, err := tx.Exec(cctx, `
 UPDATE farm.device_runtime
    SET ladder_tier    = $2::int,
@@ -1449,9 +1487,62 @@ VALUES ('host_quarantined', $1::text, $2::jsonb)`, l.cfg.Component, detail); err
 	return tx.Commit(cctx)
 }
 
-// finish closes the attempt row. started_at/finished_at bracket exactly the
-// action, so the UI can show how long a rung actually took.
-func (l *Ladder) finish(ctx context.Context, id int64, out Outcome, detail map[string]any, log *slog.Logger) {
+// rungSpent reports whether a rung's verdict is the kind of evidence that
+// justifies the next, more disruptive rung — which is precisely the question
+// [Disposition.Escalate] was written to answer.
+//
+// A verdict that does not spend the rung is a refusal (nothing ran; the device
+// is as it was), an unreachable host (nothing answered; no rung on that host
+// will help), a recovery (there is nothing left to climb for) or an abort
+// (the loop went away before a verdict). Only failed and no_change say the
+// hardware was tried and is still broken.
+func rungSpent(out Outcome, detail map[string]any) bool {
+	return DispositionOf(Result{Outcome: out, Detail: detail}).Escalate()
+}
+
+// finish closes the attempt row and, when the verdict did not spend the rung,
+// hands the rung back. started_at/finished_at bracket exactly the action, so
+// the UI can show how long a rung actually took.
+//
+// # The rung is spent by the verdict, not by the attempt
+//
+// begin moved farm.device_runtime.ladder_tier PAST this rung before anything
+// ran, because the column must be advanced under the per-device lock and the
+// action must not run inside a transaction. That leaves the climb decided by
+// the fact that an attempt was opened, whatever it then found — and what an
+// actuator finds is, more often than a broken phone, an agent that is not
+// there: no farmd-node on the host, a kernel that cannot USBDEVFS_RESET, a
+// ganged hub, a socket nobody answered. Each of those spent the rung. A dead
+// host read as a shelf of dead phones and the ladder rebooted, restarted and
+// quarantined its way through devices whose only fault was on the other end
+// of a socket.
+//
+// So the compensating write below puts the rung back when the verdict is not
+// evidence about the hardware. It is guarded on the value begin wrote: if
+// reconcileQuarantines reset the column to 0 in the meantime — the device went
+// healthy, or an operator closed a quarantine — that reset stands, because it
+// was made on better information than this attempt has.
+//
+// Cooldown is not touched here and does not need to be: begin's budget query
+// excludes 'refused' rows, which is the outcome a refusal and an unreachable
+// host both record. suppress_until is left as begin set it, on purpose. It is
+// the only thing pacing a rung the farm cannot perform: lifted, a refused
+// tier 3 on a farm with no host agent would be retried on the very next
+// cycle, forever, writing a row every fifteen seconds.
+//
+// updated_at is deliberately not written. The candidate query reads a write
+// AFTER suppress_until lapses as the watchdog's confirmation that the health
+// value is current; stamping it from here would let this loop confirm its
+// own evidence.
+func (l *Ladder) finish(ctx context.Context, id int64, c candidate, t tier, out Outcome, detail map[string]any, log *slog.Logger) {
+	if detail == nil {
+		detail = map[string]any{}
+	}
+	spent := rungSpent(out, detail)
+	// Written into the row so an operator reading a 'refused' at tier 3 and a
+	// 'refused' at tier 3 again ten minutes later can see the ladder did not
+	// climb between them, rather than infer it from the tier numbers.
+	detail["rung_spent"] = spent
 	blob := jsonDetail(detail)
 
 	// Detached from ctx: an attempt that ran must be recorded even when the
@@ -1470,7 +1561,18 @@ func (l *Ladder) finish(ctx context.Context, id int64, out Outcome, detail map[s
 		refusal = r
 	}
 
-	if _, err := l.cfg.Pool.Exec(cctx, `
+	// One transaction for the row and the rung: a row that says "refused,
+	// rung not spent" beside a column that climbed anyway is the exact
+	// disagreement this function exists to remove.
+	tx, err := l.cfg.Pool.Begin(cctx)
+	if err != nil {
+		l.log.Error("could not record the end of a recovery attempt",
+			"attempt", id, "outcome", string(out), "err", err)
+		return
+	}
+	defer tx.Rollback(cctx)
+
+	if _, err := tx.Exec(cctx, `
 UPDATE farm.recovery_attempts
    SET finished_at = now(), outcome = $2::text, detail = detail || $3::jsonb,
        refusal = COALESCE(refusal, $4::text)
@@ -1479,7 +1581,25 @@ UPDATE farm.recovery_attempts
 			"attempt", id, "outcome", string(out), "err", err)
 		return
 	}
-	log.Info("recovery attempt finished", "attempt", id, "outcome", string(out))
+
+	if !spent {
+		if _, err := tx.Exec(cctx, `
+UPDATE farm.device_runtime
+   SET ladder_tier = $2::int
+ WHERE device_id = $1::uuid AND ladder_tier = $3::int`,
+			c.DeviceID, t.Tier, rungAfter(t)); err != nil {
+			l.log.Error("could not hand back a rung the verdict did not spend",
+				"attempt", id, "outcome", string(out), "tier", t.Tier, "err", err)
+			return
+		}
+	}
+
+	if err := tx.Commit(cctx); err != nil {
+		l.log.Error("could not commit the end of a recovery attempt",
+			"attempt", id, "outcome", string(out), "err", err)
+		return
+	}
+	log.Info("recovery attempt finished", "attempt", id, "outcome", string(out), "rung_spent", spent)
 }
 
 // ---------------------------------------------------------------------------
@@ -1533,16 +1653,39 @@ func obsTier(t tier) obs.RecoveryTier {
 	}
 }
 
-// obsOutcome folds this package's five outcomes onto obs's set.
+// obsOutcome folds a rung's verdict onto obs's deliberately coarser set.
 //
-// no_change folds to failed on purpose: obs's rule is never to record a
-// recovery that cannot be proven, and "the action ran and nothing changed" is
-// not a recovery. A false "recovered" would suppress the page that should
-// follow.
-func obsOutcome(o Outcome) obs.RecoveryOutcome {
-	switch o {
-	case OutcomeRecovered:
+// It reads the disposition, not the outcome column, because the column has
+// one word — 'refused' — for two answers obs keeps apart from 'failed' for
+// opposite reasons:
+//
+//   - A refusal by the agent counts as refused_ganged when the agent said the
+//     port shares its power switch, and refused_policy otherwise. obs's
+//     vocabulary has one word for "a rule said no and nothing was touched";
+//     whose rule — the holder's disruption policy, the agent's host check, a
+//     build without uhubctl — is in farm.recovery_attempts.refusal. The ganged
+//     case is the one obs singles out because it is the only refusal whose
+//     fix is hardware: a rising rate says the rack needs per-port switching.
+//   - An unreachable host folds to failed, as it always has. Nothing is
+//     claimed about the hardware — the row's disposition says unreachable —
+//     but a host that answers nothing is an outage, and failed is the label
+//     the documented alert pages on. Filing it under a refusal would make a
+//     dead rack quiet.
+//
+// no_change and aborted fold to failed on purpose: obs's rule is never to
+// record a recovery that cannot be proven, and "the action ran and nothing
+// changed" is not a recovery. A false "recovered" would suppress the page that
+// should follow.
+func obsOutcome(o Outcome, detail map[string]any) obs.RecoveryOutcome {
+	res := Result{Outcome: o, Detail: detail}
+	switch DispositionOf(res) {
+	case DispositionRecovered:
 		return obs.OutcomeRecovered
+	case DispositionRefused:
+		if RefusalKindOf(res) == RefusalKindGanged {
+			return obs.OutcomeRefusedGanged
+		}
+		return obs.OutcomeRefusedPolicy
 	default:
 		return obs.OutcomeFailed
 	}
@@ -1624,8 +1767,9 @@ var (
 
 	refusalsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "farm", Subsystem: "recovery", Name: "refusals_total",
-		Help: "Tiers refused because a live lease in the blast radius forbade them. " +
-			"kind=refused_ganged means the rack needs per-port power switching.",
+		Help: "Tiers refused, by a live lease's disruption policy in the blast radius or by " +
+			"the host agent in front of the hub. kind=refused_ganged means the rack needs " +
+			"per-port power switching.",
 	}, []string{"tier", "kind"})
 
 	budgetSkips = prometheus.NewCounterVec(prometheus.CounterOpts{

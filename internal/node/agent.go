@@ -174,14 +174,25 @@ const (
 // implementation here — a Windows or macOS build, or a Linux kernel too old
 // for the operation to mean anything. It is wrapped, never returned bare, so
 // the message always names what was attempted and on what.
-var ErrNotSupported = errors.New("not supported on this host")
+//
+// To the recovery ladder it is a refusal — the rung was not performed and the
+// device is as it was — so it answers to [recovery.ErrRungRefused]; see the
+// vocabulary type in api.go.
+var ErrNotSupported error = &vocabulary{
+	text:  "not supported on this host",
+	means: []error{recovery.ErrRungRefused},
+}
 
 // ErrRefused marks the agent's own refusals: a request for another host, a
 // power cycle whose blast radius nobody authorised, a kernel that will undo
 // the operation silently. A refusal is not a failure of the hardware and must
 // not be recorded as one — it means the agent declined to act, and the reason
-// is in the wrapped message.
-var ErrRefused = errors.New("refused by the host agent")
+// is in the wrapped message. It answers to [recovery.ErrRungRefused] so the
+// ladder records exactly that.
+var ErrRefused error = &vocabulary{
+	text:  "refused by the host agent",
+	means: []error{recovery.ErrRungRefused},
+}
 
 // DiscoverFunc runs ONE pass of USB topology discovery for this host: read the
 // USB tree, call farm.register_slot for every position found. It is supplied
@@ -1061,7 +1072,8 @@ func (a *Agent) opHandler(want []byte, run func(context.Context, opRequest) erro
 				status = http.StatusNotImplemented
 			}
 			writeJSON(w, status, map[string]any{
-				"error": err.Error(), "refused": errors.Is(err, ErrRefused)})
+				"error": err.Error(), "refused": errors.Is(err, ErrRefused),
+				"reason": ReasonFor(err)})
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})

@@ -29,13 +29,18 @@ func init() { platform = linuxPlatform{} }
 
 type linuxPlatform struct{}
 
-const (
-	// sysfsUSBDevices holds one directory per USB device, named by its
-	// position: "3-1.4.2" is port 2 of the hub on port 4 of the hub on port 1
-	// of bus 3. That name is exactly farm.slots.usb_path, which is why a
-	// devpath can be mapped to hardware without guessing anything.
-	sysfsUSBDevices = "/sys/bus/usb/devices"
+// sysfsUSBDevices holds one directory per USB device, named by its position:
+// "3-1.4.2" is port 2 of the hub on port 4 of the hub on port 1 of bus 3. That
+// name is exactly farm.slots.usb_path, which is why a devpath can be mapped to
+// hardware without guessing anything.
+//
+// A variable rather than a constant so a test can point the blast-radius check
+// at a directory it built: what checkBlastRadius refuses, and with which
+// sentinel, is decided by what it finds here, and that decision has to be
+// provable on a build machine with no USB bus. Nothing writes it outside tests.
+var sysfsUSBDevices = "/sys/bus/usb/devices"
 
+const (
 	// devBusUSB holds the usbfs nodes the ioctl is issued against, laid out as
 	// /dev/bus/usb/<busnum>/<devnum> with both numbers zero-padded to three
 	// digits by the kernel's own device naming.

@@ -365,9 +365,32 @@ func (s *Server) featureStatuses(ctx context.Context, roles []RoleStatus) []Feat
 		{
 			Name: "Recovery ladder", State: stateIf(running["recovery"], "enabled", "unavailable"),
 			How: "tiers stored in farm.recovery_tiers, refused when blast radius exceeds a live lease's policy",
+			// A host agent beating is a fact about the fleet; holding a client
+			// to ask one with is a fact about THIS process, and only the second
+			// decides what the operator's power button does. Reporting the
+			// first alone let this line say tier 4 can act while
+			// POST /api/v1/slots/{id}/power was answering 503 on every slot.
 			Detail: ifElse(running["node"],
-				"A host agent is present, so tiers 3 and 4 (USB reset, port power) can act.",
+				"A host agent is present, so tiers 3 and 4 (USB reset, port power) can act. "+
+					ifElse(s.hostRunner != nil,
+						"This api process holds a node client too, so an operator can cycle a port from here.",
+						"This api process holds no node client, so an operator's POST /api/v1/slots/{id}/power "+
+							"still answers 503 and only the recovery role's own rungs act."),
 				"No host agent is beating: tiers 3 and 4 are REFUSED with a reason, not silently skipped."),
+		},
+		{
+			// The ladder's runner lives in the recovery process; this one is
+			// THIS process's, and it is the only thing that decides whether
+			// the operator's power button does anything.
+			Name: "Operator port power", State: stateIf(s.hostRunner != nil, "enabled", "unavailable"),
+			How: "POST /api/v1/slots/{id}/power cycles VBUS through the host's farmd-node agent, " +
+				"synchronously, under the ladder's tier-4 policy and lock, and closes its own " +
+				"farm.recovery_attempts row with the agent's answer",
+			Detail: ifElse(s.hostRunner != nil,
+				"This api process holds a node client, so a slot power cycle asks the host's agent "+
+					"at farm.hosts.node_endpoint and answers with the outcome.",
+				"This api process has no node client (FARM_NODE_TOKEN is unset), so "+
+					"POST /api/v1/slots/{id}/power answers 503 and records no attempt."),
 		},
 		{
 			Name: "Dynamic enrollment", State: stateIf(running["enroll"] || running["node"], "enabled", "unavailable"),

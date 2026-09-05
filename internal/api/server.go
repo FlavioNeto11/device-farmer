@@ -45,6 +45,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"reflect"
 	"sync"
 	"time"
 
@@ -238,15 +239,23 @@ func WithExecutorFactory(f ExecutorFactory) Option {
 // port power cycle happens on the device host, and the control plane can only
 // ask for it.
 //
-// A nil runner leaves the server as it was. Pass one built from a non-nil
-// client only — a typed nil stored in the interface is not nil here, and the
-// route would then call methods on a nil client instead of saying that no
-// agent is configured.
+// A nil runner, typed or not, leaves the server as it was: the route then
+// answers 503 saying no agent is configured, which is what a nil *node.Client
+// means. The route also needs farm.hosts.node_endpoint for the slot's host —
+// that column is how the client cmd/farmd builds finds the agent — and a host
+// without one is answered 503 before any runner is asked.
 func WithHostRunner(r recovery.HostRunner) Option {
 	return func(s *Server) {
-		if r != nil {
-			s.hostRunner = r
+		if r == nil {
+			return
 		}
+		// A typed nil — (*node.Client)(nil) in the interface — is not == nil,
+		// and stored it would have the route call methods on a nil client
+		// instead of saying that no agent is configured.
+		if v := reflect.ValueOf(r); v.Kind() == reflect.Pointer && v.IsNil() {
+			return
+		}
+		s.hostRunner = r
 	}
 }
 

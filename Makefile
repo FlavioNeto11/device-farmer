@@ -43,17 +43,21 @@ test:
 
 ## assertions: run every SQL assertion suite against DATABASE_URL
 #
-# All of them, not just the first. Each suite is one migration's proof and each
-# runs in its own transaction and rolls back, so they are independent — but a
-# suite nobody invokes protects nothing, and test/assertions_v5.sql sat here
-# unrun for exactly that reason. New suite, new line.
+# Globbed, not listed. Each migration ships its proof as another
+# test/assertions*.sql, and a list has to be edited to pick one up — which is
+# how test/assertions_v5.sql sat here unrun. A proof no target invokes is a
+# proof nobody checks.
 #
-# No `|| true` and no swallowed exit status: ON_ERROR_STOP means a failed
-# assertion exits non-zero, and this target has to fail with it.
+# The exit status is psql's, not grep's. The previous form piped into grep and
+# ended in `|| true`, so a failed assertion — the entire point of
+# ON_ERROR_STOP — still exited 0, and this target was green through a broken
+# lease protocol.
 assertions:
-	@for f in test/assertions.sql test/assertions_v5.sql test/assertions_v8.sql; do \
+	@set -e; for f in test/assertions*.sql; do \
 		echo "== $$f"; \
-		psql "$(DATABASE_URL)" -q -v ON_ERROR_STOP=1 -f $$f || exit 1; \
+		out=$$(psql "$(DATABASE_URL)" -v ON_ERROR_STOP=1 -f "$$f" 2>&1) || \
+			{ echo "$$out" | grep -E 'ERROR|FATAL' || echo "$$out"; exit 1; }; \
+		echo "$$out" | grep -E 'ok |PASSED' || true; \
 	done
 
 ## migrate: apply the schema to DATABASE_URL

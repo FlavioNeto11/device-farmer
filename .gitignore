@@ -5,3 +5,9 @@
 
 # Local artifact blobs, when FARM_ARTIFACT_DIR is left at its default.
 /artifacts/
+
+# Agent scratch: settings local to this machine, and the git worktrees the
+# parallel agents check out. `gofmt -l .` from the repository root walks into
+# these and reports hundreds of files from other branches; the main tree is
+# clean. Not ignoring them also risks committing another branch's tree wholesale.
+/.claude/

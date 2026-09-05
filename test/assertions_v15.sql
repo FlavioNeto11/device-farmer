@@ -78,6 +78,8 @@ DECLARE
   v_owner     text;
   v_cnt       int;
   v_gap       interval;
+  v_armed     boolean;
+  v_unbeaten  text[];
   v_overdue   uuid;
   v_reclaimed uuid;
   v_lease     uuid;
@@ -138,8 +140,12 @@ BEGIN
   --    lease_reclaim never reclaims across a gap that ended after the
   --    lease's last heartbeat, and in one transaction every gap ends
   --    at now().
-  SELECT farm.reaper_arm(ARRAY['reaper','api','scheduler','jobrunner'], interval '60 seconds')
-    INTO v_gap;
+  SELECT armed, gap, unbeaten INTO v_armed, v_gap, v_unbeaten
+    FROM farm.reaper_arm(ARRAY['reaper','api','scheduler','jobrunner'], interval '60 seconds');
+  IF NOT v_armed THEN
+    RAISE EXCEPTION 'R3 FAILED: the arm refused with unbeaten %, though R2 beat every watched name',
+      v_unbeaten;
+  END IF;
   IF v_gap <> interval '0' THEN
     RAISE EXCEPTION 'R3 FAILED: fresh beats produced a gap of %', v_gap;
   END IF;
@@ -189,8 +195,11 @@ BEGIN
   --    gap is exactly five minutes.
   UPDATE farm.component_heartbeat SET beat_at = now() - interval '5 minutes'
    WHERE component = 'api';
-  SELECT farm.reaper_arm(ARRAY['reaper','api','scheduler','jobrunner'], interval '60 seconds')
-    INTO v_gap;
+  SELECT armed, gap INTO v_armed, v_gap
+    FROM farm.reaper_arm(ARRAY['reaper','api','scheduler','jobrunner'], interval '60 seconds');
+  IF NOT v_armed THEN
+    RAISE EXCEPTION 'R7 FAILED: a stale beat is a GAP, not a refusal; the arm must proceed and quiesce';
+  END IF;
   IF v_gap <> interval '5 minutes' THEN
     RAISE EXCEPTION 'R7 FAILED: a five-minute-old api beat produced a gap of %', v_gap;
   END IF;

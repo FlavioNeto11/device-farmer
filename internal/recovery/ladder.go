@@ -140,10 +140,12 @@ const (
 	// attempt was ever considered. In reconcileQuarantines it means the same
 	// host's devices are never released.
 	//
-	// 'power_domain' is in the table's CHECK constraint but has no column here,
-	// so it cannot be expressed; the last arm falls back to whatever subject
-	// columns such a row does carry. That can only over-cover, which for a test
-	// that decides whether the ladder may touch a device is the safe direction.
+	// There is one arm per scope the table's CHECK permits, and migration
+	// 00014 makes that closed: a row must carry the subject column its scope
+	// names, so there is no row shape left that these arms cannot express. A
+	// power-domain row covers every slot wired to that switch — which on a
+	// ganged hub is the whole point of the scope, since cycling one port
+	// cycles them all.
 	coveredByQuarantine = `
      SELECT 1 FROM farm.quarantines q
       WHERE q.closed_at IS NULL
@@ -151,9 +153,7 @@ const (
            OR (q.scope = 'slot'   AND q.slot_id   = s.id)
            OR (q.scope = 'hub'    AND q.hub_id    = s.hub_id)
            OR (q.scope = 'host'   AND q.host_id   = s.host_id)
-           OR (q.scope NOT IN ('device','slot','hub','host')
-               AND (q.device_id = d.id OR q.slot_id = s.id
-                    OR q.hub_id = s.hub_id OR q.host_id = s.host_id)) )`
+           OR (q.scope = 'power_domain' AND q.power_domain_id = s.power_domain_id) )`
 )
 
 // Outcome mirrors the CHECK constraint on farm.recovery_attempts.outcome.

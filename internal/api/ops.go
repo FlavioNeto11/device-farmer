@@ -13,6 +13,8 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/flaviopadilha/device-farmer/internal/adbwire"
+	"github.com/flaviopadilha/device-farmer/internal/node"
+	"github.com/flaviopadilha/device-farmer/internal/recovery"
 )
 
 // mustJSON marshals a detail map for a jsonb column. A detail that cannot be
@@ -505,10 +507,19 @@ type powerOffender struct {
 // refused: lease abc for job def is no_disruption" and one that shows a dead
 // button an operator will eventually work around with a physical power switch.
 //
-// The API does not itself toggle VBUS: uhubctl runs on the host. What this
-// handler does is decide whether the action is permitted, record the decision
-// as a farm.recovery_attempts row at tier 4, and audit it. The host agent
-// consumes the attempt.
+// The API does not itself toggle VBUS: uhubctl runs on the host, and this
+// handler reaches it through the same [recovery.HostRunner] the recovery ladder
+// uses. It decides whether the action is permitted, opens a
+// farm.recovery_attempts row at tier 4, performs the cycle through the host
+// agent, and closes ITS OWN row with what the agent answered — recovered,
+// refused or failed — before replying. Nobody else ever closes that row: an
+// earlier version answered 202 and left it open for a host agent that never
+// read the table, so every approved request became a row the janitor marked
+// aborted a quarter of an hour later, and no port was ever cycled.
+//
+// A farm with no host agent gets 503 and no row at all. "We asked and nobody
+// answered" is a different fact from "nothing is configured to be asked", and
+// only the first belongs in the recovery timeline.
 func (s *Server) handleSlotPower(w http.ResponseWriter, r *http.Request) {
 	slotID, ok := pathInt64(r, "id")
 	if !ok {
@@ -612,11 +623,8 @@ SELECT l.id::text, l.job_id::text, l.tenant_id, l.holder, l.disruption_policy, l
 		return
 	}
 
-	var domainSlots int
-	if err := s.pool.QueryRow(r.Context(), `
-SELECT count(*) FROM farm.slots s
- WHERE (CASE WHEN $2::bigint IS NULL THEN s.id = $1 ELSE s.power_domain_id = $2 END)`,
-		slotID, powerDomainID).Scan(&domainSlots); err != nil {
+	domainSlots, acknowledged, err := s.powerDomainPositions(r.Context(), slotID, powerDomainID)
+	if err != nil {
 		s.fail(w, r, "slot power: size power domain", err)
 		return
 	}
@@ -689,8 +697,30 @@ SELECT count(*) FROM farm.slots s
 		return
 	}
 
-	// Permitted. Record the intent as an open attempt at tier 4; the host agent
-	// performs the switch and closes the row with its outcome.
+	// Permitted. From here on the answer is whatever the host agent says, and
+	// with no agent wired in there is no answer to give — so say that, and
+	// open no row: a row would only ever be closed by the janitor, as
+	// 'aborted', which is a claim about a process dying and not about this.
+	if s.hostRunner == nil {
+		bookCtx, bookCancel := detachedCtx(r.Context())
+		s.auditAction(bookCtx, who, "slot.power", fmt.Sprintf("slot:%d", slotID), reason,
+			mergeDetail(domain, map[string]any{"outcome": "unavailable"}))
+		bookCancel()
+		s.metrics.operatorActions.WithLabelValues("slot.power", "unavailable").Inc()
+		writeError(w, http.StatusServiceUnavailable, CodeUnavailable,
+			"no host agent is configured for this farm, so port power cannot be cycled from "+
+				"here; the cycle was not attempted and no recovery attempt was recorded",
+			mergeDetail(domain, map[string]any{
+				"remedy": "set FARM_NODE_TOKEN on the api process to the token the farmd node " +
+					"agents use, and record each host's agent address in farm.hosts.node_endpoint",
+			}))
+		return
+	}
+
+	// The row is opened BEFORE the hardware is touched. A process killed
+	// mid-cycle then leaves an open attempt the janitor closes as aborted,
+	// which is the truth; the alternative is a cycle that happened and was
+	// never written down.
 	var attemptID int64
 	if err := s.pool.QueryRow(r.Context(), `
 INSERT INTO farm.recovery_attempts (slot_id, hub_id, host_id, tier, detail)
@@ -698,39 +728,234 @@ VALUES ($1, $2, $3, $4, $5::jsonb)
 RETURNING id`, slotID, hubID, hostID, powerCycleTier,
 		mustJSON(mergeDetail(domain, map[string]any{
 			"requested_by": who, "reason": reason, "adb_devpath": adbDevpath,
+			"acknowledged": acknowledged, "budget": powerCycleBudget.String(),
 		}))).Scan(&attemptID); err != nil {
 		s.fail(w, r, "slot power: record attempt", err)
 		return
 	}
 
-	detail := mergeDetail(domain, map[string]any{
+	// The cycle runs detached from the request. By the time a caller can hang
+	// up the agent has been asked, and a VBUS cycle in flight cannot be
+	// un-asked; the row has to close with what actually happened to the port,
+	// not with whether the operator's TCP connection outlived their command.
+	// The budget is the ladder's for this same rung.
+	cycleCtx, cycleCancel := context.WithTimeout(context.WithoutCancel(r.Context()), powerCycleBudget)
+	started := time.Now()
+	cycleErr := s.cyclePortPower(cycleCtx, hostID, adbDevpath, acknowledged)
+	cycleCancel()
+	v := classifyPowerCycle(cycleErr, hostID, adbDevpath)
+
+	result := mergeDetail(domain, mergeDetail(v.detail, map[string]any{
 		"attempt_id":   attemptID,
-		"outcome":      "requested",
+		"outcome":      v.outcome,
 		"adb_devpath":  adbDevpath,
-		"usb_path":     usbPath,
-		"live_leases":  len(liveLeases),
+		"acknowledged": acknowledged,
+		"elapsed_ms":   time.Since(started).Milliseconds(),
 		"control_addr": pdAddr,
-	})
-	// The attempt row is committed and the host agent may already be acting on
-	// it, so the audit trail must not depend on the caller still being here.
+	}))
+	if v.refusal != "" {
+		result["refusal"] = v.refusal
+	}
+
 	bookCtx, bookCancel := detachedCtx(r.Context())
-	s.auditAction(bookCtx, who, "slot.power", fmt.Sprintf("slot:%d", slotID), reason, detail)
+	s.closeRecoveryAttempt(bookCtx, attemptID, v.outcome, v.refusal, result)
+	s.auditAction(bookCtx, who, "slot.power", fmt.Sprintf("slot:%d", slotID), reason, result)
 	s.recordEvent(bookCtx, eventRow{
-		Kind: "slot_power_requested", SlotID: &slotID, Actor: who, Detail: detail,
+		Kind: "slot_power_" + v.outcome, SlotID: &slotID, Actor: who, Detail: result,
 	})
 	bookCancel()
-	s.metrics.operatorActions.WithLabelValues("slot.power", "requested").Inc()
-	s.log.WarnContext(r.Context(), "slot power cycle requested",
-		"slot_id", slotID, "host_id", hostID, "actor", who, "reason", reason,
-		"slots_in_domain", domainSlots, "live_leases", len(liveLeases))
+	s.metrics.operatorActions.WithLabelValues("slot.power", v.outcome).Inc()
+	logArgs := []any{
+		"slot_id", slotID, "host_id", hostID, "devpath", adbDevpath, "actor", who,
+		"reason", reason, "attempt_id", attemptID, "slots_in_domain", domainSlots,
+		"live_leases", len(liveLeases),
+	}
+	if cycleErr != nil {
+		logArgs = append(logArgs, "err", cycleErr)
+	}
+	s.log.WarnContext(r.Context(), "slot power cycle "+v.outcome, logArgs...)
 
-	writeJSON(w, http.StatusAccepted, mergeDetail(domain, map[string]any{
-		"attempt_id": attemptID,
-		"state":      "requested",
-		"note": "the host agent performs the switch and closes recovery attempt " +
-			fmt.Sprint(attemptID) + " with its outcome. Any lease in this power domain keeps " +
-			"its device, its fence and its deadline throughout.",
+	if cycleErr != nil {
+		writeError(w, v.status, v.code, v.message, result)
+		return
+	}
+	writeJSON(w, http.StatusOK, mergeDetail(result, map[string]any{
+		"state": v.outcome,
+		"note": "the host agent cut and restored VBUS for " + adbDevpath + " and saw the port " +
+			"enumerate again; recovery attempt " + fmt.Sprint(attemptID) + " is closed as " +
+			v.outcome + ". The device's health is the watchdog's to confirm over ADB. Any " +
+			"lease in this power domain keeps its device, its fence and its deadline.",
 	}))
+}
+
+// powerCycleBudget bounds one operator-requested VBUS cycle, end to end. It is
+// the budget the recovery ladder gives the same rung, and like the node
+// client's own deadline it is longer than the agent's opBudget — CallTimeout,
+// the off-settle, the return wait and its grace — so a cycle that completes
+// normally is never reported here as a timeout.
+const powerCycleBudget = recovery.DefaultActionTimeout
+
+// powerDomainPositions lists every slot in the power domain a cycle would
+// disturb: how many there are, and the devpaths of all of them EXCEPT the
+// target, which is the acknowledgement handed to the agent.
+//
+// It is the same set the lease check selects — every slot with this
+// power_domain_id, or the slot alone when it has none — with only the target
+// dropped. That correspondence is the whole warrant for the acknowledgement:
+// nothing goes dark that the policy check did not cover, and nothing the check
+// covered is left for the agent to refuse over. Like the ladder's version it
+// does not filter on slot state, because the agent compares the list against
+// what is physically plugged in, and a slot the control plane calls inactive
+// can still have a phone in it.
+func (s *Server) powerDomainPositions(ctx context.Context, slotID int64, powerDomainID *int64) (int, []string, error) {
+	rows, err := s.pool.Query(ctx, `
+SELECT s.id, s.adb_devpath
+  FROM farm.slots s
+ WHERE (CASE WHEN $2::bigint IS NULL THEN s.id = $1 ELSE s.power_domain_id = $2 END)
+ ORDER BY s.adb_devpath`, slotID, powerDomainID)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer rows.Close()
+
+	var (
+		total    int
+		siblings []string
+	)
+	for rows.Next() {
+		var (
+			id      int64
+			devpath string
+		)
+		if err := rows.Scan(&id, &devpath); err != nil {
+			return 0, nil, err
+		}
+		total++
+		if id != slotID {
+			siblings = append(siblings, devpath)
+		}
+	}
+	return total, siblings, rows.Err()
+}
+
+// cyclePortPower asks the host agent for the cycle, delivering the
+// acknowledgement only through a runner that can carry it.
+//
+// The fallback mirrors internal/recovery: a runner that predates
+// [recovery.DomainPowerRunner] is asked to cycle the target alone rather than
+// having the acknowledgement smuggled past its signature, and the agent then
+// refuses if the domain is ganged. That refusal is the safe direction, and it
+// is reported with the agent's reason rather than silently.
+func (s *Server) cyclePortPower(ctx context.Context, hostID, devpath string, acknowledged []string) error {
+	if dr, ok := s.hostRunner.(recovery.DomainPowerRunner); ok {
+		// A copy: the caller's slice is already in the attempt row's detail,
+		// and the agent must not be handed an alias of it.
+		return dr.PortPowerWithDomain(ctx, hostID, devpath, append([]string(nil), acknowledged...))
+	}
+	if len(acknowledged) > 0 {
+		s.log.WarnContext(ctx, "power domain acknowledgement cannot be delivered to this host runner",
+			"host_id", hostID, "devpath", devpath, "acknowledged", acknowledged)
+	}
+	return s.hostRunner.PortPower(ctx, hostID, devpath)
+}
+
+// powerCycleVerdict is one host agent answer in the vocabulary
+// farm.recovery_attempts.outcome accepts, with the status the caller is told.
+type powerCycleVerdict struct {
+	outcome string
+	status  int
+	code    string
+	message string
+	refusal string
+	detail  map[string]any
+}
+
+// classifyPowerCycle maps what the runner returned onto an outcome.
+//
+// Both vocabularies are consulted: internal/recovery's sentinels and
+// [recovery.RungFault], which any runner may speak, and internal/node's own,
+// which the production client speaks. The three answers that matter are kept
+// apart because they send an operator to different ends of the rack — refused
+// means the port was never touched and repeating the request changes nothing;
+// unreachable means nothing is known about the port and the agent needs
+// attention; failed means the agent cycled the port and the device stayed
+// dark. A caller's own budget elapsing is filed as failed, not unreachable: it
+// is a decision made here, not evidence about the host.
+func classifyPowerCycle(err error, hostID, devpath string) powerCycleVerdict {
+	if err == nil {
+		return powerCycleVerdict{
+			outcome: "recovered", status: http.StatusOK,
+			detail: map[string]any{
+				// The agent waited for the port to enumerate again and that is
+				// what "recovered" asserts here. Whether ADB sees a healthy
+				// device behind it is the watchdog's to say, and it will.
+				"confirmed": false,
+				"confirmation": "the agent saw the port re-enumerate; ADB health is confirmed " +
+					"by the watchdog on its next observation, not by this call",
+			},
+		}
+	}
+
+	var fault recovery.RungFault
+	hasFault := errors.As(err, &fault)
+	unreachable := errors.Is(err, node.ErrUnreachable) || errors.Is(err, recovery.ErrHostUnreachable) ||
+		(hasFault && fault.HostUnreachable())
+	refused := errors.Is(err, node.ErrRefused) || errors.Is(err, recovery.ErrRungRefused) ||
+		(hasFault && fault.RungRefused())
+
+	switch {
+	case unreachable:
+		return powerCycleVerdict{
+			outcome: "failed", status: http.StatusBadGateway, code: CodeHostAgent,
+			message: fmt.Sprintf("the farmd-node agent on host %s could not be reached, so nothing "+
+				"is known about %s; the device is as it was, and no rung on this host will help "+
+				"until that agent answers again: %v", hostID, devpath, err),
+			detail: map[string]any{"unreachable": true, "error": err.Error()},
+		}
+	case refused:
+		return powerCycleVerdict{
+			outcome: "refused", status: http.StatusConflict, code: CodeConflict,
+			message: fmt.Sprintf("the farmd-node agent on host %s declined to cycle %s; the port "+
+				"was not touched and repeating this request unchanged gets the same answer: %v",
+				hostID, devpath, err),
+			refusal: err.Error(),
+		}
+	case errors.Is(err, context.DeadlineExceeded):
+		return powerCycleVerdict{
+			outcome: "failed", status: http.StatusGatewayTimeout, code: CodeTimeout,
+			message: fmt.Sprintf("the VBUS cycle for %s on host %s did not finish within %s; the "+
+				"agent may still be completing it, so check the port before asking again: %v",
+				devpath, hostID, powerCycleBudget, err),
+			detail: map[string]any{"timed_out": true, "error": err.Error()},
+		}
+	}
+	return powerCycleVerdict{
+		outcome: "failed", status: http.StatusBadGateway, code: CodeHostAgent,
+		message: fmt.Sprintf("the farmd-node agent on host %s cycled VBUS for %s and the device "+
+			"did not come back: %v", hostID, devpath, err),
+		detail: map[string]any{"error": err.Error()},
+	}
+}
+
+// closeRecoveryAttempt writes the outcome onto the row handleSlotPower opened.
+// It only ever closes an OPEN row: the janitor may have marked a long-running
+// attempt aborted in the meantime, and overwriting that would turn "the
+// process running this was presumed dead" into a result nobody observed.
+func (s *Server) closeRecoveryAttempt(ctx context.Context, id int64, outcome, refusal string, detail map[string]any) {
+	const q = `
+UPDATE farm.recovery_attempts
+   SET finished_at = now(), outcome = $2, refusal = nullif($3, ''), detail = detail || $4::jsonb
+ WHERE id = $1 AND finished_at IS NULL`
+
+	tag, err := s.pool.Exec(ctx, q, id, outcome, refusal, mustJSON(detail))
+	switch {
+	case err != nil:
+		s.log.ErrorContext(ctx, "could not close recovery attempt",
+			"attempt_id", id, "outcome", outcome, "err", err)
+	case tag.RowsAffected() == 0:
+		s.log.WarnContext(ctx, "recovery attempt was already closed before its outcome arrived",
+			"attempt_id", id, "outcome", outcome)
+	}
 }
 
 // recordRecoveryRefusal writes the refused attempt. farm.recovery_attempts has

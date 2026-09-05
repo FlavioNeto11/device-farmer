@@ -27,6 +27,16 @@ type HostFault struct {
 	// not be reached".
 	BudgetElapsed bool
 
+	// RefusalKind classifies a refusal when the wire answer carried enough to
+	// say what kind it was. It is [RefusalKindGanged] for
+	// [ErrRungRefusedGanged] and "" for every other refusal, and it is the
+	// value that belongs under [DetailRefusalKind] in the attempt detail.
+	//
+	// It is set only alongside DispositionRefused. "" there does not mean
+	// "not ganged" — it means the refusal did not say, and the reason text is
+	// the only account of it.
+	RefusalKind string
+
 	// Err is the error that was classified.
 	Err error
 }
@@ -48,6 +58,19 @@ type HostFault struct {
 func ClassifyHostFault(err error, aborted bool) HostFault {
 	f := HostFault{Err: err}
 
+	// The kind is read off the error itself rather than off which arm found
+	// the refusal: an agent may answer with a RungFault that also wraps
+	// ErrRungRefusedGanged, and the ganged/not-ganged distinction is the one
+	// an operator acts on — it says whether the rack needs per-port power
+	// switching or whether this one lease said no.
+	refused := func() HostFault {
+		f.Disposition = DispositionRefused
+		if errors.Is(err, ErrRungRefusedGanged) {
+			f.RefusalKind = RefusalKindGanged
+		}
+		return f
+	}
+
 	var fault RungFault
 	if errors.As(err, &fault) {
 		switch {
@@ -55,8 +78,7 @@ func ClassifyHostFault(err error, aborted bool) HostFault {
 			f.Disposition = DispositionUnreachable
 			return f
 		case fault.RungRefused():
-			f.Disposition = DispositionRefused
-			return f
+			return refused()
 		}
 	}
 	switch {
@@ -64,8 +86,7 @@ func ClassifyHostFault(err error, aborted bool) HostFault {
 		f.Disposition = DispositionUnreachable
 		return f
 	case errors.Is(err, ErrRungRefused):
-		f.Disposition = DispositionRefused
-		return f
+		return refused()
 	}
 
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {

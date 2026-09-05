@@ -28,6 +28,7 @@ func hostFaultCases() []struct {
 	aborted       bool
 	disposition   Disposition
 	budgetElapsed bool
+	refusalKind   string
 } {
 	return []struct {
 		name          string
@@ -35,19 +36,30 @@ func hostFaultCases() []struct {
 		aborted       bool
 		disposition   Disposition
 		budgetElapsed bool
+		refusalKind   string
 	}{
-		{"sentinel refused", fmt.Errorf("%w: no uhubctl", ErrRungRefused), false, DispositionRefused, false},
-		{"sentinel unreachable", fmt.Errorf("%w: dial", ErrHostUnreachable), false, DispositionUnreachable, false},
-		{"RungFault refused", hostFaultErr{msg: "declined", refused: true}, false, DispositionRefused, false},
-		{"RungFault unreachable", hostFaultErr{msg: "gone", unreachable: true}, false, DispositionUnreachable, false},
-		{"RungFault neither", hostFaultErr{msg: "ran and failed"}, false, DispositionFailed, false},
+		{"sentinel refused", fmt.Errorf("%w: no uhubctl", ErrRungRefused), false, DispositionRefused, false, ""},
+		{"sentinel unreachable", fmt.Errorf("%w: dial", ErrHostUnreachable), false, DispositionUnreachable, false, ""},
+		// The reason ClassifyHostFault carries a kind at all: a ganged refusal
+		// tells an operator the RACK needs per-port switching, and a policy
+		// refusal tells them one lease said no. Same disposition, opposite
+		// actions.
+		{"ganged refusal keeps its kind",
+			fmt.Errorf("neighbour holds no_disruption: %w", ErrRungRefusedGanged),
+			false, DispositionRefused, false, RefusalKindGanged},
+		{"a RungFault that also wraps the ganged sentinel keeps it",
+			fmt.Errorf("%w: %w", hostFaultErr{msg: "declined", refused: true}, ErrRungRefusedGanged),
+			false, DispositionRefused, false, RefusalKindGanged},
+		{"RungFault refused", hostFaultErr{msg: "declined", refused: true}, false, DispositionRefused, false, ""},
+		{"RungFault unreachable", hostFaultErr{msg: "gone", unreachable: true}, false, DispositionUnreachable, false, ""},
+		{"RungFault neither", hostFaultErr{msg: "ran and failed"}, false, DispositionFailed, false, ""},
 		{"unreachable wins over a deadline inside it",
-			fmt.Errorf("%w: %w", ErrHostUnreachable, context.DeadlineExceeded), false, DispositionUnreachable, false},
-		{"action budget elapsed", fmt.Errorf("cut short: %w", context.DeadlineExceeded), false, DispositionUnreachable, true},
-		{"action cancelled by its own budget", context.Canceled, false, DispositionUnreachable, true},
-		{"loop shutdown", context.Canceled, true, DispositionAborted, false},
-		{"loop shutdown at the deadline", context.DeadlineExceeded, true, DispositionAborted, false},
-		{"plain failure", errors.New("port stayed dark"), false, DispositionFailed, false},
+			fmt.Errorf("%w: %w", ErrHostUnreachable, context.DeadlineExceeded), false, DispositionUnreachable, false, ""},
+		{"action budget elapsed", fmt.Errorf("cut short: %w", context.DeadlineExceeded), false, DispositionUnreachable, true, ""},
+		{"action cancelled by its own budget", context.Canceled, false, DispositionUnreachable, true, ""},
+		{"loop shutdown", context.Canceled, true, DispositionAborted, false, ""},
+		{"loop shutdown at the deadline", context.DeadlineExceeded, true, DispositionAborted, false, ""},
+		{"plain failure", errors.New("port stayed dark"), false, DispositionFailed, false, ""},
 	}
 }
 
@@ -65,6 +77,12 @@ func TestClassifyHostFault(t *testing.T) {
 			}
 			if f.BudgetElapsed != tc.budgetElapsed {
 				t.Errorf("BudgetElapsed = %v, want %v", f.BudgetElapsed, tc.budgetElapsed)
+			}
+			if f.RefusalKind != tc.refusalKind {
+				t.Errorf("RefusalKind = %q, want %q", f.RefusalKind, tc.refusalKind)
+			}
+			if f.RefusalKind != "" && f.Disposition != DispositionRefused {
+				t.Errorf("a %q carries refusal kind %q; only a refusal may", f.Disposition, f.RefusalKind)
 			}
 			if !errors.Is(f.Err, tc.err) {
 				t.Errorf("Err does not carry the classified error")
@@ -97,10 +115,13 @@ func TestClassifyHostFaultMatchesTheActuator(t *testing.T) {
 			}
 			r := &rung{parent: parent, ctx: parent, act: act, log: a.log}
 
-			gotD, gotReason := a.classifyHostFault(r, what, tc.err)
+			gotD, gotReason, gotKind := a.classifyHostFault(r, what, tc.err)
 			f := ClassifyHostFault(tc.err, r.aborted())
 			if gotD != f.Disposition {
 				t.Fatalf("actuator says %q, ClassifyHostFault says %q", gotD, f.Disposition)
+			}
+			if gotKind != f.RefusalKind {
+				t.Fatalf("actuator kind %q, ClassifyHostFault %q", gotKind, f.RefusalKind)
 			}
 			if want := f.Reason(act.Tier, act.TierName, what, act.HostID); gotReason != want {
 				t.Fatalf("actuator reason:\n  %q\nHostFault.Reason:\n  %q", gotReason, want)

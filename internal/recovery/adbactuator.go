@@ -1029,61 +1029,16 @@ func (a *ADBActuator) classifyWire(r *rung, op string, err error) (Disposition, 
 // classifyHostFault turns a [HostRunner] error into one of the three answers,
 // plus the refusal's kind when the error names one.
 //
-// The agent's own classification is consulted first and the caller's context
-// second, because an agent that says "unreachable" has told us something the
-// context cannot: that the round trip never got an answer it could attribute.
-//
-// The kind is read off the sentinel chain rather than off the prose: a ganged
-// refusal reaches here as [ErrRungRefusedGanged] whether the agent answered
-// in-process or over HTTP, and the same word then lands in the attempt row and
-// on the metric. A refusal recognised only by matching its sentence would stop
-// being recognised the day somebody rewords the sentence.
+// It is [ClassifyHostFault] with the rung's identity bound in. The
+// classification itself lives there and not here because the operator's slot
+// power route calls a HostRunner too, and two copies of this decision drift:
+// one files an unreachable host as a failed rung, the other files a caller's
+// own budget as the host's fault, and the same wire answer ends up meaning two
+// different things in the same column. TestClassifyHostFaultMatchesTheActuator
+// holds the two to one answer; delegating is what makes that free.
 func (a *ADBActuator) classifyHostFault(r *rung, what string, err error) (Disposition, string, string) {
-	unreachable := func() (Disposition, string, string) {
-		return DispositionUnreachable, fmt.Sprintf(
-			"tier %d (%s) needs %s on host %s and the farmd-node agent there could not be "+
-				"reached (%v); nothing was learned about the device, and no rung on this host "+
-				"will help until that agent answers again",
-			r.act.Tier, r.act.TierName, what, r.act.HostID, err), ""
-	}
-	refused := func() (Disposition, string, string) {
-		kind := ""
-		if errors.Is(err, ErrRungRefusedGanged) {
-			kind = RefusalKindGanged
-		}
-		return DispositionRefused, fmt.Sprintf(
-			"tier %d (%s) was refused by the farmd-node agent on host %s: %v; %s was not "+
-				"performed and the device is as it was",
-			r.act.Tier, r.act.TierName, r.act.HostID, err, what), kind
-	}
-
-	var fault RungFault
-	if errors.As(err, &fault) {
-		switch {
-		case fault.HostUnreachable():
-			return unreachable()
-		case fault.RungRefused():
-			return refused()
-		}
-	}
-	switch {
-	case errors.Is(err, ErrHostUnreachable):
-		return unreachable()
-	case errors.Is(err, ErrRungRefused):
-		return refused()
-	}
-
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		if r.aborted() {
-			return DispositionAborted, "", ""
-		}
-		return DispositionUnreachable, fmt.Sprintf(
-			"tier %d (%s) ran out of its action budget waiting for the farmd-node agent on "+
-				"host %s to finish %s",
-			r.act.Tier, r.act.TierName, r.act.HostID, what), ""
-	}
-
-	return DispositionFailed, "", ""
+	f := ClassifyHostFault(err, r.aborted())
+	return f.Disposition, f.Reason(r.act.Tier, r.act.TierName, what, r.act.HostID), f.RefusalKind
 }
 
 // windowClosed reports whether ctx has run out, including the moment where its

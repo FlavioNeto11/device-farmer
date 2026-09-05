@@ -23,6 +23,17 @@ x-farmd: &farmd
   environment: &farmd-env
     DATABASE_URL: postgres://farm:farm@postgres:5432/device_farmer?sslmode=disable
     FARM_LOG_LEVEL: ${FARM_LOG_LEVEL:-info}
+    # U10 — the three numbers the fence proxy is sized by. They must agree
+    # between this control plane and node.env on every device host: every
+    # process validates FARM_SLOT_REARM against the other two at startup, and
+    # `farmd node` uses FARM_NODE_SELF_FENCE_TIMEOUT as the proxy's staleness
+    # budget. Passing them through lets one .env feed both sides. The knobs
+    # that turn the proxy ON (FARM_FENCE_TLS_CERT/KEY/CA, FARM_FENCE_LISTEN,
+    # FARM_FENCE_ADVERTISE) belong to the host's node.env alone; the node role
+    # does not run in this file.
+    FARM_SLOT_REARM: ${FARM_SLOT_REARM:-35s}
+    FARM_NODE_SELF_FENCE_TIMEOUT: ${FARM_NODE_SELF_FENCE_TIMEOUT:-20s}
+    FARM_FENCE_SAFETY_MARGIN: ${FARM_FENCE_SAFETY_MARGIN:-5s}
   depends_on:
     migrate:
       condition: service_completed_successfully

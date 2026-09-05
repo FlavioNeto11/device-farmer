@@ -181,10 +181,12 @@ config:
     components: "reaper,api,scheduler"
 
   node:
-    # FARM_NODE_SELF_FENCE_TIMEOUT — how long the host-side proxy may go
-    # without a successful fence check before it tears down its ADB sockets.
-    # This is a property of the agent on the bare-metal host; set it to the
-    # same value there and here, because lease.slotRearm is validated against it.
+    # FARM_NODE_SELF_FENCE_TIMEOUT — the host-side fence proxy's staleness
+    # budget: how old its last successful read of the host's fence floors may
+    # be and still admit a NEW connection. It tears nothing down; a live
+    # connection ends only on a fencing fact. It is consumed by `farmd node`
+    # on the bare-metal host, so set it to the same value there and here:
+    # lease.slotRearm is validated against it in every process.
     selfFenceTimeout: 20s
     # FARM_FENCE_SAFETY_MARGIN — required slack between the two.
     fenceSafetyMargin: 5s
@@ -484,7 +486,74 @@ watchdog:
 #       port: 5037
 #   - id: h02
 #     adbEndpoint: 10.20.0.12:5037
+#
+# With the fence proxy on (fenceProxy below), a host's adbEndpoint and
+# service.port name the PROXY port — FARM_FENCE_LISTEN on that host, default
+# 5038 — not 5037. The node agent advertises the proxy as
+# farm.hosts.adb_endpoint, and the watchdog pinned to the host must dial the
+# same thing it does:
+#
+#   - id: h01
+#     adbEndpoint: device-farmer-h01-adb:5038
+#     service:
+#       enabled: true
+#       address: 10.20.0.11
+#       port: 5038
 hosts: []
+
+# -----------------------------------------------------------------------------
+# U10 — the fence proxy, cluster side.
+#
+# The proxy itself runs ON each device host, inside `farmd node`, and is turned
+# on there by FARM_FENCE_TLS_CERT/KEY/CA in that machine's node.env (see
+# docs/design/fence-proxy.md, "Status: integrated on the host"). Nothing in
+# this chart serves it. What the chart holds is the material the CLUSTER needs
+# to reach a proxied host, in one Secret with the three conventional keys:
+#
+#   ca.crt    the farm CA that signed the hosts' server certificates; it is
+#             what verifies a proxy is the host it claims to be
+#   tls.crt   this cluster's client certificate. Its farm://<class>/<service>
+#             URI SAN is the class the proxy holds it to — farm://lease/... for
+#             a jobrunner, farm://maintenance/... for the watchdog and the
+#             recovery ladder (design document, section 9)
+#   tls.key   its private key
+#
+# The Secret is rendered by templates/hosts.yaml (or an existingSecret is
+# named) and mounted into every farmd pod through extraVolumes and
+# extraVolumeMounts at the bottom of this file, which is the one mechanism all
+# the pods in this chart share for material like this. Three shapes are
+# REFUSED AT RENDER TIME (_helpers.tpl, checkFence), because each renders
+# cleanly and leaves a farm that looks fenced: one or two of ca/cert/key;
+# material given while enabled is false, or inline PEMs next to an
+# existingSecret; and enabled with no extraVolumes/extraVolumeMounts pair that
+# puts THIS Secret at mountPath — a Secret nobody mounts is credentials that
+# reach no pod while looking configured.
+#
+# Which environment variables make the clients read those files is the client
+# half's contract and is not decided here. Until it lands, the files are in
+# place and unread; the host half — the proxy, the FenceSource, the advertised
+# endpoint — is complete without them.
+# -----------------------------------------------------------------------------
+fenceProxy:
+  enabled: false
+  # Inline PEMs, rendered into a Secret named <release>-fence (type
+  # kubernetes.io/tls, keys ca.crt/tls.crt/tls.key). Leave all three empty and
+  # set existingSecret to bring your own with the same three keys.
+  ca: ""
+  cert: ""
+  key: ""
+  existingSecret: ""
+  # Where the three files land in every pod. Mount the Secret here:
+  #
+  #   extraVolumes:
+  #     - name: fence
+  #       secret:
+  #         secretName: farm-device-farmer-fence   # or your existingSecret
+  #   extraVolumeMounts:
+  #     - name: fence
+  #       mountPath: /etc/device-farmer/fence
+  #       readOnly: true
+  mountPath: /etc/device-farmer/fence
 
 # -----------------------------------------------------------------------------
 # Metrics

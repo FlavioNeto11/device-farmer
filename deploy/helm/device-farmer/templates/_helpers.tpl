@@ -306,6 +306,66 @@ but the holder burns TTL it did not have to.
 {{- end -}}
 
 {{/*
+The Secret that holds the cluster's fence-proxy material: the release's own
+when the PEMs are inline, the operator's when existingSecret is named.
+*/}}
+{{- define "device-farmer.fenceSecretName" -}}
+{{- if .Values.fenceProxy.existingSecret -}}
+{{- .Values.fenceProxy.existingSecret -}}
+{{- else -}}
+{{- printf "%s-fence" (include "device-farmer.fullname" .) -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+fenceProxy validation (U10).
+
+The proxy runs on the device hosts; what the cluster holds is the material its
+clients need to reach one. Three things are refused here, because each of them
+renders cleanly and leaves a farm that LOOKS fenced:
+
+  - one or two of ca/cert/key: a client with a certificate and no CA trusts no
+    host; one with a CA and no certificate is refused by every host;
+  - material given while enabled is false, or inline PEMs next to an
+    existingSecret: one of the two would be dropped without a word;
+  - enabled with no extraVolumes/extraVolumeMounts entry that puts THIS Secret
+    at fenceProxy.mountPath: a Secret nobody mounts reaches no pod.
+*/}}
+{{- define "device-farmer.checkFence" -}}
+{{- $fp := .Values.fenceProxy -}}
+{{- $inline := 0 -}}
+{{- range list $fp.ca $fp.cert $fp.key -}}
+{{- if . -}}{{- $inline = add1 $inline -}}{{- end -}}
+{{- end -}}
+{{- if and (gt $inline 0) (lt $inline 3) -}}
+{{- fail (printf "\ndevice-farmer: fenceProxy has %d of ca, cert and key, and they are set together or not\nat all. A client with a certificate and no CA trusts no host; one with a CA and no\ncertificate is refused by every host. Set all three, or name an existingSecret that\nholds ca.crt, tls.crt and tls.key.\n" $inline) -}}
+{{- end -}}
+{{- if and (eq $inline 3) $fp.existingSecret -}}
+{{- fail "\ndevice-farmer: fenceProxy has inline ca/cert/key AND an existingSecret. The chart would\nmount the existingSecret and drop the inline material without a word. Set one or the\nother.\n" -}}
+{{- end -}}
+{{- if and (not $fp.enabled) (or (eq $inline 3) $fp.existingSecret) -}}
+{{- fail "\ndevice-farmer: fenceProxy has material (inline PEMs or an existingSecret) but\nfenceProxy.enabled is false, so nothing would be rendered or mounted and every client\nwould keep dialling the hosts without a certificate. Set fenceProxy.enabled: true, or\nremove the material.\n" -}}
+{{- end -}}
+{{- if $fp.enabled -}}
+{{- if and (eq $inline 0) (not $fp.existingSecret) -}}
+{{- fail "\ndevice-farmer: fenceProxy.enabled is true and there is nothing to mount: give ca, cert\nand key inline, or name an existingSecret holding ca.crt, tls.crt and tls.key.\n" -}}
+{{- end -}}
+{{- $secret := include "device-farmer.fenceSecretName" . -}}
+{{- $volume := "" -}}
+{{- range .Values.extraVolumeMounts -}}
+{{- if eq (.mountPath | toString) ($fp.mountPath | toString) -}}{{- $volume = .name | toString -}}{{- end -}}
+{{- end -}}
+{{- $mounted := false -}}
+{{- range .Values.extraVolumes -}}
+{{- if and $volume (eq (.name | toString) $volume) .secret (eq (.secret.secretName | toString) $secret) -}}{{- $mounted = true -}}{{- end -}}
+{{- end -}}
+{{- if not $mounted -}}
+{{- fail (printf "\ndevice-farmer: fenceProxy.enabled is true but no extraVolumes/extraVolumeMounts pair\nputs the Secret %q at\n\n  %s\n\nThe chart holds the cluster's fence material in that Secret and mounts it through\nthe one mechanism every farmd pod shares; without the mount it reaches no pod while\nlooking configured. Add:\n\n  extraVolumes:\n    - name: fence\n      secret:\n        secretName: %s\n  extraVolumeMounts:\n    - name: fence\n      mountPath: %s\n      readOnly: true\n\nor change fenceProxy.mountPath to where you mount it.\n" $secret $fp.mountPath $secret $fp.mountPath) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
 Every cross-value assertion, in one call.
 
 configmap.yaml includes this, and configmap.yaml is the one template that
@@ -319,6 +379,7 @@ because the checksum annotations re-render this template once per workload.
 {{- include "device-farmer.checkPool" . -}}
 {{- include "device-farmer.checkHosts" . -}}
 {{- include "device-farmer.checkDrainWindow" . -}}
+{{- include "device-farmer.checkFence" . -}}
 {{- end -}}
 
 {{/* Everything that is not a credential, shared by every role. */}}

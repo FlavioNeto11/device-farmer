@@ -64,10 +64,13 @@
 //
 // # Status
 //
-// This package is inert. Nothing in cmd/farmd or internal/node calls it. The
-// Postgres-backed [FenceSource], the client-side preamble sender and the
-// certificate issuance machinery are integration work owned elsewhere; section
-// 13 of the design document lists exactly what is here and what is not.
+// The host half is integrated: when farmd node is given FARM_FENCE_TLS_CERT,
+// _KEY and _CA, internal/node serves this package's [Server] on an mTLS
+// listener in front of the host's ADB server, polls the floors through a
+// [FenceSource] of its own, and advertises the proxy as farm.hosts.adb_endpoint.
+// The client-side preamble sender and the certificate issuance machinery are
+// integration work owned elsewhere; section 14 of the design document states
+// exactly what is enforced today and what is not.
 package fenceproxy
 
 import (

@@ -31,6 +31,8 @@ var allEnv = []string{
 	EnvHeartbeatEvery,
 	EnvNodeSelfFence, EnvFenceMargin, EnvNodeADBEndpoint, EnvNodeHostID,
 	EnvWatchdogInterval, EnvMigrationsTable, EnvMigrationsDir,
+	EnvFenceTLSCert, EnvFenceTLSKey, EnvFenceTLSCA, EnvFenceListen, EnvFenceAdvertise,
+	EnvFencePollInterval,
 }
 
 const testDSN = "postgres://farm@127.0.0.1:5432/farm?sslmode=disable"
@@ -129,6 +131,9 @@ func TestDefaultValues(t *testing.T) {
 		{EnvDBConnectTimeout, cfg.DBConnectTimeout, DefaultDBConnectTimeout},
 		{EnvWatchdogInterval, cfg.WatchdogInterval, DefaultWatchdogEvery},
 		{EnvMigrationsTable, cfg.MigrationsTable, DefaultMigrationsTable},
+		{EnvFenceListen, cfg.Fence.Listen, DefaultFenceListen},
+		{EnvFencePollInterval, cfg.Fence.PollInterval, DefaultFencePollInterval},
+		{"fence proxy off by default", cfg.Fence.Enabled(), false},
 	}
 	for _, c := range checks {
 		if c.got != c.want {
@@ -441,7 +446,14 @@ func TestWithoutDatabase(t *testing.T) {
 // characteristic bug: a knob that is named, parsed, validated, and then not
 // carried anywhere.
 func TestEveryVariableIsRead(t *testing.T) {
+	pems := testPEMs(t)
 	env(t, map[string]string{
+		EnvFenceTLSCert:         pems.cert,
+		EnvFenceTLSKey:          pems.key,
+		EnvFenceTLSCA:           pems.ca,
+		EnvFenceListen:          "0.0.0.0:5138",
+		EnvFenceAdvertise:       "h07.lab.example:5138",
+		EnvFencePollInterval:    "3s",
 		EnvDatabaseURL:          "postgres://farm:hunter2@db.internal:6432/farm",
 		EnvDBMaxConns:           "17",
 		EnvDBConnectTimeout:     "11s",
@@ -507,6 +519,13 @@ func TestEveryVariableIsRead(t *testing.T) {
 		{EnvWatchdogInterval, cfg.WatchdogInterval, 6 * time.Second},
 		{EnvMigrationsTable, cfg.MigrationsTable, "farm.schema_version"},
 		{EnvMigrationsDir, cfg.MigrationsDir, "/srv/migrations"},
+		{EnvFenceTLSCert, cfg.Fence.CertFile, pems.cert},
+		{EnvFenceTLSKey, cfg.Fence.KeyFile, pems.key},
+		{EnvFenceTLSCA, cfg.Fence.CAFile, pems.ca},
+		{EnvFenceListen, cfg.Fence.Listen, "0.0.0.0:5138"},
+		{EnvFenceAdvertise, cfg.Fence.Advertise, "h07.lab.example:5138"},
+		{EnvFencePollInterval, cfg.Fence.PollInterval, 3 * time.Second},
+		{"fence proxy on", cfg.Fence.Enabled(), true},
 	}
 	for _, c := range checks {
 		if c.got != c.want {

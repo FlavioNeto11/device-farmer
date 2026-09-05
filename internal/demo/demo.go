@@ -152,6 +152,18 @@ type Options struct {
 	// SkipSeed leaves the database exactly as it is. Use it to run the
 	// simulation against a farm seeded earlier, or hand-edited.
 	SkipSeed bool
+
+	// ReaperComponents is the list the startup arm passes to farm.reaper_arm:
+	// the same FARM_REAPER_COMPONENTS the reaper role beside this simulation
+	// arms with. Default lease.ReaperComponents.
+	//
+	// It must be the same list. Since migration 00012 an arm can REFUSE on a
+	// watched name that has never beaten, and a refusal recorded by one
+	// caller gates farm.lease_reclaim for every caller — so an arm on a
+	// shorter list here would succeed where the reaper's refused, clear its
+	// refusal, and stamp armed_at for a list nobody else is watching, until
+	// the reaper's next cycle refused again. Two callers, one list.
+	ReaperComponents []string
 }
 
 func (o *Options) applyDefaults() {
@@ -163,6 +175,9 @@ func (o *Options) applyDefaults() {
 	}
 	if o.Logger == nil {
 		o.Logger = slog.Default()
+	}
+	if len(o.ReaperComponents) == 0 {
+		o.ReaperComponents = lease.ReaperComponents
 	}
 }
 
@@ -312,14 +327,26 @@ func (r *Runner) run(ctx context.Context) error {
 	// first would erase the evidence of our own downtime and charge the
 	// tenant for it. On a second run of the demo this is where the previous
 	// run's downtime is given back.
-	gap, err := r.store.ReaperArm(ctx, lease.ReaperComponents, 0)
+	//
+	// The list is the reaper role's, not this package's default: see
+	// Options.ReaperComponents for why two callers must arm on one list.
+	armed, err := r.store.ReaperArm(ctx, r.opts.ReaperComponents, 0)
 	if err != nil {
 		return fmt.Errorf("demo: arm reaper: %w", err)
 	}
-	if gap > 0 {
-		obs.ControlPlaneGap(obs.ComponentReaper, gap)
+	switch {
+	case !armed.Armed:
+		// Expected on a fresh database: nothing has beaten yet, so the arm
+		// cannot tell a first boot from an outage and refuses. The reaper
+		// role running beside this simulation retries every cycle and arms
+		// once every watched component has written a row.
+		r.log.Warn("reaper refused to arm: a watched component has never beaten; "+
+			"nothing is reclaimed until it does",
+			"unbeaten", armed.Unbeaten)
+	case armed.Gap > 0:
+		obs.ControlPlaneGap(obs.ComponentReaper, armed.Gap)
 		r.log.Warn("control-plane gap refunded to every live lease",
-			"gap", gap.Round(time.Second),
+			"gap", armed.Gap.Round(time.Second),
 			"note", "our downtime costs the tenant zero lease budget")
 	}
 

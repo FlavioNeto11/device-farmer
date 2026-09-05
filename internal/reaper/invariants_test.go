@@ -120,10 +120,10 @@ func TestReaperWritesLeasesOnlyThroughTheLeaseFunctions(t *testing.T) {
 //
 // farm.reaper_arm computes the control-plane gap as the OLDEST heartbeat across
 // the components it is given. A component that beats but is not in that set
-// contributes nothing; a component in the set that never beats would record a
-// permanent outage. The reaper's own name has to be in the default set, or a
-// reaper outage — the one that most obviously must be refunded — is the one
-// outage the refund cannot see.
+// contributes nothing; a component in the set that never beats makes the arm
+// refuse. The reaper's own name has to be in the default set, or a reaper
+// outage — the one that most obviously must be refunded — is the one outage
+// the refund cannot see.
 func TestReaperComponentIsOnTheRenewalPath(t *testing.T) {
 	if !slices.Contains(lease.ReaperComponents, DefaultComponent) {
 		t.Errorf("lease.ReaperComponents = %v does not contain %q; a reaper outage would not "+

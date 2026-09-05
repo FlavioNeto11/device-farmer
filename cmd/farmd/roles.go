@@ -569,9 +569,10 @@ func runDemo(ctx context.Context, cfg *config.Config, log *slog.Logger, pool *pg
 	fns := map[string]func(context.Context) error{
 		"demo": func(c context.Context) error {
 			return demo.Run(c, pool, demo.Options{
-				Hosts:   hosts,
-				Devices: devices,
-				Logger:  log.With("component", "demo"),
+				Hosts:            hosts,
+				Devices:          devices,
+				Logger:           log.With("component", "demo"),
+				ReaperComponents: cfg.Reaper.Components,
 			})
 		},
 		"api":       func(c context.Context) error { return runAPI(c, cfg, log, pool, reg) },

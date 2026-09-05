@@ -69,6 +69,7 @@
 //
 //	increase(farm_control_plane_gap_seconds_sum[1h]) > 600
 //	sum(farm_slot_rearm_pending) > <a fraction of fleet size>
+//	farm_reaper_unbeaten_components > 0                       for 10m
 //
 // A control-plane gap is our downtime and is worth someone's Monday, but
 // it destroys nothing: farm.reaper_arm adds the gap back to every live
@@ -76,6 +77,13 @@
 // have missed. The tenant pays nothing for our outage. Treating this as
 // an emergency is what leads to disabling the quiesce gate, and disabling
 // the quiesce gate is how a control-plane restart mass-reclaims a farm.
+//
+// The third is a reaper that refuses to arm because a name in
+// FARM_REAPER_COMPONENTS has never written a heartbeat row. Nothing is
+// reclaimed while it stands, which is the safe direction; the `for` covers
+// a cold start, where the reaper's first cycle can beat the other roles to
+// the table. Past that it is a component that has not started or a name
+// the farm does not run — see docs/runbooks/component-beat-failing.md.
 //
 // # Never
 //

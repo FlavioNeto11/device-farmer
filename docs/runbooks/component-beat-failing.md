@@ -37,6 +37,39 @@ direction — but a device that should have been reclaimed an hour ago is still
 held, and the effect scales with the whole fleet rather than with the broken
 component.
 
+## A watched component that has NEVER beaten
+
+The query above only sees rows that exist, and `farm.component_heartbeat` has
+no seed rows: a component gets one the first time it beats. A name in
+`FARM_REAPER_COMPONENTS` that nothing has ever written is therefore not
+"infinitely stale" — before migration 00012 it was simply absent from the
+minimum, and its outage was invisible.
+
+Since 00012 `farm.reaper_arm` **refuses to arm** on such a name. The reaper
+stays leader, reclaims nothing, logs one `WARN` per change of the unbeaten set,
+and retries every cycle; `farm.lease_reclaim` itself is gated shut by the
+refusal, whoever recorded it. It clears by itself the moment the component
+beats.
+
+```sh
+curl -s -H "Authorization: Bearer $TOKEN" "$FARM_API_URL/api/v1/reaper" | jq '{armed, refusal, unbeaten_components, note}'
+farmd ctl reaper
+psql "$PGURL" -c "SELECT last_refusal, last_refusal_at FROM farm.reaper_state"
+```
+
+and `farm_reaper_unbeaten_components > 0` on `/metrics`. `last_refusal_at` (the
+API's `refused_at`) is when the refusal **began**: the reaper's retries leave it
+alone, and it moves only when the set of unbeaten names changes. Two causes,
+two fixes:
+
+- **The name is a component this farm runs and it has not started.** Start it;
+  nothing else is needed.
+- **The name is not something this farm runs** (a typo, a role that was never
+  deployed here). Remove it from `FARM_REAPER_COMPONENTS` and restart the
+  reaper. Do **not** insert a heartbeat row by hand to make the refusal go
+  away: that is the mirror hazard below, and it turns a loud refusal into a
+  silent permanent refund.
+
 ## Which roles matter, and how much
 
 | Role | In `FARM_REAPER_COMPONENTS`? | What its silence costs |
@@ -44,15 +77,22 @@ component.
 | `reaper` | yes | Refunds every lease; also nothing is reclaimed at all |
 | `api` | yes | Refunds every lease; holders cannot renew |
 | `scheduler` | yes | Refunds every lease; nothing is placed |
+| `jobrunner` | yes | Refunds every lease; it holds the leases the reaper enforces |
 | `watchdog` | **no, deliberately** | Health goes stale. Never moves a lease clock |
 | `recovery` | **no** | Stuck devices stay stuck |
-| `jobrunner` | **no** | Placed jobs are not picked up |
-| `janitor`, `node` | **no** | Housekeeping; host-side actions |
+| `janitor` | **no, deliberately** | Orphaned step rows stay open. It cannot extend a lease, so its outage must not extend one |
+| `node` | **no** | Host-side actions |
 
 The absences are the design, not an oversight. Listing `watchdog` in
 `FARM_REAPER_COMPONENTS` would let device health move a lease deadline, fusing
 two clocks this system keeps apart on purpose — and the Postgres role firewall
-backs it up: the watchdog may not touch `farm.leases` at all.
+backs it up: the watchdog may not touch `farm.leases` at all. The janitor is
+the same decision from the housekeeping side: the test for a name in the list
+is "can this component's silence stop a renewal", and the janitor's cannot.
+
+A component that **was** in the list, beat, and was then scaled to zero leaves a
+stale row that is refunded on every arm for as long as it exists. Remove the
+name from the list when the component leaves the farm, and delete its row.
 
 ## What is NOT wrong
 

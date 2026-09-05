@@ -203,6 +203,26 @@ type ReclaimedLease struct {
 	NewFloor int64
 }
 
+// ArmResult is what farm.reaper_arm reported.
+//
+// Armed false is a REFUSAL, not an error: a component the reaper was asked to
+// watch has never written a heartbeat row, so its silence cannot be told apart
+// from an outage that ought to be refunded. Nothing was refunded, no quiesce
+// window was set, farm.reaper_state carries the refusal, and farm.lease_reclaim
+// reclaims nothing until an arm succeeds. The reaper retries every cycle and
+// arms by itself once every watched component has beaten.
+type ArmResult struct {
+	Armed bool
+
+	// Gap is the control-plane outage refunded to every live lease. Zero on a
+	// healthy arm, and always zero on a refusal.
+	Gap time.Duration
+
+	// Unbeaten names the watched components with no heartbeat row, sorted.
+	// Nil when Armed.
+	Unbeaten []string
+}
+
 // ExpiredLease is one row of farm.lease_expire_max_runtime: a lease ended by
 // the one user-supplied clock that is allowed to end a lease automatically.
 type ExpiredLease struct {

@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+
+	"github.com/flaviopadilha/device-farmer/internal/config"
 )
 
 // The reaper's kill switch, and the only way to reach it that is not psql.
@@ -58,14 +60,53 @@ import (
 // Enabling is therefore never instant, and that is the point. An operator who
 // wants it instant does not want this endpoint; they want to explain why in the
 // audit row, which is required.
+//
+// # The arm can refuse
+//
+// Since migration 00012 farm.reaper_arm refuses when a watched component has
+// never written a heartbeat row: its silence cannot be told from an outage the
+// refund exists for. The switch still moves, but farm.lease_reclaim reclaims
+// nothing while the refusal stands — the read reports it as `refusal`, `armed`
+// is false, and the note says which components have never beaten. The reaper
+// role retries every cycle and clears it by arming once they have.
 
-// reaperArmComponents is left to farm.reaper_arm's own default
-// (ARRAY['reaper','api','scheduler']). The set of components on the renewal
-// path is a property of the schema, not of whoever is calling: naming it here
-// would let an API deployment disagree with the reaper about what counts as a
-// control-plane outage, and the disagreement would only ever be discovered
-// during one.
-const reaperArmSQL = `SELECT extract(epoch FROM farm.reaper_arm())::float8`
+// reaperArmSQL arms with the components THIS deployment watches — the same
+// FARM_REAPER_COMPONENTS the reaper role passes — and the same gap floor.
+//
+// This used to leave both to farm.reaper_arm's SQL defaults, on the argument
+// that the renewal path is a property of the schema and naming it here would
+// let the API disagree with the reaper. Since migration 00012 an arm can
+// REFUSE on the list it is given, and a refusal recorded by this endpoint
+// gates farm.lease_reclaim for every caller. The refusal the API records must
+// therefore be the refusal the reaper would record, which means the same
+// list: the SQL default is three names and the reaper's is four, so leaving it
+// to the default is the disagreement, not the cure. internal/config holds
+// every role to the renewal path, so the lists agree wherever the
+// configuration does.
+//
+// The interval crosses the wire as whole microseconds, never as a float.
+const reaperArmSQL = `
+SELECT a.armed,
+       extract(epoch FROM a.gap)::float8,
+       COALESCE(a.unbeaten, '{}'::text[])
+  FROM farm.reaper_arm($1::text[], $2::bigint * interval '1 microsecond') AS a`
+
+// reaperWatch is the component list this process arms with and reports
+// against. The Server is built with a config in production; the fallback
+// exists for the handful of tests that build one by hand.
+func (s *Server) reaperWatch() []string {
+	if s.cfg != nil && len(s.cfg.Reaper.Components) > 0 {
+		return s.cfg.Reaper.Components
+	}
+	return config.DefaultReaperComponents
+}
+
+func (s *Server) reaperGapFloor() time.Duration {
+	if s.cfg != nil && s.cfg.Reaper.GapFloor > 0 {
+		return s.cfg.Reaper.GapFloor
+	}
+	return config.DefaultReaperGapFloor
+}
 
 // reaperGapView is the most recent recorded control-plane outage.
 type reaperGapView struct {
@@ -88,12 +129,33 @@ type reaperGapView struct {
 type reaperStateView struct {
 	Enabled bool `json:"enabled"`
 
-	// Armed is enabled AND out of quiesce. It is the operational answer.
+	// Armed is enabled, out of quiesce, AND not refused. It is the
+	// operational answer.
 	Armed bool `json:"armed"`
 
 	QuiesceUntil     time.Time `json:"quiesce_until"`
 	QuiesceRemaining float64   `json:"quiesce_remaining_seconds"`
 	ArmedAt          time.Time `json:"armed_at"`
+
+	// Refusal is the refusal standing against the last farm.reaper_arm: a
+	// watched component had never beaten. While it stands farm.lease_reclaim
+	// reclaims nothing, whatever `enabled` and the quiesce window say. It is
+	// absent once an arm has succeeded.
+	//
+	// RefusedAt is when THIS refusal began, not when the reaper last retried:
+	// the reaper arms again every cycle, and a retry that meets the same
+	// refusal leaves the stamp alone. It moves only when the set of unbeaten
+	// components changes.
+	Refusal   *string    `json:"refusal,omitempty"`
+	RefusedAt *time.Time `json:"refused_at,omitempty"`
+
+	// WatchedComponents is the FARM_REAPER_COMPONENTS this process arms
+	// with, and UnbeatenComponents the subset with no heartbeat row right
+	// now. The second is live where Refusal is historical: a refusal whose
+	// components have since beaten clears on the reaper's next cycle, and a
+	// non-empty list with no refusal means the next arm will refuse.
+	WatchedComponents  []string `json:"watched_components"`
+	UnbeatenComponents []string `json:"unbeaten_components"`
 
 	// Now is the server's clock. Every countdown above is computed by Postgres
 	// against it, so a client never has to subtract its own clock from a
@@ -147,9 +209,15 @@ type reaperChangeView struct {
 // that the numbers in it describe one instant.
 const reaperStateQuery = `
 WITH st AS (
-  SELECT enabled, quiesce_until, armed_at FROM farm.reaper_state WHERE singleton
+  SELECT enabled, quiesce_until, armed_at, last_refusal, last_refusal_at
+    FROM farm.reaper_state WHERE singleton
 ), hb AS (
   SELECT beat_at FROM farm.component_heartbeat WHERE component = $1
+), unb AS (
+  SELECT COALESCE(array_agg(c.name ORDER BY c.name), '{}'::text[]) AS names
+    FROM unnest($2::text[]) AS c(name)
+    LEFT JOIN farm.component_heartbeat h ON h.component = c.name
+   WHERE h.component IS NULL
 ), cen AS (
   SELECT count(*)                                        AS live,
          count(*) FILTER (WHERE l.protected)              AS protected,
@@ -175,42 +243,53 @@ WITH st AS (
 SELECT st.enabled,
        st.quiesce_until,
        st.armed_at,
+       st.last_refusal,
+       st.last_refusal_at,
        now(),
        extract(epoch FROM greatest(st.quiesce_until - now(), interval '0'))::float8,
        hb.beat_at,
        extract(epoch FROM now() - hb.beat_at)::float8,
+       unb.names,
        cen.live, cen.protected, cen.suspect, cen.reclaimable,
        gap.component, gap.started_at, gap.ended_at,
        extract(epoch FROM gap.ended_at - gap.started_at)::float8,
        (gap.ended_at > now() - interval '6 hours')
   FROM st
   LEFT JOIN hb  ON true
+  LEFT JOIN unb ON true
   LEFT JOIN cen ON true
   LEFT JOIN gap ON true`
 
 // readReaperState runs [reaperStateQuery] against q, which is the pool for a
 // read and a transaction for a write that wants to see its own effect.
+// watched is the component list the unbeaten set is computed against.
 func readReaperState(ctx context.Context, q interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
-}, component string) (*reaperStateView, error) {
+}, component string, watched []string) (*reaperStateView, error) {
 
 	var (
 		v        reaperStateView
+		unbeaten []string
 		gapComp  *string
 		gapStart *time.Time
 		gapEnd   *time.Time
 		gapSecs  *float64
 		gapShiel *bool
 	)
-	err := q.QueryRow(ctx, reaperStateQuery, component).Scan(
-		&v.Enabled, &v.QuiesceUntil, &v.ArmedAt, &v.Now, &v.QuiesceRemaining,
-		&v.HeartbeatAt, &v.HeartbeatAgeSecs,
+	err := q.QueryRow(ctx, reaperStateQuery, component, watched).Scan(
+		&v.Enabled, &v.QuiesceUntil, &v.ArmedAt, &v.Refusal, &v.RefusedAt, &v.Now, &v.QuiesceRemaining,
+		&v.HeartbeatAt, &v.HeartbeatAgeSecs, &unbeaten,
 		&v.LiveLeases, &v.ProtectedLeases, &v.SuspectLeases, &v.ReclaimableNow,
 		&gapComp, &gapStart, &gapEnd, &gapSecs, &gapShiel)
 	if err != nil {
 		return nil, err
 	}
-	v.Armed = v.Enabled && v.QuiesceRemaining <= 0
+	// Both lists are always present in the JSON, empty rather than null: a
+	// client should never have to ask whether "no unbeaten components" was
+	// reported or merely omitted.
+	v.WatchedComponents = append([]string{}, watched...)
+	v.UnbeatenComponents = append([]string{}, unbeaten...)
+	v.Armed = v.Enabled && v.QuiesceRemaining <= 0 && v.Refusal == nil
 	if gapComp != nil && gapStart != nil && gapEnd != nil {
 		g := reaperGapView{Component: *gapComp, StartedAt: *gapStart, EndedAt: *gapEnd}
 		if gapSecs != nil {
@@ -236,6 +315,25 @@ func reaperNote(v *reaperStateView) string {
 				"farm.jobs.max_runtime still expires one, and an operator revoke still works. "+
 				"%d lease(s) would be reclaimed by the next sweep if this were turned back on now",
 			v.LiveLeases, v.ReclaimableNow)
+	case v.Refusal != nil:
+		// The refusal outranks the quiesce window: a quiesce ends by itself,
+		// a refusal ends only when the component beats.
+		when := ""
+		if v.RefusedAt != nil {
+			when = " since " + v.RefusedAt.UTC().Format(time.RFC3339)
+		}
+		stillUnbeaten := "every watched component has beaten since, so the reaper's next cycle " +
+			"re-arms by itself"
+		if len(v.UnbeatenComponents) > 0 {
+			stillUnbeaten = fmt.Sprintf("still unbeaten as seen from this process's FARM_REAPER_COMPONENTS: %s",
+				strings.Join(v.UnbeatenComponents, ", "))
+		}
+		return fmt.Sprintf(
+			"the reaper is ON but REFUSED TO ARM%s: %s. farm.lease_reclaim reclaims nothing while "+
+				"this refusal stands, whatever the quiesce window says; %s. Check that every name in "+
+				"FARM_REAPER_COMPONENTS is a component this farm actually runs. %d lease(s) would "+
+				"qualify for the first sweep after it arms",
+			when, *v.Refusal, stillUnbeaten, v.ReclaimableNow)
 	case v.QuiesceRemaining > 0:
 		return fmt.Sprintf(
 			"the reaper is ON but QUIESCED for another %.0fs (until %s): it will reclaim nothing "+
@@ -243,11 +341,19 @@ func reaperNote(v *reaperStateView) string {
 				"eligible and would be swept after the window closes",
 			v.QuiesceRemaining, v.QuiesceUntil.UTC().Format(time.RFC3339), v.ReclaimableNow)
 	default:
-		return fmt.Sprintf(
+		note := fmt.Sprintf(
 			"the reaper is ARMED: the next sweep reclaims leases whose holder stopped heartbeating "+
 				"for ttl+grace with no witness, no protection and no control-plane gap over their "+
 				"silence. %d lease(s) currently qualify",
 			v.ReclaimableNow)
+		if len(v.UnbeatenComponents) > 0 {
+			// Armed on an older list, or the row was deleted by hand: the
+			// next arm — a leadership change, an enable — will refuse.
+			note += fmt.Sprintf(". Watched component(s) %s have never beaten, so the NEXT arm will "+
+				"refuse and stop reclamation until they do",
+				strings.Join(v.UnbeatenComponents, ", "))
+		}
+		return note
 	}
 }
 
@@ -268,7 +374,7 @@ func (s *Server) RegisterReaperAdmin(mux *http.ServeMux) {
 
 // handleReaperGet serves GET /api/v1/reaper.
 func (s *Server) handleReaperGet(w http.ResponseWriter, r *http.Request) {
-	v, err := readReaperState(r.Context(), s.pool, reaperComponent)
+	v, err := readReaperState(r.Context(), s.pool, reaperComponent, s.reaperWatch())
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			// farm.reaper_state is a singleton the migration inserts. No row
@@ -348,9 +454,19 @@ RETURNING (SELECT enabled FROM prev)`, enabled).Scan(&previous)
 	// re-sends enable is asking for the reaper to be safe to run, and a
 	// no-op that leaves an accumulated backlog pointed at the next sweep is
 	// not that. See the file comment for why the off period is itself a gap.
-	var refundSeconds float64
+	//
+	// The arm may REFUSE: a watched component has never beaten. The switch
+	// still moves — the operator asked for it, and the audit row must say
+	// what they asked for — but the reply says in words that nothing will be
+	// reclaimed until that component beats and the reaper re-arms.
+	var (
+		refundSeconds float64
+		armed         = true
+		unbeaten      []string
+	)
 	if enabled {
-		if err := tx.QueryRow(r.Context(), reaperArmSQL).Scan(&refundSeconds); err != nil {
+		if err := tx.QueryRow(r.Context(), reaperArmSQL,
+			s.reaperWatch(), s.reaperGapFloor().Microseconds()).Scan(&armed, &refundSeconds, &unbeaten); err != nil {
 			s.fail(w, r, action+": arm", err)
 			return
 		}
@@ -358,7 +474,7 @@ RETURNING (SELECT enabled FROM prev)`, enabled).Scan(&previous)
 
 	// Read back inside the transaction, so the quiesce deadline in the reply is
 	// the one this call just wrote and not one a concurrent arm moved.
-	v, err := readReaperState(r.Context(), tx, reaperComponent)
+	v, err := readReaperState(r.Context(), tx, reaperComponent, s.reaperWatch())
 	if err != nil {
 		s.fail(w, r, action+": read back", err)
 		return
@@ -379,7 +495,12 @@ RETURNING (SELECT enabled FROM prev)`, enabled).Scan(&previous)
 		"quiesce_until":    v.QuiesceUntil,
 	}
 	if enabled {
-		detail["gap_refund_seconds"] = refundSeconds
+		detail["arm_refused"] = !armed
+		if armed {
+			detail["gap_refund_seconds"] = refundSeconds
+		} else {
+			detail["unbeaten_components"] = unbeaten
+		}
 	}
 	// The switch has already moved. Its audit row must not depend on the
 	// operator's connection outliving their own command: "who turned the
@@ -395,7 +516,8 @@ RETURNING (SELECT enabled FROM prev)`, enabled).Scan(&previous)
 	s.log.WarnContext(r.Context(), "reaper kill switch moved by operator",
 		"action", action, "enabled", enabled, "previous", previous, "actor", who, "reason", reason,
 		"live_leases", v.LiveLeases, "reclaimable_now", v.ReclaimableNow,
-		"quiesce_until", v.QuiesceUntil, "gap_refund_seconds", refundSeconds)
+		"quiesce_until", v.QuiesceUntil, "gap_refund_seconds", refundSeconds,
+		"arm_refused", enabled && !armed, "unbeaten_components", unbeaten)
 
 	v.Note = reaperNote(v)
 	body := reaperChangeView{
@@ -403,7 +525,18 @@ RETURNING (SELECT enabled FROM prev)`, enabled).Scan(&previous)
 		PreviousEnabled: previous,
 		Changed:         previous != enabled,
 	}
-	if enabled {
+	switch {
+	case enabled && !armed:
+		// No refund figure: a refusal did not arm, and "0s refunded" would
+		// read as a healthy arm with nothing to give back.
+		body.ArmedNote = fmt.Sprintf(
+			"farm.reaper_arm REFUSED to arm: watched component(s) %s have never written a "+
+				"heartbeat row, so their silence cannot be told from an outage. The switch is on, "+
+				"but farm.lease_reclaim reclaims nothing while that refusal stands. The reaper "+
+				"retries every cycle and arms by itself once they beat; if one of them is a name "+
+				"this farm does not run, remove it from FARM_REAPER_COMPONENTS",
+			strings.Join(unbeaten, ", "))
+	case enabled:
 		body.GapRefundSeconds = &refundSeconds
 		body.ArmedNote = fmt.Sprintf(
 			"farm.reaper_arm ran with this change, exactly as it does when the reaper gains "+
@@ -411,7 +544,7 @@ RETURNING (SELECT enabled FROM prev)`, enabled).Scan(&previous)
 				"reaper is quiesced until %s so nothing is reclaimed at the instant of restoration. "+
 				"Turning the reaper on is never instant, and that is deliberate",
 			refundSeconds, v.QuiesceUntil.UTC().Format(time.RFC3339))
-	} else {
+	default:
 		body.DisabledNote = "reclamation is stopped. Jobs still release their own leases, " +
 			"max_runtime still expires them, and an operator revoke still works — this switch " +
 			"only stops farm.lease_reclaim"

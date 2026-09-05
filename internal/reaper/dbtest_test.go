@@ -260,9 +260,10 @@ END $$;`
 	}
 	// quiesce_until = now() leaves the gate OPEN by default, so a test that
 	// wants it closed has to say so. The reverse default would let a test pass
-	// because nothing ever swept.
+	// because nothing ever swept. The same goes for a standing refusal.
 	if _, err := pool.Exec(ctx,
-		`UPDATE farm.reaper_state SET quiesce_until = now(), armed_at = now(), enabled = true`); err != nil {
+		`UPDATE farm.reaper_state SET quiesce_until = now(), armed_at = now(), enabled = true,
+		        last_refusal = NULL, last_refusal_at = NULL`); err != nil {
 		t.Fatalf("reset reaper_state: %v", err)
 	}
 }
@@ -343,6 +344,14 @@ func newFixture(t *testing.T, pool *pgxpool.Pool) *fixture {
 	f.exec(`INSERT INTO farm.tenants (id, name) VALUES ($1, $1)`, f.tenantID)
 	f.exec(`INSERT INTO farm.queues (id, tenant_id) VALUES ($1, $2)`, f.queueID, f.tenantID)
 	f.hostID, f.hubID = f.newHost("h1", "enabled")
+
+	// Every default watched component has beaten once. Since migration 00012
+	// a reaper refuses to arm otherwise, and a test about the sweep, the gate
+	// or leadership must not fail on that refusal — the test about the
+	// refusal itself watches a name nothing here beats.
+	for _, c := range lease.ReaperComponents {
+		f.beat(c, 0)
+	}
 	return f
 }
 
@@ -541,7 +550,8 @@ ON CONFLICT (component) DO UPDATE SET beat_at = EXCLUDED.beat_at`,
 // meaning "the reaper could never have reclaimed".
 func (f *fixture) openReclaimGate() {
 	f.t.Helper()
-	f.exec(`UPDATE farm.reaper_state SET quiesce_until = now() - interval '1 second', enabled = true`)
+	f.exec(`UPDATE farm.reaper_state SET quiesce_until = now() - interval '1 second', enabled = true,
+	               last_refusal = NULL, last_refusal_at = NULL`)
 	f.exec(`DELETE FROM farm.control_plane_gap`)
 }
 
@@ -579,11 +589,19 @@ func (f *fixture) leaseState(leaseID string) (state string, reason *string) {
 // suite in TestMain instead of reporting the failure it just found.
 func (f *fixture) newReaper(rec *logRecorder) *Reaper {
 	f.t.Helper()
+	return f.newReaperWatching(rec, nil)
+}
+
+// newReaperWatching is newReaper with an explicit farm.reaper_arm component
+// list; nil takes the package default.
+func (f *fixture) newReaperWatching(rec *logRecorder, components []string) *Reaper {
+	f.t.Helper()
 	r, err := New(Config{
-		Pool:    f.pool,
-		Store:   lease.NewStore(f.pool),
-		LockKey: lockKeyFor(f.t.Name()),
-		Logger:  rec.logger(),
+		Pool:       f.pool,
+		Store:      lease.NewStore(f.pool),
+		Components: components,
+		LockKey:    lockKeyFor(f.t.Name()),
+		Logger:     rec.logger(),
 	})
 	if err != nil {
 		f.t.Fatalf("new reaper: %v", err)

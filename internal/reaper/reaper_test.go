@@ -17,11 +17,13 @@ package reaper
 import (
 	"context"
 	"log/slog"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/flaviopadilha/device-farmer/internal/lease"
 )
@@ -842,6 +844,210 @@ func reclaimableLeaseAndArmedReaper(t *testing.T, f *fixture) (seededLease, *Rea
 		t.Fatalf("the arming cycle already reclaimed the lease (state=%q)", state)
 	}
 	return l, r, ctx
+}
+
+// ---------------------------------------------------------------------------
+// 8. A watched component that has never beaten
+// ---------------------------------------------------------------------------
+
+// TestReaperRefusesToArmForAComponentThatNeverBeat is the LEASE-05 blind spot.
+//
+// farm.component_heartbeat has no seed rows, so a name in the watch list that
+// nothing has ever written was simply absent from min(beat_at): the gap read
+// small, nothing was refunded, and TTL+grace ran against leases whose holder
+// had never been given a chance to renew. The reaper must now refuse to arm
+// on such a name — loudly, once per change, from the same seat — and reclaim
+// nothing until the component has beaten, at which point it arms by itself.
+func TestReaperRefusesToArmForAComponentThatNeverBeat(t *testing.T) {
+	pool := requireDB(t)
+	f := newFixture(t, pool)
+
+	dev := f.device(deviceOpts{})
+	job := f.job(jobOpts{state: "running"})
+	l := f.seedLease(dev, job, leaseOpts{
+		state:         "suspect",
+		acquiredIn:    -2 * time.Hour,
+		heartbeatIn:   -2 * time.Hour,
+		expiresIn:     -1 * time.Hour,
+		reclaimableIn: -30 * time.Minute,
+	})
+	// Gate wide open: only the refusal stands between this lease and a sweep.
+	f.exec(`UPDATE farm.reaper_state SET quiesce_until = now() - interval '1 hour', enabled = true`)
+
+	var armedBefore time.Time
+	f.scan(&armedBefore, `SELECT armed_at FROM farm.reaper_state`)
+
+	// Every default component has beaten (the fixture saw to it); "ghost" is
+	// a name in the watch list that nothing in this farm writes.
+	watch := append(slices.Clone(lease.ReaperComponents), "ghost")
+	rec := &logRecorder{}
+	r := f.newReaperWatching(rec, watch)
+	ctx := context.Background()
+	defer r.lead.release(ctx)
+
+	r.cycle(ctx)
+	r.cycle(ctx) // the refusal stands; the second cycle is for the once-per-change log
+
+	if state, reason := f.leaseState(l.id); state != "suspect" {
+		t.Fatalf("a reaper watching a component that never beat reclaimed a lease "+
+			"(state=%q reason=%q): the holder was never given a chance to renew", state, str(reason))
+	}
+	if r.armed {
+		t.Error("the loop believes it is armed after farm.reaper_arm refused")
+	}
+
+	var refusal *string
+	f.scan(&refusal, `SELECT last_refusal FROM farm.reaper_state`)
+	if refusal == nil || !strings.Contains(*refusal, "ghost") {
+		t.Errorf("farm.reaper_state.last_refusal = %q, want it to name ghost", str(refusal))
+	}
+	var armedAfter time.Time
+	f.scan(&armedAfter, `SELECT armed_at FROM farm.reaper_state`)
+	if !armedAfter.Equal(armedBefore) {
+		t.Errorf("armed_at moved from %s to %s on a refusal: a refusal is not an arm", armedBefore, armedAfter)
+	}
+	if n := f.advisoryLockHolders(lockKeyFor(t.Name())); n != 1 {
+		t.Errorf("advisory lock held by %d session(s) during a refusal, want 1: the refusal is a "+
+			"fact about the deployment, and the loop retries from the same seat", n)
+	}
+	if got := gaugeValue(t, unbeatenGauge); got != 1 {
+		t.Errorf("farm_reaper_unbeaten_components = %v, want 1", got)
+	}
+
+	warns := 0
+	for _, m := range rec.atOrAbove(slog.LevelWarn) {
+		if strings.Contains(m, "REFUSED") {
+			warns++
+		}
+	}
+	if warns != 1 {
+		t.Errorf("the refusal was logged at WARN %d time(s) across two cycles, want exactly 1: "+
+			"once per change, or the operator learns to stop reading", warns)
+	}
+	if msgs := rec.atOrAbove(slog.LevelError); len(msgs) != 0 {
+		t.Errorf("a refusal was logged at ERROR: %v; it is a deployment fact, not a failure", msgs)
+	}
+	var refusedEvents int
+	f.scan(&refusedEvents, `SELECT count(*) FROM farm.events WHERE kind = 'reaper_arm_refused'`)
+	if refusedEvents != 1 {
+		t.Errorf("reaper_arm_refused events = %d after two refusing cycles, want 1", refusedEvents)
+	}
+
+	// The ghost beats. Nothing is restarted and nobody re-enables anything:
+	// the next cycle arms on its own.
+	f.beat("ghost", 0)
+	rec.reset()
+	r.cycle(ctx)
+
+	if !r.armed {
+		t.Fatal("the loop did not arm on the cycle after every watched component had beaten")
+	}
+	f.scan(&refusal, `SELECT last_refusal FROM farm.reaper_state`)
+	if refusal != nil {
+		t.Errorf("last_refusal = %q after a successful arm, want NULL", *refusal)
+	}
+	f.scan(&armedAfter, `SELECT armed_at FROM farm.reaper_state`)
+	if !armedAfter.After(armedBefore) {
+		t.Errorf("armed_at = %s did not move past %s on the successful arm", armedAfter, armedBefore)
+	}
+	if got := gaugeValue(t, unbeatenGauge); got != 0 {
+		t.Errorf("farm_reaper_unbeaten_components = %v after arming, want 0", got)
+	}
+	if !containsMessage(rec.atOrAbove(slog.LevelInfo), "every watched component has now beaten") {
+		t.Error("the end of the refusal was not said; an operator watching the WARN needs the INFO that clears it")
+	}
+	// The arm that cleared the refusal also closed the quiesce gate, so this
+	// cycle reclaimed nothing either — the restoration rule, unchanged.
+	if state, _ := f.leaseState(l.id); state != "suspect" {
+		t.Fatalf("the arming cycle reclaimed the lease (state=%q); arming must quiesce first", state)
+	}
+
+	// And the proof that the refusal was what held the lease: open the gate
+	// and the same reaper takes it.
+	f.openReclaimGate()
+	r.cycle(ctx)
+	if state, _ := f.leaseState(l.id); state != "expired" {
+		t.Fatalf("lease state = %q after the gate opened; the refusal assertions above would pass "+
+			"against a reaper that can never reclaim at all", state)
+	}
+}
+
+// TestReaperNoticesARefusalRecordedByAnotherCaller covers the seam between
+// callers. farm.reaper_arm is also run by POST /api/v1/reaper/enable, and a
+// refusal it records gates farm.lease_reclaim for everyone. A loop that armed
+// earlier and never looked again would sweep into a shut gate forever,
+// reporting "nothing reclaimable" while dead holders piled up — the silent
+// failure this whole unit exists to remove.
+func TestReaperNoticesARefusalRecordedByAnotherCaller(t *testing.T) {
+	pool := requireDB(t)
+	f := newFixture(t, pool)
+
+	dev := f.device(deviceOpts{})
+	job := f.job(jobOpts{state: "running"})
+	l := f.seedLease(dev, job, leaseOpts{
+		state:         "suspect",
+		acquiredIn:    -2 * time.Hour,
+		heartbeatIn:   -2 * time.Hour,
+		expiresIn:     -1 * time.Hour,
+		reclaimableIn: -30 * time.Minute,
+	})
+
+	rec := &logRecorder{}
+	r := f.newReaper(rec)
+	ctx := context.Background()
+	defer r.lead.release(ctx)
+
+	r.cycle(ctx) // gains leadership and arms on the default list
+	if !r.armed {
+		t.Fatal("the reaper did not arm with every default component beating")
+	}
+	var firstArm time.Time
+	f.scan(&firstArm, `SELECT armed_at FROM farm.reaper_state`)
+
+	// Another caller arms with a list this loop does not use, and is refused.
+	// Only the refusal is left standing; the quiesce window is opened so that
+	// the refusal is the one thing gating the sweep.
+	f.exec(`SELECT * FROM farm.reaper_arm(ARRAY['reaper','ghost'])`)
+	f.exec(`UPDATE farm.reaper_state SET quiesce_until = now() - interval '1 second'`)
+	f.exec(`DELETE FROM farm.control_plane_gap`)
+
+	r.cycle(ctx)
+
+	var refusal *string
+	f.scan(&refusal, `SELECT last_refusal FROM farm.reaper_state`)
+	if refusal != nil {
+		t.Errorf("last_refusal = %q after the loop's cycle: it did not notice the standing refusal "+
+			"and re-arm on its own list", *refusal)
+	}
+	var secondArm time.Time
+	f.scan(&secondArm, `SELECT armed_at FROM farm.reaper_state`)
+	if !secondArm.After(firstArm) {
+		t.Errorf("armed_at = %s did not move past %s: the loop did not re-arm", secondArm, firstArm)
+	}
+	// Re-arming quiesced, so this cycle swept nothing — the same restoration
+	// rule as any other arm, and the reason a re-arm is safe to do here.
+	if state, _ := f.leaseState(l.id); state != "suspect" {
+		t.Fatalf("the re-arming cycle reclaimed the lease (state=%q)", state)
+	}
+}
+
+// gaugeValue reads a gauge through a scratch registry rather than Gauge.Write
+// or prometheus/testutil: the first names *dto.Metric and the second pulls in
+// a diff library, and either would add to the module graph for one read.
+func gaugeValue(tb testing.TB, g prometheus.Gauge) float64 {
+	tb.Helper()
+	reg := prometheus.NewRegistry()
+	if err := reg.Register(g); err != nil {
+		tb.Fatalf("registering gauge for a read: %v", err)
+	}
+	families, err := reg.Gather()
+	if err != nil {
+		tb.Fatalf("gathering gauge: %v", err)
+	}
+	if len(families) != 1 || len(families[0].GetMetric()) != 1 {
+		tb.Fatalf("gauge gathered %d families; a single gauge must gather as exactly one metric", len(families))
+	}
+	return families[0].GetMetric()[0].GetGauge().GetValue()
 }
 
 func str(s *string) string {

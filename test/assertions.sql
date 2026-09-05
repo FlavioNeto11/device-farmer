@@ -252,11 +252,14 @@ BEGIN
   -- ============================================================
   PERFORM farm.component_beat('reaper');
   PERFORM farm.component_beat('api');
+  -- Since 00012 a watched name with no heartbeat row makes the arm REFUSE
+  -- (test/assertions_v12.sql); every name in the list below has to have one.
+  PERFORM farm.component_beat('scheduler');
   UPDATE farm.component_heartbeat SET beat_at = now() - interval '25 minutes'
    WHERE component = 'api';   -- api was down; reaper looked healthy
 
-  SELECT farm.reaper_arm(ARRAY['reaper','api','scheduler'], interval '60 seconds')
-    INTO v_gap;
+  SELECT gap INTO v_gap
+    FROM farm.reaper_arm(ARRAY['reaper','api','scheduler'], interval '60 seconds');
   IF v_gap < interval '20 minutes' THEN
     RAISE EXCEPTION 'P13 FAILED: gap not detected across components (got %)', v_gap;
   END IF;

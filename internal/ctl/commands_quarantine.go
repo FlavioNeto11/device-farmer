@@ -132,8 +132,9 @@ func quarantineOpen(ctx context.Context, s *session, args []string) error {
 			f.Add("admin state", d.AdminState)
 			f.Add("health", dash(d.Health))
 			if d.Lease != nil {
+				// See commands_park.go: masked lease fields are nil, not "".
 				f.Addf("live lease", "%s — holder %s, job %s, expires %s; UNTOUCHED by this",
-					d.Lease.ID, d.Lease.Holder, d.Lease.JobID, stamp(&d.Lease.ExpiresAt))
+					dash(d.Lease.ID), dash(d.Lease.Holder), dash(d.Lease.JobID), stamp(&d.Lease.ExpiresAt))
 			}
 		}
 	}

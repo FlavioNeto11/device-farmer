@@ -95,8 +95,11 @@ func setParked(ctx context.Context, s *session, args []string, park bool) error 
 		f.Add("admin state", d.AdminState)
 		f.Add("health", dash(d.Health))
 		if d.Lease != nil {
+			// dash, not %s: after tenant scoping these are nil when the
+			// lease belongs to somebody else, and a masked field must read
+			// as absent rather than as a pointer address.
 			f.Addf("live lease", "%s — holder %s, job %s, expires %s; UNTOUCHED by this",
-				d.Lease.ID, d.Lease.Holder, d.Lease.JobID, stamp(&d.Lease.ExpiresAt))
+				dash(d.Lease.ID), dash(d.Lease.Holder), dash(d.Lease.JobID), stamp(&d.Lease.ExpiresAt))
 		}
 		if park && d.AdminState != "enabled" {
 			e.warnf("this device is %s, not enabled; the server will refuse to park it, because that "+
@@ -140,7 +143,8 @@ func setParked(ctx context.Context, s *session, args []string, park bool) error 
 		out.Addf("closed", "by %s %s%s", str(res.ClosedBy), ago(res.ClosedAt), closeReasonSuffix(res.CloseReason))
 	}
 	if res.LiveLease != nil {
-		out.Addf("live lease", "%s — job %s, %s; untouched", res.LiveLease.ID, res.LiveLease.JobID, res.LiveLease.State)
+		out.Addf("live lease", "%s — job %s, %s; untouched",
+			dash(res.LiveLease.ID), dash(res.LiveLease.JobID), res.LiveLease.State)
 	}
 	if res.Note != "" {
 		out.Add("note", res.Note)

@@ -171,14 +171,33 @@ config:
     heartbeatInterval: 5s
     # FARM_REAPER_COMPONENTS — the components whose downtime is refunded.
     #
-    # Add every role that is ON THE LEASE RENEWAL PATH and nothing else. api,
-    # scheduler and reaper belong here: if one of them is down, holders cannot
-    # renew and the outage must not be charged to the tenant.
+    # Every role ON THE LEASE RENEWAL PATH belongs here and nothing else, and
+    # internal/config REFUSES to start a process whose own component is on that
+    # path but missing from this list. A blind spot here is not cosmetic:
+    # farm.reaper_arm takes min(beat_at) over the components it is given, a
+    # component with no row is simply absent from that minimum, and its outage
+    # is therefore invisible to gap accounting — BLOCKER 8 in
+    # migrations/00002_lease.sql.
     #
-    # watchdog, recovery, jobrunner and node beat too, and are deliberately
-    # ABSENT. Listing watchdog here would let device health move a lease
-    # deadline, which fuses two clocks this system keeps apart on purpose.
-    components: "reaper,api,scheduler"
+    # api, scheduler and reaper: if one of them is down, holders cannot renew
+    # and the outage must not be charged to the tenant.
+    #
+    # jobrunner: it HOLDS the leases whose deadlines the reaper enforces, so a
+    # jobrunner outage is precisely the outage this refund exists for. Note
+    # this is one name more than farm.reaper_arm's own SQL default of
+    # ('reaper','api','scheduler') — that default is only reachable from a
+    # hand-typed psql call; every farmd process passes this list explicitly.
+    #
+    # watchdog, recovery and node beat too and stay ABSENT. They are on the
+    # HEALTH side of the firewall this system keeps between its clocks: listing
+    # the watchdog would let a device's health move a lease deadline, which is
+    # the fusion the whole design exists to prevent.
+    #
+    # This is what a farm RUNS, not what it could run. A component that beat
+    # once and was then scaled to zero leaves a stale row that refunds every
+    # second since it left, to every live lease, on every arm — so remove a
+    # name here when you remove it from the farm, and delete its heartbeat row.
+    components: "reaper,api,scheduler,jobrunner"
 
   node:
     # FARM_NODE_SELF_FENCE_TIMEOUT — the host-side fence proxy's staleness

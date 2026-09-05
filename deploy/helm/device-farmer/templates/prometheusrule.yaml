@@ -639,9 +639,10 @@ spec:
               {{ `{{ $labels.job }}` }} cannot write its component heartbeat
             description: >-
               farm.component_beat is failing on {{ `{{ $labels.instance }}` }}.
-              If this role is in FARM_REAPER_COMPONENTS — reaper, api and
-              scheduler by default — the gap it is opening will be refunded onto
-              every live lease in the farm when the reaper next arms.
+              If this role is in FARM_REAPER_COMPONENTS — reaper, api,
+              scheduler and jobrunner by default — the gap it is opening will be
+              refunded onto every live lease in the farm when the reaper next
+              arms.
             runbook_url: {{ $rb }}/component-beat-failing.md
 
         # The reaper is the only thing that reclaims a lease, refunds a gap or

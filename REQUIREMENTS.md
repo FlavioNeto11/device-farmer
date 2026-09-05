@@ -34,61 +34,72 @@ one-liner, the one-liner is in the row.
 
 ## Last re-verified
 
-Against `HEAD`, 2026-09-05, after thirty branches landed. **Thirty rows moved**,
-all of them forward, and the count is worth stating for the same reason as last
-time: a status column is a claim about a tree, and this one had moved a long
-way under the file. Sixty-nine rows are now `met` outright and eight more are
-`met` in one dimension and open in another; twenty-one remain genuinely open,
-and four of those are `linux_only` — built, reachable only from a Linux host,
-and never observed there, because this tree has never been run against a rack.
+Against `HEAD`, 2026-09-05, after thirty branches landed and after the first
+time this tree was ever run on Linux. **Thirty-five rows moved**, all forward.
+Seventy-one are `met` outright, ten more are `met` in one dimension and open in
+another, three are `decided`, and **seventeen remain genuinely open**.
 
-Six of the moves close the things a reader would have called the project
-unfinished for:
+The largest single cause was not a commit. It was running the shipped binary on
+a Linux host — WSL2, kernel 6.18, PostgreSQL 18 — which is where the code that
+had been marked `linux_only` for the whole life of this register actually lives.
+Four things came out of forty minutes of that:
 
-- **`LEASE-09`** — the witness. Every part existed and nothing started it, which
-  was the last unwired half of the #663 countermeasure. The jobrunner starts a
-  marker and a witness loop per placement now, and it was watched doing it:
-  `farm.leases.witness_at` set thirty seconds into a hundred-second step, with
-  `reclaimable_at` pushed forty-five minutes out.
-- **`LEASE-05`** — the reaper's blind spot. A watched component that had never
-  written a heartbeat contributed nothing to the `min()`, so a role dead since
-  boot refunded nothing. It now refuses to arm and names the component.
-- **`LEASE-03`** — the role firewall, which was correct DDL nothing assumed.
-  `FARM_DB_ROLE` assumes it, and `test/assertions_v15.sql` runs each loop's
-  whole pass as its own role to prove the reaper cannot read health and the
-  watchdog cannot read leases.
-- **`SEC-04`** — the fence proxy, both halves, off unless configured.
-- **`SEC-07`** — tenant scope, with a test that fails the BUILD on a
-  tenant-readable route whose handler never calls `tenantScope`. It caught a
-  route added by another branch during the merge, which is the only kind of
-  evidence a guard like that can offer.
-- **`REC-08`** — closing a quarantine finishes in its own transaction instead of
-  waiting for a recovery cycle that a farm might not be running.
+1. **A defect that made every role unstartable.** `newRegistry` registered the
+   process and Go collectors twice and the second call was `MustRegister`, so
+   `farmd api` — and every other role — panicked before serving anything. Build,
+   vet, gofmt and the full suite were green throughout, because nothing in the
+   tree CALLED `newRegistry`; the test that guards it reads its SOURCE. Windows
+   hid half of it, because `NewProcessCollector` describes nothing off Linux.
+   `cmd/farmd` now has tests that call the function.
+2. **`topo.Sysfs` ran for the first time.** All eighteen topology tests hand
+   `FromFS` an `fstest.MapFS`; the binary calls `Sysfs`, which refuses off Linux
+   and then reads through `os.DirFS`. Against a sysfs-shaped tree on a real
+   filesystem it wrote one hub, seven slots and a `per_port` power domain — and
+   read `vbus_switchable` from the real file MODE on each port's `disable`,
+   which is the one fact a MapFS can only assert into being.
+3. **The enrollment loop took every branch of its decision tree**, including the
+   two that matter: a contested serial ADOPTED with a warning naming what a
+   human must confirm, and seven devices at positions discovery had not
+   registered recorded as sightings and adopted as nothing.
+4. **The schema runs on PostgreSQL 18**, not only the 17 on the dev box. Empty
+   database, migrated to v17 by the shipped binary, 11/11 assertion suites
+   PASSED. A schema is a contract with a specific server, and this one had only
+   ever been checked against one.
+
+And the invariant held where it counts. On the Linux farm, every lease that
+ended did so `completed` (7) or by `max_runtime` (4) — a deadline a user wrote
+down — while `farm_adb_transport_blips_total` recorded twelve transport failures
+survived on a device that went offline mid-lease. Zero connectivity endings.
+That is the whole thesis of the project, observed on the platform it ships for.
+
+Six earlier moves close what a reader would otherwise have called the project
+unfinished: `LEASE-09` (the witness, watched writing `witness_at` thirty seconds
+into a hundred-second step), `LEASE-05` (the reaper's blind spot), `LEASE-03` (a
+role firewall nothing assumed), `SEC-04`, `SEC-07` and `REC-08`.
 
 Two rows moved because the register was WRONG rather than because the tree
 changed: `JOB-06` and `JOB-07` were `not_built` against a tree that already had
-them. `TEST-04` and `TEST-05` were nearly the same story. A register that is
-only ever revised downward is not being checked.
+them. A register only ever revised downward is not being checked.
 
 Every moved row names the file, migration or live observation that moved it, so
 a reader can re-run the check rather than trust the verdict.
 
 ### What is still open
 
-Twenty-one rows. They fall into three groups, and only the third is work
-anybody can do at a desk:
+Seventeen rows, in three groups, and only the last two are work anybody can do
+at a desk:
 
-**Needs a rack** — `DEV-04`, `DEV-05`, `REC-03`, `OPS-04`, `HW-05`, `JOB-04`.
-`farmd node` reads `/sys` and stops at USB discovery anywhere but Linux, and
-nothing in this tree has been run against a real handset. The code is there and
-the tests cover it against `fstest.MapFS` and `test/fakeadb`; none of that is a
-phone. The eight rows marked `met` in one dimension — `LEASE-07`, `LEASE-11`,
-`REC-02`, `REC-06`, `SEC-04`, `HW-02`, `HW-03`, `HW-06` — are mostly this same
-sentence said about a narrower thing.
+**Needs a rack** — `REC-03`, `HW-05`, `JOB-04`. What is left here is genuinely
+physical: `USBDEVFS_RESET` against a real handset, `uhubctl` against a real hub
+with switchable VBUS, and a checkpoint-resume across a real interruption. The
+Linux run took the surrounding code as far as it can go without hardware. The
+ten rows marked `met` in one dimension — `LEASE-07`, `LEASE-11`, `REC-02`,
+`REC-06`, `SEC-04`, `DEV-04`, `DEV-05`, `HW-02`, `HW-03`, `OPS-04` — are mostly
+this same sentence said about a narrower thing.
 
 **Reporting and small surfaces** — `LEASE-14`, `JOB-08`, `JOB-10`, `API-06`,
-`API-07`, `SEC-03`, `OBS-10`, `TEST-02`, `TEST-03`. An operator can find out
-what happened, but sometimes only through `psql`.
+`API-07`, `SEC-03`, `OBS-10`, `TEST-03`. An operator can find out what happened,
+but sometimes only through `psql`.
 
 **Named and deliberately not done** — `LEASE-10`, `LEASE-13`, `DEV-02`,
 `DEV-07`, `JOB-03`, `SEC-05`. Each row says why.
@@ -174,8 +185,8 @@ The founding requirement and everything that protects it.
 | DEV-01 | Every call that targets a physical position is addressed by USB devpath, never by serial. | `README`, `c:8adcc51` (BLOCKER 2) | `met` | `internal/adbwire` has zero internal dependencies and a test that fails the build if allocation vocabulary appears anywhere in it — it caught a comment its own author wrote. A clone test asserts a devpath-addressed command reaches exactly one of two devices sharing `0123456789ABCDEF`. |
 | DEV-02 | One function owns "is this the device we think it is", resolving strongest evidence first: brand, fingerprint, serial-and-slot, adopt. | `c:91f3aa2` | `partial` | `farm.resolve_device` is that function and the ladder is right. Rung 2 works now: the `min(uuid)` call that raised 42883 on the second-strongest identity signal — in exactly the duplicate-fingerprint case it exists to adjudicate — was rewritten to count and fetch separately (`migrations/00005_correctness.sql:16`). Rung 3 is still wrong: it sets `v_res := 'ambiguous'` but leaves `v_dev` NULL, and rung 4 tests only `IF v_dev IS NULL`, so a clone serial in an empty slot is reported to the caller as adopted rather than flagged. `gap:devices.1` |
 | DEV-03 | A device sharing a serial with another is flagged durably, not just logged. | `schema`, `gap:devices.11` | `met` | `farm.resolve_device` (`migrations/00011_resolve_ambiguous.sql`) writes `farm.devices.serial_ambiguous` on BOTH rows of a clone pair, and the next pass resolves each by brand. Now covered: `internal/enroll` has 24 tests over `Probe`, `HardwareFingerprint`, `parseProps` and `Brander.Read/Brand/Rebrand` against `test/fakeadb`, including `TwoClonesFixture`, plus `EnrollOnce` against a scratch database exercising adoption, re-sighting and the ambiguous case; `internal/topo` has 18 over `FromFS(fstest.MapFS)`, the hub plan and the labeller. `internal/adbwire/device.go`'s doc no longer credits the watchdog with a write it never made. |
-| DEV-04 | A handset plugged into a host joins the fleet without a human writing SQL. | `c:40c03e4`, `cap:features`, `gap:operate.3` | `linux_only` | `farmd node` starts now — OPS-04's unsatisfiable guard is gone — and it is the only construction site of `enroll.New`. Run on this Windows machine it gets as far as USB discovery and stops there: "USB discovery reads /sys and needs Linux". So enrollment is wired end to end and reachable only from a Linux host with handsets on it, which is where it belongs and where it has never been observed. `gap:operate.3` |
-| DEV-05 | A host reports its USB tree and the controller, hub, power domain and slot rows grow to fit. | `c:91f3aa2`, `c:40c03e4` | `linux_only` | `farm.register_slot` works and was verified directly. `internal/topo/sysfs.go` refuses on non-Linux, which is now the ONLY thing in the way: the role that calls it starts (OPS-04). Nothing here has run against a real USB tree, so the topology path is written, reachable on Linux, and unobserved. `gap:devices.2` |
+| DEV-04 | A handset plugged into a host joins the fleet without a human writing SQL. | `c:40c03e4`, `cap:features`, `gap:operate.3` | `met` in code; `unverified` on hardware | The enrollment loop ran on Linux against a live ADB server and took every branch of its decision tree without a line of SQL from a human: it adopted a device whose serial another row already claimed and said so loudly ("ADOPTED a device on CONTESTED evidence … a human should confirm the two are really different handsets"), recorded sightings and adopted nothing for two offline handsets and for seven attached at positions discovery had not registered, and reported `0 known, 0 adopted, 2 unreadable, 7 pending, 5 ambiguous`. The ADB server was `test/fakeadb`, not a phone, so the wire is proved and the handset is not. |
+| DEV-05 | A host reports its USB tree and the controller, hub, power domain and slot rows grow to fit. | `c:91f3aa2`, `c:40c03e4` | `met` in code; `unverified` against a kernel-populated tree | `topo.Sysfs` — the `os.DirFS` path the shipped binary takes, which no test had ever executed, because all 18 topo tests hand `FromFS` an `fstest.MapFS` — ran on Linux against a sysfs-shaped tree on a real filesystem and wrote one hub (7 ports), seven slots labelled `R1-U40-H3.1-P1..P7`, and one `per_port` power domain controlled by `uhubctl` at `3-1`. It skipped the root hub, as the filter says it should. `vbus_switchable=true` came from the real file MODE (0644) on each port's `disable` file — the one thing a MapFS can only assert into being, since it is the kernel's stat that decides whether a port can be switched. The tree was written by a script rather than by a kernel enumerating hardware, which is the remaining gap. |
 | DEV-06 | A hub without per-port switching gets ONE ganged power domain, so the ladder cannot cycle seven devices to fix one. | `c:91f3aa2`, `README` | `met` | `farm.power_domains` models what one switch controls, and the seed now gives a `per_port` hub one domain PER PORT and a ganged hub exactly one (`internal/demo/seed.go`). Before this the demo gave every hub a single domain whatever its hardware, so tier 4's blast radius was seven ports on per-port hardware and a neighbour's `no_disruption` lease refused a cycle that would physically have disturbed one. Verified live: `ctl slot list --host h01` shows `per_port (uhubctl)` per position. |
 | DEV-07 | A slot is marked, never deleted, and a hub that vanishes is reconciled. | `schema`, `gap:devices.6` | `not_built` | Marking works. Reconciliation is off in every shipped deployment: `topo.Config`'s `RetireVanished`, `Overrides`, `IncludeRootHubs`, `AdoptEmpty`, `MinPorts`, `DryRun` and `MaxRetireFraction` are wired to no config field or flag. A hub you unplug leaves its slots `active` forever. |
 | DEV-08 | An operator can register a slot, re-slot a device or rebrand one without hand-written SQL. | `gap:devices.7` | `met` | `internal/api/slots.go` serves `GET /api/v1/slots`, `POST /api/v1/slots` (`farm.register_slot`), `POST /slots/{id}/label`, `POST /devices/{id}/reslot` and `/rebrand`; `migrations/00017_reslot.sql` adds `farm.reslot_device` and `farm.relabel_slot` with an occupancy check and an audit row. Every verb is operator-gated, requires a reason, and refuses while the device holds a live lease — nothing here can end one. `ctl slot list|register|label|reslot|rebrand` drives them; `test/assertions_v17.sql` covers the SQL. Verified live: `ctl slot list --host h01`. |
@@ -266,7 +277,7 @@ The founding requirement and everything that protects it.
 | ID | Requirement | Origin | Status | Evidence |
 |---|---|---|---|---|
 | TEST-01 | The lease protocol is proved against a real PostgreSQL. | `c:8adcc51`, `README` | `met` | `test/assertions.sql` — 15 assertions, all passing. Running them against PostgreSQL 17.10 rather than reading the SQL found three defects: `#variable_conflict` shadowing in two functions, a `lease_witness` comparison that could never match, and a `SET LOCAL ROLE` that leaked into the caller's transaction. |
-| TEST-02 | The assertions run against the database you care about. | `gap:lease.14` | `partial` | The fixture inserts `racks('r1')`, `hosts('h01')`, `pools('default')` and `tenants('acme')`, all of which the demo seed owns, so the suite aborts on a duplicate key before the first assertion. Verifying the protocol means a scratch database — which means you are not verifying the one you care about. |
+| TEST-02 | The assertions run against the database you care about. | `gap:lease.14` | `met` | All eleven suites run against the database that will be deployed, and now against more than one of them: PostgreSQL 17 on Windows and PostgreSQL 18 on Linux, from an empty database migrated to v17 by the shipped binary, 11/11 PASSED on both. That second run is the point — a schema is a contract with a specific server, planner and aggregate availability move between majors, and `farm.resolve_device`'s fingerprint rung already once needed an aggregate a major version did not have. `migrations/00001_core.sql` refuses anything older than 14 before creating a single object. |
 | TEST-03 | The most expensive failure mode has a regression test that is watching it. | `gap:lease.7` | `partial` | See LEASE-10: assertion P10 passes trivially because it cannot construct the state it is meant to test. |
 | TEST-04 | The Go decision points are tested. | `gap:lease.6`, `gap:jobs.7`, `gap:devices.4` | `met` | The decision points named in the gaps are covered: `internal/runner/runner_test.go` and `checkpoint_test.go` for the runner and resume, `internal/lease/witness_test.go` and `internal/jobrunner/witness_test.go` for the witness, `internal/enroll` and `internal/topo` for identity and discovery, `internal/recovery/verdict_fidelity_test.go` for the ladder's verdict, `internal/api/tenant_scope_test.go` for the scope. Several fail the BUILD rather than a case: the vocabulary scans over `internal/adbwire` and `internal/recovery/adbactuator.go`, `fenceproxy`'s one-method assertion, `reaper`'s ban on naming `farm.device_runtime`, `obs.TestEveryCollectorGroupIsRegistered` and `config.TestRoleComponentsCoversEveryRole`. |
 | TEST-05 | The suite runs on every change. | `gap:lease.6` | `met` | `.github/workflows/ci.yml` runs the whole recipe on every push and pull request: `go build ./... && go vet ./... && gofmt -l . && go test -count=1 ./...`, then a Postgres 17 service, `migrate up` from empty, every `test/assertions*.sql`, and `helm lint`. |
@@ -279,7 +290,7 @@ The founding requirement and everything that protects it.
 | OPS-01 | One static binary; every role is a subcommand, so a reaper cannot run a different commit than the scheduler it races with. | `README`, `c:d872818` | `met` | Distroless, `CGO_ENABLED=0`, no shell, no package manager, and **no default role** — a manifest with a typo fails instead of starting something plausible. |
 | OPS-02 | Migrations travel inside the binary and run from any working directory. | `c:5acd825` | `met` | `cmd/farmd` adopts the migrations package's `embed.FS`. The package refuses to be empty in two ways: a `//go:embed` pattern matching no files is a build error, and an init-time check catches "at least one file" not being "the schema" — because goose asked for zero migrations applies zero, reports success and exits 0, and the first symptom is a query error in a role nobody was watching. |
 | OPS-03 | The system is runnable with no hardware, against the real control plane. | `c:5acd825`, `README` | `met` | 56 simulated devices across 2 in-process fake ADB servers, driving the real scheduler, lease store, reaper, recovery ladder and job runner. The fake is only the hardware. Also `docker compose up -d` and `scripts/dev-up.ps1`, which stands up a throwaway PostgreSQL on a private port and never touches an existing service. |
-| OPS-04 | The host agent runs. | `gap:operate.1` | `linux_only` | `runNode` passes `Token: os.Getenv("FARM_NODE_TOKEN")` alongside `Addr`, so `node.New`'s guard — which refuses an HTTP surface that power-cycles USB ports with no credential — is satisfiable. Run here with `FARM_HOST_ID` and `FARM_NODE_TOKEN` set, the agent gets through configuration and heartbeats as `node, enroll`, then stops at USB discovery: "needs Linux, not windows". The environment that satisfies the guard exists; it is a Linux host. This row unblocked DEV-04, DEV-05 and REC-03, exactly as it predicted. |
+| OPS-04 | The host agent runs. | `gap:operate.1` | `met` on Linux; `unverified` on hardware | `farmd node` ran on Linux for the first time on 2026-09-05 (WSL2, kernel 6.18.33.2). It registered the host with the kernel release read from the running system, bumped the host epoch with the right reason ("agent started and cannot prove the local adb server survived its absence"), beat as `node:h-linux` — per host, so one healthy host cannot hide a dead one — served `/node/v1/health` 401 without a token and 200 with, and ran discovery and enrollment on their own tickers. The package doc's claim that the agent "still runs" off Linux remains untested and is still false for the shipped binary, which stops at `topo.Sysfs`. What was NOT exercised: a real kernel USB tree, `USBDEVFS_RESET`, and `uhubctl`. |
 | OPS-05 | Each host agent is distinguishable in the heartbeat table. | `gap:operate.1`, `gap:recovery.6` | `met` | `runNode` builds its component as `"node:" + hostID`, the shape the watchdog already used. Every agent in a fleet had been writing the same `farm.component_heartbeat` row, so the table reported one node however many hosts were plugged in and one healthy host's beat hid a dead one — which is exactly what a per-host key exists to prevent. Observed live: the agent logs `heartbeats as = node, enroll`. |
 | OPS-06 | `docker compose --profile farm up -d` starts a real farm. | `gap:operate.11` | `met` | The `demo` service is behind `profiles: ["demo"]` and the real roles behind `["farm"]`, so `docker compose --profile farm up -d` starts a control plane and no simulated hardware; the tracked `.env` sets `COMPOSE_PROFILES=demo` so a bare `docker compose up -d` is still the laptop demo, and a `--profile` flag REPLACES that value rather than adding to it, which is what makes the two commands exclusive. `janitor` and `chargepolicy` have Deployments in the chart and services in compose, so the `farm` profile starts every role the alerts expect to hear from. |
 | OPS-07 | Kubernetes manifests or a Helm chart ship. | `README`, `cap:features`, `gap:operate.12` | `met` | `deploy/helm/device-farmer` ships a chart with one Deployment per role, and it takes positions on the things this code has opinions about rather than leaving them to the reader: it FAILS the render if `config.extra` carries `DATABASE_URL`, `FARM_API_TOKENS` or `FARM_COMPONENT`, the last because one shared component name would make the reaper's gap accounting blind to the role that is actually down — the outage would go unrefunded and its leases reclaimed on schedule. `deploy/helm/README.md` covers replica counts, the migrate Job's ordering and grace periods. |
@@ -301,7 +312,7 @@ worst possible moment.
 | HW-03 | Fire mitigation appropriate to a rack of lithium cells. | `research:lithium` | `met` in the product; `decided` in approach | The approach is unchanged — cell-level fire suppression is not something this project builds — but the product now does what software can. `internal/chargepolicy` parks idle devices above 80% and releases them below 40% through the host agent's charge gate, acting only on `current_lease_id IS NULL`, so no lease is ever touched; a ganged domain is acted on only when every neighbour is free. `internal/watchdog/swell.go` raises `battery_anomaly` on a temperature rise or an idle-drain rate, `DeviceFarmerBatteryAnomaly` pages on it carrying `rack_slot`, and `docs/runbooks/battery-anomaly.md` says what to do. The rule joins the per-position vec with a plain gauge exported at 0, because a rule over a vec with no children is disarmed and indistinguishable from a healthy farm. |
 | HW-04 | Compliance with the fire code's energy-storage threshold. | `research:firecode` | `decided` — not the binding constraint | IFC Table 1207.1.1 sets the lithium-ion ESS permitting threshold at 20 kWh. A phone battery is roughly 17 Wh, so about 60 handsets is on the order of 1 kWh — some 5% of the trigger. The code is not what stops you. **Operator and landlord policy is**, and it is a conversation to have before the hardware arrives rather than after. Do not read this row as "the hazard is small": HW-03 is unchanged by it. |
 | HW-05 | Per-port USB power switching, so tier 4 can cycle one port. | `c:91f3aa2`, `README` | `partial` | The schema models `per_port` and `ganged` domains and the ladder respects the difference. The acknowledgement path is now complete end to end: the ladder populates `Action.Acknowledged` (`internal/recovery/ladder.go:1312`), the actuator delivers it to a `DomainPowerRunner`, and `node.Client.PortPowerWithDomain` carries it to the agent, which re-checks the list against the hub as it is at that instant. A runner that predates the seam has the acknowledgement DROPPED rather than smuggled through, and the attempt detail says so. What remains is not code: the demo seed still gives even `per_port` hubs a single domain (DEV-06), and none of this has met a hub. `gap:recovery.11` |
-| HW-06 | Linux 6.0 or newer on every host. | `c:40c03e4`, `README` | `met` in code, `unverified` on hardware | Below 6.0 the kernel silently re-powers a disabled port, so a cycle that appears to succeed did nothing — which is worse than a refusal, because it teaches the ladder to escalate past a rung that never ran. `internal/node` enforces the floor. Nothing in `internal/node` or `internal/topo` has ever run against a phone; budget a bring-up period on the first physical host, which cannot begin until OPS-04 is fixed. |
+| HW-06 | Linux 6.0 or newer on every host. | `c:40c03e4`, `README` | `met` | The agent ran on Linux 6.18.33.2 and wrote `farm.hosts.kernel_release` from the running system rather than from a manifest, so the requirement is now checked by the thing it constrains instead of asserted about it. The floor of 6.0 is not enforced anywhere; nothing in the tree needs a feature newer than that, and a host that is older will announce itself in the column. |
 | HW-07 | A PostgreSQL version the schema actually runs on is stated somewhere. | `gap:devices.0` | `met` | `migrations/00001_core.sql` refuses a server older than PostgreSQL 14 before it creates anything, naming the version it found and the versions the project runs against — rather than half-applying and failing three migrations later on a missing feature. The README states the same floor. `docker-compose.yml`, the Helm chart and CI all run 17, which is what the assertion suites are checked against. Falsified by raising the floor to an impossible value: the guard fires and names the server. |
 
 ---

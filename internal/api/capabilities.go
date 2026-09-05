@@ -2,10 +2,14 @@ package api
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net/http"
 	"runtime"
 	"runtime/debug"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // Capabilities reports what this deployment can actually do, read from the
@@ -29,6 +33,18 @@ type Capabilities struct {
 	Features []FeatureStatus   `json:"features"`
 	Fleet    map[string]int    `json:"fleet"`
 	Limits   map[string]string `json:"limits"`
+}
+
+// ProbeFailure is one observation this report tried to make and could not.
+//
+// Consequence is carried because the reader's instinct on a missing number is
+// to substitute the obvious default, and the obvious default is wrong in every
+// case here: an unreadable goose table is not schema v0, and an unreadable
+// heartbeat table is not seven dead loops.
+type ProbeFailure struct {
+	Probe       string `json:"probe"`
+	Error       string `json:"error"`
+	Consequence string `json:"consequence"`
 }
 
 type BuildInfo struct {
@@ -94,14 +110,58 @@ var knownRoles = []struct{ component, meaning string }{
 
 func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+
+	// Three reads, and every one of them can fail. What matters is that a
+	// failure is not allowed to become an assertion.
+	//
+	// This handler used to discard all three errors, and the result was worse
+	// than an outage: with Postgres unreachable it answered 200 with "schema
+	// v0 — no migrations applied; run farmd migrate up", every role marked as
+	// never having beaten, and a fleet of zero devices. Each of those is a
+	// specific, confident, false claim, and each sends an operator somewhere
+	// unhelpful — to re-run a migration against a healthy schema, or to go
+	// hunting for seven dead loops that are all running fine.
+	//
+	// So a report that could not be taken is not a report. The 200 also
+	// suppressed the dashboard's own "the control plane is not answering"
+	// banner, which fires on 5xx, hiding the one true statement available.
+	schema, schemaErr := s.schemaInfo(ctx)
+	roles, rolesErr := s.roleStatuses(ctx)
+	fleet, fleetErr := s.fleetCounts(ctx)
+
+	var failed []ProbeFailure
+	for _, p := range []struct {
+		name, consequence string
+		err               error
+	}{
+		{"schema", "the applied migration version is unknown; it is NOT v0", schemaErr},
+		{"roles", "no conclusion may be drawn about which control-plane loops are beating", rolesErr},
+		{"fleet", "device, host and lease counts are unknown; they are NOT zero", fleetErr},
+	} {
+		if p.err != nil {
+			failed = append(failed, ProbeFailure{
+				Probe: p.name, Error: p.err.Error(), Consequence: p.consequence,
+			})
+		}
+	}
+	if len(failed) > 0 {
+		s.log.ErrorContext(ctx, "the capability report could not be taken",
+			"failed_probes", len(failed), "err", errors.Join(schemaErr, rolesErr, fleetErr))
+		writeError(w, http.StatusServiceUnavailable, CodeUnavailable,
+			fmt.Sprintf("this deployment's capabilities could not be observed: %d of 3 "+
+				"database probes failed. Nothing is reported, rather than reporting a "+
+				"default as a fact.", len(failed)),
+			failed)
+		return
+	}
+
 	caps := Capabilities{
-		Build:    s.buildInfo(),
-		Schema:   s.schemaInfo(ctx),
-		Auth:     s.authInfo(),
-		Roles:    s.roleStatuses(ctx),
-		Fleet:    s.fleetCounts(ctx),
-		Limits:   s.limits(),
-		Features: nil,
+		Build:  s.buildInfo(),
+		Schema: schema,
+		Auth:   s.authInfo(),
+		Roles:  roles,
+		Fleet:  fleet,
+		Limits: s.limits(),
 	}
 	caps.Features = s.featureStatuses(ctx, caps.Roles)
 	writeJSON(w, http.StatusOK, caps)
@@ -128,16 +188,24 @@ func (s *Server) buildInfo() BuildInfo {
 	return b
 }
 
-func (s *Server) schemaInfo(ctx context.Context) SchemaInfo {
+func (s *Server) schemaInfo(ctx context.Context) (SchemaInfo, error) {
 	var (
 		v  *int
 		at *time.Time
 	)
 	// goose owns this table; reading it is how the API learns which schema it
 	// is actually talking to rather than which one it shipped with.
-	_ = s.pool.QueryRow(ctx,
+	err := s.pool.QueryRow(ctx,
 		`SELECT version_id, tstamp FROM goose_db_version
 		  WHERE is_applied ORDER BY id DESC LIMIT 1`).Scan(&v, &at)
+
+	// No rows is an ANSWER, and the only one of the two that may be reported:
+	// goose has a table and nothing applied, so v0 and "run farmd migrate up"
+	// are both true. Any other error means the table could not be read, and
+	// then v0 is a guess wearing the clothes of a measurement.
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return SchemaInfo{}, fmt.Errorf("reading goose_db_version: %w", err)
+	}
 
 	out := SchemaInfo{}
 	if v != nil {
@@ -149,7 +217,7 @@ func (s *Server) schemaInfo(ctx context.Context) SchemaInfo {
 	if out.Version == 0 {
 		out.Note = "no migrations applied; run farmd migrate up"
 	}
-	return out
+	return out, nil
 }
 
 func (s *Server) authInfo() AuthInfo {
@@ -167,22 +235,30 @@ func (s *Server) authInfo() AuthInfo {
 	return info
 }
 
-func (s *Server) roleStatuses(ctx context.Context) []RoleStatus {
+func (s *Server) roleStatuses(ctx context.Context) ([]RoleStatus, error) {
 	// One row per component that has ever beaten, with how long ago. A
 	// watchdog is per-host and beats as "watchdog:h01", so prefixes match.
 	beats := map[string]int64{}
 	rows, err := s.pool.Query(ctx,
 		`SELECT component, GREATEST(0, round(extract(epoch FROM now() - beat_at)))::bigint
 		   FROM farm.component_heartbeat`)
-	if err == nil {
-		defer rows.Close()
-		for rows.Next() {
-			var c string
-			var ago int64
-			if rows.Scan(&c, &ago) == nil {
-				beats[c] = ago
-			}
+	if err != nil {
+		return nil, fmt.Errorf("reading farm.component_heartbeat: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var c string
+		var ago int64
+		if err := rows.Scan(&c, &ago); err != nil {
+			return nil, fmt.Errorf("scanning farm.component_heartbeat: %w", err)
 		}
+		beats[c] = ago
+	}
+	// A row set that stopped early is a PARTIAL heartbeat table, and a partial
+	// one reads exactly like a farm with dead roles. Checked, because not
+	// reporting that when it is untrue is the whole job of this function.
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("reading farm.component_heartbeat: %w", err)
 	}
 
 	// A component is "running" if it beat recently. The window is generous
@@ -209,13 +285,12 @@ func (s *Server) roleStatuses(ctx context.Context) []RoleStatus {
 		}
 		out = append(out, st)
 	}
-	return out
+	return out, nil
 }
 
-func (s *Server) fleetCounts(ctx context.Context) map[string]int {
-	out := map[string]int{}
+func (s *Server) fleetCounts(ctx context.Context) (map[string]int, error) {
 	var devices, hosts, healthy, leased, quarantined, jobs, artifacts int
-	_ = s.pool.QueryRow(ctx, `
+	if err := s.pool.QueryRow(ctx, `
 SELECT (SELECT count(*) FROM farm.devices),
        (SELECT count(*) FROM farm.hosts),
        (SELECT count(*) FROM farm.device_runtime WHERE health = 'healthy'),
@@ -223,16 +298,21 @@ SELECT (SELECT count(*) FROM farm.devices),
        (SELECT count(*) FROM farm.quarantines WHERE closed_at IS NULL),
        (SELECT count(*) FROM farm.jobs WHERE state IN ('queued','running')),
        (SELECT count(*) FROM farm.artifacts)`).
-		Scan(&devices, &hosts, &healthy, &leased, &quarantined, &jobs, &artifacts)
+		Scan(&devices, &hosts, &healthy, &leased, &quarantined, &jobs, &artifacts); err != nil {
+		// Zero devices and zero live leases is a coherent, readable and entirely
+		// wrong picture of a full rack. Refuse to draw it.
+		return nil, fmt.Errorf("counting the fleet: %w", err)
+	}
 
-	out["devices"] = devices
-	out["hosts"] = hosts
-	out["healthy"] = healthy
-	out["live_leases"] = leased
-	out["open_quarantines"] = quarantined
-	out["active_jobs"] = jobs
-	out["artifacts"] = artifacts
-	return out
+	return map[string]int{
+		"devices":          devices,
+		"hosts":            hosts,
+		"healthy":          healthy,
+		"live_leases":      leased,
+		"open_quarantines": quarantined,
+		"active_jobs":      jobs,
+		"artifacts":        artifacts,
+	}, nil
 }
 
 func (s *Server) limits() map[string]string {
@@ -311,10 +391,17 @@ func (s *Server) featureStatuses(ctx context.Context, roles []RoleStatus) []Feat
 			How: "server-sent events on /api/v1/stream, polled and diffed server-side",
 		},
 		{
-			Name: "Authentication", State: "not_built",
-			How: "a stub that grants every caller the operator role",
-			Detail: "Do not expose this port to a network you do not control. The seam for OIDC " +
-				"is documented in internal/api/auth.go.",
+			// Not "not_built" any more: bearer authentication is written and
+			// AuthenticatorFor refuses to start without an explicit choice, so
+			// reaching this branch means somebody set FARM_API_AUTH=allow-all
+			// on purpose. Saying a built thing does not exist would send an
+			// operator looking for work that is already done instead of at the
+			// one variable that turns it on.
+			Name: "Authentication", State: "unavailable",
+			How: "built (static bearer), and deliberately switched off with FARM_API_AUTH=allow-all",
+			Detail: "Every caller is granted the operator role. Do not expose this port to a " +
+				"network you do not control; set FARM_API_TOKENS to close it. The seam for " +
+				"OIDC is documented in internal/api/auth.go.",
 		},
 		{
 			Name: "Fence enforcement at the resource", State: "not_built",
@@ -323,8 +410,12 @@ func (s *Server) featureStatuses(ctx context.Context, roles []RoleStatus) []Feat
 				"written, so a misbehaving client could still reach a device it has been fenced out of.",
 		},
 		{
-			Name: "Helm chart", State: "not_built",
-			How: "docker-compose only; the compose file's 'farm' profile carries the per-role services",
+			Name: "Helm chart", State: "enabled",
+			How: "deploy/helm/device-farmer, one Deployment per role; docker-compose's 'farm' " +
+				"profile carries the same split for a single machine",
+			Detail: "The chart refuses DATABASE_URL, FARM_API_TOKENS and FARM_COMPONENT in " +
+				"config.extra: the first two are credentials, and one shared FARM_COMPONENT " +
+				"would make the reaper's gap accounting blind to the role that is down.",
 		},
 	}
 

@@ -50,9 +50,22 @@ func (s *Server) buildHandler() http.Handler {
 	}
 
 	// What this deployment can actually do, observed rather than declared.
-	// Unauthenticated for the same reason as healthz: an operator debugging a
-	// farm whose auth is the broken thing still needs to see its state.
-	mux.HandleFunc("GET /api/v1/capabilities", s.handleCapabilities)
+	//
+	// Gated at TENANT, which is the lowest role there is, and that is the whole
+	// design: under an open authenticator the stub hands every caller operator,
+	// so the debugging case this route exists for — an operator working on a
+	// farm whose authentication is the broken thing — still reaches it. The
+	// moment FARM_API_TOKENS is set, the same line starts asking for a
+	// credential.
+	//
+	// It was registered bare, and that is the wrong shape for this particular
+	// payload: it inventories the host agents, the schema, the fleet size and,
+	// in the open case, a labelled warning that anyone reaching this port can
+	// revoke leases and power-cycle slots. A route that hands a scanner the
+	// reconnaissance AND the notice that nothing will stop them is not a
+	// liveness probe, and unlike healthz it would have stayed open after the
+	// authentication gap it describes was closed.
+	tenant("GET /api/v1/capabilities", s.handleCapabilities)
 
 	// Job specs. Reading the vocabulary needs no privilege: a client that
 	// cannot ask what steps this server accepts has to hard-code them, and

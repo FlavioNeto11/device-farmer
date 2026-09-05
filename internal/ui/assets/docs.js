@@ -196,8 +196,25 @@
     const wrap = el('div', { class: 'doc-caps' });
 
     if (!caps) {
-      wrap.append(el('div', { class: 'doc-caps-loading' },
-        'Reading what this deployment can actually do…'));
+      /* Two different nulls. Still loading is a moment; failed to load is a
+       * state, and a panel that says "reading…" forever tells the same lie the
+       * endpoint itself used to tell — it answered 200 with a schema of v0 and
+       * an empty fleet rather than admitting it could not see. Say which of
+       * the two this is, and name what must not be concluded from the gap. */
+      const e = state.errors.capabilities;
+      wrap.append(e
+        ? el('div', { class: 'doc-warn' },
+          el('span', { class: 'doc-warn-glyph', 'aria-hidden': 'true' }, '▲'),
+          el('div', null,
+            el('div', { class: 'doc-warn-title' },
+              'What this deployment can do could not be observed'),
+            el('div', null, String(e.message || e)),
+            el('div', { class: 'doc-warn-fix' },
+              Array.isArray(e.detail) && e.detail.length
+                ? e.detail.map((p) => p.probe + ': ' + p.consequence).join(' · ')
+                : 'Nothing is shown below, because nothing below would be a statement about the farm.')))
+        : el('div', { class: 'doc-caps-loading' },
+          'Reading what this deployment can actually do…'));
       return wrap;
     }
 
@@ -266,6 +283,7 @@
   function featChip(st) {
     if (st === 'enabled') return 'chip-ok';
     if (st === 'not_built' || st === 'unavailable') return 'chip-bad';
+    if (st === 'unknown') return 'chip-unknown';
     return 'chip-degraded';
   }
 

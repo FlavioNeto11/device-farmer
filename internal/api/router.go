@@ -86,6 +86,8 @@ func (s *Server) buildHandler() http.Handler {
 	tenant("GET /api/v1/fleet", s.handleFleet)
 	tenant("GET /api/v1/devices/{id}", s.handleDevice)
 	operator("POST /api/v1/devices/{id}/exec", s.handleDeviceExec)
+	operator("POST /api/v1/devices/{id}/park", s.handleDevicePark)
+	operator("POST /api/v1/devices/{id}/unpark", s.handleDeviceUnpark)
 
 	// Physical topology and host administration.
 	tenant("GET /api/v1/topology", s.handleTopology)
@@ -109,6 +111,7 @@ func (s *Server) buildHandler() http.Handler {
 
 	// Recovery, quarantine and bulk work.
 	tenant("GET /api/v1/recovery", s.handleRecovery)
+	operator("POST /api/v1/quarantines", s.handleQuarantineOpen)
 	operator("POST /api/v1/quarantines/{id}/close", s.handleQuarantineClose)
 	tenant("GET /api/v1/bulk", s.handleBulkList)
 	operator("POST /api/v1/bulk", s.handleBulkCreate)

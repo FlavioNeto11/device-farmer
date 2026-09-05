@@ -436,6 +436,15 @@ func TestUnknownTierIsRefusedNotFaked(t *testing.T) {
 // — and there is no database in `go test`.
 const opsSource = "../api/ops.go"
 
+// quarantineSource and parkSource are the operator routes that open a
+// quarantine and park a device. Both take devices out of allocation on a
+// human's say-so, which is exactly the kind of path a "tidy up the lease
+// while we're here" shortcut would be added to.
+const (
+	quarantineSource = "../api/quarantine.go"
+	parkSource       = "../api/park.go"
+)
+
 // TestQuarantineCloseReturnsDevicesToServiceInOneTransaction.
 //
 // Before this change the handler issued exactly one UPDATE — farm.quarantines
@@ -522,6 +531,7 @@ func TestQuarantineCloseOnlyFreesDevicesNoOtherQuarantineCovers(t *testing.T) {
 		"q.slot_id   = c.current_slot_id",
 		"q.hub_id    = c.hub_id",
 		"q.host_id   = c.host_id",
+		"q.power_domain_id = c.power_domain_id",
 	} {
 		if !strings.Contains(release, frag) {
 			t.Fatalf("the release statement no longer tests %q: closing one quarantine would "+
@@ -549,60 +559,120 @@ func TestQuarantineCloseOnlyFreesDevicesNoOtherQuarantineCovers(t *testing.T) {
 //     one phone's quarantine resets health, ladder_tier and admin_state for
 //     every quarantined device on the host.
 //
+// The scope vocabulary is read from the schema rather than repeated here, so
+// that a scope added to farm.quarantines.scope without an arm in every
+// predicate fails this test instead of quietly covering nothing. Migration
+// 00014 closed the last gap that way: 'power_domain' was in the CHECK from the
+// start, had no column, and every predicate carried a fallback arm for a row
+// shape that could not be written.
+//
 // Falsify: replace any scope-guarded arm with a bare column comparison, e.g.
-// `q.host_id = s.host_id` in coveredByQuarantine.
+// `q.host_id = s.host_id` in coveredByQuarantine; or delete the power_domain
+// arm from any one of the three statements.
 func TestQuarantineCoverageIsDecidedByScope(t *testing.T) {
+	scopes := quarantineScopes(t)
+
 	for _, tc := range []struct {
-		what     string
-		sql      string
-		arms     []string
-		fallback string
+		what string
+		sql  string
+		// arms is, per scope, every fragment that must be present.
+		arms map[string][]string
 	}{
 		{
 			what: "internal/recovery coveredByQuarantine",
 			sql:  coveredByQuarantine,
-			arms: []string{
-				"q.scope = 'device' AND q.device_id = d.id",
-				"q.scope = 'slot'   AND q.slot_id   = s.id",
-				"q.scope = 'hub'    AND q.hub_id    = s.hub_id",
-				"q.scope = 'host'   AND q.host_id   = s.host_id",
+			arms: map[string][]string{
+				"device":       {"q.scope = 'device' AND q.device_id = d.id"},
+				"slot":         {"q.scope = 'slot'   AND q.slot_id   = s.id"},
+				"hub":          {"q.scope = 'hub'    AND q.hub_id    = s.hub_id"},
+				"host":         {"q.scope = 'host'   AND q.host_id   = s.host_id"},
+				"power_domain": {"q.scope = 'power_domain' AND q.power_domain_id = s.power_domain_id"},
 			},
-			fallback: "q.scope NOT IN ('device','slot','hub','host')",
 		},
 		{
 			what: "the quarantine-close release statement",
 			sql:  funcBody(t, opsSource, "handleQuarantineClose"),
-			arms: []string{
-				// which devices the closed row covered
-				"$1::text = 'device' AND d.id = $2::uuid",
-				"$1::text = 'slot'   AND d.current_slot_id = $3::bigint",
-				"$1::text = 'hub'    AND s.hub_id = $4::bigint",
-				"$1::text = 'host'   AND s.host_id = $5::text",
-				// which devices another open row still covers
-				"q.scope = 'device' AND q.device_id = c.device_id",
-				"q.scope = 'slot'   AND q.slot_id   = c.current_slot_id",
-				"q.scope = 'hub'    AND q.hub_id    = c.hub_id",
-				"q.scope = 'host'   AND q.host_id   = c.host_id",
+			// First: which devices the closed row covered. Second: which
+			// devices another open row still covers.
+			arms: map[string][]string{
+				"device": {
+					"$1::text = 'device' AND d.id = $2::uuid",
+					"q.scope = 'device' AND q.device_id = c.device_id"},
+				"slot": {
+					"$1::text = 'slot'   AND d.current_slot_id = $3::bigint",
+					"q.scope = 'slot'   AND q.slot_id   = c.current_slot_id"},
+				"hub": {
+					"$1::text = 'hub'    AND s.hub_id = $4::bigint",
+					"q.scope = 'hub'    AND q.hub_id    = c.hub_id"},
+				"host": {
+					"$1::text = 'host'   AND s.host_id = $5::text",
+					"q.scope = 'host'   AND q.host_id   = c.host_id"},
+				"power_domain": {
+					"$1::text = 'power_domain' AND s.power_domain_id = $6::bigint",
+					"q.scope = 'power_domain' AND q.power_domain_id = c.power_domain_id"},
 			},
-			fallback: "q.scope NOT IN ('device','slot','hub','host')",
+		},
+		{
+			// The operator-open sweep decides which devices LEAVE allocation,
+			// and has to agree with the close about which ones come back.
+			what: "the quarantine-open sweep",
+			sql:  sourceText(t, quarantineSource),
+			arms: map[string][]string{
+				"device":       {"$1::text = 'device' AND d.id = $2::uuid"},
+				"slot":         {"$1::text = 'slot'   AND d.current_slot_id = $3::bigint"},
+				"hub":          {"$1::text = 'hub'    AND s.hub_id = $4::bigint"},
+				"host":         {"$1::text = 'host'   AND s.host_id = $5::text"},
+				"power_domain": {"$1::text = 'power_domain' AND s.power_domain_id = $6::bigint"},
+			},
 		},
 	} {
 		t.Run(tc.what, func(t *testing.T) {
-			for _, arm := range tc.arms {
-				if !strings.Contains(tc.sql, arm) {
-					t.Errorf("%s no longer guards a subject column by scope: missing %q. "+
-						"A scope='device' row carries host_id too, so an unguarded "+
-						"host_id comparison reads one broken phone as a whole-host "+
-						"quarantine", tc.what, arm)
+			for _, scope := range scopes {
+				arms, ok := tc.arms[scope]
+				if !ok {
+					t.Errorf("%s has no arm for scope %q, which farm.quarantines.scope permits. "+
+						"A row at that scope would cover nothing: no device leaves or "+
+						"returns to allocation, and no test here names it", tc.what, scope)
+					continue
 				}
-			}
-			if !strings.Contains(tc.sql, tc.fallback) {
-				t.Errorf("%s has no arm for a scope it cannot express (the table's CHECK "+
-					"allows 'power_domain', which has no column here). Such a row must "+
-					"over-cover, never be ignored", tc.what)
+				for _, arm := range arms {
+					if !strings.Contains(tc.sql, arm) {
+						t.Errorf("%s no longer guards a subject column by scope: missing %q. "+
+							"A scope='device' row carries host_id too, so an unguarded "+
+							"host_id comparison reads one broken phone as a whole-host "+
+							"quarantine", tc.what, arm)
+					}
+				}
 			}
 		})
 	}
+}
+
+// quarantineSchema is where farm.quarantines.scope is declared, and its CHECK
+// is the one list of scopes there is.
+const quarantineSchema = "../../migrations/00003_ops.sql"
+
+// quarantineScopes reads the scope vocabulary out of the CHECK constraint.
+func quarantineScopes(t *testing.T) []string {
+	t.Helper()
+
+	src := sourceText(t, quarantineSchema)
+	m := regexp.MustCompile(`scope\s+text\s+NOT NULL\s+CHECK\s*\(\s*scope\s+IN\s*\(([^)]+)\)\s*\)`).
+		FindStringSubmatch(src)
+	if m == nil {
+		t.Fatalf("%s no longer declares scope with a CHECK (scope IN (...)); the fidelity "+
+			"tests read the scope vocabulary from there", quarantineSchema)
+	}
+	var scopes []string
+	for _, raw := range strings.Split(m[1], ",") {
+		if s := strings.Trim(strings.TrimSpace(raw), "'"); s != "" {
+			scopes = append(scopes, s)
+		}
+	}
+	if len(scopes) < 2 {
+		t.Fatalf("parsed %d scope(s) from %s; the CHECK is not in the shape this test reads", len(scopes), quarantineSchema)
+	}
+	return scopes
 }
 
 // TestQuarantineClosesAreSerialised. Two quarantines can cover one device — an
@@ -674,7 +744,8 @@ var sqlStatement = regexp.MustCompile(`(?is)^\s*(with|select|insert|update|delet
 // device by taking it back — and none of them is taken.
 //
 // Falsify: add `UPDATE farm.leases SET state='released' WHERE ...` to any string
-// literal in internal/recovery or in the quarantine-close handler.
+// literal in internal/recovery, in the quarantine handlers, or in the park
+// handler.
 func TestRecoveryNeverTouchesALease(t *testing.T) {
 	const whyNot = "A lease ends when the job says so, when a user-written deadline elapses, " +
 		"or when a human takes it back. Nothing else, and recovery is none of those."
@@ -683,7 +754,7 @@ func TestRecoveryNeverTouchesALease(t *testing.T) {
 	if err != nil {
 		t.Fatalf("glob: %v", err)
 	}
-	files = append(files, opsSource)
+	files = append(files, opsSource, quarantineSource, parkSource)
 
 	for _, f := range files {
 		if strings.HasSuffix(f, "_test.go") {
@@ -763,6 +834,18 @@ func funcBody(t *testing.T, path, name string) string {
 	}
 	t.Fatalf("%s: no function %s — the fidelity tests are pinned to it by name", path, name)
 	return ""
+}
+
+// sourceText returns a file whole, for the checks that pin a package-level
+// constant rather than a function body.
+func sourceText(t *testing.T, path string) string {
+	t.Helper()
+
+	src, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return string(src)
 }
 
 // stringLiterals returns every string literal in a Go file, with raw and

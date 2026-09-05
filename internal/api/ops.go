@@ -1022,23 +1022,24 @@ SELECT t.tier, t.name, t.description, t.blast_radius, t.requires_policy,
 }
 
 type quarantineView struct {
-	ID       int64     `json:"id"`
-	Scope    string    `json:"scope"`
-	DeviceID *string   `json:"device_id,omitempty"`
-	FarmUID  *string   `json:"farm_uid,omitempty"`
-	SlotID   *int64    `json:"slot_id,omitempty"`
-	RackSlot *string   `json:"rack_slot,omitempty"`
-	HubID    *int64    `json:"hub_id,omitempty"`
-	HostID   *string   `json:"host_id,omitempty"`
-	Reason   string    `json:"reason"`
-	OpenedAt time.Time `json:"opened_at"`
-	Auto     bool      `json:"auto"`
+	ID            int64     `json:"id"`
+	Scope         string    `json:"scope"`
+	DeviceID      *string   `json:"device_id,omitempty"`
+	FarmUID       *string   `json:"farm_uid,omitempty"`
+	SlotID        *int64    `json:"slot_id,omitempty"`
+	RackSlot      *string   `json:"rack_slot,omitempty"`
+	HubID         *int64    `json:"hub_id,omitempty"`
+	HostID        *string   `json:"host_id,omitempty"`
+	PowerDomainID *int64    `json:"power_domain_id,omitempty"`
+	Reason        string    `json:"reason"`
+	OpenedAt      time.Time `json:"opened_at"`
+	Auto          bool      `json:"auto"`
 }
 
 func (s *Server) openQuarantines(ctx context.Context) ([]quarantineView, error) {
 	const q = `
 SELECT q.id, q.scope, q.device_id::text, d.farm_uid, q.slot_id, s.rack_slot, q.hub_id, q.host_id,
-       q.reason, q.opened_at, q.auto
+       q.power_domain_id, q.reason, q.opened_at, q.auto
   FROM farm.quarantines q
   LEFT JOIN farm.devices d ON d.id = q.device_id
   LEFT JOIN farm.slots   s ON s.id = q.slot_id
@@ -1055,7 +1056,7 @@ SELECT q.id, q.scope, q.device_id::text, d.farm_uid, q.slot_id, s.rack_slot, q.h
 	for rows.Next() {
 		var v quarantineView
 		if err := rows.Scan(&v.ID, &v.Scope, &v.DeviceID, &v.FarmUID, &v.SlotID, &v.RackSlot,
-			&v.HubID, &v.HostID, &v.Reason, &v.OpenedAt, &v.Auto); err != nil {
+			&v.HubID, &v.HostID, &v.PowerDomainID, &v.Reason, &v.OpenedAt, &v.Auto); err != nil {
 			return nil, err
 		}
 		out = append(out, v)
@@ -1119,15 +1120,16 @@ func (s *Server) handleQuarantineClose(w http.ResponseWriter, r *http.Request) {
 	who := actor(r.Context())
 
 	var (
-		scope     string
-		deviceID  *string
-		slotID    *int64
-		hubID     *int64
-		hostID    *string
-		openedFor string
-		openedAt  time.Time
-		released  int64 // devices whose health left 'quarantined'
-		reenabled int64 // devices whose admin_state left 'quarantined'
+		scope         string
+		deviceID      *string
+		slotID        *int64
+		hubID         *int64
+		hostID        *string
+		powerDomainID *int64
+		openedFor     string
+		openedAt      time.Time
+		released      int64 // devices whose health left 'quarantined'
+		reenabled     int64 // devices whose admin_state left 'quarantined'
 	)
 
 	tx, err := s.pool.Begin(r.Context())
@@ -1163,8 +1165,8 @@ func (s *Server) handleQuarantineClose(w http.ResponseWriter, r *http.Request) {
 UPDATE farm.quarantines
    SET closed_at = now(), closed_by = $2
  WHERE id = $1 AND closed_at IS NULL
-RETURNING scope, device_id::text, slot_id, hub_id, host_id, reason, opened_at`, id, who).
-		Scan(&scope, &deviceID, &slotID, &hubID, &hostID, &openedFor, &openedAt)
+RETURNING scope, device_id::text, slot_id, hub_id, host_id, power_domain_id, reason, opened_at`, id, who).
+		Scan(&scope, &deviceID, &slotID, &hubID, &hostID, &powerDomainID, &openedFor, &openedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			// Roll back before reading, so the follow-up query is not answered
@@ -1204,10 +1206,12 @@ RETURNING scope, device_id::text, slot_id, hub_id, host_id, reason, opened_at`, 
 	// admin_state for every quarantined device on the host. The two errors mask
 	// each other, which is exactly how a predicate like this survives.
 	//
-	// 'power_domain' is in the table's CHECK but has no column, so it cannot be
-	// expressed; the final arm falls back to whatever subject columns such a row
-	// does carry, which can only ever over-cover — the safe direction for a test
-	// whose answer decides whether a device stays out of service.
+	// There is one arm per scope the table's CHECK permits, and 00014 made that
+	// closed: a row must carry the subject column its scope names. A power
+	// domain covers every slot wired to the same switch, which is what makes the
+	// scope worth having on a ganged hub. The same five arms, in the same
+	// shape, are recovery's coveredByQuarantine; the fidelity tests there hold
+	// both copies to the scope list in the schema.
 	//
 	// health goes to 'unknown' and not 'healthy'. Closing a quarantine is a
 	// human saying "look again", not an observation: the allocator will not
@@ -1220,16 +1224,14 @@ RETURNING scope, device_id::text, slot_id, hub_id, host_id, reason, opened_at`, 
 	// somebody else's decision and closing a quarantine does not overrule them.
 	const release = `
 WITH covered AS (
-  SELECT d.id AS device_id, d.current_slot_id, s.hub_id, s.host_id
+  SELECT d.id AS device_id, d.current_slot_id, s.hub_id, s.host_id, s.power_domain_id
     FROM farm.devices d
     LEFT JOIN farm.slots s ON s.id = d.current_slot_id
    WHERE ($1::text = 'device' AND d.id = $2::uuid)
       OR ($1::text = 'slot'   AND d.current_slot_id = $3::bigint)
       OR ($1::text = 'hub'    AND s.hub_id = $4::bigint)
       OR ($1::text = 'host'   AND s.host_id = $5::text)
-      OR ($1::text NOT IN ('device','slot','hub','host')
-          AND (d.id = $2::uuid OR d.current_slot_id = $3::bigint
-               OR s.hub_id = $4::bigint OR s.host_id = $5::text))
+      OR ($1::text = 'power_domain' AND s.power_domain_id = $6::bigint)
 ), freed AS (
   SELECT c.device_id
     FROM covered c
@@ -1240,9 +1242,7 @@ WITH covered AS (
            OR (q.scope = 'slot'   AND q.slot_id   = c.current_slot_id)
            OR (q.scope = 'hub'    AND q.hub_id    = c.hub_id)
            OR (q.scope = 'host'   AND q.host_id   = c.host_id)
-           OR (q.scope NOT IN ('device','slot','hub','host')
-               AND (q.device_id = c.device_id OR q.slot_id = c.current_slot_id
-                    OR q.hub_id = c.hub_id OR q.host_id = c.host_id)) ))
+           OR (q.scope = 'power_domain' AND q.power_domain_id = c.power_domain_id) ))
 ), health AS (
   UPDATE farm.device_runtime r
      SET health = 'unknown', health_since = now(), ladder_tier = 0, updated_at = now()
@@ -1258,7 +1258,7 @@ WITH covered AS (
 )
 SELECT (SELECT count(*) FROM health), (SELECT count(*) FROM admin)`
 
-	if err := tx.QueryRow(r.Context(), release, scope, deviceID, slotID, hubID, hostID).
+	if err := tx.QueryRow(r.Context(), release, scope, deviceID, slotID, hubID, hostID, powerDomainID).
 		Scan(&released, &reenabled); err != nil {
 		s.fail(w, r, "close quarantine: return the devices to service", err)
 		return
@@ -1278,6 +1278,7 @@ SELECT (SELECT count(*) FROM health), (SELECT count(*) FROM admin)`
 		"slot_id":           slotID,
 		"hub_id":            hubID,
 		"host_id":           hostID,
+		"power_domain_id":   powerDomainID,
 		"devices_released":  released,
 		"devices_reenabled": reenabled,
 	}

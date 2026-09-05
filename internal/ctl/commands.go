@@ -258,17 +258,18 @@ type hostListResponse struct {
 }
 
 type quarantine struct {
-	ID       int64     `json:"id"`
-	Scope    string    `json:"scope"`
-	DeviceID *string   `json:"device_id"`
-	FarmUID  *string   `json:"farm_uid"`
-	SlotID   *int64    `json:"slot_id"`
-	RackSlot *string   `json:"rack_slot"`
-	HubID    *int64    `json:"hub_id"`
-	HostID   *string   `json:"host_id"`
-	Reason   string    `json:"reason"`
-	OpenedAt time.Time `json:"opened_at"`
-	Auto     bool      `json:"auto"`
+	ID            int64     `json:"id"`
+	Scope         string    `json:"scope"`
+	DeviceID      *string   `json:"device_id"`
+	FarmUID       *string   `json:"farm_uid"`
+	SlotID        *int64    `json:"slot_id"`
+	RackSlot      *string   `json:"rack_slot"`
+	HubID         *int64    `json:"hub_id"`
+	HostID        *string   `json:"host_id"`
+	PowerDomainID *int64    `json:"power_domain_id"`
+	Reason        string    `json:"reason"`
+	OpenedAt      time.Time `json:"opened_at"`
+	Auto          bool      `json:"auto"`
 }
 
 type recoveryTier struct {
@@ -1815,11 +1816,13 @@ func cmdRecovery(ctx context.Context, s *session, args []string) error {
 
 // quarantineWhere renders a quarantine's position.
 //
-// A hub- or host-scoped quarantine covers no single rack slot, and printing
-// "(unslotted)" for it would claim something false about hardware — that a
-// device is off the rack — when the row is not about a device at all. It names
-// the blast radius instead, which is also the thing an operator needs to see:
-// one quarantine covering a whole hub is six phones nobody can schedule.
+// A hub-, host- or power-domain-scoped quarantine covers no single rack slot,
+// and printing "(unslotted)" for it would claim something false about hardware
+// — that a device is off the rack — when the row is not about a device at all.
+// It names the blast radius instead, which is also the thing an operator needs
+// to see: one quarantine covering a whole hub is six phones nobody can
+// schedule, and one covering a ganged power domain is every port on that
+// switch.
 func quarantineWhere(q quarantine) string {
 	if q.RackSlot != nil && strings.TrimSpace(*q.RackSlot) != "" {
 		return *q.RackSlot
@@ -1829,6 +1832,11 @@ func quarantineWhere(q quarantine) string {
 		return "(whole hub)"
 	case "host":
 		return "(whole host)"
+	case "power_domain":
+		if q.PowerDomainID != nil {
+			return fmt.Sprintf("(power domain %d)", *q.PowerDomainID)
+		}
+		return "(whole power domain)"
 	}
 	return unslotted
 }

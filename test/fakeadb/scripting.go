@@ -177,6 +177,8 @@ type script struct {
 	devpath string // "" matches any device
 	prefix  string // service prefix, e.g. "shell:getprop "
 	payload string
+	// fn, when set, computes the payload from the service string instead.
+	fn func(service string) string
 }
 
 // Echo is the default payload a device service returns: the device's identity
@@ -198,7 +200,35 @@ func (s *Server) Respond(devpath, servicePrefix, payload string) {
 	s.mu.Unlock()
 }
 
+// RespondWith scripts a device service whose answer depends on what the device
+// was told earlier — a file on the phone that reads back what the previous
+// command wrote, which is what a brand looks like from the wire. fn receives
+// the whole service string and returns the payload. It is called outside the
+// server's lock, so it may keep its own state under its own lock, and it may
+// call back into the server.
+//
+//	srv.RespondWith(devpath, "shell,v2,raw:", func(svc string) string { ... })
+func (s *Server) RespondWith(devpath, servicePrefix string, fn func(service string) string) {
+	s.mu.Lock()
+	s.scripts = append(s.scripts, script{devpath: devpath, prefix: servicePrefix, fn: fn})
+	s.mu.Unlock()
+}
+
 func (s *Server) scriptFor(d Device, service string) []byte {
+	sc, ok := s.matchScript(d, service)
+	switch {
+	case !ok:
+		return []byte(Echo(d, service))
+	case sc.fn != nil:
+		return []byte(sc.fn(service))
+	}
+	return []byte(sc.payload)
+}
+
+// matchScript picks the most recently registered script that applies. The
+// lock is released before a scripted function runs, so the function is free
+// to consult or change the server.
+func (s *Server) matchScript(d Device, service string) (script, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for i := len(s.scripts) - 1; i >= 0; i-- {
@@ -209,9 +239,9 @@ func (s *Server) scriptFor(d Device, service string) []byte {
 		if sc.prefix != "" && !strings.HasPrefix(service, sc.prefix) {
 			continue
 		}
-		return []byte(sc.payload)
+		return sc, true
 	}
-	return []byte(Echo(d, service))
+	return script{}, false
 }
 
 // ---------------------------------------------------------------------

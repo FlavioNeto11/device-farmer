@@ -1199,6 +1199,19 @@ type bulkSelector struct {
 	// default: a bulk shell across the farm that lands inside somebody's
 	// six-hour run is the most expensive mistake this endpoint can make.
 	IncludeLeased bool `json:"include_leased,omitempty"`
+
+	// IncludeUnhealthy reaches devices whose health is anything other than
+	// healthy — offline, unauthorized, recovering, missing, retired, or never
+	// observed at all. Off by default; see bulkSelectorWhere for why health is
+	// an exclusion and not merely an optional filter.
+	IncludeUnhealthy bool `json:"include_unhealthy,omitempty"`
+
+	// IncludeQuarantined reaches devices covered by an open quarantine. Off by
+	// default, and separate from IncludeUnhealthy on purpose: a quarantine is
+	// somebody else's active claim on the hardware, not a property of the
+	// device, and an operator who wants to shell into a degraded handset has
+	// not thereby asked to interrupt the recovery ladder mid-cycle.
+	IncludeQuarantined bool `json:"include_quarantined,omitempty"`
 }
 
 type bulkCreateRequest struct {
@@ -1379,21 +1392,67 @@ func targetArrays(ts []bulkTarget) ([]string, []*int64) {
 // touched.
 const bulkSelectorLimit = 1000
 
-// expandBulkSelector resolves a selector into addressable targets, separating
-// out the devices that hold a live lease.
-func (s *Server) expandBulkSelector(ctx context.Context, sel bulkSelector) (targets, skipped []bulkTarget, err error) {
-	var (
-		conds = []string{
-			"f.adb_devpath IS NOT NULL",
-			"f.adb_endpoint IS NOT NULL",
-			"f.admin_state = 'enabled'",
-		}
-		args []any
-	)
+// bulkSelectorWhere renders a selector as WHERE conditions over farm.v_fleet,
+// with the arguments they reference.
+//
+// # Health and quarantine are EXCLUSIONS, not filters
+//
+// The first three conditions ask whether a device is addressable at all: we
+// know where it is on the USB tree, we know which ADB server to reach it
+// through, and an operator has not administratively disabled it. Everything
+// after them used to be a filter the caller opted into, health included — which
+// meant the default population of a bulk command was every attached device
+// regardless of its state, and a plain {"selector":{}} sprayed a shell across
+// handsets that were offline, unauthorized, mid-reboot, or sitting under an
+// open quarantine with the recovery ladder actively power-cycling them.
+//
+// That is wrong twice over. A command sent to a device that cannot answer is a
+// timeout the operator then has to read past to find the results they wanted,
+// so the run is worse than if those devices had never been in it. And a command
+// sent to a device the ladder is working on is a second writer on hardware
+// mid-remediation: it can hold the transport open across a reset the ladder is
+// counting on, so an operator investigating an incident manufactures the next
+// one.
+//
+// So both are excluded by default and each has its own opt-in, because they are
+// different facts:
+//
+//   - health is a property of the device. Naming a health explicitly IS the
+//     opt-in — a caller asking for health "offline" has said exactly which
+//     population they want, and quietly ANDing "healthy" onto that would match
+//     nothing and read as a bug. include_unhealthy lifts the default for a
+//     caller who wants every health at once. Note that unobserved devices have
+//     a NULL health here (v_fleet LEFT JOINs farm.device_runtime) and "never
+//     seen" is not "known good", so the default equality excludes them too.
+//   - quarantine is somebody else's claim. Only include_quarantined lifts it,
+//     whatever health was asked for. f.quarantine_id covers every scope the
+//     view resolves, so a hub- or host-wide quarantine keeps bulk work off
+//     every device under it and not merely off the device row it names.
+//
+// None of this touches a lease. Leased devices are still separated out by
+// expandBulkSelector into `skipped`, and no condition here can end, shorten or
+// otherwise disturb a lease that exists.
+func bulkSelectorWhere(sel bulkSelector) (conds []string, args []any) {
+	conds = []string{
+		"f.adb_devpath IS NOT NULL",
+		"f.adb_endpoint IS NOT NULL",
+		"f.admin_state = 'enabled'",
+	}
 	add := func(format, value string) {
 		args = append(args, value)
 		conds = append(conds, fmt.Sprintf(format, len(args)))
 	}
+
+	if !sel.IncludeQuarantined {
+		conds = append(conds, "f.quarantine_id IS NULL")
+	}
+	switch {
+	case sel.Health != "":
+		add("f.health = $%d", sel.Health)
+	case !sel.IncludeUnhealthy:
+		conds = append(conds, "f.health = 'healthy'")
+	}
+
 	if sel.Pool != "" {
 		add("f.pool_id = $%d", sel.Pool)
 	}
@@ -1404,9 +1463,6 @@ func (s *Server) expandBulkSelector(ctx context.Context, sel bulkSelector) (targ
 		args = append(args, sel.Hub)
 		conds = append(conds, fmt.Sprintf("(f.hub_path = $%d OR f.hub_id::text = $%d)", len(args), len(args)))
 	}
-	if sel.Health != "" {
-		add("f.health = $%d", sel.Health)
-	}
 	if sel.Model != "" {
 		add("f.model ILIKE '%%' || $%d || '%%'", sel.Model)
 	}
@@ -1415,6 +1471,18 @@ func (s *Server) expandBulkSelector(ctx context.Context, sel bulkSelector) (targ
 		conds = append(conds, fmt.Sprintf("(f.device_id::text = ANY($%d) OR f.farm_uid = ANY($%d))",
 			len(args), len(args)))
 	}
+	return conds, args
+}
+
+// expandBulkSelector resolves a selector into addressable targets, separating
+// out the devices that hold a live lease.
+//
+// Devices excluded by bulkSelectorWhere — quarantined, or not healthy — do not
+// appear in either return value: they did not match the selector, in the same
+// way an admin-disabled device does not. Only a leased device is reported as
+// skipped, because that one was matched and then declined.
+func (s *Server) expandBulkSelector(ctx context.Context, sel bulkSelector) (targets, skipped []bulkTarget, err error) {
+	conds, args := bulkSelectorWhere(sel)
 
 	query := fmt.Sprintf(`
 SELECT f.device_id::text, f.hub_id, f.adb_endpoint, f.adb_devpath, f.lease_id::text, f.job_id::text

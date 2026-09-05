@@ -218,7 +218,6 @@ type lease struct {
 	TenantID         string     `json:"tenant_id"`
 	QueueID          string     `json:"queue_id"`
 	Holder           string     `json:"holder"`
-	HolderInstance   string     `json:"holder_instance"`
 	Protected        bool       `json:"protected"`
 	DisruptionPolicy string     `json:"disruption_policy"`
 	AcquiredAt       time.Time  `json:"acquired_at"`
@@ -1839,13 +1838,21 @@ func quarantineWhere(q quarantine) string {
 // ---------------------------------------------------------------------------
 
 type bulkSelector struct {
-	Pool          string   `json:"pool,omitempty"`
-	Host          string   `json:"host,omitempty"`
-	Hub           string   `json:"hub,omitempty"`
-	Health        string   `json:"health,omitempty"`
-	Model         string   `json:"model,omitempty"`
-	DeviceIDs     []string `json:"device_ids,omitempty"`
-	IncludeLeased bool     `json:"include_leased,omitempty"`
+	Pool      string   `json:"pool,omitempty"`
+	Host      string   `json:"host,omitempty"`
+	Hub       string   `json:"hub,omitempty"`
+	Health    string   `json:"health,omitempty"`
+	Model     string   `json:"model,omitempty"`
+	DeviceIDs []string `json:"device_ids,omitempty"`
+
+	IncludeLeased bool `json:"include_leased,omitempty"`
+	// The server excludes devices that are not healthy, and devices under an
+	// open quarantine, before it addresses anything. Both are mirrored here so
+	// the CLI can express what the API can: an operator waking a shelf of
+	// offline handsets needs include-unhealthy, and without a flag for it the
+	// only interface that could reach them would be curl.
+	IncludeUnhealthy   bool `json:"include_unhealthy,omitempty"`
+	IncludeQuarantined bool `json:"include_quarantined,omitempty"`
 }
 
 type bulkCreateRequest struct {
@@ -1872,7 +1879,8 @@ func cmdBulk(ctx context.Context, s *session, args []string) error {
 	g.bind(fs)
 	g.bindDestructive(fs)
 	var selectors repeatable
-	fs.Var(&selectors, "selector", "k=v; repeatable. Keys: pool, host, hub, health, model, device, include-leased")
+	fs.Var(&selectors, "selector", "k=v; repeatable. Keys: pool, host, hub, health, model, device, "+
+		"include-leased, include-unhealthy, include-quarantined")
 	maxPerHub := fs.Int("max-per-hub", 4, "how many devices on one hub may answer at once")
 	execTimeout := fs.Duration("exec-timeout", 30*time.Second, "how long each command may run on a device")
 	follow := fs.Bool("follow", true, "stream results until the run finishes")
@@ -1907,12 +1915,30 @@ func cmdBulk(ctx context.Context, s *session, args []string) error {
 	f.Add("selector", selectors.String())
 	f.Addf("max per hub", "%d  (a hub answering all at once browns out its power domain and "+
 		"manufactures the incident you are investigating)", *maxPerHub)
-	preview, leased, truncated := e.previewSelector(ctx, sel)
+	preview, leased, excluded, truncated := e.previewSelector(ctx, sel)
 	if truncated {
 		f.Addf("matches", "AT LEAST %d device(s) — the preview hit its own limit, so the real "+
 			"blast radius is larger than this", len(preview))
 	} else {
 		f.Addf("matches", "%d device(s)", len(preview))
+	}
+	if excluded > 0 {
+		// Named rather than silently subtracted. A device that is offline or
+		// mid-recovery is not addressable work, but an operator who expected
+		// forty and is being shown three must be told which rule took the rest
+		// — and which selector key gives them back.
+		f.Addf("excluded", "%d device(s) the selector matched are not healthy or are under an "+
+			"open quarantine, and are NOT addressed. Add --selector include-unhealthy=true or "+
+			"--selector include-quarantined=true to reach them", excluded)
+	}
+	if len(preview) == 0 && excluded > 0 {
+		return fmt.Errorf("every device this selector matched is excluded: %d not healthy or "+
+			"quarantined. Nothing would run. Add --selector include-unhealthy=true or "+
+			"--selector include-quarantined=true if you meant to reach them", excluded)
+	}
+	if sel.IncludeQuarantined {
+		f.Add("quarantined", "INCLUDED — the recovery ladder may be power-cycling these devices "+
+			"while your command runs on them")
 	}
 	if sel.IncludeLeased {
 		f.Addf("of which leased", "%d — include-leased is ON, so these WILL be disturbed mid-run", leased)
@@ -2126,12 +2152,46 @@ func parseSelectors(raw []string) (bulkSelector, error) {
 				return sel, usageErrf("--selector include-leased takes true or false, not %q", value)
 			}
 			sel.IncludeLeased = b
+		case "include-unhealthy", "include_unhealthy":
+			b, err := strconv.ParseBool(value)
+			if err != nil {
+				return sel, usageErrf("--selector include-unhealthy takes true or false, not %q", value)
+			}
+			sel.IncludeUnhealthy = b
+		case "include-quarantined", "include_quarantined":
+			b, err := strconv.ParseBool(value)
+			if err != nil {
+				return sel, usageErrf("--selector include-quarantined takes true or false, not %q", value)
+			}
+			sel.IncludeQuarantined = b
 		default:
 			return sel, usageErrf("unknown selector key %q; use pool, host, hub, health, model, "+
-				"device or include-leased", key)
+				"device, include-leased, include-unhealthy or include-quarantined", key)
 		}
 	}
 	return sel, nil
+}
+
+// bulkExcludes reports whether the server will refuse to address this device
+// for the given selector, and why in operator words.
+//
+// It mirrors the two exclusions in the API's own selector expansion. Keeping
+// the preflight in step matters more than it looks: the operator approves a
+// blast radius from the number in front of them, and a preview that counted
+// devices the server then declined would over-report every run against a shelf
+// that had gone offline — or promise seven devices and touch three.
+func bulkExcludes(sel bulkSelector, health *string, quarantineID *int64) (bool, string) {
+	if quarantineID != nil && !sel.IncludeQuarantined {
+		return true, "quarantined"
+	}
+	// Naming a health explicitly is itself the opt-in, exactly as on the
+	// server; a device whose health was never observed is not known good.
+	if sel.Health == "" && !sel.IncludeUnhealthy {
+		if health == nil || *health != "healthy" {
+			return true, "not healthy"
+		}
+	}
+	return false, ""
 }
 
 // previewSelector resolves the selector against the fleet so the confirmation
@@ -2140,7 +2200,11 @@ func parseSelectors(raw []string) (bulkSelector, error) {
 // It is best effort and says so: the server expands the selector itself, and a
 // preview that disagreed would not change what the run does. What it must never
 // do is under-report, so a failure here is reported rather than swallowed.
-func (e *env) previewSelector(ctx context.Context, sel bulkSelector) (racks []string, leased int, truncated bool) {
+//
+// excluded counts the devices the selector matched and the server will not
+// address, so an operator whose run is about to be empty is told which rule
+// emptied it rather than reading "matched no addressable devices" and guessing.
+func (e *env) previewSelector(ctx context.Context, sel bulkSelector) (racks []string, leased, excluded int, truncated bool) {
 	q := url.Values{}
 	setIf(q, "pool", sel.Pool)
 	setIf(q, "host", sel.Host)
@@ -2158,21 +2222,31 @@ func (e *env) previewSelector(ctx context.Context, sel bulkSelector) (racks []st
 				racks = append(racks, unknownSlot)
 				continue
 			}
+			// Naming a device by id is not an override: the server applies the
+			// same exclusions however the device was selected.
+			if skip, _ := bulkExcludes(sel, d.Device.Health, d.Device.QuarantineID); skip {
+				excluded++
+				continue
+			}
 			racks = append(racks, rackSlotOf(d.Device.RackSlot))
 			if d.Device.Lease != nil {
 				leased++
 			}
 		}
-		return racks, leased, false
+		return racks, leased, excluded, false
 	}
 
 	resp, _, err := fetch[fleetResponse](ctx, e.client, apiPrefix+"/fleet", q)
 	if err != nil {
 		e.warnf("could not preview the selector (%v); the server will expand it and you will "+
 			"be told the count before anything runs", err)
-		return nil, 0, false
+		return nil, 0, 0, false
 	}
 	for _, d := range resp.Devices {
+		if skip, _ := bulkExcludes(sel, d.Health, d.QuarantineID); skip {
+			excluded++
+			continue
+		}
 		racks = append(racks, rackSlotOf(d.RackSlot))
 		if d.Lease != nil {
 			leased++
@@ -2182,7 +2256,7 @@ func (e *env) previewSelector(ctx context.Context, sel bulkSelector) (racks []st
 	// "1000 devices" when the selector matches four thousand is the one
 	// failure mode this preflight must not have: an operator approves a blast
 	// radius on the number in front of them.
-	return racks, leased, resp.Truncated
+	return racks, leased, excluded, resp.Truncated
 }
 
 // ---------------------------------------------------------------------------

@@ -25,6 +25,7 @@ DO $$
 DECLARE
   v_dev   uuid;
   v_dev2  uuid;
+  v_dev3  uuid;
   v_res   text;
   v_cnt   int;
   v_job   uuid;
@@ -51,16 +52,32 @@ BEGIN
   -- A fingerprint claimed by two devices must identify neither: not a
   -- crash, and not an arbitrary pick between them. Adopt a second device
   -- on the other host, then make it collide.
+  --
+  -- The expected word changed in 00011_resolve_ambiguous.sql, and the
+  -- assertion this line makes did not. "Identifies neither" was always
+  -- the claim; 'adopted_new' was only how the old function happened to
+  -- SAY it — rung 2 set 'ambiguous' and rung 4 overwrote it on the way
+  -- past, so the caller was told the fleet had never seen this device
+  -- when in fact two of its rows collide with it. A fingerprint has no
+  -- flag column of its own, so that answer was the only record the
+  -- collision happened at all. It now reports 'ambiguous' and still
+  -- adopts, which is why device_id is checked here too.
   SELECT device_id INTO v_dev2 FROM farm.resolve_device(
     'h02','3-1.1', NULL, '\x3344'::bytea, 'SER-B', 'default', '{}'::jsonb);
   UPDATE farm.devices SET hw_fingerprint = '\x1122'::bytea WHERE id = v_dev2;
 
-  SELECT resolution INTO v_res FROM farm.resolve_device(
+  SELECT device_id, resolution INTO v_dev3, v_res FROM farm.resolve_device(
     'h01','3-1.2', NULL, '\x1122'::bytea, NULL, 'default', '{}'::jsonb);
-  IF v_res <> 'adopted_new' THEN
-    RAISE EXCEPTION 'V1 FAILED: a fingerprint claimed by two devices resolved to one (%)', v_res;
+  IF v_res = 'hw_fingerprint' THEN
+    RAISE EXCEPTION 'V1 FAILED: a fingerprint claimed by two devices identified one of them';
   END IF;
-  RAISE NOTICE 'V1b ok  a fingerprint claimed by two devices identifies neither';
+  IF v_res <> 'ambiguous' THEN
+    RAISE EXCEPTION 'V1 FAILED: a fingerprint claimed by two devices resolved as % (expected ambiguous)', v_res;
+  END IF;
+  IF v_dev3 IS NULL OR v_dev3 IN (v_dev, v_dev2) THEN
+    RAISE EXCEPTION 'V1 FAILED: the contested fingerprint did not adopt a distinct device';
+  END IF;
+  RAISE NOTICE 'V1b ok  a fingerprint claimed by two devices identifies neither, and says so';
 
   -- ============================================================
   -- V2  An unknown selector key is REFUSED at acquire.

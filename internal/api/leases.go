@@ -22,6 +22,37 @@ import (
 // Every deadline in this system belongs to the database clock; a countdown
 // computed from a client's wall clock would be a second source of truth about
 // when a lease ends, and the whole design has exactly one.
+//
+// # holder_instance is deliberately absent
+//
+// farm.lease_renew matches on the triple (id, fence, holder_instance), and the
+// first two are already public: GET /api/v1/fleet and the event stream both
+// carry lease_id and fence for every live lease in the farm. holder_instance is
+// the only member of that triple that is not, which makes it a bearer
+// capability rather than a description — whoever holds all three can renew a
+// lease that is not theirs, keeping a device pinned to somebody else's job past
+// the point its real holder stopped asking for it.
+//
+// So it is not listed. Not to operators either, and not only to the lease's own
+// holder:
+//
+//   - An operator gains nothing. The value's only legitimate reader is the
+//     holder, which was handed it by POST /api/v1/leases/acquire (minted there
+//     when the caller omitted one) and must keep it for the life of the lease;
+//     it never needs to read it back from a list. A field nobody reads and
+//     everybody can see is a credential waiting to be copied into a screenshot,
+//     a log line, a dashboard or a support dump.
+//   - "Only to its own holder" is not implementable here and would be circular
+//     if it were. A caller's identity is a token with a role and a tenant, not
+//     a holder_instance; the only way to prove you are the holder is to present
+//     the very value you would be asking for.
+//
+// The handling of release, below, already states this as a fact it relies on —
+// that renew "additionally requires holder_instance, which is returned only to
+// the acquirer and is never exposed by a farm-wide view". Selecting it into
+// every list response made that sentence false. Nothing about withholding it
+// can end or shorten a lease: renewal EXTENDS a deadline, and the holder that
+// legitimately renews already has the value.
 type leaseView struct {
 	ID               string     `json:"id"`
 	Fence            int64      `json:"fence"`
@@ -35,7 +66,6 @@ type leaseView struct {
 	TenantID         string     `json:"tenant_id"`
 	QueueID          string     `json:"queue_id"`
 	Holder           string     `json:"holder"`
-	HolderInstance   string     `json:"holder_instance"`
 	HolderEpoch      int        `json:"holder_epoch"`
 	Protected        bool       `json:"protected"`
 	DisruptionPolicy string     `json:"disruption_policy"`
@@ -54,9 +84,12 @@ type leaseView struct {
 	ReleaseReason    *string    `json:"release_reason,omitempty"`
 }
 
+// leaseColumns is the projection every lease listing shares. l.holder_instance
+// is not in it and must not be added: see leaseView. holder_epoch is, because
+// it counts re-attachments and names no secret.
 const leaseColumns = `
   l.id::text, l.fence, l.state, l.device_id::text, d.farm_uid, l.slot_id, s.rack_slot, d.host_id,
-  l.job_id::text, l.tenant_id, l.queue_id, l.holder, l.holder_instance::text, l.holder_epoch,
+  l.job_id::text, l.tenant_id, l.queue_id, l.holder, l.holder_epoch,
   l.protected, l.disruption_policy,
   EXTRACT(EPOCH FROM l.ttl)::bigint, EXTRACT(EPOCH FROM l.grace)::bigint,
   l.acquired_at, l.heartbeat_at, l.heartbeat_seq, l.expires_at, l.reclaimable_at,
@@ -73,7 +106,7 @@ func scanLease(sc scanner) (leaseView, error) {
 	var v leaseView
 	err := sc.Scan(
 		&v.ID, &v.Fence, &v.State, &v.DeviceID, &v.FarmUID, &v.SlotID, &v.RackSlot, &v.HostID,
-		&v.JobID, &v.TenantID, &v.QueueID, &v.Holder, &v.HolderInstance, &v.HolderEpoch,
+		&v.JobID, &v.TenantID, &v.QueueID, &v.Holder, &v.HolderEpoch,
 		&v.Protected, &v.DisruptionPolicy, &v.TTLSeconds, &v.GraceSeconds,
 		&v.AcquiredAt, &v.HeartbeatAt, &v.HeartbeatSeq, &v.ExpiresAt, &v.ReclaimableAt,
 		&v.ExpiresInS, &v.ReclaimableInS,

@@ -648,16 +648,40 @@ func (e *Enroller) record(ctx context.Context, h hostRow, id Identity, hasSlot b
 	// that filters on ABI, like a device that runs no native code at all.
 	e.writeABIs(ctx, devID, id.ABIs, log)
 
-	if resolution == ResolutionAdoptedNew {
+	// A device joining the fleet is a timeline event whether or not the
+	// evidence it joined on was clean.
+	//
+	// farm.resolve_device returns 'ambiguous' ONLY from its adoption branch
+	// (see migrations/00011_resolve_ambiguous.sql): every rung that can detect
+	// a collision — a fingerprint or a serial claimed by more than one device —
+	// names no device by definition, so the row is created either way and the
+	// word describes the evidence, not a half-finished write. Gating this on
+	// 'adopted_new' alone meant a tray of clone-serial handsets — duplicate OEM
+	// serials being real, which is why farm.slots addresses by devpath — was
+	// genuinely adopted, branded and put to work while /api/v1/events said no
+	// device had joined and farm_enroll_adopted_total under-counted the fleet.
+	if resolution == ResolutionAdoptedNew || resolution == ResolutionAmbiguous {
+		contested := resolution == ResolutionAmbiguous
 		adoptedTotal.Inc()
-		log.Info("ADOPTED a new device: nothing the fleet already knew matched it",
-			"device", devID, "usb_path", id.USBPath, "serial", truncate(id.Serial, 64),
-			"model", truncate(id.Model, 64), "fingerprint_keys", id.FingerprintKeys)
+		if contested {
+			log.Warn("ADOPTED a device on CONTESTED evidence: another device in this fleet claims "+
+				"the same serial or hardware fingerprint, so this row was created rather than "+
+				"matched; a human should confirm the two are really different handsets",
+				"device", devID, "usb_path", id.USBPath, "serial", truncate(id.Serial, 64),
+				"model", truncate(id.Model, 64), "fingerprint_keys", id.FingerprintKeys)
+		} else {
+			log.Info("ADOPTED a new device: nothing the fleet already knew matched it",
+				"device", devID, "usb_path", id.USBPath, "serial", truncate(id.Serial, 64),
+				"model", truncate(id.Model, 64), "fingerprint_keys", id.FingerprintKeys)
+		}
 		e.event(ctx, "device_adopted", devID, slotID, map[string]any{
 			"host": h.ID, "usb_path": id.USBPath,
 			"serial": truncate(id.Serial, 64), "model": truncate(id.Model, 64),
 			"manufacturer":    truncate(id.Manufacturer, 64),
 			"had_fingerprint": len(id.HWFingerprint) > 0,
+			// The observation row carries the full evidence; this flag is what
+			// makes the collision visible on the timeline itself.
+			"ambiguous": contested,
 		}, log)
 	}
 
@@ -1171,7 +1195,9 @@ var (
 
 	adoptedTotal = prometheus.NewCounter(prometheus.CounterOpts{
 		Namespace: "farm", Subsystem: "enroll", Name: "adopted_total",
-		Help: "Devices adopted into farm.devices because nothing known matched them.",
+		Help: "Devices adopted into farm.devices because nothing known matched them. Counts the " +
+			"adoptions made on contested evidence too (resolutions_total{resolution=\"ambiguous\"}), " +
+			"since those are devices joining the fleet as much as any other.",
 	})
 
 	brandsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{

@@ -186,6 +186,11 @@ func newRegistry(log *slog.Logger) (*prometheus.Registry, error) {
 	// describes nothing off Linux, so half the collision does not exist there.
 	// A metrics decision that behaves differently per GOOS has to be exercised
 	// on the GOOS that runs it.
+	//
+	// It was found twice over, independently, and both times by running the
+	// binary rather than by reading it: once by scripts/linux-acceptance.sh and
+	// once as the FIRST thing test/e2e caught, because the acceptance harness is
+	// the only test that starts the shipped binary as a process.
 	for _, c := range []prometheus.Collector{
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 		collectors.NewGoCollector(),

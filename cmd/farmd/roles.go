@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
@@ -56,6 +57,28 @@ func newLogger(cfg *config.Config, w io.Writer) *slog.Logger {
 
 // openPool connects and verifies the connection before the role starts, so a
 // bad DSN fails at startup rather than on the first request.
+//
+// With FARM_DB_ROLE set, every physical connection executes SET ROLE before
+// the pool hands it out. That is what puts the role firewall of
+// migrations/00002_lease.sql in force for the whole process rather than for
+// the three functions that carry their own SET: a reaper started as
+// farm_reaper cannot read farm.device_runtime from ANY statement it runs, not
+// only from inside farm.lease_reclaim.
+//
+// SET ROLE is a session setting, so it survives every Acquire and Release on
+// that connection; AfterConnect runs once per connection and that is enough.
+// AfterRelease is deliberately NOT used to RESET ROLE. The reset would undo
+// the one SET the connection ever received, so from its second acquisition on
+// the connection would run as the login user — a firewall in force for
+// exactly one acquisition per connection. Re-issuing SET ROLE in BeforeAcquire
+// would repair that at a round trip per acquire and buy nothing: every
+// acquirer in this process is the same role, so there is nobody to reset
+// between. One SET per connection, kept for its life, is the whole mechanism.
+//
+// A refused SET ROLE — the login user is not a member of the role, which is
+// the grant migration 00015 makes — surfaces from Ping and the role does not
+// start. Starting anyway would mean running as the login user while the
+// startup summary says otherwise.
 func openPool(ctx context.Context, cfg *config.Config) (*pgxpool.Pool, error) {
 	pc, err := pgxpool.ParseConfig(cfg.DatabaseURL)
 	if err != nil {
@@ -63,6 +86,16 @@ func openPool(ctx context.Context, cfg *config.Config) (*pgxpool.Pool, error) {
 	}
 	if cfg.DBMaxConns > 0 {
 		pc.MaxConns = cfg.DBMaxConns
+	}
+	if cfg.DBRole != "" {
+		stmt := "SET ROLE " + pgx.Identifier{cfg.DBRole}.Sanitize()
+		pc.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
+			if _, err := conn.Exec(ctx, stmt); err != nil {
+				return fmt.Errorf("%s refused — the login user must be a member of %s, "+
+					"which migration 00015 grants: %w", stmt, cfg.DBRole, err)
+			}
+			return nil
+		}
 	}
 
 	dialCtx, cancel := context.WithTimeout(ctx, cfg.DBConnectTimeout)

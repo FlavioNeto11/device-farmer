@@ -706,8 +706,9 @@ func runNode(ctx context.Context, cfg *config.Config, log *slog.Logger, pool *pg
 			"physical host, and guessing which one would attach a rack of phones to the wrong row")
 	}
 
-	// The naming map is checked before the bus is opened: a collision in it
-	// is a mistake in a file, and reporting it should not wait on hardware.
+	// The naming map is read here and judged by topo.New below, both before
+	// the first pass: a collision in it is a mistake in a file, and a file
+	// should fail the process that was given it, not every scan after.
 	overrides, err := topo.LoadOverrides(cfg.Topo.OverridesPath)
 	if err != nil {
 		return fmt.Errorf("%s: %w", config.EnvTopoOverrides, err)

@@ -88,8 +88,12 @@ type Overrides struct {
 // An empty path is no overrides. Unknown keys are refused rather than
 // skipped, because a file that spells "hubTokens" would otherwise load as an
 // empty map and every label on the host would quietly fall back to the derived
-// scheme. The map is checked the way NewLabeler checks it, so a collision is a
-// startup error for the node and not a failed pass every five minutes.
+// scheme.
+//
+// This reads the file and judges its shape; it does not judge the map. The
+// values come back as written, and [New] sanitises them and refuses the ones
+// that collide — once, when the process starts, and in one place, so that a
+// map built in code and a map read from a file are held to the same rule.
 func LoadOverrides(path string) (Overrides, error) {
 	if path == "" {
 		return Overrides{}, nil
@@ -112,16 +116,13 @@ func LoadOverrides(path string) (Overrides, error) {
 	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
 		return Overrides{}, fmt.Errorf("topo: overrides %s: trailing data after the JSON object", path)
 	}
-	clean, err := normalizeOverrides(ov)
-	if err != nil {
-		return Overrides{}, fmt.Errorf("overrides %s: %w", path, err)
-	}
-	return clean, nil
+	return ov, nil
 }
 
 // normalizeOverrides sanitises every override and refuses the ones that
-// collide. It is what NewLabeler applies, split out so a file can be checked
-// at load time with no host to build a labeler for.
+// collide. It runs once per map: in [New] for the map a Discoverer carries,
+// and in [NewLabeler] for a labeler built on its own. A map that came through
+// either is clean, and [newLabeler] takes it as it is.
 func normalizeOverrides(ov Overrides) (Overrides, error) {
 	out := Overrides{
 		HubTokens:  make(map[string]string, len(ov.HubTokens)),
@@ -186,21 +187,27 @@ type Labeler struct {
 // hubs answering to "H3" is worse than no label at all, since it sends an
 // operator confidently to the wrong one.
 func NewLabeler(hostID, rack string, rackUnit int, ov Overrides) (*Labeler, error) {
-	hostID = strings.TrimSpace(hostID)
-	if hostID == "" {
+	if strings.TrimSpace(hostID) == "" {
 		return nil, fmt.Errorf("topo: a labeler needs a host id")
 	}
-
 	clean, err := normalizeOverrides(ov)
 	if err != nil {
 		return nil, err
 	}
+	return newLabeler(hostID, rack, rackUnit, clean), nil
+}
+
+// newLabeler builds a labeler from a map that normalizeOverrides has already
+// been over. It cannot fail: a clean map has nothing left to refuse, and the
+// host id was checked by whoever holds the map. Discovery calls this on every
+// pass with the map New sanitised, which is why the sanitising is not here.
+func newLabeler(hostID, rack string, rackUnit int, clean Overrides) *Labeler {
 	return &Labeler{
-		host:     hostID,
+		host:     strings.TrimSpace(hostID),
 		rack:     strings.TrimSpace(rack),
 		rackUnit: rackUnit,
 		ov:       clean,
-	}, nil
+	}
 }
 
 // HubToken returns the "H" component for a hub.

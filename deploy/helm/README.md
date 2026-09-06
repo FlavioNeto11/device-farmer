@@ -4,9 +4,10 @@ The control plane belongs in a cluster. The thing it controls does not.
 
 This directory holds a Helm chart for the seven control-plane roles — `api`,
 `scheduler`, `reaper`, `recovery`, `jobrunner`, `janitor`, `watchdog` — plus
-the schema migration that has to succeed before any of them start. It
-deliberately does not deploy the eighth role, `node`, and the first section
-below explains why that split cannot be helped.
+the schema migration that has to succeed before any of them start. The eighth
+role, `node`, belongs on the machine the phones are plugged into; the chart
+renders it only if you ask for it, off by default, and the first section below
+is the argument for leaving it off.
 
 ```
 helm upgrade --install farm ./device-farmer \
@@ -24,25 +25,55 @@ bare-metal half, and what is not wired up yet.
 
 ---
 
-## The split that cannot be helped
+## The split, and the DaemonSet that does not close it
 
 `farmd node` is the agent that lives on a device host — the machine with the
-USB hubs and the phones. It cannot be a workload in this chart, and not for a
-packaging reason:
+USB hubs and the phones. **The shipped way to run it is the systemd unit in the
+next section, on that machine.**
 
-| What it does | Why a cluster workload cannot |
+The chart can also run it as a DaemonSet — `node.enabled`, off by default, every
+knob documented under `node:` in `values.yaml` — for a farm whose device hosts
+*are* cluster nodes. That option exists because it was asked for. It does not
+change which deployment this project stands behind, and it is not a packaging
+preference: four things are true of the containerized shape, and turning it on
+fixes none of them.
+
+| | Why this is not the shipped path |
 | --- | --- |
-| Reads the USB tree from `/sys` to learn each device's `devpath` (`usb:3-1.4.2`) | The tree it must read is *that machine's*. A pod's view is the node's, and only if it is that node. |
-| Recovery tier 3: `USBDEVFS_RESET` — an ioctl on `/dev/bus/usb/BBB/DDD` | Needs the host's character devices and the privilege to ioctl them. |
-| Recovery tier 4: VBUS power cycle via `uhubctl` | Needs raw access to the hub, and a binary the distroless control-plane image does not ship. |
-| Enrolls devices against the local ADB server, per host epoch | The epoch is a property of the ADB server process on that machine. |
+| **Tier 4 needs a second image** | `uhubctl` is another binary, with a libusb dependency and therefore a libc. This chart deploys the one distroless static image every role shares — OPS-01, *one static binary, every role a subcommand* — so in a pod tier 4 refuses with 501 and names uhubctl. Shipping a second image would put a second security posture on the machine that has physical control of the phones. |
+| **Tier 3 costs `privileged: true`** | Kubernetes has no per-device cgroup API: nothing in a Pod spec says "allow `open()` on char major 189". The narrow form (`device_cgroup_rules`) exists only in compose. So `node.usbReset.enabled` is the whole device cgroup or none of it, which is why it is a second switch and not part of `node.enabled`. |
+| **A restart is ordinary here, and it is not free** | Every agent start bumps `farm.hosts.host_epoch` on purpose: the new process cannot prove the local ADB server survived its absence, and a stale transport id is a wrong device away from a reset landing on somebody's running job. On bare metal a restart is a deploy. In a cluster it is also a drain, a preemption, an eviction and an image update — each one re-observing every device on that machine. |
+| **Nothing on this path has met hardware** | No phone, no USB bus, no `USBDEVFS_RESET` ever issued and no VBUS ever cut, in a container or out of one — REQUIREMENTS.md REC-03 and HW-05. The DaemonSet in this chart has been rendered and never applied. |
 
-If your device hosts happen to be cluster nodes, you *could* express this as a
-privileged DaemonSet with `hostPath: /dev/bus/usb`, `hostNetwork`, a pinned
-`nodeSelector` and a `uhubctl` in the image. This chart does not ship one on
-purpose: that is a different security posture from the rest of the control
-plane, and most farms plug their phones into machines that are not cluster
-members at all.
+What a pod *can* do is the software half, and that is the default shape when
+the DaemonSet is enabled: discovery and enrollment need `/sys` and nothing
+else. `internal/topo` only ever reads sysfs — down to the per-port test for
+whether VBUS can be switched, which is a file-mode read — so the mount is
+read-only, and a writable `/sys` inside a privileged container would be one of
+the best-known container escapes bought for nothing.
+
+That shape is only safe because the agent says so out loud. An agent with no
+`/dev/bus/usb` refuses tier 3 with a 501 naming the missing mount, and one that
+is denied by a file mode refuses with a 409 naming the udev rule; neither is
+recorded as a rung that ran and failed. That distinction is the whole safety
+argument, because a *failed* rung is the one the ladder answers by escalating —
+to cutting VBUS, and then to quarantine, on a device the agent never touched.
+
+Two things the chart cannot do for you in either deployment. Nothing in farmd
+writes `farm.hosts.node_endpoint`, so no agent can be dialled until a human
+runs `UPDATE farm.hosts SET node_endpoint = '<host>:8082' WHERE id = '<id>'`
+once per machine. And the token is yours to place: `node.token.existingSecret`
+must name the same Secret the api, recovery and chargepolicy roles read
+`FARM_NODE_TOKEN` from, or every call answers 401.
+
+> A paragraph under **Not wired up yet** below still says this role cannot start
+> in this build for want of that token wiring. It is stale, and has been since
+> the commit that wrote it: `cmd/farmd/roles.go` passes `Token: cfg.Node.Token`,
+> and `scripts/linux-acceptance.sh` starts the role and asserts that
+> `/node/v1/health` answers 401 without a bearer token and 200 with one. The
+> real gap it points at is smaller and is in this document: the `node.env` block
+> in the next section does not set `FARM_NODE_TOKEN`, and the agent refuses to
+> start without it, so add the line when you copy that file.
 
 The consequence is visible rather than hidden. Without a node agent, recovery
 tiers 3 and 4 are **refused with a reason naming what is missing**, not
@@ -197,6 +228,7 @@ that variable and `hosts[].adbEndpoint` should name the same endpoint.
 | Deployment | `jobrunner` | **Scales.** Jobs are claimed with `SKIP LOCKED` plus a per-job advisory lock, and a lease is re-attached by `job_id`, so two replicas never fight over one device. |
 | Deployment ×N | `watchdog` | One per entry in `hosts[]`, replicas pinned at 1: there is no election, and a second replica would only double the probe rate against that host's single ADB server. |
 | Service + EndpointSlice ×N | — | Stable in-cluster names for the bare-metal ADB servers. |
+| DaemonSet | `node` | **Off by default**, behind `node.enabled`, and the first section above is the argument for leaving it off. `hostNetwork`, a required `nodeSelector`, `/sys` read-only; `node.usbReset.enabled` adds `privileged: true` and `/dev/bus/usb` for tier 3 alone — tier 4 refuses in any pod, because uhubctl is not in this image. |
 | ServiceMonitor | — | Optional, behind `serviceMonitor.enabled`. |
 
 ### Why most of these have no probes

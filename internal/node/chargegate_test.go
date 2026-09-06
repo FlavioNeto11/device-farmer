@@ -568,11 +568,11 @@ func TestRecoveryCycleSupersedesTheGate(t *testing.T) {
 	}
 }
 
-type fakePlatform struct{ portPowerErr error }
+type fakePlatform struct{ portPowerErr, usbResetErr error }
 
 func (fakePlatform) kernelRelease() (string, error) { return "6.8.0-45-generic", nil }
 
-func (fakePlatform) usbReset(context.Context, string, opsConfig) error { return nil }
+func (p fakePlatform) usbReset(context.Context, string, opsConfig) error { return p.usbResetErr }
 
 func (p fakePlatform) portPower(context.Context, string, []string, opsConfig) error {
 	return p.portPowerErr

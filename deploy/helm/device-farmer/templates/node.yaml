@@ -1,0 +1,320 @@
+{{/*
+node — the host agent, as a DaemonSet. OFF BY DEFAULT, and off is still the
+answer this chart argues for.
+
+`farmd node` belongs on the machine the phones are plugged into. The shipped
+way to run it is the systemd unit in deploy/helm/README.md, and this template
+does not change that; it exists because a farm whose device hosts ARE cluster
+nodes asked to run it the same way it runs everything else. What that costs is
+written down in values.yaml under `node:` and repeated in the annotations of
+the object below, where an operator who never read the values file will still
+meet it.
+
+The four facts that make this the second-best deployment, none of which is
+fixed by enabling it:
+
+  1. Tier 4 (VBUS) cannot work in this image at all. uhubctl is a second
+     binary with a libusb dependency, and this chart deploys the ONE distroless
+     static image every role shares — OPS-01, "one static binary, every role a
+     subcommand". A second image is a second security posture on the machine
+     that has physical control of the phones. The agent refuses tier 4 with 501
+     and names uhubctl (internal/node/uhubctl.go, uhubctlPath); nothing is
+     faked and no rung is recorded as attempted.
+
+  2. Tier 3 (USBDEVFS_RESET) costs `privileged: true`. Kubernetes has no
+     per-device cgroup API: there is no way to say "allow open() on char major
+     189" in a Pod spec. The narrow form exists only in compose
+     (device_cgroup_rules), so the choice here is the whole device cgroup or
+     none of it. node.usbReset.enabled is that choice, and it is separate from
+     node.enabled for exactly that reason.
+
+  3. A restart is ordinary here and is not free. Every agent start bumps
+     farm.hosts.host_epoch on purpose — the new process cannot prove the local
+     ADB server survived its absence (internal/node/agent.go, hostLoop) — so a
+     rolling update re-observes every device on every host it touches. On bare
+     metal a restart is a deploy; in a cluster it is also a drain, a
+     preemption and an image update.
+
+  4. NOTHING ON THIS PATH HAS EVER MET HARDWARE. No phone, no USB bus, no
+     USBDEVFS_RESET ever issued, no VBUS ever cut, and this DaemonSet has been
+     rendered and never applied. REQUIREMENTS.md REC-03 and HW-05 say the same
+     thing about the agent itself.
+
+What IS safe, and is why the default shape is unprivileged: discovery and
+enrollment need /sys and nothing else. internal/topo reads sysfs exclusively —
+even the per-port VBUS-switchability test is a mode read — so a read-only mount
+is enough, and an agent with no usbfs refuses tiers 3 and 4 with 501 rather
+than filing them against a handset it never touched
+(internal/node/usbfs.go, usbfsOpenError).
+*/}}
+
+{{/*
+The guards run whether or not anything is rendered, because a values file that
+configures this role and forgets to enable it is exactly the shape that
+installs cleanly and does nothing.
+*/}}
+{{- $node := .Values.node | default dict -}}
+{{- $token := $node.token | default dict -}}
+{{- $usbReset := $node.usbReset | default dict -}}
+
+{{- if and (not $node.enabled) (or $usbReset.enabled $token.existingSecret) -}}
+{{- fail "\ndevice-farmer: node.* is configured but node.enabled is false.\n\nNothing under node: is read by any other template, so this release would render\nno DaemonSet, no agent would run on any device host, and recovery tiers 3 and 4\nwould stay refused — while the values file reads as though the host half were\ndeployed.\n\nSet node.enabled: true, or remove the node.* values. Read the block above\n`node:` in values.yaml first: the shipped way to run this role is the systemd\nunit in deploy/helm/README.md, on the physical machine.\n" -}}
+{{- end -}}
+
+{{- if $node.enabled -}}
+
+{{- if not $token.existingSecret -}}
+{{- fail "\ndevice-farmer: node.enabled is true and node.token.existingSecret is empty.\n\n`farmd node` cannot start without FARM_NODE_TOKEN. FARM_NODE_ADDR always\nresolves to an address — internal/config reads an empty environment variable as\nunset and falls back to :8082 — and internal/node.New refuses an HTTP surface\nwith no credential, because these routes can cut power to a port holding a live\nlease. The pod would CrashLoopBackOff on every device host with that refusal in\nits logs.\n\nThis chart will not render a second inline credential: name the Secret that\nalready carries this token to the api, recovery and chargepolicy roles.\n\n  node:\n    token:\n      existingSecret: device-farmer-node    # key FARM_NODE_TOKEN\n\nIt must be the SAME value those roles were given, or every tier-3 and tier-4\ncall answers 401 — which is a refusal, so no rung is ever recorded as failed,\nbut no rung is ever performed either.\n" -}}
+{{- end -}}
+
+{{- if not $node.nodeSelector -}}
+{{- fail "\ndevice-farmer: node.enabled is true and node.nodeSelector is empty.\n\nA DaemonSet with no selector lands on EVERY schedulable node in the cluster.\nEach of those pods registers a farm.hosts row named after its node and beats as\nnode:<node name>, so a cluster of forty workers grows forty host rows with no\nphones behind them, and topology discovery scans forty USB trees that contain\nnothing.\n\nLabel the machines that actually have hubs and select them:\n\n  kubectl label node <machine> device-farmer.io/device-host=true\n\n  node:\n    nodeSelector:\n      device-farmer.io/device-host: \"true\"\n" -}}
+{{- end -}}
+
+{{/*
+The agent's own drain, in seconds, from the two budgets in its source. The
+kubelet SIGKILLs at the end of the grace period, and what is left dark by a
+kill is a phone's power.
+*/}}
+{{- $drain := 133 -}}
+{{- $grace := $node.terminationGracePeriodSeconds | int -}}
+{{- if lt $grace $drain -}}
+{{- fail (printf "\ndevice-farmer: node.terminationGracePeriodSeconds is %d, and the agent's own drain is %d.\n\n  73s  internal/node/agent.go, Agent.opBudget: CallTimeout + PowerOffSettle +\n       PortReturnTimeout + DefaultOpGrace. It is the grace the node endpoint\n       gives an in-flight hardware operation, so that a VBUS cycle interrupted\n       by a SIGTERM still gets to turn the power back ON.\n  60s  internal/node/chargegate.go, chargeGateShutdownBudget: restoring power\n       to every port this agent is holding dark for the charge policy. It runs\n       beside the drain above and takes the same hardware mutex, so an\n       operation in flight when the signal arrives delays it by up to the full\n       73.\n\nNone of the four terms is settable from the environment today. A kubelet that\nkills the process before they finish leaves ports without power and no process\nalive to give it back; the agent logs the exact `uhubctl -a on` command for the\nports it did not reach, but only if it is still running to log it.\n\nRaise node.terminationGracePeriodSeconds to at least %d.\n" $grace $drain $drain) -}}
+{{- end -}}
+
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "device-farmer.componentName" (dict "ctx" $ "component" "node") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "device-farmer.labels" (dict "ctx" $ "component" "node") | nindent 4 }}
+  annotations:
+    # These three survive into the cluster, where the values file does not.
+    device-farmer.io/unproven: >-
+      This deployment shape has never run against hardware. No phone, no USB bus,
+      no USBDEVFS_RESET ever issued and no VBUS ever cut, in a container or out
+      of one. The shipped way to run farmd node is the systemd unit in
+      deploy/helm/README.md, on the physical machine.
+    device-farmer.io/tier-4: >-
+      Recovery tier 4 (VBUS power cycle) is REFUSED on every pod of this
+      DaemonSet with HTTP 501: uhubctl is not in the distroless image and this
+      chart ships no second image. The ladder records a refusal, not a failed
+      rung, and stops at tier 3.
+    device-farmer.io/node-endpoint: >-
+      Nothing in farmd writes farm.hosts.node_endpoint, so the recovery ladder
+      and the charge policy cannot dial these agents until a human does:
+      UPDATE farm.hosts SET node_endpoint = '<node address>:{{ $node.port }}' WHERE id = '<node name>';
+      The pods are reachable at that address because hostNetwork is set below.
+spec:
+  selector:
+    matchLabels:
+      {{- include "device-farmer.selectorLabels" (dict "ctx" $ "component" "node") | nindent 6 }}
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # One host at a time. A restart re-observes every device on the machine it
+      # lands on (the host epoch bumps), and on a host running the fence proxy
+      # it also severs the ADB sessions the proxy is carrying. Neither ends a
+      # lease — nothing in farmd does — but doing it to the whole farm at once
+      # turns a routine image bump into a farm-wide re-enumeration.
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        {{- include "device-farmer.labels" (dict "ctx" $ "component" "node") | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        {{- include "device-farmer.configChecksums" . | nindent 8 }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- include "device-farmer.podPreamble" . | nindent 6 }}
+      # hostNetwork is not optional for this role, and it is not about
+      # performance. Three things need it:
+      #   - the node endpoint below is dialled at THIS MACHINE's address, and a
+      #     pod IP changes on every restart while farm.hosts.node_endpoint does
+      #     not;
+      #   - the fence proxy, when its PEMs are mounted, decides what to
+      #     advertise as farm.hosts.adb_endpoint from the local interfaces
+      #     (internal/node/fence.go, AdvertiseAddr) — in a pod network namespace
+      #     the first global-unicast address is the POD's, and the whole cluster
+      #     would start dialling it for this host's devices;
+      #   - the ADB server it enrols against is the host's own.
+      hostNetwork: true
+      # With hostNetwork the pod would otherwise inherit the node's resolv.conf
+      # and fail to resolve in-cluster names — including the Postgres Service in
+      # DATABASE_URL, which is the only thing this role needs the network for
+      # besides adb.
+      dnsPolicy: ClusterFirstWithHostNet
+      terminationGracePeriodSeconds: {{ $grace }}
+      securityContext:
+        {{- if $usbReset.enabled }}
+        # ROOT, because usbfs gates on write permission to the device node and
+        # the image's own 65532 owns nothing on the host. On bare metal this is
+        # a udev rule and an unprivileged user; a container cannot be given a
+        # host group it does not know the gid of, and the shipped image has no
+        # /etc/group to put one in.
+        runAsNonRoot: false
+        runAsUser: 0
+        runAsGroup: 0
+        seccompProfile:
+          type: RuntimeDefault
+        {{- else }}
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+        {{- end }}
+      {{- with $node.nodeSelector }}
+      # The machines with hubs. Checked above: an empty selector would put an
+      # agent, and a farm.hosts row, on every node in the cluster.
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $node.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $node.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: node
+          image: {{ include "device-farmer.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["node"]
+          securityContext:
+            {{- if $usbReset.enabled }}
+            # privileged: true is the ONLY way to open a char device the pod was
+            # not given, because Kubernetes exposes no per-device cgroup rule.
+            # It is the whole device cgroup, not major 189, and it is why this
+            # switch is off by default and separate from node.enabled.
+            privileged: true
+            # The API server rejects `false` beside privileged: true, and a
+            # privileged container has every capability regardless.
+            allowPrivilegeEscalation: true
+            runAsUser: 0
+            # farmd writes nothing to its own filesystem in this role.
+            readOnlyRootFilesystem: true
+            {{- else }}
+            # The software half: discovery, enrollment, heartbeats. It opens no
+            # device node, so it keeps the same hardening every other role in
+            # this chart runs with, and tiers 3 and 4 answer 501.
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+            {{- end }}
+          # NO PROBES, for the reason every other role in this chart has none,
+          # and one more of its own. The reason shared with the others: liveness
+          # here is farm.component_heartbeat, and a probe would be a second
+          # opinion able to restart a process that is holding real work — this
+          # one restarts it mid-VBUS-cycle, which is how a phone is left dark.
+          # The one of its own: every /node/v1 route including GET
+          # /node/v1/health requires the bearer token on purpose (the health
+          # answer is the reconnaissance an attacker wants before choosing a
+          # port to cut power to), so an api-shaped httpGet probe would get 401
+          # forever and restart every agent in the farm on its failure
+          # threshold. If you must have one, probe GET /healthz on the metrics
+          # port below, which is unauthenticated and touches no database.
+          envFrom:
+            {{- include "device-farmer.envFrom" . | nindent 12 }}
+          env:
+            {{- include "device-farmer.databaseEnv" (dict "ctx" $) | nindent 12 }}
+            # farm.hosts.id IS the Kubernetes node name, and it is not
+            # overridable: one value shared by every pod of a DaemonSet would
+            # have every machine in the farm upserting one host row, bumping one
+            # epoch and claiming each other's devpaths. The pods cannot read
+            # their Node object either — this chart mounts no ServiceAccount
+            # token — so spec.nodeName is the only per-machine identity
+            # available. It must match the ids in hosts[] if you also run
+            # per-host watchdogs, and those must be DNS-1123 labels.
+            - name: FARM_HOST_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            {{- if $node.adb.endpoint }}
+            - name: FARM_ADB_ENDPOINT
+              value: {{ $node.adb.endpoint | quote }}
+            {{- else }}
+            # THE CLUSTER DIALS THIS STRING: it is written to
+            # farm.hosts.adb_endpoint verbatim, and the watchdog, the recovery
+            # ladder and every jobrunner reach this host's devices through it.
+            # It is the node's own address, not 127.0.0.1, even though
+            # hostNetwork makes loopback work from inside — a row that says
+            # 127.0.0.1 is a row no other machine can use. The ADB server must
+            # therefore be listening on it: `adb -a -P 5037 nodaemon server`.
+            - name: FARM_NODE_HOST_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            - name: FARM_ADB_ENDPOINT
+              value: "$(FARM_NODE_HOST_IP):{{ $node.adb.port }}"
+            {{- end }}
+            # Both of these are HOST ports under hostNetwork, and both are set
+            # here rather than taken from the ConfigMap for that reason: the
+            # ConfigMap's copies are the cluster's numbers, and a device host
+            # already running a Prometheus or another agent needs its own.
+            - name: FARM_NODE_ADDR
+              value: ":{{ $node.port }}"
+            - name: FARM_METRICS_ADDR
+              value: ":{{ $node.metricsPort }}"
+            # Required. node.New refuses to serve these routes without it, and
+            # the recovery ladder must present the same value.
+            - name: FARM_NODE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $token.existingSecret | quote }}
+                  key: {{ $token.existingSecretKey | default "FARM_NODE_TOKEN" | quote }}
+            {{- with $node.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          resources:
+            {{- toYaml $node.resources | nindent 12 }}
+          volumeMounts:
+            # READ-ONLY, and that is not a compromise: internal/topo reads sysfs
+            # and never writes it, down to the per-port VBUS-switchability test,
+            # which is a mode read (internal/topo/sysfs.go). A writable /sys in
+            # a privileged container is one of the best-known container escapes
+            # and buys this agent nothing.
+            - name: sys
+              mountPath: /sys
+              readOnly: true
+            {{- if $usbReset.enabled }}
+            # The usbfs nodes tier 3 issues its ioctl against. A bind mount of
+            # the DIRECTORY, never a fixed list of device nodes: a device gets a
+            # new devnum every time it re-enumerates, which is precisely what a
+            # reset makes it do, so nodes injected at pod-create time are stale
+            # after the first tier-3 and the agent re-reads devnum from sysfs on
+            # every call (internal/node/hostops.go, readUSBNode).
+            - name: dev-bus-usb
+              mountPath: /dev/bus/usb
+            {{- end }}
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      volumes:
+        # THE WHOLE OF /sys, mounted at /sys, and not the /sys/bus/usb subtree.
+        # The entries under /sys/bus/usb/devices are symlinks into /sys/devices,
+        # so a subtree mount leaves every one of them dangling and the host
+        # reads as empty. At /sys rather than the /host/sys convention because
+        # the two halves of the agent must read the same tree: topo takes its
+        # root from FARM_SYSFS_ROOT, but internal/node/hostops.go reads
+        # /sys/bus/usb/devices directly for the blast-radius check and for
+        # devnum, and that path is not configurable.
+        - name: sys
+          hostPath:
+            path: /sys
+            type: Directory
+        {{- if $usbReset.enabled }}
+        # type: Directory, so a node with no usbfs fails to start the pod
+        # instead of quietly creating an empty directory the agent would then
+        # read as a host with no devices.
+        - name: dev-bus-usb
+          hostPath:
+            path: /dev/bus/usb
+            type: Directory
+        {{- end }}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+{{- end }}

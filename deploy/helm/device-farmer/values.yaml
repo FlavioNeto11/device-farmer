@@ -893,3 +893,156 @@ chargepolicy:
   #         name: device-farmer-node
   #         key: FARM_NODE_TOKEN
   extraEnv: []
+
+# -----------------------------------------------------------------------------
+# node — THE HOST AGENT, IN THE CLUSTER. OFF, AND OFF IS STILL THE RIGHT ANSWER.
+#
+# `farmd node` is the agent that lives on the machine the phones are plugged
+# into. It reads the USB tree from /sys and registers every position it finds,
+# enrols the devices it sees against that machine's ADB server, and performs
+# recovery tier 3 (USBDEVFS_RESET on /dev/bus/usb) and tier 4 (a VBUS power
+# cycle through uhubctl). THE SHIPPED WAY TO RUN IT IS THE SYSTEMD UNIT in
+# deploy/helm/README.md, on the physical host. This block does not change that.
+#
+# It is here because a farm whose device hosts ARE cluster nodes asked to run
+# it the way it runs everything else. Turning it on does not fix any of these:
+#
+#   1. TIER 4 CANNOT WORK IN THIS IMAGE, EVER. uhubctl is a second binary with
+#      a libusb dependency, and this chart deploys the one distroless static
+#      image every role shares — OPS-01, "one static binary, every role a
+#      subcommand". A second image would be a second security posture on the
+#      machine that has physical control of the phones, which is what that rule
+#      exists to prevent. The agent refuses tier 4 with HTTP 501 naming
+#      uhubctl; the ladder records a refusal, not a failed rung, and stops at
+#      tier 3. Nothing is faked and no phone is escalated against.
+#
+#   2. TIER 3 COSTS `privileged: true`, all of it. Kubernetes has no per-device
+#      cgroup API — there is no way to say "allow open() on char major 189" in
+#      a Pod spec. The narrow form (device_cgroup_rules) exists only in
+#      compose. So node.usbReset.enabled below is the whole device cgroup or
+#      nothing, and it is a separate switch from node.enabled for that reason.
+#
+#   3. A RESTART IS ORDINARY HERE AND IT IS NOT FREE. Every agent start bumps
+#      farm.hosts.host_epoch deliberately: the new process cannot prove the
+#      local ADB server survived its absence, and a stale transport id is a
+#      wrong device away from a reset landing on somebody's running job. On
+#      bare metal a restart is a deploy. In a cluster it is also a node drain,
+#      a preemption, an image update and an eviction, and each one re-observes
+#      every device on that machine.
+#
+#   4. NOTHING ON THIS PATH HAS MET HARDWARE. No phone, no USB bus, no
+#      USBDEVFS_RESET ever issued and no VBUS ever cut — in a container or out
+#      of one. This DaemonSet has been rendered and never applied.
+#      REQUIREMENTS.md REC-03 and HW-05 record the same gap for the agent
+#      itself, and no deployment choice closes it.
+#
+# What IS sound, and is why the default shape is the unprivileged one:
+# discovery and enrollment need /sys and nothing else. internal/topo only ever
+# reads sysfs — even the per-port test for whether VBUS can be switched is a
+# file-mode read — so the read-only mount is enough for the whole package. And
+# an agent with no usbfs now says so: tier 3 answers 501 ("this host cannot
+# perform the rung at all") instead of filing an ENOENT as a rung that ran and
+# failed, which used to escalate the ladder toward cutting power to a device
+# the agent had never touched.
+#
+# What this chart still cannot do for you: nothing in farmd writes
+# farm.hosts.node_endpoint, so the recovery ladder and the charge policy cannot
+# dial these agents until a human runs
+#
+#   UPDATE farm.hosts SET node_endpoint = '<node address>:8082' WHERE id = '<node name>';
+#
+# once per machine. The DaemonSet's own annotations say so too, because that is
+# where an operator who never read this file will be looking.
+#
+# The namespace must also allow it: hostPath volumes are forbidden by the
+# baseline and restricted Pod Security levels, and privileged by all but the
+# privileged level.
+# -----------------------------------------------------------------------------
+node:
+  # OFF. Read the four points above before changing this.
+  enabled: false
+
+  # Recovery tier 3 inside the pod, and nothing else: `privileged: true`,
+  # runAsUser 0, and a bind mount of /dev/bus/usb. Point 2 above is the whole
+  # story — Kubernetes cannot grant one char device, so this grants the device
+  # cgroup. With it off the agent still discovers, enrols and heartbeats, and
+  # refuses tier 3 with a 501 that says /dev/bus/usb was not mounted in.
+  usbReset:
+    enabled: false
+
+  # Which machines. REFUSED IF EMPTY while node.enabled is true: a DaemonSet
+  # with no selector lands on every schedulable node, and each of those pods
+  # registers a farm.hosts row named after its node.
+  #
+  #   kubectl label node <machine> device-farmer.io/device-host=true
+  nodeSelector:
+    device-farmer.io/device-host: "true"
+  tolerations: []
+  affinity: {}
+
+  # FARM_NODE_TOKEN, and it is required: FARM_NODE_ADDR always resolves to an
+  # address (an empty environment variable reads as unset and falls back to
+  # :8082), and the agent refuses to serve those routes without a credential,
+  # because they can cut power to a port holding a live lease. The pod would
+  # crash-loop with that refusal in its logs.
+  #
+  # existingSecret only. This must be the SAME token the api, recovery and
+  # chargepolicy roles are given — see chargepolicy.extraEnv above — and this
+  # chart will not render a second inline copy of a credential that has to
+  # match something it does not own.
+  token:
+    existingSecret: ""
+    existingSecretKey: FARM_NODE_TOKEN
+
+  # FARM_NODE_ADDR and FARM_METRICS_ADDR, both HOST ports: this DaemonSet runs
+  # with hostNetwork, which it needs so that the node endpoint has an address
+  # that survives a restart and so that the fence proxy advertises this machine
+  # rather than a pod IP. They are set on the pod rather than taken from the
+  # ConfigMap for the same reason — the ConfigMap's :8082 and :9090 are the
+  # cluster's numbers and bind nothing there — and a device host already
+  # running a Prometheus or another agent needs its own.
+  #
+  # A metricsPort away from metricsService.port takes these pods out of the
+  # release's headless metrics Service, which targets that number.
+  port: 8082
+  metricsPort: 9090
+
+  adb:
+    # The port the host's ADB server listens on. It must be listening on the
+    # node's own address, not just loopback — `adb -a -P 5037 nodaemon server`,
+    # exactly as the bare-metal recipe in deploy/helm/README.md says — because
+    # this becomes farm.hosts.adb_endpoint and the whole cluster dials it.
+    port: 5037
+    # Override the whole endpoint. Empty means the node's own address (from the
+    # downward API) and the port above, which is right for every shape this
+    # DaemonSet supports; set it only if the ADB server this host's devices are
+    # behind is somewhere else, and remember that every pod of the DaemonSet
+    # would then be given the same string.
+    endpoint: ""
+
+  # The agent's own drain is 133 seconds and this is REFUSED BELOW IT: 73s of
+  # grace for an in-flight hardware operation to put a port's power back
+  # (internal/node/agent.go, opBudget) and 60s to release every port the charge
+  # policy is holding dark (internal/node/chargegate.go), which runs beside it
+  # and waits on the same hardware mutex. A kubelet that kills the process
+  # before those finish leaves phones without power and nothing alive to give
+  # it back. None of the four terms is settable from the environment today.
+  terminationGracePeriodSeconds: 150
+
+  resources:
+    requests:
+      cpu: 50m
+      memory: 96Mi
+    limits:
+      memory: 256Mi
+
+  # Anything else this agent needs, on top of the shared ConfigMap: the fence
+  # proxy's FARM_FENCE_TLS_CERT/KEY/CA (with extraVolumes/extraVolumeMounts to
+  # put them in the pod), or the FARM_TOPO_* discovery knobs.
+  #
+  # Taking the shared ConfigMap is the point: FARM_NODE_SELF_FENCE_TIMEOUT and
+  # FARM_SLOT_REARM are asserted against each other in every process, so an
+  # agent that reads the cluster's own ConfigMap cannot disagree with it about
+  # the one number that keeps a reclaimed slot parked until the previous
+  # holder's sockets are gone.
+  extraEnv: []

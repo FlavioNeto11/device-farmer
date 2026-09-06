@@ -274,9 +274,17 @@ func (s *FSSource) Devices(ctx context.Context) ([]Device, error) {
 	}
 
 	if len(out) == 0 && len(failed) > 0 {
+		// Read-only is enough and the remedy must say so. This package never
+		// writes /sys — even the per-port VBUS-switchability test is a mode
+		// read — so a reader who mounts it read-write to satisfy this sentence
+		// buys nothing and, in the privileged container the hardware rungs
+		// need, hands away /sys/kernel/uevent_helper and the cgroup release
+		// agent. Same wording as Sysfs's own refusal above, for the same
+		// reason.
 		return nil, fmt.Errorf("topo: no USB device in %s could be read, so this pass says "+
-			"nothing about the host; check that /sys is mounted read-write and unmasked "+
-			"and that the process may traverse it: %s",
+			"nothing about the host; if this is a container, bind-mount /sys — read-only "+
+			"is enough — and check that it is not masked and that the process may "+
+			"traverse it: %s",
 			s.label, strings.Join(failed, "; "))
 	}
 	if len(failed) > 0 {

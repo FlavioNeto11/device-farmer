@@ -1,11 +1,22 @@
 # The mTLS fence proxy
 
-Status: **designed; integrated on the host; the client half is a separate
-change.**
+Status: **built, both halves, and off unless configured.**
 Code: `internal/fenceproxy/proxy.go`, `internal/fenceproxy/proxy_test.go`
 (the proxy); `internal/node/fence.go`, `internal/node/fencesource.go` (the
-host integration: `farmd node` serves it when given TLS material). Section 14
-states exactly what is enforced today and what is not.
+host integration: `farmd node` serves it when given `FARM_FENCE_TLS_*`);
+`adbwire.WithTLS` and `adbwire.WithAdmissionPreamble` fed by
+`FARM_FENCE_CLIENT_CERT/KEY/CA` (the client half — `internal/adbwire/doc.go:70`
+names them as exactly that, and `internal/api/server.go:112` installs them).
+
+> **This line used to say the client half was a separate change, and the
+> sections below still argue from that.** It stopped being true when the
+> admission preamble landed; `GET /api/v1/capabilities` has reported
+> `enabled`/`unavailable` rather than `not_built` since, and `REQUIREMENTS.md`
+> SEC-04 says "Both halves ship". The stale status was read and repeated as
+> fact during a later design review, which is the cost of a document that
+> argues from its own header. What has NEVER happened is a run against real
+> hardware: `farmd node` stops at USB discovery anywhere but Linux. Read every
+> "not built" below as "not verified against a handset".
 
 ---
 
@@ -29,9 +40,14 @@ job, close every ADB socket, write nothing further.
 ADB connection keeps holding it. A client that dials `127.0.0.1:5037` on the
 host — or the host's port 5037 from anywhere the network allows — never
 presented a fence to begin with. Nothing between the client and the handset has
-ever heard of a fence. `GET /api/v1/capabilities` reports this accurately:
+ever heard of a fence. That was the state this document was written against.
+`GET /api/v1/capabilities` now reports, per process:
 
-    "Fence enforcement at the resource": "not_built"
+    "Fence enforcement at the resource": "enabled"      # certificates configured
+    "Fence enforcement at the resource": "unavailable"  # this process dials in the clear
+
+It never reports on the farm, only on itself — no single process can see
+whether every host is running a proxy.
 
 Several comments in the tree already describe a proxy that does not exist, and
 they are the reason this document has to be written before any code is:
@@ -817,12 +833,13 @@ UPDATE farm.devices SET fence_floor = nextval('farm.fence_seq') WHERE id = <dev>
 UPDATE farm.slots   SET rearm_at    = now() + p_rearm           WHERE id = <slot>;
 ```
 
-**Needs one word — `README.md:250` and `internal/api/capabilities.go:318`**,
-once the integration lands: `"Fence enforcement at the resource"` moves from
-`not_built` to `degraded` when no proxy is beating on a host and to `enabled`
-when one is. It stays `not_built` until then, and this unit does not change it,
-because the proxy is not wired in and a capability report that lies is worse than
-one that says `not_built`.
+**This landed, differently from the plan.** `internal/api/capabilities.go`
+reports `enabled` when this process has `FARM_FENCE_CLIENT_CERT/KEY/CA` and
+`unavailable` when it does not, naming the variables that are missing. The
+`degraded` state proposed here was not built: it would have required the api to
+know whether a proxy is beating on every host, which no single process can see,
+and a capability report that guesses is the thing this paragraph was written to
+avoid.
 
 ---
 

@@ -13,10 +13,25 @@ Not a socket error. Not a probe timeout. Not a device going offline. Not a pod
 being evicted.
 
 The reference implementation in this space, [DeviceFarmer/STF][stf], has an
-issue that has been [open and unanswered since 2023][663]: a device running
-automation on a Kubernetes-hosted STF gets an `ECONNRESET` after about ninety
-minutes and is **automatically released** mid-run, destroying hours of work.
-Its lease model assumes an interactive human with a timeout.
+issue that has been [open since 2023][663]: a six-hour test on a
+Kubernetes-hosted STF gets an `ECONNRESET` after about ninety minutes and the
+device is **automatically released** mid-run, destroying hours of work. Its
+lease model assumes an interactive human with a timeout.
+
+Read the thread before repeating the moral, because it is sharper than the
+summary. The reporter found that the failure tracks `--screen-jpeg-quality`:
+at 25 the connections die, at 0–1 they hold. So the proximate cause is most
+likely the screen stream saturating an IPsec link, not STF's timer. A
+maintainer replied that this "sounds like a network issue… not due to STF
+itself" and asked for a packet capture. On the narrow question they were
+probably right.
+
+**That is the point.** A transport can always fail, and here it did. What
+turned a dropped packet into six hours of destroyed work was a lease model in
+which losing the transport is a reason to take the device away. Nothing in that
+chain has to be a bug for the outcome to be unacceptable — which is why this
+project makes the outcome unrepresentable instead of arguing about whose fault
+the packet was.
 
 Here that failure is unrepresentable rather than handled:
 

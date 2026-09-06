@@ -25,6 +25,15 @@ a device loss and a ninety-minute `ECONNRESET` on a perfectly healthy phone
 destroys somebody's multi-hour test run. That bug is far more often introduced
 by an operator procedure than by a line of code.
 
+**`farmd ctl endings` is how you check it.** With a lease id it answers "how did
+THIS one end"; without one it lists what has been ending, filterable by class —
+`job`, `deadline`, `operator`, `reaper` — and by time. It reads the ledger a
+trigger on `farm.leases` writes inside the same transaction as every ending, so
+an ending cannot be missing from it while the lease is closed. Two answers there
+are incidents rather than information: `unaccounted`, meaning a lease was closed
+with no reason recorded at all, and a terminal lease the ledger has no row for.
+The command says so on `stderr` in both cases.
+
 ## Setup, once per shell
 
 ```sh

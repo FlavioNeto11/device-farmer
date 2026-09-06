@@ -111,6 +111,13 @@ func (s *Server) buildHandler() http.Handler {
 
 	// Leases. renew and release are the hot path; revoke is the human one.
 	tenant("GET /api/v1/leases", s.handleLeaseList)
+	// How leases ended, from the ledger the trigger on farm.leases writes.
+	// Registered before the {id} routes only for readability — the mux matches
+	// on specificity, not on order — and tenant-gated because a tenant asking
+	// why its own lease ended is the first question it will have. Both are
+	// scoped to the caller's own endings; an operator sees the farm.
+	tenant("GET /api/v1/leases/endings", s.handleLeaseEndings)
+	tenant("GET /api/v1/leases/{id}/ending", s.handleLeaseEnding)
 	tenant("POST /api/v1/leases/acquire", s.handleLeaseAcquire)
 	tenant("POST /api/v1/leases/{id}/renew", s.handleLeaseRenew)
 	tenant("POST /api/v1/leases/{id}/release", s.handleLeaseRelease)

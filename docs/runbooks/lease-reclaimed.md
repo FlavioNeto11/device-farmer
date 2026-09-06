@@ -60,6 +60,13 @@ page is to find out why, before it happens to twenty leases instead of one.
 **1. What exactly was ended, and how silent was it?**
 
 ```sh
+farmd ctl endings --ended-by reaper --limit 20
+```
+
+That reads `farm.v_lease_endings` over the API, so it needs a token and not a
+database session. Without one, the same rows:
+
+```sh
 psql "$PGURL" -c "
 SELECT ended_at, lease_id, job_id, tenant_id, holder, protected,
        held_seconds, heartbeat_age_s, ended_by
@@ -68,7 +75,7 @@ SELECT ended_at, lease_id, job_id, tenant_id, holder, protected,
  ORDER BY ended_at DESC LIMIT 20"
 ```
 
-`heartbeat_age_s` is the number that matters. Compare it to `ttl + grace`
+`heartbeat_age_s` — the `BEAT AGE` column — is the number that matters. Compare it to `ttl + grace`
 (defaults: 15m + 30m = 2700s). An age barely over the threshold means the
 deadline was too tight or the outage was ours. An age of many hours means the
 holder really was gone.
@@ -93,12 +100,24 @@ after the gap ended.
 **3. Who was holding them, and are they still failing?**
 
 ```sh
+farmd ctl endings --ended-by reaper --since 24h --limit 200
+farmd ctl jobs --state failed
+```
+
+The `by holder:` line under the table is the count per holder **over the rows
+listed**, not over the whole 24 hours. If `stderr` says the listing was cut,
+those counts are a sample and this judgement — one holder, or many — is exactly
+the one a sample gets wrong; raise `--limit` until the warning stops, or use the
+SQL below, which groups over the window. To confirm a single holder,
+`farmd ctl endings --ended-by reaper --since 24h --holder <name>`. Without a
+token:
+
+```sh
 psql "$PGURL" -c "
 SELECT holder, count(*), max(ended_at)
   FROM farm.v_lease_endings
  WHERE release_reason = 'holder_expired' AND ended_at > now() - interval '24 hours'
  GROUP BY holder ORDER BY 2 DESC"
-farmd ctl jobs --state failed
 ```
 
 One holder dominating the list is a broken supervisor. Many holders means it is

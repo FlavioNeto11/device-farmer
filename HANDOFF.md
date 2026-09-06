@@ -1,120 +1,125 @@
 # Estado da sessão — retomar daqui
 
-Atualizado em 2026-09-05, depois de mergear as trinta branches abertas e
-reverificar o registro contra a árvore resultante. Este arquivo é o único lugar
-que reúne o estado; leia-o antes de qualquer coisa.
+Atualizado em 2026-09-06, depois de mergear as quarenta e nove branches desta
+sessão e reverificar tudo contra a árvore resultante. Este arquivo é o único
+lugar que reúne o estado; leia-o antes de qualquer coisa.
 
 ## Onde o repositório está
 
-- `main` = `82ecdbc`, **empurrado para o origin**. Árvore limpa.
+- `main` = `76aa430`, **empurrado para o origin**. Árvore limpa.
 - Remote: `https://github.com/FlavioNeto11/device-farmer`
-- **Nenhum PR aberto.** Trinta mergeados no total; os vinte e um desta rodada
-  foram `--no-ff`, então o histórico mostra o que cada um trouxe.
-- Schema **v17**, contígua (`00001`…`00017`). 184 arquivos Go, **1 575 testes de
-  topo em 21 pacotes**, **11 suítes de asserção SQL**.
+- **Nenhum PR aberto.** 49 merges nesta sessão, 133 commits, 30 deles por PR —
+  o resto foi branch de worktree mergeada direto. Todos `--no-ff`, então o
+  histórico mostra o que cada um trouxe.
+- Schema **v21**, contígua (`00001`…`00021`). 213 arquivos Go, **896 funções
+  `TestX` — 1 726 testes contando subtestes — em 23 pacotes**, **15 suítes de
+  asserção SQL**, **11 arquivos de cenário em `test/e2e`**.
 - Nove papéis: `api`, `scheduler`, `reaper`, `recovery`, `jobrunner`, `janitor`,
   `chargepolicy`, `watchdog`, `node` — mais `all` e `demo`, que multiplexam.
 
-### Verificado de ponta a ponta nesta sessão
+### Verificado de ponta a ponta, nesta ordem, contra este commit
 
 ```
-go build ./... && go vet ./... && gofmt -l .      # limpos
-go test -count=1 ./...                            # 21 pacotes ok
-farmd migrate up  (banco vazio → v17)             # 17 migrations
-test/assertions*.sql                              # 11 suítes, todas PASSED
+go build ./... && go vet ./... && gofmt -l .       # limpos, DATABASE_URL VAZIA
+go test -count=1 ./...                             # 23 pacotes ok
+farmd migrate up  (banco vazio -> v21)             # 21 migrations
+test/assertions*.sql                               # 15 suítes, 15 PASSED
+go test ./test/e2e/                                # ok, 302 s
+go test ./internal/... ./cmd/...  (com banco)      # ok
+scripts/linux-acceptance.sh   (via WSL)            # 55 checks, exit 0
 ```
 
-Contra um farm vivo (56 devices simulados, schema v17): `healthz` 200,
-`/api/v1/capabilities` **401 sem credencial e 200 com**, todas as rotas de
-leitura 200 para operator, **`/api/v1/reaper` e `/api/v1/bulk` 403 para
-tenant**, as 7 áreas do Docs 200 com as contagens batendo, `/metrics` 200 com
-1 031 linhas e todas as séries que alguma regra de alerta nomeia presentes.
+A corrida no Linux é a que vale mais: **kernel 6.18.33.2, PostgreSQL 18.6**, o
+binário deste tree subindo de verdade, `topo.Sysfs` lendo uma árvore USB de um
+sistema de arquivos real (o modo `0644` do `disable` de cada porta é o sinal do
+kernel para VBUS chaveável), e **as 15 suítes contra um segundo major**. O
+script globa `test/assertions*.sql`, então uma suíte escrita amanhã entra sem
+ninguém precisar lembrar.
 
-Três provas vivas que valem mais que a suíte:
-
-1. **A testemunha escreve.** Job de 100 s com `FARM_LEASE_WITNESS_INTERVAL=30s`:
-   lease colocado às 17:19:08, `farm.leases.witness_at` gravado às 17:19:38 com
-   `witness_extensions=1` e `reclaimable_at` empurrado para 18:04:08;
-   `farm_jobrunner_witness_total{outcome="accepted"} 1`. Era `LEASE-09`, a linha
-   mais importante do registro, e era a última metade não ligada do
-   contramedida do #663.
-2. **O reaper se recusa a armar num componente que nunca bateu.**
-   `farm.reaper_arm(ARRAY['reaper','api','ghost_component'], '60s')` devolve
-   `f | 00:00:00 | {ghost_component}` e `reaper_state.last_refusal` diz por quê.
-3. **Fechar quarentena termina na própria chamada.** Quarentena de hub sobre 7
-   devices: `devices_released: 7`, `devices_reenabled: 7`, e o banco lê
-   `unknown|enabled|7` no instante seguinte — sem ciclo de recovery no meio.
+E o invariante, medido vivo: 9 falhas de transporte sobreviveram, **nenhum lease
+se moveu**, e todo lease encerrado saiu por `completed` — nunca por
+conectividade.
 
 ## O que mudou nesta rodada
 
-Vinte e uma branches, na ordem registrada em `<scratchpad>/merge-order.md`, com
-`go build && go vet && gofmt -l && go test` limpo entre cada uma. Sete
-precisaram de reconciliação de verdade, e essas são as que importam:
+Duas levas. A primeira fechou o registro (catorze unidades); a segunda foram
+quatro pendências que a própria verificação encontrou.
 
-- **`internal/recovery`: dois classificadores viraram um.** #19 deu ao
-  `classifyHostFault` do atuador um terceiro retorno (o *kind* da recusa) e #24
-  extraiu a MESMA decisão para um `ClassifyHostFault` exportado, para a rota de
-  slot power do operador escrever linhas indistinguíveis das da escada.
-  Mergeados, sobravam duas implementações de uma decisão. `HostFault` carrega
-  `RefusalKind`, e o método do atuador é aquela função com a identidade do
-  degrau amarrada.
-- **`config.Fence` colidiu.** #18 é o proxy que o *host* SERVE
-  (`FARM_FENCE_TLS_*`); #21 é o que um processo do plano de controle
-  APRESENTA (`FARM_FENCE_CLIENT_*`). Os dois se chamavam `Fence` e um sombreava
-  o outro sem o compilador reclamar. O lado cliente virou `Config.FenceClient`.
-- **`deviceLease.ID/Holder/JobID` viraram ponteiros** (#12, mascaramento por
-  tenant) e quatro superfícies novas de `ctl` formatavam com `%s`. `go vet`
-  pegou todas.
-- **A linha do marcador no `Summary()`** que #23 adicionou foi perdida numa
-  resolução de conflito dois merges depois e restaurada — o teste do próprio #23
-  a encontrou.
-- **`assertions_v15.sql`** arma o reaper pela assinatura nova do `00012`.
-- **`TestEveryTenantReadableRouteIsScoped`** (#12) reprovou o build por causa do
-  `GET /api/v1/slots` que #16 tinha acabado de adicionar. É o único tipo de
-  evidência que um teste desses consegue oferecer, e o resultado foi uma entrada
-  na allowlist com a razão escrita: `slotView` não carrega lease, job nem tenant.
+**O que o registro não sabia, e três agentes acharam procurando:**
 
-Um defeito real apareceu na verificação final e foi corrigido:
+- **`SEC-05` estava aberta por uma porta que ninguém tinha experimentado.** A
+  listagem de leases estava limpa, mas `00009` gravava `prior_instance` e
+  `new_instance` no `detail` de um evento `lease_reattached`, e
+  `GET /api/v1/events` projetava `detail` **verbatim** — republicando
+  `lease_id + fence + holder_instance` numa linha só, para um token de operador
+  que não tem escopo entre tenants, e direto na timeline do dashboard. O
+  comentário em `internal/api/leases.go` que pulava a checagem de tenant no
+  renew **se justificava** na afirmação que isso quebrava.
+- **`JOB-03` era mais estreita do que o registro dizia, e a receita documentada
+  não funcionava.** O status era lido na largada e no reattach; um soak que
+  morria na quarta hora ainda dava step verde. E a spec de referência da aba
+  Docs mandava conferir com `cat …result` e `expect_exit: [0]`, que julga o
+  `cat`.
+- **`JOB-10` estava em tensão direta com um requisito irmão**, e nada arbitrava.
+  A resolução foi **reter** o veredito em vez de rebaixá-lo: o job fica
+  `running`, que é a ausência de veredito, e as duas exigências passam a valer.
 
-- **`internal/demo` roubava jobs submetidos pela API.** `runDemo` sobe o
-  scheduler e o jobrunner REAIS ao lado do simulador, e o `schedulableJobs` do
-  simulador pegava todo job na fila. O modelo dele de duração é a CONTAGEM de
-  steps, então ele soltava o lease em quatro segundos enquanto o runner estava a
-  um segundo de cem, e o step do operador ficava `running` para sempre sob uma
-  linha de log dizendo "job complete". Agora o simulador só agenda o que ele
-  mesmo enfileirou (`farm.jobs.created_by = 'demo-feeder'`). Dois testes novos,
-  ambos falsificados.
+**As quatro pendências da segunda leva:**
+
+| | O que era | Onde ficou |
+|---|---|---|
+| F1 | O dashboard nunca recebia stream numa fazenda com token, porque `EventSource` não manda header | Tíquete de uso único, TTL de 30 s, gasto na primeira apresentação, abre **aquela** rota e nada mais |
+| F2 | `/specs/kinds` descrevia um `wait_for` que não existia mais | `00021`, mais um teste que fixa os identificadores dentro da prosa |
+| F3 | Uma renovação que falha no jobrunner virava só linha de log | `HolderHooks` ligado — o alerta já listava o jobrunner como publicador e estava cego para ele |
+| F4 | `FARM_MIGRATIONS_TABLE=farm.x` num banco novo falhava com `schema "farm" does not exist` | O migrador cria o schema e **anuncia**; num banco já migrado, **recusa** |
+
+### Quatro defeitos que só apareceram rodando
+
+Nenhum deles era visível numa suíte verde, e é por isso que a corrida no Linux
+virou parte da receita:
+
+1. **Todo papel entrava em pânico no startup** por um registro duplicado de
+   collector, enquanto `go build`, `go vet`, `gofmt` e a suíte inteira ficavam
+   verdes — porque ninguém chamava `newRegistry`. Só existia no Linux: o
+   process collector do prometheus não descreve nada em outros sistemas.
+2. **`topo.Sysfs` nunca tinha executado.** Todo teste de topologia entrega ao
+   `FromFS` um `fstest.MapFS`; o binário chama `Sysfs`, que lê por `os.DirFS` e
+   tira a chaveabilidade de VBUS do **modo** do arquivo — que um MapFS só sabe
+   afirmar.
+3. **O dashboard não recebia stream** em nenhuma fazenda com token.
+4. **A schema só tinha sido checada contra um major do PostgreSQL.**
+
+E três testes estavam passando pelo motivo errado — um afirmava sobre
+`encoding/json` em vez do código, um casava a linha errada do arquivo que
+varria, um tinha um relógio que tornava a própria falsificação indetectável. Os
+três foram escritos nesta sessão, pelo mesmo processo que depois os pegou. É
+para isso que serve falsificar cada asserção.
 
 ## Estado do registro
 
-`REQUIREMENTS.md` e a aba **Docs → Requirements** estão sincronizados
-célula-a-célula (68 linhas divergiam; agora o JSON é gerado do Markdown).
+`REQUIREMENTS.md` e a aba **Docs → Requirements** estavam sincronizados
+célula-a-célula na rodada passada e **tinham se desencontrado de novo em 35
+células**. Agora `TestDocsRegisterMatchesREQUIREMENTS` lê os dois e compara cada
+célula, então o próximo desencontro reprova o build em vez de chegar à tela.
 
-- **69 de 101** linhas em `met`, mais **8** em `met` numa dimensão e abertas em
-  outra, mais **3** `decided`.
-- **21 abertas**, e a separação delas é a informação:
-  - **precisam de rack** (6): `DEV-04`, `DEV-05`, `REC-03`, `OPS-04`, `HW-05`,
-    `JOB-04`. Nada nesta árvore jamais encostou num aparelho.
-  - **são relato** (9): `LEASE-14`, `JOB-08`, `JOB-10`, `API-06`, `API-07`,
-    `SEC-03`, `OBS-10`, `TEST-02`, `TEST-03`. Dá para descobrir o que aconteceu,
-    às vezes só pelo `psql`.
-  - **nomeadas e deliberadamente não feitas** (6): `LEASE-10`, `LEASE-13`,
-    `DEV-02`, `DEV-07`, `JOB-03`, `SEC-05`.
-- Os gaps das seis áreas caíram de **88 para 20**. Vinte e nove foram movidos
-  para a tabela "Gaps closed" de cada página — registrados, não apagados, porque
-  quem lembra de um gap precisa distinguir **corrigido** de **nunca existiu**.
+- **86 de 101** linhas em `met`, **11** em `met` numa dimensão e abertas em
+  outra, **3** `decided`.
+- **Uma aberta**: `REC-03` — tiers 3 (`USBDEVFS_RESET`) e 4 (corte de VBUS)
+  contra hardware real. `HW-05` é a mesma frase sobre uma coisa mais estreita.
+  **Não há telefone nesta máquina**, e nenhuma mudança de código muda isso. Ler
+  que uma porta *pode* ser chaveada não é chaveá-la, e o registro não finge o
+  contrário.
+- Os gaps das sete páginas do Docs estão em **18** (a página `surface` zerou).
 
 ## O que fazer ao retomar, nesta ordem
 
-1. **Rodar contra um rack.** É o item 1 do registro e seis linhas esperam por
-   ele. `farmd node` lê `/sys` e para na descoberta USB fora do Linux; reset USB,
-   corte de VBUS por `uhubctl` e a metade-host do proxy de fence estão escritos e
-   testados contra `fstest.MapFS` e `test/fakeadb`, e nada disso é um telefone.
-2. **`JOB-08`** — mostrar qual step falhou e o que ele imprimiu. As linhas estão
-   em `farm.job_steps`; falta a rota e o painel.
-3. **`JOB-10`** — reconciliar o estado do job com as linhas de step. O caso que
-   produzia a divergência no demo foi corrigido; a reconciliação que a tornaria
-   impossível não existe.
+1. **Rodar contra um rack.** É o item 1 do registro e as duas últimas linhas
+   esperam por ele. Tudo que leva às duas chamadas está escrito, testado e
+   agora **rodado** no Linux; o que falta é o aparelho.
+2. **`-race`.** Nunca rodou nesta máquina (não há compilador C). É o buraco de
+   cobertura mais barato de fechar em qualquer máquina que tenha gcc.
+3. **`REC-02`, `SEC-04`, `OPS-04`, `DEV-04`, `DEV-05`** — as linhas `met` em
+   código e `unverified` em hardware. Todas viram `met` numa tarde com um rack.
 4. O resto está ordenado em `REQUIREMENTS.md` → *What the register argues for
    next*.
 
@@ -128,13 +133,23 @@ célula-a-célula (68 linhas divergiam; agora o JSON é gerado do Markdown).
   senha.
 - Uma mensagem de commit (`a832121`) perdeu a palavra "armed" para uma expansão
   de crase do shell. O conteúdo está certo; a frase ficou com um buraco.
+- **`00002` e `00008` foram editadas depois de aplicadas** (a corrida do
+  `CREATE ROLE`, PR #49). É deliberado e está dito dentro das próprias
+  migrations: goose nunca reexecuta uma migration aplicada, então uma `00023`
+  não alcançaria o statement que corre. Nenhum banco já migrado muda — as duas
+  formas terminam com os mesmos três papéis existindo.
 
 ## Armadilhas do ambiente
 
 - **`make` não existe** nesta máquina. Comandos crus.
-- **`DATABASE_URL` precisa ficar VAZIO** durante `go test ./...`. Os pacotes com
+- **`DATABASE_URL` precisa ficar VAZIA** durante `go test ./...`. Os pacotes com
   teste SQL pulam sem ela e a suíte passa; **setada e quebrada, o `TestMain`
   derruba o pacote inteiro**.
+- **O banco compartilhado de dev precisa estar migrado.** Vários testes de
+  `internal/` leem o banco que `DATABASE_URL` aponta em vez de criar um próprio.
+  Com ele atrasado, `TestPublishedStepVocabulary` falha dizendo que a *prosa* de
+  um step está errada — a mensagem não menciona versão de schema, e custa tempo.
+  Rodar `farmd migrate up` contra ele antes de acusar o código.
 - **Asserções precisam de banco de rascunho.** Criar, migrar, rodar, derrubar —
   um banco com seed de demo mata as asserções em chave duplicada.
 - Postgres de desenvolvimento: `postgres://farm@127.0.0.1:55432/...` (trust,
@@ -145,10 +160,18 @@ célula-a-célula (68 linhas divergiam; agora o JSON é gerado do Markdown).
   não consegue fazer bind **não derruba mais o papel** — ele loga e exporta
   `farm_metrics_listener_up 0`.
 - `/.claude/` está no `.gitignore` — `gofmt -l .` da raiz é confiável.
-- Heredoc `python - <<'PY'` nesta máquina **come `\n` dentro de strings**
-  ocasionalmente, e crases dentro de heredoc `<<'MSG'` do `git commit -F -`
-  **são expandidas pelo shell**. Para editar arquivo, escrever o script com a
-  ferramenta Write e chamá-lo, ou usar `sed`.
+- **Não editar um script de shell enquanto ele roda.** O bash lê o arquivo por
+  offset; reescrevê-lo debaixo dele faz a execução continuar no meio de uma
+  linha. Aconteceu com `linux-acceptance.sh` nesta sessão, e o erro de sintaxe
+  que apareceu não existia no arquivo.
+- Heredoc `python - <<'PY'` nesta máquina **come a barra invertida dentro de
+  strings** — a barra dupla vira simples e o Go não compila. Crases dentro de
+  heredoc `<<'MSG'` do `git commit -F -` **são expandidas pelo shell**, e um
+  heredoc grande com crases e aspas pode nem fechar. Para escrever arquivo,
+  usar a ferramenta Write ou `cat > arquivo.py <<'PYEOF'` com um script curto.
+- Python aqui é o do Windows: `/tmp/x` dentro de uma **string** do script
+  resolve para `C:\tmp\x`, mesmo que o Git Bash traduza o mesmo caminho quando
+  passado como **argumento**. Usar caminho Windows dentro do script.
 - `farm.jobs` exige tenant e queue que existam: no demo são `acme` e `ci`, não
   `default`. O pool é `default`. Um spec precisa de `"version": 1` e o payload
   vai numa chave com o nome do kind (`{"kind":"sleep","sleep":{"duration":"..."}}`).
@@ -168,7 +191,7 @@ Três pesquisas profundas estabeleceram, com fonte primária:
    falhou em suprimir **e** em impedir propagação; em nitrogênio puro, sem
    oxigênio e sem chama, propagou mesmo assim. Mitigação é contenção,
    espaçamento, limitação de carga e detecção precoce — as duas primeiras estão
-   em `docs/siting.md`, e as duas últimas chegaram nesta rodada
+   em `docs/siting.md`, e as duas últimas no código
    (`internal/chargepolicy` segura a banda 40–80%, `internal/watchdog/swell.go`
    levanta `battery_anomaly` com `rack_slot`, e `DeviceFarmerBatteryAnomaly`
    pagina em cima).

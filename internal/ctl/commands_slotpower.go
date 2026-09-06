@@ -238,6 +238,13 @@ func jsonCell(v json.RawMessage) string {
 // finished 'failed' or 'aborted' is a failure of the action even though the
 // transport and the policy check both worked. A server that hands off and
 // answers 'requested' has nothing to fail yet.
+//
+// A finished-failed cycle is partial — exit 4 — and not a failure of ctl. The
+// request was authorised, the policy check ran, the attempt is on record in
+// farm.recovery_attempts with its outcome, and no lease moved. Exit 1 there
+// would tell a script the control plane is unreachable and send it to re-POST
+// a cycle the farm already performed; 4 says the one target it addressed did
+// not come back, which is a slot to go and look at, not a request to repeat.
 func powerOutcome(raw json.RawMessage) error {
 	var body struct {
 		Outcome string `json:"outcome"`
@@ -247,7 +254,8 @@ func powerOutcome(raw json.RawMessage) error {
 	}
 	switch body.Outcome {
 	case "failed", "aborted":
-		return fmt.Errorf("the power cycle finished with outcome %q; no lease was affected", body.Outcome)
+		return fmt.Errorf("%w: the power cycle finished with outcome %q; no lease was affected",
+			ErrPartial, body.Outcome)
 	}
 	return nil
 }

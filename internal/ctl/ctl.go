@@ -15,11 +15,18 @@
 // would eventually be used to. So ctl cannot develop privileges the API does
 // not have, and a ctl that works is evidence the API works.
 //
-// The one exception is `ctl validate`, which parses a spec with
-// internal/jobspec and never leaves the machine. Validating locally is not a
-// private privilege: it is the same library the server runs, and refusing to
-// submit a spec that cannot be valid saves a round trip without deciding
-// anything the server would have decided differently.
+// There is no exception, and `ctl validate` used to be one. It parsed a spec
+// with this binary's build of internal/jobspec and never opened a socket,
+// which looked like a saved round trip and was really a second authority on
+// what a spec means. The two drift the first time either side ships without
+// the other: a ctl older than the control plane refuses a spec the farm would
+// have run, a newer one waves through what the farm will refuse — and the
+// second failure surfaces at submit, after the operator has been told the
+// document is fine. So `validate`, `submit`, `kinds` and `resets` all ask the
+// server (POST /specs/validate, GET /specs/kinds, GET /specs/resets), ctl
+// renders the answer, and `validate` prints which URL decided. The cost is
+// honest: validating a spec now needs a farm in reach, because only the farm
+// knows whether the artifacts it names are in the store.
 //
 // # Destructive commands
 //

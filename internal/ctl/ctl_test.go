@@ -78,6 +78,105 @@ func TestBulkOutcomeIsPartialNotFailure(t *testing.T) {
 	}
 }
 
+// TestExecOutcomeIsPartialNotFailure holds the single-target half of the same
+// contract. `ctl device exec` addresses one phone rather than sixty, but the
+// question a script asks is identical: did the farm fail, or did the target?
+// A device that exits non-zero is a completed run — the API answered, the
+// attempt is on the server, no lease moved — so it is 4, and only a run whose
+// state is unknown is 1.
+func TestExecOutcomeIsPartialNotFailure(t *testing.T) {
+	if err := execOutcome(execResponse{ExitCode: 0, Exited: true}); err != nil {
+		t.Fatalf("a command that exited 0 returned %v", err)
+	}
+
+	err := execOutcome(execResponse{ExitCode: 7, Exited: true})
+	if err == nil {
+		t.Fatal("a command that exited 7 returned nil")
+	}
+	if !errors.Is(err, ErrPartial) {
+		t.Fatalf("a failed device command is not ErrPartial: %v", err)
+	}
+	if got := ExitCode(err); got != 4 {
+		t.Fatalf("exit code = %d, want 4", got)
+	}
+	// The device's own number survives into the message. ctl's status says
+	// which side failed; the text says how the phone said so.
+	if !strings.Contains(err.Error(), "exited 7") {
+		t.Fatalf("the message drops the device's exit code: %q", err.Error())
+	}
+	if errors.Is(err, ErrRefused) {
+		t.Fatalf("a failed device command reads as refused: %v", err)
+	}
+
+	// The stream that ended without an exit frame. adbwire leaves the code at
+	// -1 and the API answers 200, so this arrives looking like a failure and
+	// is not one: the command may still be running. 4 would promise a script
+	// the run is over and every target's fate is on the server.
+	err = execOutcome(execResponse{ExitCode: -1, Exited: false})
+	if err == nil {
+		t.Fatal("a command with no exit status returned nil")
+	}
+	if errors.Is(err, ErrPartial) {
+		t.Fatalf("an outcome nobody knows reads as a completed run: %v", err)
+	}
+	if got := ExitCode(err); got != 1 {
+		t.Fatalf("a command with no exit status exited %d (%v), want 1", got, err)
+	}
+	if !strings.Contains(err.Error(), "UNKNOWN") {
+		t.Fatalf("the message does not say the outcome is unknown: %q", err.Error())
+	}
+}
+
+// TestExecExitsPartialAndTransportFailureExitsOne drives the whole verb, not
+// just the outcome function, and pins the two readings apart end to end: the
+// same invocation against a working farm whose phone failed, and against an
+// address nothing answers on.
+func TestExecExitsPartialAndTransportFailureExitsOne(t *testing.T) {
+	api := newFakeAPI(t)
+	api.reply("GET /api/v1/devices/d1", http.StatusOK, map[string]any{
+		"device": map[string]any{
+			"device_id": "d1", "farm_uid": "df-aaaa", "rack_slot": "R1-U3-P2",
+			"host_id": "h01", "adb_devpath": "1-1.4.2", "health": "healthy",
+			"pool": "default", "admin_state": "active",
+		},
+	})
+	api.reply("POST /api/v1/devices/d1/exec", http.StatusOK, map[string]any{
+		"device_id": "d1", "adb_devpath": "1-1.4.2", "command": "pm path com.example",
+		"exit_code": 7, "stderr": "Error: could not find package\n", "exited": true, "duration_ms": 120,
+	})
+
+	_, errOut, err := api.runExec(t, "d1", "pm path com.example")
+	if got := ExitCode(err); got != 4 {
+		t.Fatalf("a device command that exited 7 exited %d (%v), want 4", got, err)
+	}
+	// The device's stderr is still the device's, on ctl's stderr, and the
+	// exit line names the devpath an operator would go and look at.
+	for _, want := range []string{"could not find package", "exit 7"} {
+		if !strings.Contains(errOut, want) {
+			t.Errorf("stderr omits %q:\n%s", want, errOut)
+		}
+	}
+
+	// The same verb against a port nothing is listening on. Nothing ran, the
+	// server holds no row, and the state of the device is unknown — which is
+	// the one case that must stay 1, or exit 4 would mean nothing.
+	dead := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	deadURL := dead.URL
+	dead.Close()
+
+	var out, errb bytes.Buffer
+	err = runWith(context.Background(), nil, []string{
+		"device", "exec", "d1", "--reason", "triage", "--yes", "--url", deadURL,
+		"--", "pm path com.example",
+	}, &out, &errb, nil)
+	if got := ExitCode(err); got != 1 {
+		t.Fatalf("an unreachable API exited %d (%v), want 1", got, err)
+	}
+	if errors.Is(err, ErrPartial) {
+		t.Fatalf("a transport failure reads as a partial run: %v", err)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // A fake control plane
 // ---------------------------------------------------------------------------
@@ -141,6 +240,19 @@ func (f *fakeAPI) run(t *testing.T, args ...string) (stdout, stderr string, err 
 	t.Helper()
 	var out, errb bytes.Buffer
 	err = runWith(context.Background(), nil, append(args, "--url", f.URL), &out, &errb, nil)
+	return out.String(), errb.String(), err
+}
+
+// runExec drives `ctl device exec`, which cannot go through run: that appends
+// --url last, and everything after the `--` separator is the command meant for
+// the phone. The flag would be typed at the device instead of at ctl.
+func (f *fakeAPI) runExec(t *testing.T, target, command string) (stdout, stderr string, err error) {
+	t.Helper()
+	var out, errb bytes.Buffer
+	err = runWith(context.Background(), nil, []string{
+		"device", "exec", target, "--reason", "triage", "--yes", "--url", f.URL,
+		"--", command,
+	}, &out, &errb, nil)
 	return out.String(), errb.String(), err
 }
 
@@ -493,8 +605,9 @@ func TestPowerRendersWhateverTheServerAnswers(t *testing.T) {
 }
 
 // TestPowerOutcomeAndRefusal: a 409 is the refusal this endpoint exists for
-// and exits 3; a 2xx whose outcome says the cycle failed is a failure of the
-// action and exits 1; a non-integer slot never reaches the wire.
+// and exits 3; a 2xx whose outcome says the cycle failed is one target failing
+// inside a run that completed, and exits 4; a non-integer slot never reaches
+// the wire.
 func TestPowerOutcomeAndRefusal(t *testing.T) {
 	api := newFakeAPI(t)
 	api.reply("GET /api/v1/fleet", http.StatusOK, powerFleet())
@@ -509,9 +622,14 @@ func TestPowerOutcomeAndRefusal(t *testing.T) {
 		t.Fatalf("a refused cycle exited %d (%v), want 3", got, err)
 	}
 
+	// 4, not the 1 this used to assert. The POST was authorised and answered,
+	// the attempt is on record, and no lease moved: the run completed and the
+	// single target in it failed, which is what the package doc calls partial.
+	// Exit 1 here read as "could not reach the API" and would send a retrying
+	// script to re-POST a cycle the farm had already performed.
 	out, _, err := api.run(t, "power", "8", "--yes", "--reason", "port wedged")
-	if got := ExitCode(err); got != 1 {
-		t.Fatalf("a cycle that finished failed exited %d (%v), want 1", got, err)
+	if got := ExitCode(err); got != 4 {
+		t.Fatalf("a cycle that finished failed exited %d (%v), want 4", got, err)
 	}
 	if !strings.Contains(out, "outcome:") || !strings.Contains(out, "failed") {
 		t.Errorf("the failed outcome was not rendered before the exit:\n%s", out)

@@ -17,7 +17,6 @@ import (
 	"time"
 
 	"github.com/flaviopadilha/device-farmer/internal/artifacts"
-	"github.com/flaviopadilha/device-farmer/internal/jobspec"
 )
 
 // ---------------------------------------------------------------------------
@@ -756,17 +755,42 @@ func cmdDeviceExec(ctx context.Context, s *session, args []string) error {
 	return execOutcome(res)
 }
 
-// execOutcome mirrors the device's exit code onto ctl's.
+// execOutcome reports a non-zero device exit as a partial run: exit 4.
 //
-// The transport worked and the API answered; the command on the phone failed.
-// Reporting that as ctl's own failure is what lets a script read it the way it
-// would read a local command's status — and it says nothing about any lease,
-// which is why the message names the command and not the device.
+// The transport worked, the API answered 200, and the server holds the row for
+// what it ran. The only thing that failed is the command on the phone — one
+// target of a run whose size happens to be one. That is this package's
+// definition of partial, and `ctl bulk` already draws the same line across
+// sixty devices; a run of one is still a run.
+//
+// This used to mirror the device's status onto ctl's, which sounds faithful
+// and is not. There is no room for the device's numbers: ctl has already spent
+// 1, 2, 3 and 4 on meanings of its own, so a phone exiting 2 would surface as
+// "the invocation was wrong" and one exiting 3 as "the remote refused". In
+// practice every device failure collapsed to 1 — indistinguishable from "could
+// not reach the API", which is the one reading that sends a script to retry
+// the control plane when what needs looking at is a handset. The device's own
+// code is not lost: it is in this message, and in the exit line printed above
+// it. ctl's status answers ctl's question.
+// A stream that ended without an exit frame is the exception, and it is the
+// reason this reads res.Exited rather than only the number. adbwire leaves
+// ExitCode at -1 when no ShellExit packet arrived (adbwire.DrainShellV2), and
+// the API passes that through as a 200, so "-1, did not exit" reaches here
+// looking like any other failure. It is not one: the command may still be
+// running on the phone. Exit 4 would tell a script the run completed and every
+// target's fate is recorded, which is the one thing that is not true here, so
+// an unknown outcome stays 1 — the same answer unknownOutcome gives a write
+// whose reply never arrived.
 func execOutcome(res execResponse) error {
+	if !res.Exited {
+		return errors.New("the command's exit status never arrived, so whether it finished on the " +
+			"device is UNKNOWN; nothing was retried and no lease was affected")
+	}
 	if res.ExitCode == 0 {
 		return nil
 	}
-	return fmt.Errorf("the command exited %d on the device", res.ExitCode)
+	return fmt.Errorf("%w: the command exited %d on the device; no lease was affected",
+		ErrPartial, res.ExitCode)
 }
 
 // ---------------------------------------------------------------------------
@@ -1252,306 +1276,15 @@ func cmdJobCancel(ctx context.Context, s *session, args []string) error {
 }
 
 // ---------------------------------------------------------------------------
-// submit, validate
+// reading a spec off disk
 // ---------------------------------------------------------------------------
 
-// jobCreateRequest is the body of POST /jobs.
-type jobCreateRequest struct {
-	Pool              string          `json:"pool"`
-	Queue             string          `json:"queue"`
-	Tenant            string          `json:"tenant"`
-	Spec              json.RawMessage `json:"spec,omitempty"`
-	Selector          json.RawMessage `json:"selector,omitempty"`
-	ExpectedDurationS int64           `json:"expected_duration_s,omitempty"`
-	MaxRuntimeS       int64           `json:"max_runtime_s,omitempty"`
-}
-
-func cmdSubmit(ctx context.Context, s *session, args []string) error {
-	fs := newFlags("submit", s.err)
-	var g globals
-	g.bind(fs)
-	file := fs.String("f", "", "path to the job spec, or - for stdin")
-	pool := fs.String("pool", "", "pool to allocate from (required)")
-	queue := fs.String("queue", "", "queue to file under (required)")
-	tenant := fs.String("tenant", "", "tenant that owns the job (required)")
-	profile := fs.String("profile", "", "device profile the job expects, carried in the selector")
-	expect := fs.Duration("expect-duration", 0, "how long the job is expected to take; over 30m the lease is protected")
-	maxRuntime := fs.Duration("max-runtime", 0, "hard deadline; the only user-supplied clock that may end the lease")
-
-	if rest, err := parseArgs(fs, args); err != nil {
-		return err
-	} else if len(rest) > 0 {
-		return usageErrf("submit takes no positional arguments; pass the spec with -f %s", rest[0])
-	}
-	if strings.TrimSpace(*file) == "" {
-		return usageErrf("submit needs -f <spec.json>")
-	}
-	e, err := s.open(&g)
-	if err != nil {
-		return err
-	}
-	switch {
-	case strings.TrimSpace(*pool) == "":
-		return usageErrf("submit needs --pool")
-	case strings.TrimSpace(*queue) == "":
-		return usageErrf("submit needs --queue")
-	case strings.TrimSpace(*tenant) == "":
-		return usageErrf("submit needs --tenant")
-	}
-	// A negative max runtime is a deadline in the past. farm.jobs.max_runtime
-	// is an unconstrained interval and the reaper expires a lease once
-	// now() > acquired_at + max_runtime, so `--max-runtime -1h` files a job
-	// whose lease dies on the first pass after it is acquired — and it dies
-	// with release_reason 'max_runtime', which reads as the deadline working.
-	// The only user-supplied clock that may end a lease has to be a clock the
-	// user meant, so a typed minus sign is refused here rather than turned
-	// into a job that cannot run.
-	if *maxRuntime < 0 {
-		return usageErrf("--max-runtime is %s: a negative deadline is already in the past, and "+
-			"this job's lease would be expired as soon as it was acquired", *maxRuntime)
-	}
-	if *expect < 0 {
-		return usageErrf("--expect-duration is %s; it is how long the job is expected to take", *expect)
-	}
-
-	raw, err := readSpecFile(*file, s.in)
-	if err != nil {
-		return err
-	}
-	// Validated here, before anything is filed. The server validates too and is
-	// the authority; doing it locally first means a spec with nine defects
-	// produces nine messages and no half-created job.
-	spec, err := jobspec.Parse(raw)
-	if err != nil {
-		reportSpecProblems(e, err)
-		return fmt.Errorf("%s did not validate; nothing was submitted", *file)
-	}
-	canonical, err := json.Marshal(spec)
-	if err != nil {
-		return fmt.Errorf("re-encode spec: %w", err)
-	}
-
-	req := jobCreateRequest{
-		Pool:              strings.TrimSpace(*pool),
-		Queue:             strings.TrimSpace(*queue),
-		Tenant:            strings.TrimSpace(*tenant),
-		Spec:              canonical,
-		ExpectedDurationS: int64(expect.Seconds()),
-		MaxRuntimeS:       int64(maxRuntime.Seconds()),
-	}
-	if p := strings.TrimSpace(*profile); p != "" {
-		sel, err := json.Marshal(map[string]string{"profile": p})
-		if err != nil {
-			return fmt.Errorf("encode selector: %w", err)
-		}
-		req.Selector = sel
-	}
-
-	body, err := e.client.Post(ctx, apiPrefix+"/jobs", req)
-	if err != nil {
-		return err
-	}
-	if e.format == FormatJSON {
-		return e.out.RawJSON(body)
-	}
-
-	var res struct {
-		Job job    `json:"job"`
-		ID  string `json:"id"`
-	}
-	if err := json.Unmarshal(body, &res); err != nil {
-		return e.out.RawJSON(body)
-	}
-	id := res.Job.ID
-	if id == "" {
-		id = res.ID
-	}
-	f := &Fields{}
-	f.Add("job", id)
-	f.Add("state", firstNonEmpty(res.Job.State, "queued"))
-	f.Add("pool", req.Pool)
-	f.Add("queue", req.Queue)
-	f.Add("tenant", req.Tenant)
-	f.Addf("steps", "%d", len(spec.Steps))
-	f.Addf("spec total timeout", "%s", spec.TotalTimeout())
-	if *expect > 0 {
-		note := ""
-		if *expect > protectionThreshold {
-			note = "  (over 30m: the lease will be protected and is never reclaimed automatically)"
-		}
-		f.Addf("expected duration", "%s%s", *expect, note)
-	}
-	if *maxRuntime > 0 {
-		f.Addf("max runtime", "%s  (this deadline, and nothing else, may end the lease on a clock)", *maxRuntime)
-	} else {
-		f.Add("max runtime", "none — this lease ends when the job ends or a human revokes it")
-	}
-	if err := e.out.Fields(f); err != nil {
-		return err
-	}
-	e.out.Blank()
-	e.out.Text("nothing is scheduled yet: the scheduler turns this row into a lease.")
-	e.out.Text("follow it with: ctl job %s", id)
-	return nil
-}
-
-func cmdValidate(ctx context.Context, s *session, args []string) error {
-	_ = ctx // validation is local; no request is made and none is needed
-
-	fs := newFlags("validate", s.err)
-	var g globals
-	g.bind(fs)
-	file := fs.String("f", "", "path to the job spec, or - for stdin")
-	if rest, err := parseArgs(fs, args); err != nil {
-		return err
-	} else if len(rest) > 0 {
-		return usageErrf("validate takes no positional arguments; pass the spec with -f %s", rest[0])
-	}
-	if strings.TrimSpace(*file) == "" {
-		return usageErrf("validate needs -f <spec.json>")
-	}
-	format, err := ParseFormat(g.output)
-	if err != nil {
-		return err
-	}
-	// This command opens no connection, so it deliberately does not build a
-	// client: `ctl validate` has to work on a laptop with no farm in reach.
-	out := NewPrinter(s.out, format)
-	e := &env{session: s, out: out, format: format}
-
-	raw, err := readSpecFile(*file, s.in)
-	if err != nil {
-		return err
-	}
-	spec, parseErr := jobspec.Parse(raw)
-	if parseErr != nil {
-		if format == FormatJSON {
-			// The report is emitted and THEN the command fails. A validation
-			// gate in CI reads the exit code, not the document, so rendering a
-			// list of defects and exiting 0 would let a broken spec through the
-			// one check that exists to stop it.
-			if err := out.JSON(map[string]any{
-				"valid":    false,
-				"problems": specProblems(parseErr),
-				"error":    parseErr.Error(),
-			}); err != nil {
-				return err
-			}
-		} else {
-			reportSpecProblems(e, parseErr)
-		}
-		return fmt.Errorf("%s is not a valid job spec", *file)
-	}
-
-	if format == FormatJSON {
-		return out.JSON(map[string]any{
-			"valid":         true,
-			"version":       spec.Version,
-			"steps":         len(spec.Steps),
-			"total_timeout": spec.TotalTimeout().String(),
-			"artifacts":     specArtifacts(spec),
-		})
-	}
-
-	t := NewTable("#", "STEP", "KIND", "TIMEOUT", "ON ERROR", "DETAIL")
-	for i, st := range spec.Steps {
-		onErr := "stop"
-		if st.ContinueOnError {
-			onErr = "continue"
-		}
-		t.Row(strconv.Itoa(i), st.ID, string(st.Kind()), spec.StepTimeout(st).String(), onErr, stepDetail(st))
-	}
-	if err := out.Table(t); err != nil {
-		return err
-	}
-	out.Blank()
-	out.Text("%s is valid: version %d, %s, total timeout %s",
-		*file, spec.Version, plural(len(spec.Steps), "step", "steps"), spec.TotalTimeout())
-	if refs := specArtifacts(spec); len(refs) > 0 {
-		out.Text("artifacts referenced: %s", strings.Join(refs, ", "))
-		out.Text("each must already be in the store, by sha256, before this job runs: ctl artifacts")
-	}
-	return nil
-}
-
-// stepDetail renders the one field of a step an operator scanning a spec cares
-// about. The closed vocabulary is what makes this a type switch rather than a
-// reflective walk over an open map.
-func stepDetail(st jobspec.Step) string {
-	switch p := st.Payload.(type) {
-	case jobspec.Push:
-		return p.SHA256[:min(12, len(p.SHA256))] + " -> " + p.Dest
-	case jobspec.Install:
-		return p.SHA256[:min(12, len(p.SHA256))]
-	case jobspec.Uninstall:
-		return p.Package
-	case jobspec.Shell:
-		return p.Command
-	case jobspec.ShellDetached:
-		return p.Command + "  (handle " + p.Handle + ")"
-	case jobspec.WaitFor:
-		return p.Probe
-	case jobspec.Pull:
-		return p.Path + " -> artifact " + p.Artifact
-	case jobspec.Assert:
-		return p.Probe + " " + string(p.Operator) + " " + p.Value
-	case jobspec.Reset:
-		return "tier " + string(p.Tier)
-	case jobspec.Sleep:
-		return p.Duration.String()
-	case nil:
-		return "(no payload)"
-	}
-	return ""
-}
-
-// specArtifacts lists every content hash and artifact name a spec depends on.
-func specArtifacts(spec jobspec.Spec) []string {
-	var out []string
-	seen := map[string]bool{}
-	add := func(s string) {
-		if s != "" && !seen[s] {
-			seen[s] = true
-			out = append(out, s)
-		}
-	}
-	for _, st := range spec.Steps {
-		switch p := st.Payload.(type) {
-		case jobspec.Push:
-			add(p.SHA256)
-		case jobspec.Install:
-			add(p.SHA256)
-		case jobspec.Pull:
-			add("(produces) " + p.Artifact)
-		}
-	}
-	return out
-}
-
-// specProblems extracts every defect from a validation failure, or the single
-// message when the document did not even decode.
-func specProblems(err error) []jobspec.Problem {
-	var ve *jobspec.ValidationError
-	if errors.As(err, &ve) {
-		return ve.Problems
-	}
-	return []jobspec.Problem{{Path: "(document)", Message: err.Error()}}
-}
-
-// reportSpecProblems prints every defect at once. A person fixing a spec should
-// need one edit, not ten round trips, which is the entire reason
-// jobspec.ValidationError carries all of them.
-func reportSpecProblems(e *env, err error) {
-	problems := specProblems(err)
-	fmt.Fprintf(e.err, "%s\n\n", plural(len(problems), "problem", "problems"))
-	t := NewTable("WHERE", "PROBLEM")
-	t.MaxCell(120)
-	for _, p := range problems {
-		t.Row(p.Path, p.Message)
-	}
-	_ = t.Render(e.err)
-}
-
+// readSpecFile hands the document to the caller as the bytes it found, without
+// looking inside it. Deciding whether a spec can run is the server's job —
+// `ctl submit` and `ctl validate` both post to /api/v1/specs/validate — so
+// there is nothing here to parse it with, and that is the point: a client that
+// understood the vocabulary would be a second authority on it, wrong in one
+// direction the moment either side shipped a version the other had not.
 func readSpecFile(path string, stdin io.Reader) ([]byte, error) {
 	if path == "-" {
 		b, err := io.ReadAll(stdin)

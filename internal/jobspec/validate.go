@@ -68,11 +68,43 @@ type validator struct {
 	spec     Spec
 	problems []Problem
 
-	stepIDs     map[string]string // id            -> path of the first step using it
-	handles     map[string]string // detached handle -> path
+	stepIDs     map[string]string // id                   -> path of the first step using it
 	resultPaths map[string]string // detached result path -> path
-	pushDest    map[string]seen   // artifact sha256 -> where it was first pushed
-	pullSource  map[string]seen   // artifact name   -> where it was first pulled from
+	pushDest    map[string]seen   // artifact sha256      -> where it was first pushed
+	pullSource  map[string]seen   // artifact name        -> where it was first pulled from
+
+	// handles is every detached handle the spec declares, collected in a pass
+	// BEFORE any step is checked. A wait_for that names a handle has to be
+	// told apart three ways — declared above it, declared below it, declared
+	// nowhere — and a validator that learned handles as it walked could only
+	// ever see the ones above, so it would report an ordering mistake as a
+	// missing step. Collecting first also keeps every problem in step order,
+	// which is what an editor highlighting them expects.
+	handles map[string]handleDecl
+}
+
+// handleDecl records where a detached handle was declared: the path, for an
+// error message, and the step's index, so a wait_for naming it can be told
+// whether the work it waits for has been started by the time it runs.
+type handleDecl struct {
+	path  string
+	index int
+}
+
+// collectHandles records the first declaration of every well-formed detached
+// handle. A malformed one is skipped: checkStep reports it where it was
+// written, and a wait_for naming it is then told the handle is not declared,
+// which is true of every handle this spec could actually run with.
+func (v *validator) collectHandles(steps []Step) {
+	for i, st := range steps {
+		d, ok := derefPayload(st.Payload).(ShellDetached)
+		if !ok || !handleRe.MatchString(d.Handle) {
+			continue
+		}
+		if _, dup := v.handles[d.Handle]; !dup {
+			v.handles[d.Handle] = handleDecl{path: fmt.Sprintf("steps[%d]", i), index: i}
+		}
+	}
 }
 
 // seen records the first use of an artifact so a later conflicting use can name
@@ -108,7 +140,7 @@ func Validate(s Spec) error {
 	v := &validator{
 		spec:        s,
 		stepIDs:     map[string]string{},
-		handles:     map[string]string{},
+		handles:     map[string]handleDecl{},
 		resultPaths: map[string]string{},
 		pushDest:    map[string]seen{},
 		pullSource:  map[string]seen{},
@@ -148,9 +180,9 @@ func Validate(s Spec) error {
 		steps = steps[:MaxSteps]
 	}
 
+	v.collectHandles(steps)
 	for i, st := range steps {
-		path := fmt.Sprintf("steps[%d]", i)
-		checkStep(v, path, st, checkInherited)
+		checkStep(v, i, st, checkInherited)
 	}
 
 	if total := s.TotalTimeout(); total > MaxTotalTimeout {
@@ -164,7 +196,9 @@ func Validate(s Spec) error {
 	return &ValidationError{Problems: v.problems}
 }
 
-func checkStep(v *validator, path string, st Step, checkInherited bool) {
+func checkStep(v *validator, index int, st Step, checkInherited bool) {
+	path := fmt.Sprintf("steps[%d]", index)
+
 	// Id first: every later message quotes it.
 	switch {
 	case st.ID == "":
@@ -282,33 +316,53 @@ func checkStep(v *validator, path string, st Step, checkInherited bool) {
 			v.add(p+".handle",
 				"%q must start alphanumeric and use only letters, digits and . _ - (it names a file on the device)",
 				pl.Handle)
-		} else if first, dup := v.handles[pl.Handle]; dup {
+		} else if first := v.handles[pl.Handle]; first.index != index {
+			// collectHandles recorded the FIRST step declaring each handle, so
+			// any other index means this step is not it.
 			v.add(p+".handle", "duplicate handle %q, already used by %s; "+
-				"a handle is how a reconnected runner finds this process again", pl.Handle, first)
-		} else {
-			v.handles[pl.Handle] = path
+				"a handle is how a reconnected runner finds this process again", pl.Handle, first.path)
 		}
 
 	case WaitFor:
-		if strings.TrimSpace(pl.Probe) == "" {
+		// A wait_for waits for exactly one thing. Both spellings at once is a
+		// step that has been told two stories, and neither can be preferred
+		// without guessing which one its author meant.
+		switch hasProbe := strings.TrimSpace(pl.Probe) != ""; {
+		case hasProbe && pl.Handle != "":
+			v.add(p, "sets both \"probe\" and \"handle\", which are two different waits: "+
+				"a handle waits for a shell_detached command's exit status and judges it, "+
+				"a probe waits for a shell command of your own to exit 0. Keep one")
+		case !hasProbe && pl.Handle == "":
 			v.add(p+".probe", "must be a shell command that exits 0 once the condition holds, "+
-				`such as "[ \"$(getprop sys.boot_completed)\" = \"1\" ]"`)
+				`such as "[ \"$(getprop sys.boot_completed)\" = \"1\" ]"; `+
+				"or set \"handle\" instead, to wait for a shell_detached command and judge the exit status it publishes")
+		case pl.Handle != "":
+			checkWaitHandle(v, p+".handle", index, pl.Handle)
+		}
+
+		// The clocks are the same two fields either way, but what they time is
+		// not: one re-runs the author's probe, the other re-reads the device's
+		// status file. A message naming a probe would send the author of a
+		// handle-form wait looking for a field they deliberately did not set.
+		what, unit := "the probe", "re-run the probe"
+		if pl.Handle != "" {
+			what, unit = "the status read", "re-read the detached command's status"
 		}
 		if pl.Interval <= 0 {
-			v.add(p+".interval", "must be positive, got %s; write how often to re-run the probe, such as \"5s\"", pl.Interval)
+			v.add(p+".interval", "must be positive, got %s; write how often to %s, such as \"5s\"", pl.Interval, unit)
 		}
 		if pl.Timeout <= 0 {
 			v.add(p+".timeout", "must be positive, got %s; write how long the condition may take, such as \"10m\"", pl.Timeout)
 		}
 		if pl.Interval > 0 && pl.Timeout > 0 && pl.Interval > pl.Timeout {
-			v.add(p+".interval", "%s is longer than the %s this step waits, so the probe would run once at most",
-				pl.Interval, pl.Timeout)
+			v.add(p+".interval", "%s is longer than the %s this step waits, so %s would happen once at most",
+				pl.Interval, pl.Timeout, what)
 		}
 		// The step's own timeout must outlast the condition's, or the step
-		// kills a probe that was still allowed to succeed.
+		// cuts off a wait that was still allowed to succeed.
 		if pl.Timeout > 0 && eff > 0 && pl.Timeout.Std() > eff {
-			v.add(p+".timeout", "%s is longer than the step's %s timeout, which would cut the probe short",
-				pl.Timeout, Duration(eff))
+			v.add(p+".timeout", "%s is longer than the step's %s timeout, which would cut %s short",
+				pl.Timeout, Duration(eff), what)
 		}
 
 	case Pull:
@@ -373,6 +427,33 @@ func noteArtifactTarget(v *validator, index map[string]seen, key, verb, path, st
 	if first.target != target {
 		v.add(path, "artifact %q is also %s %q by step %q; one artifact means one path",
 			key, verb, first.target, first.stepID)
+	}
+}
+
+// checkWaitHandle resolves the handle a wait_for named against the
+// declarations collectHandles gathered before the walk.
+//
+// The three outcomes are three different edits, and saying which one this is
+// costs one map lookup. "Nothing declares it" is a typo or a deleted step.
+// "It is declared below you" is an ordering mistake, and the spec would RUN:
+// the wait would find no trace of the command on the device and burn its whole
+// timeout, which on a soak is the six hours its author wrote down.
+func checkWaitHandle(v *validator, path string, index int, handle string) {
+	if !handleRe.MatchString(handle) {
+		v.add(path, "%q must start alphanumeric and use only letters, digits and . _ - "+
+			"(it is a shell_detached step's handle)", handle)
+		return
+	}
+	decl, declared := v.handles[handle]
+	switch {
+	case !declared:
+		v.add(path, "no shell_detached step in this spec declares handle %q; "+
+			"a wait_for names the handle of the detached command whose exit status it is waiting for, "+
+			"or writes a probe of its own instead", handle)
+	case decl.index > index:
+		v.add(path, "handle %q is declared by %s, which runs after this step; "+
+			"a wait for work that has not been started yet can only run out its own clock — "+
+			"move the wait below the shell_detached step", handle, decl.path)
 	}
 }
 

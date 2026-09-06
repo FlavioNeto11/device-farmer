@@ -351,13 +351,50 @@ type ShellDetached struct {
 	Handle string `json:"handle"`
 }
 
-// WaitFor polls a shell probe until it exits zero.
+// WaitFor waits for something on the device to become true. It has two forms,
+// and what separates them is what the step is allowed to conclude when the
+// wait ends.
 //
-// The probe is a device-side test, so a transport error while polling is just
-// a poll that did not happen: the runner reconnects and keeps polling until
-// Timeout, which is a deadline on the CONDITION, not on the connection.
+// Either way a transport error while polling is just a poll that did not
+// happen: the runner reconnects and keeps polling until Timeout, which is a
+// deadline on the CONDITION, not on the connection.
+//
+// # The two forms
+//
+// With Probe it polls a shell command until that command exits zero. This is
+// the general form — "wait until the device says yes" — and it says nothing
+// about anything except its own probe.
+//
+// With Handle it waits on a [ShellDetached] step declared earlier in the same
+// spec, and it waits for that command's EXIT STATUS rather than for a file to
+// appear. That distinction is the entire reason this field exists. The obvious
+// probe for a detached run is `test -f /data/local/tmp/farm/soak.result`, and
+// `test -f` becomes true the instant the wrapper publishes a status — 0 and
+// 137 alike. The natural repair, a shell step running `cat …soak.result` with
+// expect_exit [0], does not work either: cat exits 0 whatever the file says.
+// So a soak that started cleanly and was killed four hours later produced a
+// green wait_for and a green job, and the failure sat in a file on the phone
+// that nothing ever read. Naming the handle makes the RUNNER read that status —
+// through the same probe a resume's re-attach uses — and judge the code.
+//
+// Exactly one of the two is set. A step given both has been told to wait for
+// two different things and cannot mean what it says, so [Validate] refuses it
+// rather than picking one.
 type WaitFor struct {
-	Probe    string   `json:"probe"`
+	// Probe is a device-side shell command, polled until it exits zero. Empty
+	// when Handle names a detached run instead.
+	Probe string `json:"probe,omitempty"`
+
+	// Handle names the shell_detached step this wait is about. That step must
+	// appear EARLIER in the spec: a wait for work nothing has started yet can
+	// only ever run out its own clock.
+	//
+	// A detached run has no expect_exit of its own — see [ShellDetached] — so
+	// the spec-level DefaultExpectExit is what decides whether the status this
+	// wait reads is a success, exactly as it does when a resume re-attaches to
+	// the same run.
+	Handle string `json:"handle,omitempty"`
+
 	Interval Duration `json:"interval"`
 
 	// Timeout is how long the condition may take. The enclosing step's timeout
@@ -817,6 +854,28 @@ func (s Spec) StepByID(id string) (int, Step, bool) {
 		}
 	}
 	return 0, Step{}, false
+}
+
+// DetachedByHandle finds the [ShellDetached] payload that declares handle.
+//
+// It is how a [WaitFor] that names a handle reaches the paths it has to read.
+// The waiting step carries only the token; the files on the device — the
+// status, the log — are named by the detached payload, and copying them into
+// the wait_for would create a second place they could disagree. Handles are
+// unique within a spec, so the first match is the only one.
+//
+// [Validate] refuses a spec whose wait_for names a handle nothing declares, so
+// a miss here means a document reached the runner without being validated.
+func (s Spec) DetachedByHandle(handle string) (ShellDetached, bool) {
+	if handle == "" {
+		return ShellDetached{}, false
+	}
+	for _, st := range s.Steps {
+		if d, ok := derefPayload(st.Payload).(ShellDetached); ok && d.Handle == handle {
+			return d, true
+		}
+	}
+	return ShellDetached{}, false
 }
 
 // ---------------------------------------------------------------------------

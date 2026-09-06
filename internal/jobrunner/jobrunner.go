@@ -233,6 +233,11 @@ type Config struct {
 
 	// HolderConfig configures the renewal loop of every lease this process
 	// holds. Its Interval is the clock the Takeover default is derived from.
+	//
+	// Logger and Hooks are set per placement and ignored here, the same way
+	// WitnessConfig's are: the logger gains the job, lease, device and fence,
+	// and the hooks are this package's own meters (renewal.go). A caller's
+	// Hooks would be silently discarded, so set neither.
 	HolderConfig lease.HolderConfig
 
 	// WitnessConfig configures the witness loop this loop starts for every
@@ -731,6 +736,11 @@ func (jr *JobRunner) runJob(ctx context.Context, c claim) {
 
 	hcfg := jr.cfg.HolderConfig
 	hcfg.Logger = log
+	// The hooks are this loop's, not the caller's, for the same reason the
+	// logger is: these are the holders that carry the farm's work, and their
+	// renewal outcomes are the one thing an operator has to watch the FIRST of
+	// this system's three clocks with. See renewal.go.
+	hcfg.Hooks = renewalHooks()
 	// The holder's parent is the loop's context, so a SIGTERM stops renewal
 	// without releasing anything: the lease, the device and the fence survive
 	// the process, which is exactly what a pod eviction must cost.
@@ -1832,6 +1842,15 @@ func Collectors() []prometheus.Collector {
 	for _, o := range markerOutcomes {
 		markerRefreshTotal.WithLabelValues(o)
 	}
+	// And for the renewal loop, where it matters most of all. A holder whose
+	// renewals are failing is the state the witness exists to survive, and the
+	// rule that reads farm_jobrunner_renewals_total{outcome="transient"} has to
+	// be armed on a farm where nothing has gone wrong yet — otherwise the
+	// series springs into existence at the moment it first goes bad, which
+	// makes the incident its own alarm and arms nothing before it.
+	for _, o := range renewalOutcomes {
+		renewalsTotal.WithLabelValues(o)
+	}
 
 	return []prometheus.Collector{
 		cyclesTotal, claimedTotal, contendedTotal, reattachedTotal,
@@ -1840,5 +1859,6 @@ func Collectors() []prometheus.Collector {
 		pollErrors, beatFailures, atCapacity,
 		runningGauge, placedGauge, deferredGauge,
 		witnessTotal, markerRefreshTotal, witnesslessTotal,
+		renewalsTotal,
 	}
 }

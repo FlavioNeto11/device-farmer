@@ -46,6 +46,14 @@ PUBLISHED by exactly one role:
                                                                    scheduler, reaper
     farm_api_*                                                     api
 
+farm_lease_renew_failures_total is the one line above that was aspirational for
+longer than it should have been. internal/lease has always exported HolderHooks
+so a holder's renewal outcomes could be measured; internal/jobrunner — which
+builds every holder in a running farm — supplied none, so the only publisher
+was the api's hand-driven renew endpoint. DeviceFarmerLeaseFenced could fire
+for a curl and not for a job. internal/jobrunner/renewal.go wires the hooks,
+so the kind="fenced" page below now reads the holders that carry the work.
+
 templates/servicemonitor.yaml scrapes the api Service and nothing else, because
 the other roles serve no HTTP — FARM_METRICS_ADDR is read by internal/config and
 listened on by nobody. In a split deployment (this chart's default) the api's
@@ -604,19 +612,22 @@ spec:
     # -----------------------------------------------------------------------
     # Rules over the per-role metrics.
     #
-    # OFF BY DEFAULT, and it must stay off until BOTH of these are true:
+    # OFF BY DEFAULT, and it had to stay off until BOTH of these were true:
     #
-    #   1. cmd/farmd passes each role's Collectors() to obs.RegisterAll. As of
-    #      this writing it calls RegisterAll(reg, log) with no groups, so nine
-    #      of the ten packages that export Collectors() are registered nowhere
-    #      and every farm_reaper_*, farm_scheduler_*, farm_jobrunner_* and
-    #      farm_watchdog_* series below is absent from /metrics.
+    #   1. cmd/farmd passes each role's Collectors() to obs.RegisterAll. It
+    #      called RegisterAll(reg, log) with no groups for long enough that
+    #      nine of the ten packages exporting Collectors() were registered
+    #      nowhere. newRegistry now names all twelve, and
+    #      obs.TestEveryCollectorGroupIsRegistered fails if one is dropped.
     #   2. The non-api roles serve FARM_METRICS_ADDR and something scrapes
-    #      them. internal/config reads that variable; nothing listens on it.
+    #      them. cmd/farmd now wraps every role in a listener on it, and
+    #      templates/servicemonitor.yaml selects the headless metrics Service,
+    #      which is one target per pod.
     #
-    # Turning this on before then ships four rules that return no data and
-    # never fire, which is the exact failure this whole file is written to
-    # avoid. Turn it on in the same change that makes the series real.
+    # Both hold, so the series below are real. The switch stays off because
+    # enabling a page is the operator's decision and not a chart default —
+    # turn it on once you have confirmed your Prometheus is scraping the
+    # metrics Service, and read templates/servicemonitor.yaml first.
     # -----------------------------------------------------------------------
     - name: device-farmer.roles
       interval: {{ $t.evaluationInterval }}
@@ -644,6 +655,79 @@ spec:
               refunded onto every live lease in the farm when the reaper next
               arms.
             runbook_url: {{ $rb }}/component-beat-failing.md
+
+        # The IN-PROGRESS form of DeviceFarmerLeaseReclaimed, and the only rule
+        # in this file that fires while the work can still be saved. That one
+        # is a tombstone: by the time it fires the lease is gone and the job
+        # with it. This one fires with the leases still held, still renewable,
+        # and still covered by ttl+grace, the gap refund and the witness.
+        #
+        # WHY THIS IS NOT A RATIO OVER A THRESHOLD. The obvious rule —
+        # "transient failures are more than N% of attempts" — has to be tuned
+        # against arithmetic nobody should have to know: a failing holder
+        # retries on a backoff capped at 15s while a healthy one renews every
+        # 90s, so one stuck lease out of four produces several times more
+        # failure events per minute than the other three produce successes. Any
+        # threshold picked against that is a threshold picked against
+        # internal/lease's backoff constants. So the rule asks something the
+        # arithmetic cannot distort: this replica has had renewal failures, and
+        # NOT ONE renewal has landed in the window. That is a renewal path that
+        # is down, not a database that hiccuped, and it disarms itself the
+        # moment one renewal succeeds.
+        #
+        # WHEN IT FIRES, which is the number to check if you retune it. The
+        # `unless` arm cannot go true until the rate window has drained of
+        # successes, so the earliest possible fire is renewalWindow +
+        # renewalsFailingFor after the last renewal that landed — 10 minutes as
+        # shipped. That has to stay under a lease's remaining budget, whose
+        # floor is FARM_LEASE_TTL + FARM_LEASE_GRACE at the schema's own
+        # minimums of 10m and 5m. An alert that arrives after
+        # DeviceFarmerLeaseReclaimed is a slower way of reading the tombstone.
+        #
+        # WHAT IS DELIBERATELY NOT HERE, for the same reason kind="transient"
+        # is absent from the lost-work group above: any rule that fires on a
+        # single failed renewal, or on a few among many that are landing. A
+        # transient failure proves nothing about the lease — the deadline is
+        # untouched, the device is still the job's, the holder retries — and a
+        # page that trains an operator to read a database blip as a device loss
+        # is DeviceFarmer/STF #663 arriving through the on-call rota instead of
+        # through a code change. farm_jobrunner_renewals_total{outcome=
+        # "transient"} belongs on a dashboard beside outcome="ok"; only its
+        # total absence of successes belongs here.
+        #
+        # WARNING, not critical: this is a ticket. Nothing has been lost, and
+        # the three pages in the lost-work group above still stand behind it if
+        # the outage outlives everything that covers it.
+        - alert: DeviceFarmerLeaseRenewalsFailing
+          expr: |-
+            sum by (job, instance) (
+              rate(farm_jobrunner_renewals_total{outcome="transient"}[{{ $t.renewalWindow }}])
+            ) > 0
+            unless
+            sum by (job, instance) (
+              rate(farm_jobrunner_renewals_total{outcome=~"ok|self_healed"}[{{ $t.renewalWindow }}])
+            ) > 0
+          for: {{ $t.renewalsFailingFor }}
+          labels:
+            severity: warning
+            component: lease
+          annotations:
+            summary: >-
+              No lease renewal has landed on {{ `{{ $labels.instance }}` }}, and
+              they are still being attempted
+            description: >-
+              Every renewal this jobrunner attempted in the last
+              {{ $t.renewalWindow }} failed and none succeeded, and it has been
+              that way for {{ $t.renewalsFailingFor }}. Nothing is lost
+              yet and no device has been reallocated: a failed renewal proves
+              nothing about a lease, so every job on this replica is still
+              running on its own device with its deadline untouched. What is
+              running out is the budget — ttl+grace, extended by the
+              control-plane gap the reaper will refund and by any witness the
+              placements can still present. Fix the path between this replica
+              and Postgres before that budget does run out; do not restart
+              anything on the strength of this alert alone.
+            runbook_url: {{ $rb }}/lease-renewals-failing.md
 
         # The reaper is the only thing that reclaims a lease, refunds a gap or
         # marks a lease suspect. Two leaders is impossible — it is a Postgres

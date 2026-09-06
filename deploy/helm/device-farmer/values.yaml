@@ -226,7 +226,17 @@ config:
   # lease; this clock only writes to the health tables.
   watchdogInterval: 5s
 
-  # FARM_MIGRATIONS_TABLE — goose's version table.
+  # FARM_MIGRATIONS_TABLE — goose's version table, and the table the API's
+  # capability probe reads the applied schema version out of.
+  #
+  # A schema-qualified value is created if it is missing, because goose writes
+  # this table before the first migration runs and on a new database nothing
+  # else has made room for it yet; the migrate Job logs the schema it created.
+  # Check that line after a change here: a typo makes a schema nobody meant and
+  # starts a second, empty ledger in it, and every later run then agrees the
+  # database is at version 0. On a database that has already been migrated, a
+  # ledger that does not exist is refused instead of created, so the Job fails
+  # loudly rather than replaying the whole set into tables that are there.
   migrationsTable: public.goose_db_version
 
   # FARM_API_URL — how `farmd ctl` and in-cluster clients reach the API.

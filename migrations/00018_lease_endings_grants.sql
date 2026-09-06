@@ -45,7 +45,7 @@
 -- WHO DOES NOT, AND WHY THAT IS THE POINT
 --
 -- farm_watchdog and farm_parker carry REVOKE ALL ON farm.leases
--- (00002_lease.sql:80, 00008_parked.sql:250). That REVOKE is the
+-- (00002_lease.sql:102, 00008_parked.sql:254). That REVOKE is the
 -- STF #663 firewall stated in DDL: the health plane and the parking
 -- path must be unable to learn anything about an allocation, so that no
 -- future edit to them can be written to end one. A view is precisely the

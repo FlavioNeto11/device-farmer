@@ -37,6 +37,35 @@
 -- loop turned out to need its forbidden table, which is the finding
 -- that makes the firewall worth assuming: the separation costs the
 -- loops nothing they were actually using.
+--
+-- Nor does it guard any of these grants against a migrator applying the
+-- same migration to another database at the same moment, and it
+-- deliberately should not. Two different objects are involved and they
+-- behave differently:
+--
+--   - A TABLE grant is per-database. It lives in the pg_class entry of
+--     the table it is about, so 00002's REVOKE on farm.device_runtime
+--     touches only the database being migrated. Another database's
+--     farm_reaper keeps whatever that database granted it.
+--   - A MEMBERSHIP grant (the line below, 00002:108, 00008:260) is
+--     cluster-wide: pg_auth_members is a shared catalog. But Postgres
+--     locks the role before it writes, so a second identical GRANT
+--     waits, re-reads, and reports "already been granted" as a NOTICE.
+--     Not an error, and never a moment in which the membership is gone.
+--
+-- Only CREATE ROLE races, because there is no object to lock yet, and
+-- 00002 and 00008 guard it where they issue it — for every database
+-- migrated from empty after that edit landed; a cluster whose roles
+-- already exist has nothing left to race over. Turning any block here
+-- into a REVOKE-then-GRANT to make it "idempotent" would MANUFACTURE
+-- the window it claimed to close, and every revoke in reach is one the
+-- #663 firewall depends on.
+--
+-- The Down below is the exception, and cannot be made into anything
+-- else: REVOKE ... FROM current_user unmakes a cluster-wide membership,
+-- so rolling 00015 back in one database stops every OTHER farm in the
+-- cluster from assuming its runtime roles. Roll back one farm on a
+-- shared cluster and you have stopped them all.
 -- =====================================================================
 
 -- +goose StatementBegin

@@ -188,10 +188,22 @@ config:
     # ('reaper','api','scheduler') — that default is only reachable from a
     # hand-typed psql call; every farmd process passes this list explicitly.
     #
-    # watchdog, recovery and node beat too and stay ABSENT. They are on the
-    # HEALTH side of the firewall this system keeps between its clocks: listing
-    # the watchdog would let a device's health move a lease deadline, which is
-    # the fusion the whole design exists to prevent.
+    # watchdog, recovery, janitor, chargepolicy, node and enroll beat too and
+    # stay ABSENT. They are on the HEALTH side of the firewall this system keeps
+    # between its clocks: listing the watchdog would let a device's health move a
+    # lease deadline, which is the fusion the whole design exists to prevent.
+    # This is no longer only advice. farmd REFUSES TO START — every role, not
+    # just the reaper — if one of those names appears here, under its own
+    # spelling or its per-host key ("watchdog:h01"), because farm.reaper_arm ADDS
+    # a watched component's downtime to expires_at and reclaimable_at of every
+    # held and suspect lease. A watchdog outage would otherwise extend every live
+    # lease in the farm by its own length.
+    #
+    # The refusal covers the names farmd knows it beats under. A health component
+    # RENAMED with FARM_COMPONENT is caught only on the pod that carries the
+    # rename — which in this chart is every pod, since they share this ConfigMap,
+    # but a hand-edited manifest that sets the variable on the reaper alone would
+    # start. Review a name here that you do not recognise.
     #
     # This is what a farm RUNS, not what it could run. A component that beat
     # once and was then scaled to zero leaves a stale row that refunds every

@@ -1392,6 +1392,16 @@ Fix by raising %s above %s + %s, or by lowering the proxy's self-fence timeout.`
 			fail("%s: %v", EnvDatabaseURL, err)
 		}
 	}
+	// ---- the migration version table ---------------------------------
+	// One name, written by goose in `farmd migrate` and read back by
+	// /api/v1/capabilities. It is checked for every role rather than only for
+	// the two that touch it, because a manifest is shared: a name the api
+	// cannot read is a name the operator wants to hear about while they are
+	// editing it, not at the first capability call — which, since a failed
+	// probe is a 503, would tell them a fully migrated database has no schema.
+	if _, _, err := MigrationsTableParts(c.MigrationsTable); err != nil {
+		fail("%s (%q) %v", EnvMigrationsTable, c.MigrationsTable, err)
+	}
 	// ---- runtime database role -----------------------------------------
 	// The role is assumed by SET ROLE on every connection of ONE pool, so it
 	// can only be right for a process that is one component. Refusing the
@@ -1926,6 +1936,90 @@ func contains(hay []string, needle string) bool {
 		}
 	}
 	return false
+}
+
+// MigrationsTableParts splits a FARM_MIGRATIONS_TABLE value into the schema
+// and table halves a reader has to quote separately, and refuses the values on
+// which the migrator and its readers would not be naming the same table.
+//
+// It is exported because the name has to travel to whoever reads the table and
+// must arrive already split and already checked. Validate calls it too, so
+// there is one rule rather than a boot-time rule and a read-time one that can
+// drift apart.
+//
+// A table name is an identifier and not a value, so it reaches SQL by quoting
+// rather than by binding. That makes two properties load-bearing, and the
+// second is the one that is easy to miss.
+//
+// The name must be one or two dot-separated parts, because quoting a two-part
+// name as ONE part names a table nobody has:
+// pgx.Identifier{"public.goose_db_version"}.Sanitize() renders
+// "public.goose_db_version" — a single quoted identifier that happens to
+// contain a dot.
+//
+// And every part must already be spelled the way Postgres folds it, because
+// goose writes this name into its DDL unquoted while a reader quotes it. Those
+// are the same table for a lowercase name and different tables for
+// "Farm_Versions": goose would create farm_versions, the reader would ask for
+// "Farm_Versions", and the operator would be told a fully migrated database
+// has no schema — the exact failure this whole path exists to end.
+//
+// schema is empty for an unqualified name, leaving resolution to search_path,
+// which is what goose does with the same value.
+func MigrationsTableParts(name string) (schema, table string, err error) {
+	schema, table, qualified := strings.Cut(name, ".")
+	if !qualified {
+		schema, table = "", name
+	}
+	if table == "" || (qualified && schema == "") || strings.Contains(table, ".") {
+		return "", "", fmt.Errorf("must be a table name, optionally schema-qualified — %q, or a "+
+			"bare %q resolved through search_path. goose creates this table and the "+
+			"capability probe reads the applied version out of it, and a name that is "+
+			"not one or two dot-separated parts quotes into an identifier neither can "+
+			"resolve", DefaultMigrationsTable, "goose_db_version")
+	}
+	for _, part := range []string{schema, table} {
+		if part == "" {
+			continue // an unqualified name has no schema half
+		}
+		if e := foldedIdentifier(part); e != nil {
+			// Wrong case is the common shape of this mistake and the fix is
+			// mechanical, so name it. goose already folded the value when it
+			// created the table, which makes the folded spelling the table
+			// that exists — an operator should not have to derive that from a
+			// character class while their fleet is refusing to boot.
+			if lower := strings.ToLower(part); foldedIdentifier(lower) == nil {
+				return "", "", fmt.Errorf("part %q %w. Set it to %q, the name goose folded "+
+					"this to when it created the table", part, e, lower)
+			}
+			return "", "", fmt.Errorf("part %q %w", part, e)
+		}
+	}
+	return schema, table, nil
+}
+
+// foldedIdentifier accepts only the identifiers Postgres leaves alone, so that
+// quoting the name and interpolating it raw name the same table. Anything else
+// is a value goose and its readers would spell differently.
+func foldedIdentifier(s string) error {
+	if len(s) > 63 {
+		return fmt.Errorf("is %d characters; Postgres truncates an identifier at 63, so "+
+			"goose would create a table under a name no reader can spell", len(s))
+	}
+	for i, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r == '_':
+		case r >= '0' && r <= '9':
+			if i == 0 {
+				return errors.New("must not start with a digit")
+			}
+		default:
+			return errors.New("must match [a-z_][a-z0-9_]*: goose writes this name into its " +
+				"DDL unquoted, so Postgres folds it, while a reader quotes it — anything " +
+				"needing quotes would be created under one name and looked for under another")
+		}
+	}
+	return nil
 }
 
 // validComponentName keeps the primary key of farm.component_heartbeat to

@@ -681,6 +681,32 @@ func TestPreflightRefusals(t *testing.T) {
 		role: "node",
 		envs: map[string]string{EnvTopoOverrides: "/nonexistent/overrides.json"},
 		want: []string{EnvTopoOverrides, "overrides.json"},
+	}, {
+		// OBS-10. The name is quoted into SQL as an identifier by whoever
+		// reads the table, and three dot-separated parts quote into a name
+		// no schema holds.
+		name: "migrations table with three parts",
+		role: "api",
+		envs: map[string]string{EnvMigrationsTable: "db.public.goose_db_version"},
+		want: []string{EnvMigrationsTable, "one or two dot-separated parts"},
+	}, {
+		name: "migrations table with an empty schema half",
+		role: "api",
+		envs: map[string]string{EnvMigrationsTable: ".goose_db_version"},
+		want: []string{EnvMigrationsTable, "optionally schema-qualified"},
+	}, {
+		// The half that is easy to miss: goose writes this name into its DDL
+		// unquoted and Postgres folds it, so a mixed-case value creates one
+		// table and is read back under another.
+		name: "migrations table needing quotes to mean itself",
+		role: "api",
+		envs: map[string]string{EnvMigrationsTable: "public.Goose_DB_Version"},
+		want: []string{EnvMigrationsTable, "Goose_DB_Version", "[a-z_][a-z0-9_]*", `"goose_db_version"`},
+	}, {
+		name: "migrations table longer than an identifier",
+		role: "api",
+		envs: map[string]string{EnvMigrationsTable: strings.Repeat("v", 64)},
+		want: []string{EnvMigrationsTable, "truncates an identifier at 63"},
 	}}
 
 	for _, tc := range cases {
@@ -700,6 +726,76 @@ func TestPreflightRefusals(t *testing.T) {
 				if !strings.Contains(msg, want) {
 					t.Errorf("refusal does not mention %q.\ngot:\n%s", want, msg)
 				}
+			}
+		})
+	}
+}
+
+// TestMigrationsTableParts covers the split OBS-10 turns on.
+//
+// The reader of the migration table cannot bind its name — a table is an
+// identifier, not a value — so it quotes it, and quoting the DEFAULT as a
+// single part is the trap: pgx.Identifier{"public.goose_db_version"} renders
+// one quoted name containing a dot, which no schema holds. Anything that is
+// not one or two non-empty parts is refused rather than guessed at, so the
+// reader never has to invent a resolution the migrator would not share.
+func TestMigrationsTableParts(t *testing.T) {
+	cases := []struct {
+		in            string
+		schema, table string
+		ok            bool
+	}{
+		{DefaultMigrationsTable, "public", "goose_db_version", true},
+		{"farm.schema_version", "farm", "schema_version", true},
+		// Unqualified stays unqualified: search_path resolves it, which is
+		// what goose does with the same value.
+		{"goose_db_version", "", "goose_db_version", true},
+		{"", "", "", false},
+		{"db.public.goose_db_version", "", "", false},
+		{".goose_db_version", "", "", false},
+		{"public.", "", "", false},
+		// Spelled differently by the two halves of the system: goose would
+		// create farm.schema_version and a reader would ask for the name as
+		// written and find nothing.
+		{"farm.Schema_Version", "", "", false},
+	}
+	for _, tc := range cases {
+		schema, table, err := MigrationsTableParts(tc.in)
+		if (err == nil) != tc.ok || schema != tc.schema || table != tc.table {
+			t.Errorf("MigrationsTableParts(%q) = (%q, %q, err=%v), want (%q, %q, ok=%v)",
+				tc.in, schema, table, err, tc.schema, tc.table, tc.ok)
+		}
+	}
+
+	// The refusal has to be a repair instruction, not a character class: an
+	// operator whose fleet has stopped booting needs the name goose actually
+	// created, and deriving it from [a-z_][a-z0-9_]* at 3am is not the job.
+	_, _, err := MigrationsTableParts("farm.Schema_Version")
+	if err == nil || !strings.Contains(err.Error(), `"schema_version"`) {
+		t.Errorf("refusing a mixed-case name must name the folded spelling; got %v", err)
+	}
+}
+
+// TestMigrationsTableAcceptsWhatGooseCanCreate keeps the new refusal from
+// growing teeth it should not have. A rule that also rejected the names an
+// operator legitimately uses would close OBS-10 by making the knob unusable,
+// which is the same outage wearing a different message.
+func TestMigrationsTableAcceptsWhatGooseCanCreate(t *testing.T) {
+	for _, name := range []string{
+		DefaultMigrationsTable,
+		"goose_db_version",
+		"farm.schema_version",
+		"_private.v2_migrations",
+	} {
+		t.Run(name, func(t *testing.T) {
+			env(t, withDSN(map[string]string{EnvMigrationsTable: name}))
+			cfg, err := Load("api")
+			if err != nil {
+				t.Fatalf("Load refused %s=%q, a name goose creates and reads happily:\n%v",
+					EnvMigrationsTable, name, err)
+			}
+			if cfg.MigrationsTable != name {
+				t.Errorf("MigrationsTable = %q, want %q", cfg.MigrationsTable, name)
 			}
 		})
 	}

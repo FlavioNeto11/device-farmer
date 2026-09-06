@@ -11,6 +11,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/flaviopadilha/device-farmer/internal/config"
 	"github.com/flaviopadilha/device-farmer/internal/runner"
 )
 
@@ -191,22 +192,35 @@ func (s *Server) buildInfo() BuildInfo {
 }
 
 func (s *Server) schemaInfo(ctx context.Context) (SchemaInfo, error) {
+	// The table is FARM_MIGRATIONS_TABLE, not necessarily goose_db_version.
+	// This query used to name goose_db_version literally and unqualified,
+	// which made it wrong twice over on a farm that had set the variable: it
+	// read the wrong table, and it read it through whatever search_path the
+	// connection happened to carry while the configured default is
+	// public-qualified. The operator saw a migration that worked followed by
+	// a capability probe that failed, and — a failed probe being a 503 — was
+	// told their fully migrated database had no schema.
+	table, err := s.migrationsTable()
+	if err != nil {
+		return SchemaInfo{}, err
+	}
+
 	var (
 		v  *int
 		at *time.Time
 	)
 	// goose owns this table; reading it is how the API learns which schema it
 	// is actually talking to rather than which one it shipped with.
-	err := s.pool.QueryRow(ctx,
-		`SELECT version_id, tstamp FROM goose_db_version
-		  WHERE is_applied ORDER BY id DESC LIMIT 1`).Scan(&v, &at)
+	err = s.pool.QueryRow(ctx,
+		`SELECT version_id, tstamp FROM `+table+
+			` WHERE is_applied ORDER BY id DESC LIMIT 1`).Scan(&v, &at)
 
 	// No rows is an ANSWER, and the only one of the two that may be reported:
 	// goose has a table and nothing applied, so v0 and "run farmd migrate up"
 	// are both true. Any other error means the table could not be read, and
 	// then v0 is a guess wearing the clothes of a measurement.
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		return SchemaInfo{}, fmt.Errorf("reading goose_db_version: %w", err)
+		return SchemaInfo{}, fmt.Errorf("reading %s: %w", table, err)
 	}
 
 	out := SchemaInfo{}
@@ -220,6 +234,39 @@ func (s *Server) schemaInfo(ctx context.Context) (SchemaInfo, error) {
 		out.Note = "no migrations applied; run farmd migrate up"
 	}
 	return out, nil
+}
+
+// migrationsTable renders FARM_MIGRATIONS_TABLE as a quoted SQL identifier,
+// ready to be concatenated into a statement.
+//
+// Concatenated, because a table name is an identifier and not a value: it
+// cannot be $1. The in-repo precedent is cmd/farmd's SET ROLE, which quotes
+// FARM_DB_ROLE the same way. The split matters as much as the quoting — see
+// config.MigrationsTableParts for why quoting the default as a single part
+// would name a table nobody has.
+//
+// The name is re-checked here rather than trusted, because config.Validate is
+// the boot path and this Server can also be built around a Config assembled in
+// code. Checking is what makes the quoting safe to rely on: for a value the
+// same function has already passed, Sanitize only adds quotes, and the pair
+// leaves no way for an operator-set variable to become an injection point.
+func (s *Server) migrationsTable() (string, error) {
+	// An empty name is a hand-built Config rather than an operator's choice —
+	// Load always fills this in — so the default is what it would have got.
+	name := config.DefaultMigrationsTable
+	if s.cfg != nil && s.cfg.MigrationsTable != "" {
+		name = s.cfg.MigrationsTable
+	}
+	schema, table, err := config.MigrationsTableParts(name)
+	if err != nil {
+		return "", fmt.Errorf("this process holds a Config that never went through "+
+			"config.Validate, which refuses this at boot: %s (%q) %w",
+			config.EnvMigrationsTable, name, err)
+	}
+	if schema == "" {
+		return pgx.Identifier{table}.Sanitize(), nil
+	}
+	return pgx.Identifier{schema, table}.Sanitize(), nil
 }
 
 func (s *Server) authInfo() AuthInfo {

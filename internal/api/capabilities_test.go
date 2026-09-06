@@ -250,26 +250,7 @@ func TestWitnessExtensionsAreReportedOnlyWhileAJobrunnerBeats(t *testing.T) {
 // Falsify: drop the pgx.ErrNoRows branch from schemaInfo, so no-rows becomes
 // an error; this test then fails while the two above still pass.
 func TestNoMigrationsAppliedIsStillAnAnswer(t *testing.T) {
-	dsn := strings.TrimSpace(os.Getenv("DATABASE_URL"))
-	if dsn == "" {
-		t.Skip("no DATABASE_URL; this case needs a real, reachable database")
-	}
-
-	// One connection, so the TEMP table below is visible to every query this
-	// server makes. A temp table shadows the real goose_db_version for this
-	// session alone and vanishes with it, so a migrated development database
-	// can host the unmigrated case without being touched.
-	cfg, err := pgxpool.ParseConfig(dsn)
-	if err != nil {
-		t.Fatalf("parsing DATABASE_URL: %v", err)
-	}
-	cfg.MaxConns = 1
-	pool, err := pgxpool.NewWithConfig(context.Background(), cfg)
-	if err != nil {
-		t.Fatalf("connecting: %v", err)
-	}
-	defer pool.Close()
-
+	pool := oneSessionPool(t)
 	ctx := context.Background()
 	if _, err := pool.Exec(ctx,
 		`CREATE TEMP TABLE goose_db_version (
@@ -277,7 +258,13 @@ func TestNoMigrationsAppliedIsStillAnAnswer(t *testing.T) {
 		t.Skipf("cannot create the temporary goose table here: %v", err)
 	}
 
+	// The name is unqualified so that the temp table above is what the probe
+	// finds: pg_temp comes first in search_path. Spelling it out is also the
+	// honest shape of this test now that the probe reads the configured name
+	// rather than a literal — the table it looks in is a choice, and a test
+	// that leaves the choice implicit is testing the default by accident.
 	s := &Server{
+		cfg:       &config.Config{MigrationsTable: "goose_db_version"},
 		pool:      pool,
 		log:       slog.New(slog.NewTextHandler(io.Discard, nil)),
 		auth:      NewAllowAll(slog.New(slog.NewTextHandler(io.Discard, nil)), "test"),
@@ -291,4 +278,103 @@ func TestNoMigrationsAppliedIsStillAnAnswer(t *testing.T) {
 	if info.Version != 0 || !strings.Contains(info.Note, "farmd migrate up") {
 		t.Errorf("schemaInfo on an unmigrated database = %+v; want v0 with the migrate note", info)
 	}
+}
+
+// TestSchemaVersionComesFromTheConfiguredTable is OBS-10: FARM_MIGRATIONS_TABLE
+// is the migrator's knob and the probe's knob, or it is a knob that breaks the
+// thing it configures.
+//
+// `farmd migrate` has always honoured it — cmd/farmd/migrate.go calls
+// goose.SetTableName — while this probe named goose_db_version literally and
+// unqualified. So an operator who renamed the table got a migration that
+// worked and then a capability call that could not find a table, and because a
+// failed probe is a 503 (OBS-09) the answer they were handed said the schema
+// version of their fully migrated database was unknown.
+//
+// Both shapes are covered because they fail differently. A qualified name is
+// the one that needs the split — quoting "pg_temp.farm_schema_version" as a
+// single identifier asks for a table whose NAME contains a dot — and an
+// unqualified one is the one that must still resolve through search_path, the
+// way goose resolves the same value.
+//
+// Falsify: restore the literal `FROM goose_db_version` in schemaInfo. Both
+// cases then fail — against an unmigrated database with the table missing
+// entirely, and against a migrated one by reporting the real public schema
+// version instead of the one written here.
+func TestSchemaVersionComesFromTheConfiguredTable(t *testing.T) {
+	pool := oneSessionPool(t)
+	ctx := context.Background()
+
+	// Deliberately NOT named goose_db_version: a probe that still reaches the
+	// default table cannot accidentally pass this test.
+	if _, err := pool.Exec(ctx,
+		`CREATE TEMP TABLE farm_schema_version (
+		   id serial primary key, version_id bigint, is_applied boolean, tstamp timestamptz)`); err != nil {
+		t.Skipf("cannot create a temporary version table here: %v", err)
+	}
+	// Three rows in goose's own shape: a superseded version, the applied one,
+	// and a rolled-back row above it. Only the last row with is_applied is the
+	// answer, so a probe that dropped either the filter or the ordering would
+	// report 16 or 18 rather than 17.
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO farm_schema_version (version_id, is_applied, tstamp) VALUES
+		   (16, true,  now() - interval '2 hours'),
+		   (17, true,  now() - interval '1 hour'),
+		   (18, false, now())`); err != nil {
+		t.Fatalf("seeding the version table: %v", err)
+	}
+
+	for _, name := range []string{"pg_temp.farm_schema_version", "farm_schema_version"} {
+		t.Run(name, func(t *testing.T) {
+			s := &Server{
+				cfg:       &config.Config{MigrationsTable: name},
+				pool:      pool,
+				log:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+				auth:      NewAllowAll(slog.New(slog.NewTextHandler(io.Discard, nil)), "test"),
+				startedAt: time.Now(),
+			}
+
+			info, err := s.schemaInfo(ctx)
+			if err != nil {
+				t.Fatalf("%s=%q is the table the migrator writes, so the probe must be able "+
+					"to read it: %v", config.EnvMigrationsTable, name, err)
+			}
+			if info.Version != 17 {
+				t.Errorf("schema version = %d, want 17 — the probe is not reading %q",
+					info.Version, name)
+			}
+			if info.Applied == "" {
+				t.Errorf("schema %+v carries no applied_at; the row has one", info)
+			}
+			// The note exists to send an operator to `farmd migrate up`, and a
+			// migrated farm that is told to migrate is the OBS-10 report in
+			// miniature.
+			if info.Note != "" {
+				t.Errorf("a migrated database was given the unmigrated note %q", info.Note)
+			}
+		})
+	}
+}
+
+// oneSessionPool is a pool of exactly one connection, so that a TEMP table
+// created through it is visible to every later query. Temp tables vanish with
+// the session, which lets a migrated development database host these cases
+// without being touched.
+func oneSessionPool(t *testing.T) *pgxpool.Pool {
+	t.Helper()
+	dsn := strings.TrimSpace(os.Getenv("DATABASE_URL"))
+	if dsn == "" {
+		t.Skip("no DATABASE_URL; this case needs a real, reachable database")
+	}
+	pc, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		t.Fatalf("parsing DATABASE_URL: %v", err)
+	}
+	pc.MaxConns = 1
+	pool, err := pgxpool.NewWithConfig(context.Background(), pc)
+	if err != nil {
+		t.Fatalf("connecting: %v", err)
+	}
+	t.Cleanup(pool.Close)
+	return pool
 }

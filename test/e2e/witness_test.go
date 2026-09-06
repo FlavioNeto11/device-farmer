@@ -171,6 +171,23 @@ const (
 	markerOKSeries        = `farm_jobrunner_marker_refreshes_total{outcome="ok"}`
 	markerFailedSeries    = `farm_jobrunner_marker_refreshes_total{outcome="failed"}`
 	reaperExpiredSeries   = `farm_reaper_leases_ended_total{reason="holder_expired"}`
+
+	// The renewal path's own meters, on the two registers internal/jobrunner
+	// writes each outcome to: its own, which counts every ATTEMPT so a failure
+	// rate has a denominator, and the fleet-wide one internal/obs owns, which
+	// is what DeviceFarmerLeaseFenced is written over.
+	//
+	// Both matter to this scenario for the same reason the witness series do.
+	// It refuses renewals deliberately, for its whole length, and until the
+	// hooks were wired the only external record of that was a WARN line: an
+	// operator watching /metrics through this outage saw a farm identical to
+	// one where nothing was wrong. These are what changed.
+	renewalOKSeries         = `farm_jobrunner_renewals_total{outcome="ok"}`
+	renewalSelfHealedSeries = `farm_jobrunner_renewals_total{outcome="self_healed"}`
+	renewalTransientSeries  = `farm_jobrunner_renewals_total{outcome="transient"}`
+	renewalFencedSeries     = `farm_jobrunner_renewals_total{outcome="fenced"}`
+	leaseRenewTransient     = `farm_lease_renew_failures_total{kind="transient"}`
+	leaseRenewFenced        = `farm_lease_renew_failures_total{kind="fenced"}`
 )
 
 func TestWitnessSavesALeaseTheHolderCannotRenew(t *testing.T) {
@@ -282,10 +299,18 @@ func TestWitnessSavesALeaseTheHolderCannotRenew(t *testing.T) {
 	}
 
 	// The holder has been TRYING. This is the difference between "blind" and
-	// "not yet due", and it is the only direct evidence the test can hold: the
-	// jobrunner wires no hook to its holder, so a refused renewal reaches
-	// metrics nowhere and is otherwise only a "lease renewal failed, retrying
-	// (lease NOT lost)" line in the jobrunner's log above.
+	// "not yet due", and there are now two independent registers of it: the
+	// sequence the trigger takes a number from on the server, and the holder's
+	// own meter on the client, which internal/jobrunner wires from
+	// lease.HolderHooks.
+	//
+	// The METER is read first and the sequence second, so the comparison below
+	// is sound in one direction: the trigger takes its number before it raises,
+	// and the holder records the error only after receiving it, so every
+	// increment the meter has already published is backed by a refusal the
+	// sequence had already issued. Reading them the other way round would let
+	// a retry land in between and make the meter look like it over-counted.
+	seen := readWitnessCounter(t, f, "jobrunner", renewalTransientSeries)
 	refused := witnessBlockedRenewals(t, f)
 	if refused < 1 {
 		t.Fatalf("the renewal outage has refused %d renewals, with this holder renewing every %s and "+
@@ -295,6 +320,56 @@ func TestWitnessSavesALeaseTheHolderCannotRenew(t *testing.T) {
 	}
 	t.Logf("the renewal path has refused %d attempt(s) so far; heartbeat_seq is still %d at holder_epoch %d",
 		refused, granted.heartbeats, granted.holderEpoch)
+
+	// THE ASSERTION THIS UNIT EXISTS FOR. Everything above was already true
+	// before the hooks were wired; what was missing was any way for an
+	// operator to know it. A holder whose renewals are failing is the exact
+	// condition the witness loop exists to survive, and it reached no meter,
+	// so a rule written over one returned no data and never fired — which
+	// reads identically to a farm on which nothing has gone wrong.
+	switch {
+	case seen < 1:
+		t.Fatalf("%s is %v while the outage has refused %d renewal(s): the holder's renewal "+
+			"outcomes reach no metric, so this outage is invisible to everything except the "+
+			"jobrunner's own log", renewalTransientSeries, seen, refused)
+	case seen > float64(refused):
+		// Read meter-then-sequence, so the sequence can only be ahead. A meter
+		// ahead of it means something other than this outage is failing the
+		// renewal path, and every count below would be measuring a mixture.
+		t.Errorf("the holder has recorded %v transient renewal failures but the outage has only "+
+			"refused %d; something other than the trigger is failing renewals, so this scenario is "+
+			"no longer about one fault", seen, refused)
+	}
+
+	// And the classification, which is the one thing here that must never be
+	// wrong in either direction. internal/lease reports fencing for ZERO ROWS
+	// and for nothing else; this outage raises an exception, so every refusal
+	// above is transient by construction. A fenced count here would mean the
+	// holder had been told to abort a job that is running perfectly well —
+	// DeviceFarmer/STF #663 with the control plane as the trigger — and it
+	// would also have paged a human through DeviceFarmerLeaseFenced.
+	for _, series := range []string{renewalFencedSeries, leaseRenewFenced} {
+		if n := readWitnessCounter(t, f, "jobrunner", series); n != 0 {
+			t.Fatalf("%s is %v: a renewal that failed with an ordinary error was recorded as proof "+
+				"the lease is gone. The lease is not gone — %s", series, n, granted.describe())
+		}
+	}
+	// The same refusals on the fleet-wide register, which is the one
+	// DeviceFarmerLeaseFenced reads and which the jobrunner published nothing
+	// to until these hooks existed.
+	if n := readWitnessCounter(t, f, "jobrunner", leaseRenewTransient); n < 1 {
+		t.Errorf("%s is %v: this replica's holders are failing every renewal and the fleet-wide "+
+			"counter has not heard about any of it", leaseRenewTransient, n)
+	}
+	// Nothing landed, which the server has already said (heartbeat_seq is 0)
+	// and the client must agree with. A meter that reported successes here
+	// would be counting something other than this lease's renewals.
+	for _, series := range []string{renewalOKSeries, renewalSelfHealedSeries} {
+		if n := readWitnessCounter(t, f, "jobrunner", series); n != 0 {
+			t.Errorf("%s is %v with heartbeat_seq still %d: a renewal was recorded as landing on a "+
+				"farm where the renewal path is closed", series, n, granted.heartbeats)
+		}
+	}
 
 	// -----------------------------------------------------------------
 	// 2. Elapsed time, applied by hand. See the file comment.
@@ -763,6 +838,27 @@ func TestWitnessSavesALeaseTheHolderCannotRenew(t *testing.T) {
 			"the holder stopped trying, so the later phases were not an outage", refused, n)
 	} else {
 		t.Logf("the holder was refused %d renewals across the run and never stopped holding", n)
+	}
+
+	// The same account on the holder's own meter. It has to have moved since
+	// the first witness for the same reason the sequence does — a holder that
+	// stopped trying would make the later phases a quiet lease rather than an
+	// outage — and the three other outcomes have to be untouched, because a
+	// run in which one renewal landed, or in which one was read as fencing,
+	// is not the run every assertion above was written about.
+	if now := readWitnessCounter(t, f, "jobrunner", renewalTransientSeries); now <= seen {
+		t.Errorf("%s stood at %v by the first witness and %v at the end; the holder's meter stopped "+
+			"moving while the outage did not", renewalTransientSeries, seen, now)
+	} else {
+		t.Logf("the holder recorded %v refused renewals of its own, and one lease that never ended", now)
+	}
+	for _, series := range []string{
+		renewalOKSeries, renewalSelfHealedSeries, renewalFencedSeries, leaseRenewFenced,
+	} {
+		if n := readWitnessCounter(t, f, "jobrunner", series); n != 0 {
+			t.Errorf("%s is %v at the end of a run in which heartbeat_seq never left 0 and the job "+
+				"released its own lease with reason %q", series, n, l.reason)
+		}
 	}
 
 	// The marker's counts are folded in when the placement ends, which is why

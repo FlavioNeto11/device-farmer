@@ -675,11 +675,16 @@ prometheusRule:
   apiJob: ""
 
   # Rules over the per-role metrics (farm_reaper_*, farm_scheduler_*,
-  # farm_jobrunner_*). OFF, and it must stay off until the non-api roles both
-  # register their collectors and serve FARM_METRICS_ADDR somewhere Prometheus
-  # can reach. See the long comment above the roles group in
-  # templates/prometheusrule.yaml — enabling this early ships rules that return
-  # no data and therefore never fire, which reads as coverage and is not.
+  # farm_jobrunner_*). OFF, because enabling a page is your decision and not a
+  # chart default.
+  #
+  # The two things that once made it unsafe are both fixed: cmd/farmd registers
+  # every package's Collectors() in every role, and every role binds
+  # FARM_METRICS_ADDR, which serviceMonitor scrapes one target per pod. So turn
+  # this on once you have confirmed your Prometheus is actually scraping the
+  # metrics Service — enabling it while nothing scrapes those pods ships rules
+  # that return no data and therefore never fire, which reads as coverage and
+  # is not. DeviceFarmerAlertingBlind is the rule that says so out loud.
   roleScrape: false
 
   thresholds:
@@ -698,6 +703,33 @@ prometheusRule:
     # and how much is summarised in one page, not whether it fires.
     lostWorkWindow: 15m
     fenceWindow: 10m
+
+    # DeviceFarmerLeaseRenewalsFailing, the in-progress form of
+    # DeviceFarmerLeaseReclaimed. The rule fires only while NOT ONE renewal has
+    # landed on a replica that is attempting them, so neither number is a
+    # sensitivity dial — together they decide how long an outage must last
+    # before it is worth a ticket. ADD THEM UP before changing either: the
+    # `unless` arm cannot go true until the whole window has drained of
+    # successes, so the earliest this can fire is renewalWindow +
+    # renewalsFailingFor after the last renewal that landed. 10 minutes, as
+    # shipped.
+    #
+    # That sum is the only number that matters, and it has to stay under the
+    # budget a lease has left. Worst case is the schema's own floors —
+    # FARM_LEASE_TTL 10m and FARM_LEASE_GRACE 5m, below which farm.jobs' CHECK
+    # refuses the job — so 15 minutes from the last landed renewal to
+    # reclamation, before the control-plane gap refund and any witness extend
+    # it. At this chart's defaults (15m + 30m) it is 45. Ten leaves room in
+    # both, which is the whole point of the rule: it has to arrive while the
+    # leases can still be saved, not alongside the page that says they were
+    # not.
+    #
+    # renewalWindow must also stay several renewal intervals wide
+    # (config.lease.renewInterval, 90s above) or one slow renewal reads as a
+    # replica with no successes at all. Four intervals, here. renewalsFailingFor
+    # then rides out a Postgres failover on top of that.
+    renewalWindow: 6m
+    renewalsFailingFor: 4m
 
     # DeviceFarmerAPIDown. Two scrape intervals plus slack, so a rolling deploy
     # of the api does not page.

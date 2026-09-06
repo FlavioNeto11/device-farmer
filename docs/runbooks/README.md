@@ -58,6 +58,14 @@ not offer.
 | `DeviceFarmerLeaseReclaimed` | [lease-reclaimed.md](lease-reclaimed.md) |
 | `DeviceFarmerLeaseFenced` | [lease-fenced.md](lease-fenced.md) |
 
+The lower two are tombstones: by the time either fires, the lease has ended.
+The first is not — a protected lease waits indefinitely for a person, which is
+why it pages. `DeviceFarmerLeaseRenewalsFailing`, in the control-plane table
+below, is the only alert in the set that can fire while **nothing has been lost
+yet**: the renewals are merely failing, every lease still has its deadline, and
+at the shipped thresholds it arrives about ten minutes into the outage — ahead
+of all three of these at this chart's defaults. A warning for that reason.
+
 ### The control plane
 
 | Alert | Runbook |
@@ -66,6 +74,7 @@ not offer.
 | `DeviceFarmerAPIAuthOpen` | [api-auth-open.md](api-auth-open.md) |
 | `DeviceFarmerControlPlaneGap`, `DeviceFarmerControlPlaneGapBudget` | [control-plane-gap.md](control-plane-gap.md) |
 | `DeviceFarmerComponentBeatFailing` | [component-beat-failing.md](component-beat-failing.md) |
+| `DeviceFarmerLeaseRenewalsFailing` | [lease-renewals-failing.md](lease-renewals-failing.md) |
 | `DeviceFarmerReaperNotLeading`, `DeviceFarmerSchedulerNotLeading` | [reaper-not-leading.md](reaper-not-leading.md) |
 
 ### Hardware

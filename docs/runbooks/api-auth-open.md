@@ -87,6 +87,13 @@ having used the open door, deliberately or not. Also check for work that was
 destroyed while it was open:
 
 ```sh
+farmd ctl endings --reason operator_revoked --since 168h --limit 200
+```
+
+Every revoke in the last week, with the holder and tenant whose run it ended.
+Without a token:
+
+```sh
 psql "$PGURL" -c "
 SELECT ended_at, lease_id, job_id, tenant_id, release_reason, ended_by
   FROM farm.v_lease_endings

@@ -100,6 +100,14 @@ Anything with an `age` above a minute or two is still down. `age` above
 anyway.**
 
 ```sh
+farmd ctl reaper
+farmd ctl endings --ended-by reaper --since 6h
+```
+
+`ctl reaper` reads `farm.reaper_state`; `ctl endings` reads the ledger over the
+API. Without a token, both from the database:
+
+```sh
 psql "$PGURL" -c "SELECT singleton, armed_at, quiesce_until, enabled FROM farm.reaper_state"
 psql "$PGURL" -c "
 SELECT ended_at, lease_id, job_id, release_reason, heartbeat_age_s
@@ -108,8 +116,8 @@ SELECT ended_at, lease_id, job_id, release_reason, heartbeat_age_s
  ORDER BY ended_at DESC"
 ```
 
-`quiesce_until` should be in the future by roughly the longest live TTL. If that
-second query returns rows whose `ended_at` sits inside or just after a recorded
+`quiesce_until` should be in the future by roughly the longest live TTL. If the
+endings listing returns rows whose `ended_at` sits inside or just after a recorded
 gap, **the refund did not protect them** — that is a real incident, and it is
 [lease-reclaimed.md](lease-reclaimed.md), not this file.
 

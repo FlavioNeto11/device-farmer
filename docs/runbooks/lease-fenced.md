@@ -47,6 +47,20 @@ not "why did it fence" but **"what took the lease away, and was that right?"**
 **1. Find the ending that caused the fence.** A fence is always downstream of a
 release; the release row says who did it and why.
 
+If the alert named a lease, ask about that one directly:
+
+```sh
+farmd ctl endings <lease id>
+```
+
+Otherwise, everything that ended around the fence:
+
+```sh
+farmd ctl endings --since 30m
+```
+
+Without a token, the same rows:
+
 ```sh
 psql "$PGURL" -c "
 SELECT ended_at, lease_id, job_id, tenant_id, holder, release_reason, ended_by,
@@ -56,7 +70,7 @@ SELECT ended_at, lease_id, job_id, tenant_id, holder, release_reason, ended_by,
  ORDER BY ended_at DESC"
 ```
 
-Read `release_reason`, and route on it:
+Read `release_reason` — the `REASON` column — and route on it:
 
 | `release_reason` | What actually happened | Where to go |
 | --- | --- | --- |
@@ -105,10 +119,17 @@ whether one holder does it constantly.
 
 ## When to escalate
 
-- **A fence with no matching row in `farm.v_lease_endings`.** The lease vanished
+- **A fence with no matching row in the ledger.** `farmd ctl endings <lease id>`
+  says so in as many words: `ended: no` on a lease whose state is `released` or
+  `expired`, and a warning naming this file. The lease reached a terminal state
   without a recorded release. That is a database-level problem — a row deleted
   out of band, a fence column moved, a migration mid-flight — and it needs an
   engineer immediately. Every holder in the farm is trusting that column.
+- **An ending whose `ENDED BY` reads `unaccounted`.** The lease was closed with
+  no `release_reason` at all, so it names none of the three ways a lease may
+  end. Same severity as the row above. `farmd ctl endings` counts them at the
+  bottom of the listing — over the rows listed, so a page it warns was cut can
+  hide more of them further back.
 - **Fences arriving in a burst across many tenants.** Look for a mass reclaim
   first ([lease-reclaimed.md](lease-reclaimed.md)), then for a control-plane
   gap ([control-plane-gap.md](control-plane-gap.md)).

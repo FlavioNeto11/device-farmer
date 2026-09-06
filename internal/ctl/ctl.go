@@ -734,6 +734,12 @@ var commands = []command{
 	{"kinds", "", "the step vocabulary this server accepts", cmdSpecKinds},
 	{"resets", "--profile p [--tier t]", "exactly what a reset tier will run, before it runs", cmdSpecResets},
 	{"leases", "[--state s] [--host h] [--device d]", "who holds what", cmdLeases},
+	// The other half of `leases`: that one is who holds what now, this one is
+	// how the ones that are over ended. It reads the ledger migration 00007
+	// writes on every ending, which until now was reachable only from psql —
+	// so the first question of every incident review needed a database session
+	// at 3am.
+	{"endings", "[<lease id>] [--reason r] [--ended-by b] [--since d]", "how leases ended: job, deadline, operator or reaper", cmdEndings},
 	{"lease", "revoke <id> --reason r", "take a device back from its holder", cmdLease},
 	{"reaper", "[disable|enable --reason r]", "the kill switch for automatic reclamation", cmdReaper},
 	{"recovery", "[--outcome o --tier n --hub id --since d]", "the ladder, recent attempts, open quarantines", cmdRecovery},

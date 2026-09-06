@@ -206,7 +206,15 @@ func TestAuthenticatorForAnonymousOptInAllowsOpen(t *testing.T) {
 	// This is the path the packaged demo takes. docker-compose.yml binds the
 	// demo to 0.0.0.0 inside its container so the published port works, so the
 	// demo cannot lean on the loopback allowance and says out loud, in the
-	// manifest an operator reads, that this API is open.
+	// manifest an operator reads, that this API is open: the demo service
+	// carries FARM_API_ALLOW_ANONYMOUS: "true" and a comment saying why.
+	//
+	// This comment described that manifest for a while before the manifest
+	// said it, and nothing caught the drift — no test in this repository reads
+	// docker-compose.yml. `docker compose up -d`, the first command in the
+	// README, brought up a demo container that exited 1 here on every start
+	// and was restarted forever. If this line is ever deleted from the compose
+	// file, that is what comes back.
 	log, out := captureLog()
 	a, err := AuthenticatorFor(exposedCfg(), log)
 	if err != nil {

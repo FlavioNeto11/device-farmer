@@ -5,16 +5,26 @@
 #
 # This brings up Postgres, applies the schema, and runs the demo: 56 simulated
 # devices across two in-process fake ADB servers, driven by the REAL scheduler,
-# lease store, reaper and recovery ladder. No phone is attached.
+# lease store, reaper and recovery ladder. No phone is attached, and that is
+# why the demo's API runs open — see FARM_API_ALLOW_ANONYMOUS on that service.
 #
 # For a real farm, use the farm profile instead:
 #
+#   export FARM_API_TOKENS='<token>:operator:<you>'
 #   docker compose --profile farm up -d
 #
+# The export is NOT optional. The api binds 0.0.0.0 so its published port
+# works, and farmd refuses to serve an exposed listener with no credential —
+# correct, on the profile that drives real phones. Without it every other
+# service comes up and the api restarts forever printing the refusal; the api
+# service below says why compose cannot turn that into a parse-time error.
+#
 # That starts the per-role services at the bottom and leaves the demo out —
-# the two are exclusive, see .env. Then run one `farmd node` per host that
-# has devices plugged into it; that one cannot run in this compose file,
-# because it needs /dev/bus/usb on the physical machine.
+# the two are exclusive, see .env. Then run one `farmd node` per host that has
+# devices plugged into it. If they are plugged into THIS machine, the node
+# profile at the bottom runs that agent here:
+#
+#   FARM_HOST_ID=h01 docker compose --profile farm --profile node up -d
 
 name: device-farmer
 
@@ -34,10 +44,22 @@ x-farmd: &farmd
     # budget. Passing them through lets one .env feed both sides. The knobs
     # that turn the proxy ON (FARM_FENCE_TLS_CERT/KEY/CA, FARM_FENCE_LISTEN,
     # FARM_FENCE_ADVERTISE) belong to the host's node.env alone; the node role
-    # does not run in this file.
+    # in this file does not run the proxy.
     FARM_SLOT_REARM: ${FARM_SLOT_REARM:-35s}
     FARM_NODE_SELF_FENCE_TIMEOUT: ${FARM_NODE_SELF_FENCE_TIMEOUT:-20s}
     FARM_FENCE_SAFETY_MARGIN: ${FARM_FENCE_SAFETY_MARGIN:-5s}
+    # The shared secret between this control plane and every `farmd node`
+    # agent, and it must be the SAME value on both sides. Unset, the recovery
+    # ladder refuses tiers 3 and 4 ("no host agent is configured for this
+    # farm"), POST /api/v1/slots/{id}/power answers 503, and the charge policy
+    # observes without holding a port — each of them says so at startup.
+    #
+    # This is a passthrough, not a value: compose forwards a host variable
+    # into a container only when the service NAMES it. Without this line
+    # `export FARM_NODE_TOKEN=...` reached the compose CLI and stopped there,
+    # which made .env's "those belong in the shell that runs compose" false
+    # for exactly the two variables it was written about.
+    FARM_NODE_TOKEN: ${FARM_NODE_TOKEN:-}
     # Every role serves its own /metrics here, not just the api. Set it to
     # "off" for a role you do not want scraped; a bind failure is logged and
     # exported as farm_metrics_listener_up 0, and never stops the role.
@@ -92,6 +114,22 @@ services:
     environment:
       <<: *farmd-env
       FARM_API_ADDR: "0.0.0.0:8080"
+      # This API is OPEN, on purpose, and this line is where that is said out
+      # loud in the manifest an operator reads.
+      #
+      # A container that binds 127.0.0.1 inside its own netns cannot serve a
+      # published port, so the demo binds 0.0.0.0 and cannot lean on farmd's
+      # loopback allowance. What is behind it is simulated: 56 fake devices on
+      # two in-process ADB servers, so "every caller is an operator" costs
+      # nobody a phone. NewAllowAll still logs AUTHENTICATION IS DISABLED on
+      # every start.
+      #
+      # Without this line the demo exits 1 the moment it reaches
+      # api.AuthenticatorFor and `docker compose up -d` — the first command in
+      # this file — never serves 8420.
+      # internal/api/auth_test.go TestAuthenticatorForAnonymousOptInAllowsOpen
+      # pins this exact path and names this service.
+      FARM_API_ALLOW_ANONYMOUS: "true"
     command: ["demo", "-hosts", "2", "-devices", "56"]
     ports:
       - "${FARM_PORT:-8420}:8080"
@@ -100,12 +138,14 @@ services:
   # ---------------------------------------------------------------------
   # Real farm. Each role scales and fails independently.
   #
+  #   export FARM_API_TOKENS='<token>:operator:<you>'
   #   docker compose --profile farm up -d
   #
   # The watchdog and the recovery ladder reach your hosts' ADB servers over
   # TCP, so farm.hosts.adb_endpoint must be an address this network can route
-  # to. Run `farmd node` on each physical host separately: it needs
-  # /dev/bus/usb, which is exactly why it cannot live in the cluster.
+  # to. Run `farmd node` on each physical host — on the machine the phones are
+  # plugged into, which for a single-machine farm can be the node profile at
+  # the bottom of this file and for a rack of hosts is `farmd node` on each.
   # ---------------------------------------------------------------------
   api:
     <<: *farmd
@@ -113,6 +153,25 @@ services:
     environment:
       <<: *farmd-env
       FARM_API_ADDR: "0.0.0.0:8080"
+      # The credential this farm authenticates callers with, passed through
+      # from the shell exactly like FARM_NODE_TOKEN above. Unlike the demo,
+      # allow-anonymous would be the wrong answer here: this profile points at
+      # real phones, and open means every caller on the network holds the
+      # operator role — revoke a lease, drain a host, cut VBUS on a port under
+      # a live job.
+      #
+      # Deliberately ${VAR:-} and NOT ${VAR:?message}. Compose interpolates the
+      # entire file before it filters by profile, so a required-variable check
+      # on a farm-profile service fails every command in the project, including
+      # the bare `docker compose up -d` that starts the demo. Verified against
+      # compose v5.5.0: with this written as ${FARM_API_TOKENS:?...},
+      # COMPOSE_PROFILES=demo docker compose config exits with "required
+      # variable FARM_API_TOKENS is missing a value" and starts nothing. There
+      # is no profile-scoped form of that check, so the refusal an operator who
+      # forgot the export gets is farmd's own, in
+      # `docker compose --profile farm logs api`; it names this variable and
+      # what an open control plane would cost.
+      FARM_API_TOKENS: ${FARM_API_TOKENS:-}
     command: ["api"]
     ports:
       - "${FARM_PORT:-8420}:8080"
@@ -149,15 +208,124 @@ services:
     # advisory-lock singleton as the reaper: a second replica idles.
     command: ["janitor"]
 
+  chargepolicy:
+    <<: *farmd
+    profiles: ["farm"]
+    # Holds idle devices inside the charge band: above the ceiling a device
+    # with no live lease is parked and its port held dark, at the floor it is
+    # released. It acts ONLY on devices with no lease and ends none — a full
+    # battery is not on the list of things that end a lease.
+    #
+    # Not a nicety, and the reason it belongs in every farm rather than only in
+    # the chart: the band is the software half of the lithium mitigation
+    # REQUIREMENTS.md HW-03 rates as met. A rack held at 100% state of charge
+    # is the state that requirement exists to prevent, and the gate on the host
+    # agent fails towards ON, so with no policy loop running every port stays
+    # powered and nothing anywhere reports it — chargepolicy is deliberately
+    # not one of the reaper's watched components, so its silence is not a gap.
+    #
+    # It needs FARM_NODE_TOKEN to hold a port. Without one it still beats,
+    # scans and counts every device it would have held under
+    # farm_chargepolicy_skipped_total{reason="no_client"}, and says so at
+    # startup. Another advisory-lock singleton: a second replica idles.
+    command: ["chargepolicy"]
+
   watchdog:
     <<: *farmd
     profiles: ["farm"]
+    # With no FARM_HOST_ID this is the fleet-wide shape: one process
+    # supervising every row in farm.hosts. It enumerates them ONCE at startup,
+    # so a host enrolled later is not watched until this container restarts —
+    # fine while a farm is being brought up, and the reason the chart defaults
+    # watchdog.superviseAllHosts to false and renders nothing instead.
+    #
+    # On a fresh farm that table is empty and the role exits 1 with "no hosts
+    # registered; set FARM_HOST_ID or seed farm.hosts". That is expected, not a
+    # broken deployment: the inherited restart policy retries until the first
+    # `farmd node` enrols a host, and the retry is what re-runs the
+    # enumeration. Docker's backoff caps at about a minute, so it catches up
+    # within a minute of the first enrolment.
     command: ["watchdog"]
 
   recovery:
     <<: *farmd
     profiles: ["farm"]
     command: ["recovery"]
+
+  # ---------------------------------------------------------------------
+  # The host agent, for the single-machine shape: phones plugged into the
+  # machine that runs this file.
+  #
+  #   FARM_HOST_ID=h01 docker compose --profile farm --profile node up -d
+  #
+  # OFF unless "node" is named. A bare `docker compose up -d` and
+  # `--profile farm up -d` both leave it out, because a container holding
+  # write access to USB device nodes is not something to start by accident.
+  #
+  # Why it is here at all: the agent needs the USB tree and write access to
+  # /dev/bus/usb, and a container CAN have both — what matters is how much
+  # else comes with them. device_cgroup_rules below admits character major
+  # 189 and nothing else, which is usbfs and only usbfs: the phones, and no
+  # other device on the machine. That is the narrow form, and compose is where
+  # it can be said. A Kubernetes pod that needs /dev/bus/usb takes
+  # `privileged: true` and with it every device node on the host, which is
+  # what deploy/helm's DaemonSet does; this is the safer of the two paths.
+  #
+  # WHAT IS UNPROVEN, and it is most of this: NO PHONE HAS EVER BEEN ATTACHED
+  # TO THIS PROJECT, on any deployment shape. Nothing below has been run
+  # against hardware. What is known from the code rather than from a run:
+  #
+  #   - Tier 3 (USBDEVFS_RESET) is an ioctl on an /dev/bus/usb node opened
+  #     write-only, which the mount and the cgroup rule cover.
+  #   - Tier 4 (VBUS) shells out to uhubctl, and uhubctl is NOT in this image
+  #     — distroless carries the binary and nothing else. Tier 4 will refuse
+  #     with "uhubctl is not installed on this host", which is the honest
+  #     answer and not a silent no-op, but it means a farm that needs tier 4
+  #     runs `farmd node` on the host itself. The same goes for the charge
+  #     gate, which holds a port through uhubctl.
+  #   - The USB tree is read from /sys/bus/usb/devices, which Docker already
+  #     mounts read-only from the host, so nothing is bind-mounted for it.
+  #     Linux only, kernel 6.0 or newer; below that the kernel silently
+  #     re-powers a disabled port and the agent refuses tier 4 with the
+  #     kernel version as the reason.
+  # ---------------------------------------------------------------------
+  node:
+    <<: *farmd
+    profiles: ["node"]
+    command: ["node"]
+    environment:
+      <<: *farmd-env
+      # A node agent speaks for exactly one physical host and farmd refuses to
+      # guess which; unset, this container exits 1 saying so. It is the id the
+      # rest of the farm knows this machine by — farm.hosts.id.
+      FARM_HOST_ID: ${FARM_HOST_ID:-}
+      # The ADB server this host's phones are attached to. README runs it as
+      # its own container publishing 5037 on the host, so from inside this
+      # network it is the host gateway rather than a compose service name.
+      FARM_ADB_ENDPOINT: ${FARM_ADB_ENDPOINT:-host.docker.internal:5037}
+      # The agent's own HTTP surface: the port recovery tiers 3 and 4 and the
+      # charge gate are asked for. Record this container's address in
+      # farm.hosts.node_endpoint for the control plane to dial it.
+      #
+      # The address is present only when the token is, and that is not
+      # decoration: node.New REFUSES an Addr with no Token — an
+      # unauthenticated endpoint that power-cycles USB ports is worse than no
+      # endpoint — so a fixed address here would make an agent with no token
+      # exit 1 instead of doing the two things it can still do, which are
+      # discovery and enrolment. Serving nothing is a legitimate deployment.
+      FARM_NODE_ADDR: ${FARM_NODE_TOKEN:+0.0.0.0:8090}
+    # The image runs as nonroot and usbfs nodes are root-owned, so this one
+    # service runs as root. Root inside a cgroup that admits a single device
+    # major is a far smaller grant than --privileged, which is the alternative.
+    user: "0:0"
+    # README's adbd container publishes 5037 on the host; this is how a
+    # container on a user-defined network reaches it.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - /dev/bus/usb:/dev/bus/usb
+    device_cgroup_rules:
+      - "c 189:* rmw"
 
   # ---------------------------------------------------------------------
   # Scraping. Every farmd role serves /metrics on 9090 inside this network,

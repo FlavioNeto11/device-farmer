@@ -116,9 +116,16 @@ manifest that was written for a laptop.
 
 Give the release credentials. Either inline:
 
+`--set-string` and the escaped comma are both load-bearing. FARM_API_TOKENS is
+a comma-separated list, and helm's `--set` parser splits on commas before the
+value ever reaches the chart: the unescaped form fails outright with
+`Error: failed parsing --set data: key "<token2>:tenant:<team>" has no value`,
+which is not the message you want at the point in an incident where you are
+reading this page.
+
 ```sh
 helm -n <ns> upgrade <release> deploy/helm/device-farmer --reuse-values \
-  --set auth.tokens='<token>:operator:<name>,<token2>:tenant:<team>' \
+  --set-string auth.tokens='<token>:operator:<name>\\,<token2>:tenant:<team>' \
   --set config.extra.FARM_API_AUTH=null \
   --set config.extra.FARM_API_ALLOW_ANONYMOUS=null
 ```

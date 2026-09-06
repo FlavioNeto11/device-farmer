@@ -188,6 +188,18 @@ func (s *Server) buildInfo() BuildInfo {
 			}
 		}
 	}
+	// What the linker was told wins over what the toolchain inferred. For a
+	// `go build` of a main module the toolchain infers "(devel)" and the block
+	// above leaves the "dev" default standing, which is how a released image
+	// came to report itself as a development build. The image is also compiled
+	// -buildvcs=false, so vcs.revision is absent there and the stamp is the only
+	// source of a revision at all.
+	if s.build.Version != "" {
+		b.Version = s.build.Version
+	}
+	if s.build.Revision != "" {
+		b.Revision = s.build.Revision
+	}
 	return b
 }
 

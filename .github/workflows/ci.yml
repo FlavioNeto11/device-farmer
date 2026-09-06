@@ -127,8 +127,16 @@ jobs:
         run: helm lint "$CHART" -f "$VALUES"
       - name: render with everything switched on
         run: helm template ci "$CHART" -n device-farmer -f "$VALUES" > /dev/null
-      - name: render with defaults and a DSN only
-        run: helm template ci "$CHART" -n device-farmer --set database.dsn=postgres://farm@pg:5432/device_farmer > /dev/null
+      - name: render with the smallest install that can actually run
+        # A DSN alone used to be that install. It is not any more, and the
+        # chart now says so at render time rather than at CrashLoopBackOff:
+        # the api refuses an unauthenticated listener the network can reach,
+        # so a release with no credential decision is one `helm install --wait`
+        # timeout whose message never mentions a token. The refusal itself is
+        # asserted below, in "the guards still refuse"; this step asserts the
+        # other half, that adding the one missing thing is enough.
+        run: |
+          helm template ci "$CHART" -n device-farmer             --set database.dsn=postgres://farm@pg:5432/device_farmer             --set auth.tokens=ci-token:operator:ci > /dev/null
       - name: render with both credentials from existing Secrets
         run: |
           helm template ci "$CHART" -n device-farmer -f "$VALUES" \
@@ -168,6 +176,10 @@ jobs:
         run: |
           if helm template ci "$CHART" -n device-farmer > /dev/null 2>&1; then
             echo "rendered with no database configured"; exit 1
+          fi
+          if helm template ci "$CHART" -n device-farmer                --set database.dsn=postgres://farm@pg:5432/device_farmer > /dev/null 2>&1; then
+            echo "rendered a release whose api cannot start: no auth.tokens, no"
+            echo "auth.existingSecret, and a listener on 0.0.0.0"; exit 1
           fi
           if helm template ci "$CHART" -n device-farmer -f "$VALUES" --set database.existingSecret=farm-postgres > /dev/null 2>&1; then
             echo "rendered with database.dsn AND database.existingSecret"; exit 1

@@ -968,11 +968,21 @@ func TestOurOwnTickRateIsNotAHostOutage(t *testing.T) {
 	stub := startStub(t, []string{"device"}, nil)
 
 	a := NewADBActuator(slog.New(slog.DiscardHandler), nil)
-	// A poll interval an order of magnitude longer than the window it has to
-	// poll inside. The device underneath is healthy and says so on the first
-	// read anyone bothers to take.
-	a.SettleInterval = 2 * time.Second
-	a.ControlConfirm = 50 * time.Millisecond
+	// A poll interval forty times longer than the window it has to poll inside.
+	// The device underneath is healthy and says so on the first read anyone
+	// bothers to take.
+	//
+	// The RATIO is the fixture; the absolute numbers only have to be larger
+	// than the machine's scheduling noise. They were 2s and 50ms — the same
+	// forty to one — and the confirm loop's defence is to shrink the interval to
+	// half the remaining budget, so the first tick was due at 25ms. Inside a
+	// loaded build container that tick did not always arrive before the window
+	// closed, and the run recorded probes:1 reads:0: not a defect, exactly the
+	// "never asked" the loop reports instead of an outage, but it made this test
+	// fail for a reason that is about the host it runs on. Ten times the budget
+	// keeps the fixture and drops the race.
+	a.SettleInterval = 20 * time.Second
+	a.ControlConfirm = 500 * time.Millisecond
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -982,7 +992,7 @@ func TestOurOwnTickRateIsNotAHostOutage(t *testing.T) {
 		DeviceID: "11111111-1111-1111-1111-111111111111", SlotID: 7,
 		Devpath: testDevpath, RackSlot: testRackSlot,
 		HubID: 3, HubPath: "3-1", HostID: testHost,
-		ADBEndpoint: stub.addr(), Timeout: 2 * time.Second,
+		ADBEndpoint: stub.addr(), Timeout: 5 * time.Second,
 	})
 	if err != nil {
 		t.Fatalf("Recover: %v", err)

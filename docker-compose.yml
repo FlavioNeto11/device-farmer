@@ -33,6 +33,14 @@ x-farmd: &farmd
     context: .
     args:
       VERSION: ${VERSION:-dev}
+      # .dockerignore keeps .git out of the build context and the Dockerfile
+      # compiles -buildvcs=false, so the linker has no source for a commit
+      # other than this argument. Passing only VERSION produced an image whose
+      # labels, `farmd version` and /api/v1/capabilities all reported no commit
+      # at all. Unset here it degrades to that same honest blank rather than to
+      # a wrong SHA read out of whatever directory the build ran in.
+      COMMIT: ${COMMIT:-}
+      BUILD_DATE: ${BUILD_DATE:-}
   image: device-farmer/farmd:${VERSION:-dev}
   environment: &farmd-env
     DATABASE_URL: postgres://farm:farm@postgres:5432/device_farmer?sslmode=disable

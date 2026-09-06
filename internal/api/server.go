@@ -162,6 +162,13 @@ type Server struct {
 	bg       sync.WaitGroup
 
 	startedAt time.Time
+	// build is what the linker stamped into package main. It is passed in
+	// rather than read here because -ldflags -X writes into main, which this
+	// package cannot see: debug.ReadBuildInfo reports Main.Version as
+	// "(devel)" for any `go build` of a main module, so /capabilities
+	// answered "dev" on every stamped release image ever built. Empty means
+	// nobody stamped this binary, and that is reported as "dev", not guessed.
+	build BuildStamp
 }
 
 // Option configures a Server.
@@ -223,6 +230,27 @@ func WithRoutes(mount func(*Server, *http.ServeMux)) Option {
 // assets, so the API only holds the hook.
 func WithUI(h http.Handler) Option {
 	return func(s *Server) { s.ui = h }
+}
+
+// BuildStamp carries what the linker put in package main. cmd/farmd owns those
+// variables; this is how they reach the one route that reports them.
+type BuildStamp struct {
+	Version  string
+	Revision string
+	Date     string
+}
+
+// WithBuild hands the server the build metadata the linker stamped into
+// package main.
+//
+// Without it GET /api/v1/capabilities reports version "dev" for every build,
+// including a released image, because the only source it had was
+// debug.ReadBuildInfo — and Main.Version is "(devel)" for a `go build` of a
+// main module. The image now also builds with -buildvcs=false, so vcs.revision
+// is empty too: asking a running farm which commit it is had no correct answer
+// left. Callers that stamp nothing keep the old reported value.
+func WithBuild(b BuildStamp) Option {
+	return func(s *Server) { s.build = b }
 }
 
 // WithStreamInterval sets the SSE poll period.

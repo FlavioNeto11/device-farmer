@@ -389,6 +389,9 @@ func runAPI(ctx context.Context, cfg *config.Config, log *slog.Logger, pool *pgx
 
 	opts := []api.Option{
 		api.WithLogger(log),
+		// The linker stamps these into package main; internal/api cannot see
+		// them, so /capabilities reported "dev" for every image ever built.
+		api.WithBuild(api.BuildStamp{Version: version, Revision: commit, Date: buildDate}),
 		api.WithRegistry(reg),
 		// The dashboard ships inside the binary and is mounted at "/", so a
 		// farm has an operator interface with nothing else deployed.

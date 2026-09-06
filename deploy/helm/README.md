@@ -66,14 +66,9 @@ once per machine. And the token is yours to place: `node.token.existingSecret`
 must name the same Secret the api, recovery and chargepolicy roles read
 `FARM_NODE_TOKEN` from, or every call answers 401.
 
-> A paragraph under **Not wired up yet** below still says this role cannot start
-> in this build for want of that token wiring. It is stale, and has been since
-> the commit that wrote it: `cmd/farmd/roles.go` passes `Token: cfg.Node.Token`,
-> and `scripts/linux-acceptance.sh` starts the role and asserts that
-> `/node/v1/health` answers 401 without a bearer token and 200 with one. The
-> real gap it points at is smaller and is in this document: the `node.env` block
-> in the next section does not set `FARM_NODE_TOKEN`, and the agent refuses to
-> start without it, so add the line when you copy that file.
+> The `node.env` block in the next section does not set `FARM_NODE_TOKEN`,
+> and the agent refuses to start without it. Add the line when you copy that
+> file.
 
 The consequence is visible rather than hidden. Without a node agent, recovery
 tiers 3 and 4 are **refused with a reason naming what is missing**, not
@@ -288,6 +283,8 @@ migration hook runs and before anything exists in the cluster.
 | A `hosts[].id` that is not a DNS-1123 label, or repeated | It becomes a Deployment name and a Service name. `farm.hosts.id` is unconstrained `text` in the schema, so an id that is legal in Postgres and illegal in Kubernetes is ordinary — and a repeated id means one machine silently loses its watchdog. |
 | A `hosts[].service.address` carrying a port or a scheme | It becomes an EndpointSlice address or an `ExternalName`, and neither accepts one. |
 | `DATABASE_URL`, `FARM_API_TOKENS` or `FARM_COMPONENT` in `config.extra` | The first two are credentials and belong in `database.*` / `auth.*`. The third is per-role identity: one shared `FARM_COMPONENT` would make the reaper's gap accounting blind to the role that is actually down, so its outage goes unrefunded and its leases are reclaimed on schedule. |
+| Neither `auth.tokens` nor `auth.existingSecret`, on a listener the network can reach | The api refuses to serve an unauthenticated control plane on a non-loopback address, so every api pod would sit in `CrashLoopBackOff` while `helm install --wait` ran out its own timeout — five minutes, ending in a message that never mentions a token. Set one of the two, or opt into an open control plane on purpose. |
+| A release name long enough to collapse the component suffix | `<fullname>-<component>` was truncated from the tail, and the tail is the only part that tells `reaper` from `scheduler`. Past a certain length every Deployment rendered under one name: at the quiet end one host's watchdog simply vanished, at the loud end nine workloads became one — after the migration hook had already run. |
 
 `hosts[]` is validated from `templates/configmap.yaml`, which renders in every
 possible release. That matters: the checks used to live in `watchdog.yaml`, so
@@ -336,55 +333,40 @@ release back afterwards.
 
 ---
 
-## Not wired up yet
+## What this chart still cannot do for you
 
-Two things in this chart describe a contract the binary does not fully honour
-today. Both are one call site away, and both are documented here rather than
-quietly omitted:
+Both entries that used to stand here were about call sites that no longer
+exist, and they had been false since before the commit that wrote them. They
+are recorded rather than deleted, because a reader who remembers being told the
+API was open needs to be able to tell FIXED from NEVER TRUE.
 
-1. **`FARM_API_TOKENS` is mounted, but check that your build reads it.**
-   At the commit this chart was written against, `runAPI` in
-   `cmd/farmd/roles.go` passes `api.NewAllowAll(...)` unconditionally, so the
-   API grants every caller the operator role no matter what this chart puts in
-   its environment. Run the binary with the exact environment the chart mounts
-   and it says so itself:
+| It used to say | What is true, and how it was checked |
+|---|---|
+| "`FARM_API_TOKENS` is mounted, but check that your build reads it" — `runAPI` passes `api.NewAllowAll(...)` unconditionally, so every caller is an operator no matter what the chart mounts | `cmd/farmd/roles.go` calls `api.AuthenticatorFor(cfg, log)`; the string `NewAllowAll` does not appear in the file. Measured on a live cluster: with `auth.tokens` set, `GET /api/v1/capabilities` answers **401 with no credential and 200 with the token**, and a wrong token answers 401. With `auth.tokens` empty the chart now refuses to render at all rather than installing an api that cannot start. |
+| "`farmd node` cannot start in this build" — `runNode` never passes a `Token` and `node.New` refuses that combination | `cmd/farmd/roles.go` passes `Token: cfg.Node.Token`. `scripts/linux-acceptance.sh` starts the role against a real filesystem and asserts `/node/v1/health` answers **401 without a bearer token and 200 with one**; both checks pass on Linux 6.18 / PostgreSQL 18.6. |
 
-   ```
-   level=WARN msg="AUTHENTICATION IS DISABLED: every request is granted the operator role"
-     authenticator=allow-all fix="set FARM_API_TOKENS to a token list, or supply an Authenticator"
-   ```
+What remains true, and is the reason `.auth.open` exists: **a chart cannot know
+what image you deployed.** `auth.tokens` being set is not evidence that the
+running binary honours it, and "tokens are configured" is exactly the sentence
+that stops someone checking. So ask the server rather than the values file:
 
-   That line appears **with `FARM_API_TOKENS` set**. `api.AuthenticatorFor` in
-   `internal/api/auth_wiring.go` already implements the token parsing, the role
-   levels, the constant-time compare, and a refusal to come up open on a
-   non-loopback listener; `runAPI` needs to call it instead of `NewAllowAll`.
+```sh
+curl -s http://<api>/api/v1/capabilities | jq '.auth, .build'
+# {"mode":"bearer","open":false, ...}
+# {"version":"0.1.0","revision":"<sha>", ...}
+```
 
-   Do not trust this paragraph — ask the server, which reports the
-   authenticator it actually installed rather than the one you configured:
+`open: false` is the whole answer for authentication, and `build` is how you
+know which image produced it — that field reported `"dev"` for every binary
+ever built until the linker's stamp was passed through to the API, so a farm
+you deployed last week may still answer `dev` if its image predates that fix.
 
-   ```sh
-   curl -s http://<api>/api/v1/capabilities | jq .auth
-   # {"mode":"allow-all","open":true,"consequence":"every request is granted the operator role: ...
-   ```
+The genuine gap is narrower and lives in this document: the `node.env` block
+above does not set `FARM_NODE_TOKEN`, and the agent refuses to start without
+it. Without a node agent, recovery tiers 3 and 4 are **refused with a reason
+naming what is missing**, never silently skipped.
 
-   `open: true` is the whole answer. `NOTES.txt` prints the same instruction in
-   both branches, and deliberately does **not** tell you the farm is protected
-   just because you set `auth.tokens` — a chart cannot know what image you
-   deployed, and "tokens are configured" is exactly the sentence that would
-   stop someone checking. Until `.auth.open` reads false, treat the API port as
-   privileged: keep the Service `ClusterIP` and put a NetworkPolicy in front
-   of it.
-
-2. **`farmd node` cannot start in this build.** `runNode` always passes
-   `Addr: cfg.NodeAddr` (default `:8082`) and never a `Token`, and
-   `node.New` refuses that combination — correctly, since the node endpoint
-   can cut power to a port holding a live lease and must never be reachable
-   unauthenticated. It needs an environment variable for the shared token
-   (`FARM_NODE_TOKEN`, say) wired into `node.Config.Token`, and the same
-   secret given to the recovery ladder's host runner. The systemd unit above
-   is otherwise correct and will work as soon as it exists.
-
-Neither gap affects the lease invariant. They affect who may talk to the
+Neither of these affects the lease invariant. They affect who may talk to the
 control plane, and whether recovery tiers 3 and 4 can act at all.
 
 ---
@@ -392,9 +374,17 @@ control plane, and whether recovery tiers 3 and 4 can act at all.
 ## Validating a change to this chart
 
 ```sh
-helm lint deploy/helm/device-farmer --set database.dsn=postgres://farm@pg:5432/device_farmer
-helm template farm deploy/helm/device-farmer -n device-farmer -f my-hosts.yaml | kubectl apply --dry-run=server -f -
+# Both need a credential decision as well as a DSN: with neither auth.tokens
+# nor auth.existingSecret the chart refuses, because the api would not start.
+helm lint deploy/helm/device-farmer -f my-hosts.yaml
+helm template farm deploy/helm/device-farmer -n device-farmer -f my-hosts.yaml   | kubectl apply --dry-run=server -f -
 ```
+
+**`helm lint` alone is not a check on this chart.** Helm 4 reports a template
+`fail` at INFO and then prints `0 chart(s) failed`, so a lint of a values file
+the chart would REFUSE to install still exits 0. `helm template` is the one
+that fails, which is why CI runs both and why the line above passes a values
+file rather than a bare `--set`.
 
 With **no** database configured, `helm template` (and `helm install`) fail on
 purpose, with a message naming the value to set. A control plane that renders

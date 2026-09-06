@@ -323,11 +323,25 @@ echo "if it is still here in a minute:  kubectl -n $NS get pods"
 # timeout that names neither. The chart deliberately keeps a failed migration's
 # pod so `kubectl logs` has something to show, and at the default timeout
 # nobody is still watching when it gets there.
+# The image id, so that rebuilding under an unmoved tag actually reaches the
+# cluster. Kubernetes rolls a Deployment when its pod TEMPLATE changes, and
+# `--set image.tag=local` renders the same template whatever the tag now points
+# at: a rebuild imported cleanly, helm reported "deployed", and the pods went on
+# running the binary from before the edit. Nothing said so — the only way to
+# find out was to compare .status.containerStatuses[].imageID against
+# `docker images --no-trunc`. Stamping the id into an annotation makes a changed
+# image a changed template. An unchanged image stamps the same value and rolls
+# nothing, so re-running this script stays free.
+IMAGE_ID=$(docker images --no-trunc --format '{{.ID}}' "$IMAGE" | head -n 1)
+[ -n "$IMAGE_ID" ] || die "built $IMAGE but docker cannot report its id, so a
+rebuild could not be told from the image already running in the cluster."
+
 helm upgrade --install "$RELEASE" "$ROOT/deploy/helm/device-farmer" \
 	--namespace "$NS" \
 	"${VALUES[@]}" \
 	--set image.repository="$IMAGE_REPO" \
 	--set image.tag="$IMAGE_TAG" \
+	--set podAnnotations."device-farmer\\.io/image-id"="$IMAGE_ID" \
 	--wait --timeout 16m
 
 # Ask the cluster for the release's names rather than re-deriving them. The
@@ -347,6 +361,7 @@ FULLNAME=${API_SVC%-api}
 if [ "$MODE" = demo ]; then
 	say "simulated hardware: $DEVICES devices across $HOSTS hosts"
 	sed -e "s|__IMAGE__|$IMAGE|g" \
+		-e "s|__IMAGE_ID__|$IMAGE_ID|g" \
 		-e "s|__CONFIGMAP__|$FULLNAME-config|g" \
 		-e "s|__DB_SECRET__|$FULLNAME-db|g" \
 		-e "s|__AUTH_SECRET__|$FULLNAME-auth|g" \

@@ -62,6 +62,14 @@ spec:
       app.kubernetes.io/name: device-farmer-demo
   template:
     metadata:
+      annotations:
+        # The id of the image this pod was applied for. The tag never moves, so
+        # a rebuilt image is a different binary under the same name and nothing
+        # in the pod template changes: kubectl applies a no-op and the cluster
+        # keeps running the old bits, silently. Stamping the id here makes a
+        # changed image a changed template, which is what a rollout is for — and
+        # an unchanged one still applies to nothing.
+        device-farmer.io/image-id: __IMAGE_ID__
       labels:
         app.kubernetes.io/name: device-farmer-demo
         app.kubernetes.io/component: demo

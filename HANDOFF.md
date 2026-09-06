@@ -1,16 +1,36 @@
 # Estado da sessão — retomar daqui
 
-Atualizado em 2026-09-06, depois de mergear as quarenta e nove branches desta
-sessão e reverificar tudo contra a árvore resultante. Este arquivo é o único
-lugar que reúne o estado; leia-o antes de qualquer coisa.
+Atualizado em 2026-09-06, depois de fechar o registro e depois empacotar a
+coisa para valer — Docker e Kubernetes, rodados, não só escritos. Este arquivo
+é o único lugar que reúne o estado; leia-o antes de qualquer coisa.
+
+## Como subir isto, agora
+
+```bash
+docker compose up -d          # 56 devices simulados, dashboard em :8420
+bash scripts/k8s-up.sh        # o mesmo num Kubernetes local, um comando
+bash scripts/k8s-down.sh      # e some sem deixar nada
+```
+
+Para uma fazenda de verdade o token não é opcional — a api se recusa a servir
+um plano de controle aberto num endereço que a rede alcança:
+
+```bash
+export FARM_API_TOKENS='<token>:operator:<voce>'
+docker compose --profile farm up -d
+```
+
+E se for usar o `ctl` contra o compose, aponte-o: o default dele é
+`127.0.0.1:8080` e o compose publica em 8420.
 
 ## Onde o repositório está
 
-- `main` = `76aa430`, **empurrado para o origin**. Árvore limpa.
+- `main` = `a910279`, **empurrado para o origin**. Árvore limpa.
 - Remote: `https://github.com/FlavioNeto11/device-farmer`
-- **Nenhum PR aberto.** 49 merges nesta sessão, 133 commits, 30 deles por PR —
-  o resto foi branch de worktree mergeada direto. Todos `--no-ff`, então o
-  histórico mostra o que cada um trouxe.
+- **Nenhum PR aberto.** 56 merges nesta sessão; 55 PRs mergeados no total, 1
+  fechado. Todos `--no-ff`, então o histórico mostra o que cada um trouxe.
+  (`gh pr list --state merged` responde 30 por causa do limite padrão dele —
+  passe `--limit`.)
 - Schema **v21**, contígua (`00001`…`00021`). 213 arquivos Go, **896 funções
   `TestX` — 1 726 testes contando subtestes — em 23 pacotes**, **15 suítes de
   asserção SQL**, **11 arquivos de cenário em `test/e2e`**.
@@ -21,12 +41,15 @@ lugar que reúne o estado; leia-o antes de qualquer coisa.
 
 ```
 go build ./... && go vet ./... && gofmt -l .       # limpos, DATABASE_URL VAZIA
-go test -count=1 ./...                             # 23 pacotes ok
+go test -count=1 ./...                             # 24 pacotes ok
 farmd migrate up  (banco vazio -> v21)             # 21 migrations
 test/assertions*.sql                               # 15 suítes, 15 PASSED
-go test ./test/e2e/                                # ok, 302 s
-go test ./internal/... ./cmd/...  (com banco)      # ok
+go test ./test/e2e/                                # ok, 297 s
 scripts/linux-acceptance.sh   (via WSL)            # 55 checks, exit 0
+docker build .                                     # 36 MB, contexto 375 kB
+docker compose up -d                               # dashboard 200, 56 devices
+docker compose --profile farm up -d                # 9 serviços, 401/401/200
+bash scripts/k8s-up.sh                             # cluster vivo, e de volta
 ```
 
 A corrida no Linux é a que vale mais: **kernel 6.18.33.2, PostgreSQL 18.6**, o
@@ -94,6 +117,74 @@ E três testes estavam passando pelo motivo errado — um afirmava sobre
 varria, um tinha um relógio que tornava a própria falsificação indetectável. Os
 três foram escritos nesta sessão, pelo mesmo processo que depois os pegou. É
 para isso que serve falsificar cada asserção.
+
+## Empacotamento — o que a auditoria e as corridas acharam
+
+O Dockerfile, o compose e o chart já existiam e eram bons. **Ninguém nunca
+tinha rodado nenhum dos três.** Uma auditoria de 54 agentes achou 69 defeitos
+verificados (6 bloqueadores, 18 major); as corridas ao vivo acharam os mesmos
+bloqueadores por conta própria, o que é a única forma de confiar nos dois.
+
+Os três que impediam qualquer uso, e todos eram o mesmo mecanismo:
+
+1. **`docker compose up -d`** — a primeira linha do próprio arquivo — deixava o
+   `demo` em loop de restart. Ele faz bind em `0.0.0.0` e a api se recusa a
+   servir aberta num endereço que a rede alcança. A recusa está certa e nomeia
+   este deployment exato; o manifesto nunca ligava a escotilha que ela nomeia —
+   e `internal/api/auth_test.go` afirmava, num comentário, que ligava.
+2. **`--profile farm`** falhava igual com a resposta oposta e correta: um token.
+   `FARM_API_TOKENS` não era interpolado em lugar nenhum, então a promessa do
+   `.env` de que credenciais vivem "no shell que roda o compose" não alcançava
+   nada. Não dá para usar `${VAR:?}` aqui: o compose interpola o documento
+   inteiro **antes** de filtrar por profile, então uma variável obrigatória num
+   serviço do farm quebra todo comando do projeto, inclusive o do demo. Está
+   escrito no arquivo para ninguém "consertar" de volta.
+3. **`helm install`** com só um DSN instalava uma fazenda quebrada: cinco
+   minutos de `--wait` e um timeout que não menciona token nenhum — enquanto o
+   `values.yaml` documentava essa recusa exata um campo acima do valor que a
+   causa. Agora recusa no render, em menos de um segundo, com a saída na
+   mensagem.
+
+O que só apareceu rodando:
+
+- **`chargepolicy` estava no chart e não no compose**, então a fazenda do
+  compose e a do chart não eram a mesma fazenda — e a banda 40–80% (a única
+  mitigação de incêndio que software alcança) não era segurada.
+- **`trunc 63` cortava o sufixo do componente**, não o prefixo. Passado um
+  comprimento de release, nove Deployments renderizavam com um nome só —
+  primeiro sumindo o watchdog de um host, calado, depois oito workloads —
+  **depois** do hook de migração já ter rodado.
+- **Seis templates diziam "este papel não serve HTTP".** Todos servem
+  `/healthz` em :9090. Mas o conserto óbvio (um `livenessProbe` ali) seria pior
+  que o comentário: uma falha de bind de métricas é deliberadamente não-fatal
+  ("um reaper que não sobe é o único caminho automático de release fora do ar"),
+  e `/healthz` responde 200 vindo de um reaper travado. Ficou `startupProbe`, e
+  o motivo está escrito.
+- **O contexto de build era de 340 MB**, 91% worktrees de agente, sem
+  `.dockerignore`. Hoje: 375 kB.
+- **`CGO_ENABLED=0 GOOS=linux go vet ./... && go test ./...`** — o prefixo de
+  atribuição vale para **um** comando, então os testes rodavam com CGO ligado
+  enquanto o binário ao lado não. Consertar deixou o build mais **rápido**.
+- **Uma fazenda viva não sabia dizer que build era.** `-X main.version` escreve
+  no pacote `main`, que `internal/api` não vê, então `/api/v1/capabilities`
+  respondia `"dev"` para toda imagem já construída.
+- **`k8s-up.sh --build` reconstruía e o cluster continuava com o binário
+  antigo.** A tag não se move, então o template do pod não muda e nada rola. O
+  id da imagem agora vai numa anotação.
+
+### Kubernetes local, nesta máquina
+
+O Kubernetes do Docker Desktop está **ligado** (eu liguei; `KubernetesEnabled`
+no `settings-store.json`, backup em `settings-store.json.bak-before-k8s`).
+Contexto `docker-desktop`, um nó, v1.36.1, **modo kind** — então ele não
+compartilha o image store do daemon. Ele *consegue* puxar imagem local pelo
+`desktop-containerd-registry-mirror`, mas kind/k3d/minikube puros não, então
+`k8s-up.sh` importa explicitamente e **confere que chegou** em vez de descobrir
+por um `ImagePullBackOff`.
+
+O default do chart, `ghcr.io/flaviopadilha/device-farmer/farmd`, **não existe** —
+nada neste repositório o publica ainda. O job novo de CI publica no GHCR; até
+uma tag sair, um `helm install` com os valores padrão não tem imagem para puxar.
 
 ## Estado do registro
 

@@ -26,7 +26,7 @@ package e2e
 // config.MinLeaseTTL is ten minutes and config.MinLeaseGrace five, so waiting
 // for a lease to become reclaimable by the clock costs a quarter of an hour of
 // test — and a quarter-hour test is a test nobody runs. The guard trigger
-// farm.trg_leases_guard is BEFORE UPDATE only (migrations/00002_lease.sql:150):
+// farm.trg_leases_guard is BEFORE UPDATE only (migrations/00002_lease.sql:158):
 // it forbids MOVING a deadline backwards and says nothing about a row that
 // ARRIVES with one already in the past. So the leases below are inserted two
 // hours silent, exactly as test/assertions_v12.sql:74 builds its own.

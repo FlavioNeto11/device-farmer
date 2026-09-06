@@ -7,7 +7,7 @@
       "heading": "What a lease is",
       "body": "A lease is one row in `farm.leases`. It binds a **job** to a **device** at a **fence**, for a stated `ttl` and `grace`, and it is the only thing that grants the right to drive that device.\n\nOwnership is keyed on `job_id`, not on the pod. `holder` is a pod name and is audit-only; `holder_instance` identifies one process incarnation and is what renew matches on. Two partial unique indexes make the arithmetic hold: `leases_one_live_per_device` and `leases_one_live_per_job`, both `WHERE state IN ('held','suspect')`. The schema comment says why the index and not the row lock is what prevents a double grant: under READ COMMITTED, EvalPlanQual re-checks quals only on the locked relation, so a subquery against leases still sees the original snapshot.\n\nFour states, two of them live: `held` and `suspect` are LIVE; `released` and `expired` are terminal. A device is free when `devices.current_lease_id IS NULL`, maintained by the `leases_sync_device` trigger rather than by an anti-join.\n\nOne grep is worth more than the paragraph above: exactly one Go file outside `internal/lease` writes this table, and it is the operator revoke handler.",
       "bullets": [
-        "`protected` and `disruption_policy` are SNAPSHOTS copied from the job at acquire time (00002_lease.sql:274-284). Changing `jobs.protected` afterwards does not change a live lease.",
+        "`protected` and `disruption_policy` are SNAPSHOTS copied from the job at acquire time (00002_lease.sql:304-314). Changing `jobs.protected` afterwards does not change a live lease.",
         "`expires_at` and `reclaimable_at` are plain columns, not GENERATED — `timestamptz + interval` is STABLE, not IMMUTABLE, so Postgres rejects a generation expression.",
         "`CHECK (reclaimable_at >= expires_at)` on the table: the grace band can be zero-width but never negative.",
         "`jobs.ttl >= 10 minutes` and `jobs.grace >= 5 minutes` are CHECK-constrained (00001_core.sql:260-263). A config violating them fails every acquire with SQLSTATE 23514, which is why internal/config refuses to start instead.",
@@ -64,7 +64,7 @@
         ]
       },
       "bullets": [
-        "Health IS an input to ALLOCATION (`lease_acquire` phase 2 requires `adb_state='device' AND health='healthy'`, 00002_lease.sql:239-240). It is never an input to RECLAMATION. That asymmetry is why one role cannot both have and not have `SELECT` on `device_runtime`, and why farm_reaper is a separate role.",
+        "Health IS an input to ALLOCATION (`lease_acquire` phase 2 requires `adb_state='device' AND health='healthy'`, 00002_lease.sql:269-270). It is never an input to RECLAMATION. That asymmetry is why one role cannot both have and not have `SELECT` on `device_runtime`, and why farm_reaper is a separate role.",
         "internal/adbwire must not import internal/lease, internal/reaper, internal/scheduler, `database/sql` or pgx, and must contain no allocation vocabulary. `TestPackageCannotReachAllocation` (client_test.go:1022) scans every production file in the package and fails the build if any of that appears.",
         "internal/obs closes the back door too: `obs.TransportBlip` is the only symbol adbwire may call, and it accepts no lease, job, fence or holder identifier and returns nothing, so there is no value for transport code to branch on (obs/metrics.go:472-486).",
         "The node agent (internal/node) has no lease vocabulary and does not import internal/lease. It power-cycles USB ports UNDER live leases on purpose (agent.go:22-35)."
@@ -103,7 +103,7 @@
     },
     {
       "heading": "The fence: what it protects, and where it is not checked",
-      "body": "`leases.fence` is a monotonic `bigint` from `farm.fence_seq`, UNIQUE per lease. `devices.fence_floor` is the monotonic floor for that device. A live lease sits exactly AT the floor — the INSERT trigger does `fence_floor = GREATEST(fence_floor, NEW.fence)` (00002_lease.sql:141).\n\nEnding a lease deliberately pushes the floor to a fresh `nextval()` ABOVE the fence it closed. That is what makes the previous holder's fence stale. `lease_release` (:406) and `lease_reclaim` (:568) both do it; the operator revoke does it in Go (api/leases.go:658); `lease_expire_max_runtime` does NOT.\n\nThe fence is checked in four places, and it is worth knowing which two do which job.",
+      "body": "`leases.fence` is a monotonic `bigint` from `farm.fence_seq`, UNIQUE per lease. `devices.fence_floor` is the monotonic floor for that device. A live lease sits exactly AT the floor — the INSERT trigger does `fence_floor = GREATEST(fence_floor, NEW.fence)` (00002_lease.sql:171).\n\nEnding a lease deliberately pushes the floor to a fresh `nextval()` ABOVE the fence it closed. That is what makes the previous holder's fence stale. `lease_release` (:406) and `lease_reclaim` (:568) both do it; the operator revoke does it in Go (api/leases.go:658); `lease_expire_max_runtime` does NOT.\n\nThe fence is checked in four places, and it is worth knowing which two do which job.",
       "bullets": [
         "**Fence equality, against the lease row.** `farm.lease_renew` (:334) matches `(id, fence, holder_instance)`; zero rows is terminal for the caller. `farm.lease_release` (:397) matches `(id, fence)` and returns false on a mismatch — the idempotent case, not an error.",
         "**Fence versus the device floor.** `farm.lease_witness` (:374) refuses when `l.fence < devices.fence_floor` — the comparison is `>=`, not `>`, precisely because a live lease sits AT the floor. `farm.device_state_write` (00004_operate.sql:455) refuses a durable device-state write below the floor, and refuses again on `written_by_fence` regression.",
@@ -132,14 +132,14 @@
           "note": "Scratch database, rolled back. Contrast this with the max_runtime section, where the same sequence is ACCEPTED."
         }
       ],
-      "source": "migrations/00002_lease.sql:141, :334, :374, :397, :406, :568; migrations/00004_operate.sql:455; internal/api/leases.go:658"
+      "source": "migrations/00002_lease.sql:171, :364, :404, :427, :436, :598; migrations/00004_operate.sql:455; internal/api/leases.go:658"
     },
     {
       "heading": "The ending that cannot be written down",
       "body": "`farm.leases.release_reason` has a CHECK with exactly seven values (00001_core.sql:324):\n\n`completed`, `failed`, `job_cancelled`, `max_runtime`, `operator_revoked`, `holder_expired`, `device_retired`\n\nRead the list again for what is missing. There is no `device_offline`, no `transport_error`, no `unreachable`, no `probe_failed`. Connectivity has no word in this domain, so \"released because the transport dropped\" raises `check_violation` (SQLSTATE 23514) instead of silently destroying six hours of work.\n\nThe Go type `lease.ReleaseReason` mirrors the CHECK exactly, and `Store.Release` deliberately does NOT pre-validate. Neither does the HTTP handler — it requires the field to be non-empty and passes it through verbatim (api/leases.go:396-409, :433-438). The database is the enforcement point on purpose: a client-side allow-list would replace a loud, tested, server-side refusal with a quiet one. `ReleaseReason.Valid()` exists for callers building a reason from operator input who want to reject it early; nothing on the release path calls it.",
       "bullets": [
         "If a transport failure genuinely ended your run, the honest reason is `failed` — the JOB failed. If it did not end the run, the honest response is to keep holding the device.",
-        "`holder_expired` is written in exactly one place in the whole tree: `farm.lease_reclaim` (00002_lease.sql:563). A live holder writing it would be lying about who gave up."
+        "`holder_expired` is written in exactly one place in the whole tree: `farm.lease_reclaim` (00002_lease.sql:593). A live holder writing it would be lying about who gave up."
       ],
       "examples": [
         {
@@ -161,7 +161,7 @@
     },
     {
       "heading": "The guard triggers",
-      "body": "`leases_guard` is a `BEFORE UPDATE` trigger (00002_lease.sql:95-133) enforcing four rules. Every one exists because a plausible-looking future edit would otherwise quietly destroy work.",
+      "body": "`leases_guard` is a `BEFORE UPDATE` trigger (00002_lease.sql:125-163) enforcing four rules. Every one exists because a plausible-looking future edit would otherwise quietly destroy work.",
       "bullets": [
         "**Identity is immutable.** `device_id`, `fence`, `job_id` and `acquired_at` cannot change on an existing lease. Note `acquired_at` is in that set — `max_runtime` is computed from it, so a mutable `acquired_at` would be a way to extend or shorten a user's deadline behind their back.",
         "**`expires_at` never moves backwards.** Without this, a plain `now() + ttl` in a renewal silently erases a control-plane-gap refund. The SQL uses `GREATEST(l.expires_at, now() + l.ttl)`; the trigger is what stops a future edit from dropping the GREATEST.",
@@ -185,13 +185,13 @@
           "note": "Both run against the live database in rolled-back transactions. The first is two jobs on one phone; the second is one job hoarding two."
         }
       ],
-      "source": "migrations/00002_lease.sql:95-133; migrations/00001_core.sql:335-338"
+      "source": "migrations/00002_lease.sql:125-163; migrations/00001_core.sql:335-338"
     },
     {
       "heading": "The role firewall: health is UNREADABLE to reclamation",
-      "body": "The draft design put `lease_acquire` and `lease_reclaim` in the same process, which voids the firewall: acquire MUST read `device_runtime` to allocate, reclaim must be unable to. One role cannot both have and not have that SELECT.\n\nResolution: `farm_reaper` is a distinct NOLOGIN role with `REVOKE ALL ON farm.device_runtime`, and `farm.lease_reclaim` carries a **function-level** `SET role = farm_reaper` (00002_lease.sql:533).\n\nThe mechanism detail matters. A function-level `SET` is saved on entry and RESTORED ON EXIT, so the role change is scoped to that function alone. `SET LOCAL ROLE` in the body would leak `farm_reaper` into the rest of the caller's transaction and the next unrelated statement would fail on a table the reaper cannot see. Assertion P15 tests exactly that, by calling `lease_reclaim` and then reading `farm.component_heartbeat` — a table the reaper's grant list does not include.\n\nNote that the header comment at 00002_lease.sql:31 still describes the old `SET LOCAL ROLE` design. The function is what runs; the comment is stale.\n\nThis is not a style rule. No future edit to `lease_reclaim` can make releasing a device depend on whether that device is reachable, because the SELECT is not there to be written.",
+      "body": "The draft design put `lease_acquire` and `lease_reclaim` in the same process, which voids the firewall: acquire MUST read `device_runtime` to allocate, reclaim must be unable to. One role cannot both have and not have that SELECT.\n\nResolution: `farm_reaper` is a distinct NOLOGIN role with `REVOKE ALL ON farm.device_runtime`, and `farm.lease_reclaim` carries a **function-level** `SET role = farm_reaper` (00002_lease.sql:563).\n\nThe mechanism detail matters. A function-level `SET` is saved on entry and RESTORED ON EXIT, so the role change is scoped to that function alone. `SET LOCAL ROLE` in the body would leak `farm_reaper` into the rest of the caller's transaction and the next unrelated statement would fail on a table the reaper cannot see. Assertion P15 tests exactly that, by calling `lease_reclaim` and then reading `farm.component_heartbeat` — a table the reaper's grant list does not include.\n\nNote that the header comment at 00002_lease.sql:31 still describes the old `SET LOCAL ROLE` design. The function is what runs; the comment is stale.\n\nThis is not a style rule. No future edit to `lease_reclaim` can make releasing a device depend on whether that device is reachable, because the SELECT is not there to be written.",
       "bullets": [
-        "`GRANT farm_reaper TO farm_scheduler` (00002_lease.sql:87) exists only so the caller can `SET ROLE`. Membership does not weaken the firewall: SET ROLE REPLACES the active privilege set, so farm_scheduler's own SELECT on device_runtime is not in effect while the function runs.",
+        "`GRANT farm_reaper TO farm_scheduler` (00002_lease.sql:117) exists only so the caller can `SET ROLE`. Membership does not weaken the firewall: SET ROLE REPLACES the active privilege set, so farm_scheduler's own SELECT on device_runtime is not in effect while the function runs.",
         "The Go equivalent of the rule is simpler: `farm.device_runtime` is named nowhere in internal/reaper/reaper.go except in its own warning paragraph (reaper.go:34). Never add a health check in Go around `Store.Reclaim` — that rebuilds #663 on top of a schema built to prevent it.",
         "The firewall is in force for `farm.lease_reclaim` and for nothing else — see Gaps. The grants on `farm_watchdog` and `farm_scheduler` are correct and unused."
       ],
@@ -211,11 +211,11 @@
           "note": "The session user on this deployment is `farm`, and `SELECT rolsuper FROM pg_roles WHERE rolname=current_user` returns t. SET ROLE to a non-superuser role drops superuser privileges for the duration, so the firewall holds even from a superuser connection — which is the only reason it holds at all here, since every component connects as `farm`."
         }
       ],
-      "source": "migrations/00002_lease.sql:37-88, :506-582; internal/reaper/reaper.go:22-40"
+      "source": "migrations/00002_lease.sql:37-118, :536-612; internal/reaper/reaper.go:22-40"
     },
     {
       "heading": "held -> suspect -> held: suspect does NOT mean broken",
-      "body": "When `expires_at` passes with no heartbeat, `farm.lease_mark_suspect` (00002_lease.sql:481) moves the lease from `held` to `suspect`.\n\nEntering suspect **does nothing**. No reset, no reboot, no reallocation, no release. The device stays unschedulable and stays with its holder. `devices.current_lease_id` still points at the lease — the sync trigger only clears it on a transition INTO a terminal state.\n\nA heartbeat anywhere in the grace band self-heals `suspect -> held` at the SAME fence with zero work lost. `lease_renew` sets `state='held'` unconditionally and reports the pre-image as `was_suspect`, computed from a sibling CTE because `RETURNING` yields the post-update row (so `RETURNING state='suspect'` would be a metric that silently reads zero forever).\n\nEvery suspect row is an alert. None of them is an action.",
+      "body": "When `expires_at` passes with no heartbeat, `farm.lease_mark_suspect` (00002_lease.sql:511) moves the lease from `held` to `suspect`.\n\nEntering suspect **does nothing**. No reset, no reboot, no reallocation, no release. The device stays unschedulable and stays with its holder. `devices.current_lease_id` still points at the lease — the sync trigger only clears it on a transition INTO a terminal state.\n\nA heartbeat anywhere in the grace band self-heals `suspect -> held` at the SAME fence with zero work lost. `lease_renew` sets `state='held'` unconditionally and reports the pre-image as `was_suspect`, computed from a sibling CTE because `RETURNING` yields the post-update row (so `RETURNING state='suspect'` would be a metric that silently reads zero forever).\n\nEvery suspect row is an alert. None of them is an action.",
       "bullets": [
         "Holders in the shipped binary renew every 60s (`lease.DefaultRenewInterval`), so with a 15-minute TTL roughly fourteen consecutive renewals must fail before a lease even becomes suspect. A database that is down for ten minutes costs a running job exactly nothing. Note that `FARM_LEASE_RENEW_INTERVAL` does not change this — see Gaps.",
         "internal/config refuses to start if `RenewInterval * 3 > TTL` (config.go:355-361): a holder must be able to lose two consecutive renewals — a rolling deploy, a Postgres failover, a long GC pause — without going suspect.",
@@ -231,11 +231,11 @@
           "note": "Scratch database, rolled back. Same fence. Same device. Nothing was reallocated. `was_suspect=t` is worth a counter, never a page."
         }
       ],
-      "source": "migrations/00002_lease.sql:481-494, :309-348; internal/reaper/reaper.go:311-344; internal/config/config.go:353-361"
+      "source": "migrations/00002_lease.sql:511-524, :339-378; internal/reaper/reaper.go:311-344; internal/config/config.go:353-361"
     },
     {
       "heading": "Protected leases and 'hold and page'",
-      "body": "A lease is `protected` if the job asked for it, OR if `jobs.expected_duration > interval '30 minutes'`. The rule is one line in `lease_acquire` (00002_lease.sql:275-276):\n\n`v_protected := j.protected OR COALESCE(j.expected_duration > interval '30 minutes', false);`\n\n`farm.lease_reclaim` has `AND l.protected = false` in its candidate CTE (:552). A protected lease that goes silent is NEVER automatically reclaimed. It sits in `suspect` indefinitely, holding its device, until a human resolves it.\n\nThis is a deliberate trade: a long job is exactly the job where an automatic reclaim is most expensive, so the system chooses to strand one device over destroying six hours of work. The cost is that a genuinely dead six-hour job parks a device until somebody notices — which is why the 'page' half has to actually exist, and here it does not.",
+      "body": "A lease is `protected` if the job asked for it, OR if `jobs.expected_duration > interval '30 minutes'`. The rule is one line in `lease_acquire` (00002_lease.sql:305-306):\n\n`v_protected := j.protected OR COALESCE(j.expected_duration > interval '30 minutes', false);`\n\n`farm.lease_reclaim` has `AND l.protected = false` in its candidate CTE (:552). A protected lease that goes silent is NEVER automatically reclaimed. It sits in `suspect` indefinitely, holding its device, until a human resolves it.\n\nThis is a deliberate trade: a long job is exactly the job where an automatic reclaim is most expensive, so the system chooses to strand one device over destroying six hours of work. The cost is that a genuinely dead six-hour job parks a device until somebody notices — which is why the 'page' half has to actually exist, and here it does not.",
       "bullets": [
         "Protection shields against the holder-silence path ONLY. `farm.lease_expire_max_runtime` has no `protected` filter and ends a protected lease like any other — verified, see that section.",
         "An operator revoke also ignores `protected`. That is correct: a human taking a device back is one of the three legitimate endings.",
@@ -257,11 +257,11 @@
           "note": "Zero on this farm right now. The API surfaces the same number as `protected_suspect` in GET /api/v1/leases (api/leases.go:172-179). That JSON field is currently the only place this count is exposed."
         }
       ],
-      "source": "migrations/00002_lease.sql:274-277, :552; internal/reaper/reaper.go:317-344; internal/api/leases.go:158-181"
+      "source": "migrations/00002_lease.sql:304-307, :582; internal/reaper/reaper.go:317-344; internal/api/leases.go:158-181"
     },
     {
       "heading": "The control-plane gap refund and the quiesce gate",
-      "body": "Our downtime is refunded to tenants, never charged to them as lease budget.\n\n`farm.reaper_arm` (00002_lease.sql:428) runs on every gain of leadership, BEFORE the first sweep. Sweeping first and arming second would reclaim exactly the leases the refund exists to save, so `cycle()` stands the reaper down entirely if arming fails (reaper.go:243-258).\n\nIt does two things:\n\n1. **Gap refund.** It takes the OLDEST beat across `{reaper, api, scheduler}` — every component on the renewal path, not just the reaper's own. If that beat is older than the gap floor (60s), it writes a `control_plane_gap` row and adds the whole gap to `expires_at` and `reclaimable_at` of every live lease.\n2. **Quiesce.** `quiesce_until = now() + COALESCE(max(ttl), interval '15 minutes')` over live leases. The delay derives from the longest TTL the reaper could have missed, not from a guessed constant. `lease_reclaim` returns immediately while `now() < quiesce_until`.\n\nThe multi-component gap is the BLOCKER-8 fix. Keying it on the reaper's own heartbeat alone is how a healthy reaper next to a dead API reclaims the entire farm: the reaper's beat is fresh, no gap is recorded, and after ttl+grace every unprotected lease in the farm is taken.",
+      "body": "Our downtime is refunded to tenants, never charged to them as lease budget.\n\n`farm.reaper_arm` (00002_lease.sql:458) runs on every gain of leadership, BEFORE the first sweep. Sweeping first and arming second would reclaim exactly the leases the refund exists to save, so `cycle()` stands the reaper down entirely if arming fails (reaper.go:243-258).\n\nIt does two things:\n\n1. **Gap refund.** It takes the OLDEST beat across `{reaper, api, scheduler}` — every component on the renewal path, not just the reaper's own. If that beat is older than the gap floor (60s), it writes a `control_plane_gap` row and adds the whole gap to `expires_at` and `reclaimable_at` of every live lease.\n2. **Quiesce.** `quiesce_until = now() + COALESCE(max(ttl), interval '15 minutes')` over live leases. The delay derives from the longest TTL the reaper could have missed, not from a guessed constant. `lease_reclaim` returns immediately while `now() < quiesce_until`.\n\nThe multi-component gap is the BLOCKER-8 fix. Keying it on the reaper's own heartbeat alone is how a healthy reaper next to a dead API reclaims the entire farm: the reaper's beat is fresh, no gap is recorded, and after ttl+grace every unprotected lease in the farm is taken.",
       "bullets": [
         "`lease_reclaim` ALSO refuses any lease whose silence overlaps a gap: `NOT EXISTS (gap WHERE g.ended_at > l.heartbeat_at AND g.ended_at > now() - interval '6 hours')`. Belt and braces — the refund moves the deadline, this clause blocks the reclaim outright.",
         "Leader election uses a session advisory lock on a DEDICATED connection (`0x6661726d52656170`, which spells \"farmReap\"). Two reapers arming at once would refund the same outage twice; two restarting in a loop would extend every lease in the farm forever (reaper.go:551-561).",
@@ -285,7 +285,7 @@
           "note": "Live farm. A NEGATIVE quiesce_remaining means the window has already closed and the reaper is free to act; a positive one means nothing can be reclaimed for that long regardless of how overdue it is. `armed_at` is when leadership was last gained — if it is recent and you did not restart anything, a reaper lost and regained the advisory lock."
         }
       ],
-      "source": "migrations/00002_lease.sql:414-468, :540-557; internal/reaper/reaper.go:243-290, :551-561; internal/config/config.go:386-418"
+      "source": "migrations/00002_lease.sql:444-498, :570-587; internal/reaper/reaper.go:243-290, :551-561; internal/config/config.go:386-418"
     },
     {
       "heading": "Witness extensions and their cap",
@@ -317,11 +317,11 @@
           "note": "Zero, across every lease this farm has ever issued. The mechanism is implemented end to end in SQL and in Go and has no producer."
         }
       ],
-      "source": "migrations/00002_lease.sql:355-376, :327-332; internal/lease/store.go:270-300; internal/lease/holder.go:305-330; internal/config/config.go:363-369"
+      "source": "migrations/00002_lease.sql:385-406, :357-362; internal/lease/store.go:270-300; internal/lease/holder.go:305-330; internal/config/config.go:363-369"
     },
     {
       "heading": "Pod eviction: re-attach at the same fence",
-      "body": "A Kubernetes pod eviction — node drain, preemption, spot reclaim, cluster upgrade, OOM restart — is the most ordinary event in a control plane and is not evidence that anything on the phone died.\n\n`lease_acquire` is idempotent on `job_id`. Phase 1 (00002_lease.sql:206-230) looks for an existing lease for this job in `held` or `suspect` and hands it straight back. It updates `holder`, `holder_instance`, `holder_epoch + 1`, `heartbeat_at`, and pushes the deadlines outward with `GREATEST`. It **never bumps the fence**: the job's own work may still be running detached on the device, and bumping would fence out its own process.\n\nThe correct response to SIGTERM is therefore `Holder.Stop()`, not `Holder.Release()`. Stop cancels the holder's context so local work unwinds, and leaves the lease, the device and the fence exactly as they are. `Release` on shutdown would hand a half-finished job's device to somebody else. `internal/runner` follows this: on any cancellation that is not fencing and not max_runtime it sets `ReleaseReason = \"\"` and returns without touching the lease (runner.go:726-731).",
+      "body": "A Kubernetes pod eviction — node drain, preemption, spot reclaim, cluster upgrade, OOM restart — is the most ordinary event in a control plane and is not evidence that anything on the phone died.\n\n`lease_acquire` is idempotent on `job_id`. Phase 1 (00002_lease.sql:236-260) looks for an existing lease for this job in `held` or `suspect` and hands it straight back. It updates `holder`, `holder_instance`, `holder_epoch + 1`, `heartbeat_at`, and pushes the deadlines outward with `GREATEST`. It **never bumps the fence**: the job's own work may still be running detached on the device, and bumping would fence out its own process.\n\nThe correct response to SIGTERM is therefore `Holder.Stop()`, not `Holder.Release()`. Stop cancels the holder's context so local work unwinds, and leaves the lease, the device and the fence exactly as they are. `Release` on shutdown would hand a half-finished job's device to somebody else. `internal/runner` follows this: on any cancellation that is not fencing and not max_runtime it sets `ReleaseReason = \"\"` and returns without touching the lease (runner.go:726-731).",
       "bullets": [
         "A holder that sees `Reattached` must assume the device is DIRTY with its own prior state and resume from `jobs.checkpoint` rather than starting over. The API says so in the response body's `note` field.",
         "`NewHolderInstance()` must be called ONCE per process incarnation. Re-minting it mid-run fences the process out of its own lease.",
@@ -344,11 +344,11 @@
           "note": "Live API. Renew matches holder_instance as well as fence, so a resurrected pod that skipped acquire cannot renew a lease its replacement now holds. The lease was still `held` at fence 2258 afterwards — being told you lost changes nothing about the lease."
         }
       ],
-      "source": "migrations/00002_lease.sql:206-230, :232-297; internal/lease/holder.go:333-345 (Stop), :347-405 (Release); internal/runner/runner.go:712-731"
+      "source": "migrations/00002_lease.sql:236-260, :262-327; internal/lease/holder.go:333-345 (Stop), :347-405 (Release); internal/runner/runner.go:712-731"
     },
     {
       "heading": "max_runtime: two endings that look the same and are not",
-      "body": "`max_runtime` is the one user-supplied clock allowed to end a lease automatically, because the user wrote the number down. It reaches the lease by TWO different paths, and the difference is whether the previous holder gets fenced.\n\n**Path 1 — the holder notices.** `internal/runner` derives a relative deadline from what Postgres says is left of the budget, and on expiry releases with `ReasonMaxRuntime` through `lease.Store.Release`. That is `farm.lease_release`: state becomes `released`, `fence_floor` is raised to a fresh nextval, the slot is quarantined for rearm. Clean.\n\n**Path 2 — the sweep.** `farm.lease_expire_max_runtime` (00002_lease.sql:591) is the safety net for a holder that did not notice — a wedged process, a crashed runner. It sets only `state`, `released_at` and `release_reason`. State becomes `expired`. The floor is NOT raised. The slot is NOT quarantined.\n\n`state` is how you tell them apart, and on this farm both are happening: 19 `released`/max_runtime and 14 `expired`/max_runtime.\n\nThe sweep is the ending most likely to surprise you at 3am, for three verified reasons.\n\n**It ignores `protected`.** There is no `protected` filter in the function.\n\n**It does not fence.** The device is freed by the sync trigger and becomes immediately schedulable while the previous holder's fence is still AT (not below) the floor, so `farm.device_state_write` still accepts it.\n\n**It is not gated by quiesce or by `reaper_state.enabled`.** Those gates live inside `lease_reclaim` only. A control-plane outage refunds `expires_at` and `reclaimable_at`; it does not move `acquired_at + max_runtime`. After a long outage, every job past its max_runtime is ended on the restored reaper's first sweep.",
+      "body": "`max_runtime` is the one user-supplied clock allowed to end a lease automatically, because the user wrote the number down. It reaches the lease by TWO different paths, and the difference is whether the previous holder gets fenced.\n\n**Path 1 — the holder notices.** `internal/runner` derives a relative deadline from what Postgres says is left of the budget, and on expiry releases with `ReasonMaxRuntime` through `lease.Store.Release`. That is `farm.lease_release`: state becomes `released`, `fence_floor` is raised to a fresh nextval, the slot is quarantined for rearm. Clean.\n\n**Path 2 — the sweep.** `farm.lease_expire_max_runtime` (00002_lease.sql:621) is the safety net for a holder that did not notice — a wedged process, a crashed runner. It sets only `state`, `released_at` and `release_reason`. State becomes `expired`. The floor is NOT raised. The slot is NOT quarantined.\n\n`state` is how you tell them apart, and on this farm both are happening: 19 `released`/max_runtime and 14 `expired`/max_runtime.\n\nThe sweep is the ending most likely to surprise you at 3am, for three verified reasons.\n\n**It ignores `protected`.** There is no `protected` filter in the function.\n\n**It does not fence.** The device is freed by the sync trigger and becomes immediately schedulable while the previous holder's fence is still AT (not below) the floor, so `farm.device_state_write` still accepts it.\n\n**It is not gated by quiesce or by `reaper_state.enabled`.** Those gates live inside `lease_reclaim` only. A control-plane outage refunds `expires_at` and `reclaimable_at`; it does not move `acquired_at + max_runtime`. After a long outage, every job past its max_runtime is ended on the restored reaper's first sweep.",
       "examples": [
         {
           "label": "A protected lease, ended by the sweep, with the fence unmoved",
@@ -372,7 +372,7 @@
           "note": "Scratch database, rolled back. With the reaper globally disabled and quiesced for an hour, reclaim correctly does nothing and max_runtime ends a lease anyway. If you turn the reaper off during an incident, max_runtime keeps firing."
         }
       ],
-      "source": "migrations/00002_lease.sql:591-606, :384-411, :540-542; internal/runner/runner.go:467-484, :716-722; internal/reaper/reaper.go:346-370"
+      "source": "migrations/00002_lease.sql:621-636, :414-441, :570-572; internal/runner/runner.go:467-484, :716-722; internal/reaper/reaper.go:346-370"
     },
     {
       "heading": "Renew: two outcomes that must never be swapped",
@@ -400,7 +400,7 @@
           "note": "Do NOT page on `fenced` alone on this farm. The demo evicts a pod every 25 seconds and 1179 leases carry holder_epoch>0; each eviction leaves a superseded holder instance whose next renew is correctly fenced. `fenced` counts stale holders learning the truth. The series that counts destroyed work is `farm_lease_reaped_total{reason=\"holder_expired\"}`, which reads 0."
         }
       ],
-      "source": "migrations/00002_lease.sql:309-348; internal/lease/store.go:229-266 (Renew), :66-78 (ErrFenced); internal/lease/holder.go:414-490 (run), :492-505 (renewOnce); internal/api/leases.go:300-389"
+      "source": "migrations/00002_lease.sql:339-378; internal/lease/store.go:229-266 (Renew), :66-78 (ErrFenced); internal/lease/holder.go:414-490 (run), :492-505 (renewOnce); internal/api/leases.go:300-389"
     },
     {
       "heading": "test/assertions.sql — exactly what passed",
@@ -541,7 +541,7 @@
           "lang": "sql",
           "code": "SELECT l.id AS lease_id, l.job_id, l.tenant_id,\n       now() - l.heartbeat_at AS silent_for\n  FROM farm.leases l\n WHERE l.state = 'suspect'\n   AND l.reclaimable_at < now()\n   AND l.protected = false\n   AND (l.witness_at IS NULL OR l.witness_at < now() - l.grace)\n   AND NOT EXISTS (SELECT 1 FROM farm.control_plane_gap g\n                    WHERE g.ended_at > l.heartbeat_at\n                      AND g.ended_at > now() - interval '6 hours')\n ORDER BY l.reclaimable_at;",
           "output": "(0 rows)",
-          "note": "This is `farm.lease_reclaim`'s candidate CTE verbatim (00002_lease.sql:544-557), minus the quiesce gate that query 2 covers. Zero rows means the next sweep destroys nothing."
+          "note": "This is `farm.lease_reclaim`'s candidate CTE verbatim (00002_lease.sql:574-587), minus the quiesce gate that query 2 covers. Zero rows means the next sweep destroys nothing."
         },
         {
           "label": "5. Has the control plane ever destroyed work on this farm?",
@@ -551,7 +551,7 @@
           "note": "`holder_expired` absent = zero reclaims, ever. That is the number to alert on: it counts work the control plane destroyed. Do NOT try to answer this from farm.events — that table records 0 lease_released and 0 lease_reclaimed rows against 1239 ended leases, because ordinary endings are not written there. See Gaps. For the one revoke, `SELECT detail FROM farm.events WHERE kind='lease_revoked'` does give you `revoked_fence` and `new_fence_floor`, and farm.audit_log gives you the human's name and reason."
         }
       ],
-      "source": "Derived from migrations/00002_lease.sql:544-557 and internal/api/leases.go; all run against postgres://farm@127.0.0.1:55432/device_farmer"
+      "source": "Derived from migrations/00002_lease.sql:574-587 and internal/api/leases.go; all run against postgres://farm@127.0.0.1:55432/device_farmer"
     },
     {
       "heading": "Revoking: the human path",

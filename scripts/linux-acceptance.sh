@@ -14,9 +14,11 @@
 #      decision that behaves differently per GOOS has to be exercised on the
 #      GOOS that runs it.
 #
-#   2. `topo.Sysfs` reads the USB tree. All eighteen tests in internal/topo hand
-#      `FromFS` an `fstest.MapFS`; the shipped binary calls `Sysfs`, which
-#      refuses on any GOOS but Linux and then reads through `os.DirFS`. The
+#   2. `topo.Sysfs` reads the USB tree. Every test in internal/topo that reads a
+#      tree hands `FromFS` an `fstest.MapFS` — the one that names a real
+#      directory does it to prove `Sysfs` REFUSES a path that is not a bus.
+#      The shipped binary calls `Sysfs`, which refuses on any GOOS but Linux
+#      and then reads through `os.DirFS`. The
 #      difference is not cosmetic: whether a hub's ports can have their VBUS
 #      switched is read from the file MODE of each port's `disable`, and a MapFS
 #      can only assert a mode into being. Here the kernel's own stat answers.
@@ -24,8 +26,10 @@
 #   3. The schema runs on the server you deploy. A schema is a contract with a
 #      specific PostgreSQL: planner behaviour, aggregate availability and
 #      defaults move between majors, and farm.resolve_device's fingerprint rung
-#      already once needed an aggregate a major did not have. Running the eleven
-#      assertion suites against a second major is the cheapest way to find out.
+#      already once needed an aggregate a major did not have. Running every
+#      assertion suite against a second major is the cheapest way to find out.
+#      The loop below globs test/assertions*.sql, so a suite added tomorrow is
+#      run here without anyone remembering to come back and say so.
 #
 # WHAT IT DOES NOT PROVE. There is no handset here. The ADB servers are the
 # demo's in-process fakes and the USB tree is written by this script, not

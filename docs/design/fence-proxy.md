@@ -190,7 +190,7 @@ so the database refuses every write at the old fence; on a host running the
 fence proxy the old fence is also refused at the ADB socket, and on a host
 without one the holder is relied upon to honour it. One site keeps the old
 wording on purpose: the comment inside `farm.lease_release` at
-`migrations/00002_lease.sql:426-427` is part of an applied migration, and
+`migrations/00002_lease.sql:434-435` is part of an applied migration, and
 applied migrations are not edited. Read it as the design intent it was written
 as; the conditional truth lives in the Go prose beside the callers.
 

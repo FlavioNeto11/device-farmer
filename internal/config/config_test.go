@@ -249,6 +249,40 @@ func TestDefaultReaperComponentsCoversTheRenewalPath(t *testing.T) {
 	}
 }
 
+// TestEveryHealthComponentIsRefusedInTheWatchList — LEASE-13, driven by
+// roleComponents rather than by a hand-written list, so a component added to a
+// role on the health side is covered by this guard the day it is added.
+//
+// The table case in TestPreflightRefusals proves the message; this proves the
+// coverage. Both are needed: a deny list that is right today and silently
+// incomplete next quarter is the shape this whole check exists to avoid.
+func TestEveryHealthComponentIsRefusedInTheWatchList(t *testing.T) {
+	off := healthPlaneComponents()
+	if len(off) == 0 {
+		t.Fatal("no component is off the renewal path; the assertion below proves nothing")
+	}
+	for _, name := range off {
+		t.Run(name, func(t *testing.T) {
+			list := append(append([]string{}, DefaultReaperComponents...), name)
+			env(t, withDSN(map[string]string{EnvReaperComponent: strings.Join(list, ",")}))
+			if cfg, err := Load("api"); err == nil {
+				t.Fatalf("%s=%q was accepted; a %s outage would then extend every live "+
+					"lease. got %+v", EnvReaperComponent, strings.Join(list, ","), name, cfg)
+			} else if !strings.Contains(err.Error(), name) {
+				t.Errorf("the refusal does not name %q:\n%s", name, err)
+			}
+		})
+	}
+	// And the renewal path itself stays accepted, or the deny list would have
+	// become the blind spot: every role's own default watch list is this one.
+	env(t, withDSN(map[string]string{
+		EnvReaperComponent: strings.Join(DefaultReaperComponents, ","),
+	}))
+	if _, err := Load("api"); err != nil {
+		t.Fatalf("the default watch list was refused by the deny list: %v", err)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Preflight refusals
 // ---------------------------------------------------------------------------
@@ -391,6 +425,57 @@ func TestPreflightRefusals(t *testing.T) {
 		role: "watchdog",
 		envs: map[string]string{EnvComponent: "api"},
 		want: []string{EnvComponent, "stand in for"},
+	}, {
+		// LEASE-13. The edit that reads like more thorough monitoring: the
+		// watchdog beats, so the arm succeeds, and every watchdog outage is
+		// then refunded to every live lease in the farm.
+		name: "the health plane added to the watch list",
+		role: "reaper",
+		envs: map[string]string{EnvReaperComponent: "reaper,api,scheduler,jobrunner,watchdog"},
+		want: []string{EnvReaperComponent, `"watchdog"`, "health side", "EVERY held and suspect lease", "extend every live lease"},
+	}, {
+		// The three that beat under a bare name on a farm that runs them, so
+		// the arm's unbeaten refusal never fires and the fusion is silent.
+		name: "the recovery ladder added to the watch list",
+		role: "api",
+		envs: map[string]string{EnvReaperComponent: "reaper,api,scheduler,jobrunner,recovery"},
+		want: []string{EnvReaperComponent, `"recovery"`, "health side"},
+	}, {
+		name: "the janitor added to the watch list",
+		role: "api",
+		envs: map[string]string{EnvReaperComponent: "reaper,api,scheduler,jobrunner,janitor"},
+		want: []string{EnvReaperComponent, `"janitor"`, "health side"},
+	}, {
+		name: "the charge policy added to the watch list",
+		role: "api",
+		envs: map[string]string{EnvReaperComponent: "reaper,api,scheduler,jobrunner,chargepolicy"},
+		want: []string{EnvReaperComponent, `"chargepolicy"`, "health side"},
+	}, {
+		name: "enrollment added to the watch list",
+		role: "api",
+		envs: map[string]string{EnvReaperComponent: "reaper,api,scheduler,jobrunner,enroll"},
+		want: []string{EnvReaperComponent, `"enroll"`, "health side"},
+	}, {
+		// The spelling that actually has a row in farm.component_heartbeat, so
+		// it is the one an operator copies out of a query and the one that
+		// would take effect. The refusal names both what was written and the
+		// component it belongs to.
+		name: "a per-host health key added to the watch list",
+		role: "api",
+		envs: map[string]string{EnvReaperComponent: "reaper,api,scheduler,jobrunner,node:h01"},
+		want: []string{EnvReaperComponent, `"node:h01"`, `"node"`, "health side"},
+	}, {
+		// LEASE-13, the half a deny list of canonical names cannot reach. A
+		// renamed watchdog beats as "wd:h01", which is a name that HAS a row,
+		// so the arm succeeds and refunds a health outage to every lease. The
+		// process that owns the rename is the only one that can say so.
+		name: "a renamed health component that its own farm watches",
+		role: "watchdog",
+		envs: map[string]string{
+			EnvComponent:       "wd",
+			EnvReaperComponent: "reaper,api,scheduler,jobrunner,wd:h01",
+		},
+		want: []string{EnvComponent, EnvReaperComponent, `"wd"`, "health side", "extend every live lease"},
 	}, {
 		// U8 — an inverted band would park every idle phone on sight and
 		// release none of them.

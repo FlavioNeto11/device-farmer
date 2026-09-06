@@ -1250,6 +1250,60 @@ Fix by raising %s above %s + %s, or by lowering the proxy's self-fence timeout.`
 		fail("%s must name at least one component; an empty list disables gap "+
 			"accounting entirely", EnvReaperComponent)
 	}
+	// LEASE-13: a health-plane component in the watch list fuses the health
+	// clock into the lease clock.
+	//
+	// farm.reaper_arm does not merely observe the names it is given. When the
+	// oldest beat among them is older than the gap floor it ADDS that gap to
+	// expires_at and reclaimable_at of every held and suspect lease
+	// (migrations/00012_reaper_arm_unbeaten.sql). The arm runs once per gain of
+	// reaper leadership, so a component that stays silent is refunded again on
+	// every restart, deploy and failover for as long as it is gone. That refund
+	// is right for a component whose silence stopped renewals from landing. For
+	// a component on the health side of the firewall it is the forbidden fusion,
+	// and it is reached by an edit that reads like MORE monitoring: adding
+	// "watchdog" to the list an operator already trusts.
+	//
+	// Migration 00012 closed one half of this by accident. A health component
+	// listed on a farm that does not run it now has no heartbeat row, so the
+	// arm refuses loudly. The realistic misconfiguration is the other half — a
+	// farm that DOES run the watchdog, the recovery ladder, the janitor or the
+	// charge policy, all of which beat — where the arm succeeds and the refund
+	// runs against every lease with nothing said.
+	//
+	// A deny list and not !onRenewalPath(name), because these are RESOLVED
+	// names: "api-canary" and "scheduler-a" are exactly what the rename guard
+	// below exists to keep working, and refusing every name that is not one of
+	// the four canonical ones would refuse them too. Only the names this binary
+	// itself beats under on the health side are refused.
+	//
+	// The base name before ":" is what is compared. The per-host components
+	// beat under a suffixed key — "watchdog:h01", "node:h01" — and that key,
+	// copied out of farm.component_heartbeat by an operator who went looking
+	// for a name that exists, is the spelling that has a row and would
+	// therefore take effect.
+	//
+	// A health component RENAMED by FARM_COMPONENT is not reachable from here:
+	// this process cannot know what another process was renamed to. The guard
+	// for that half lives in the loop below, on the process that owns the
+	// rename and therefore does know.
+	for _, name := range c.Reaper.Components {
+		base, _, _ := strings.Cut(name, ":")
+		if !contains(healthPlaneComponents(), base) {
+			continue
+		}
+		fail("%s names %q, and %q is on the health side of the firewall rather than the "+
+			"lease renewal path. farm.reaper_arm ADDS a watched component's downtime to "+
+			"expires_at and reclaimable_at of EVERY held and suspect lease, on every gain "+
+			"of reaper leadership for as long as it stays silent, so a %s outage longer "+
+			"than %s would extend every live lease in the farm by the length of that "+
+			"outage — device health deciding when a lease ends, which is the fusion this "+
+			"control plane exists to prevent. Drop it and alert on its "+
+			"farm.component_heartbeat row instead; %s is only for components whose downtime "+
+			"stops renewals from landing (%s, or renames of those)",
+			EnvReaperComponent, name, base, base, EnvReaperGapFloor, EnvReaperComponent,
+			strings.Join(DefaultReaperComponents, ", "))
+	}
 	// BLOCKER 8: a component on the renewal path that is not watched is a
 	// blind spot big enough to mass-reclaim the farm.
 	//
@@ -1280,6 +1334,32 @@ Fix by raising %s above %s + %s, or by lowering the proxy's self-fence timeout.`
 				"key of a component ON the lease renewal path. Its beat would stand in for "+
 				"that component's, so a real outage there would be refunded to no lease",
 				EnvComponent, canon, name)
+		case !onRenewalPath(canon) && name != canon && watchedAs(c.Reaper.Components, name):
+			// LEASE-13, the half the deny list above cannot reach. That list
+			// knows the canonical health-plane names; it cannot know that a
+			// watchdog somewhere was renamed, so a farm that watches "wd:h01"
+			// would sail past it while the arm found a real row and refunded a
+			// real health outage to every lease.
+			//
+			// This process is the one that owns the rename, and every pod of a
+			// Helm release reads FARM_REAPER_COMPONENTS from the same
+			// ConfigMap, so the renamed component is normally handed the list
+			// that names it and refuses here. It is a narrower net than the
+			// deny list — a farm that sets the variable on the reaper alone
+			// still boots — and it composes with the arm's own refusal: a
+			// health component that crashloops on this message writes no
+			// heartbeat, and a watched name with no row makes farm.reaper_arm
+			// refuse to arm rather than reclaim.
+			fail("%s renames the %q component of this process to %q, and %s watches that name "+
+				"(%s). %q is on the health side of the firewall: farm.reaper_arm would ADD "+
+				"this process's downtime to expires_at and reclaimable_at of EVERY held and "+
+				"suspect lease, so an outage here would extend every live lease in the farm "+
+				"by its own length — device health deciding when a lease ends. Remove %q "+
+				"from %s; that list is only for components whose downtime stops renewals "+
+				"from landing (%s, or renames of those)",
+				EnvComponent, canon, name, EnvReaperComponent,
+				strings.Join(c.Reaper.Components, ","), canon, name, EnvReaperComponent,
+				strings.Join(DefaultReaperComponents, ", "))
 		}
 	}
 	// FARM_COMPONENT on a role that runs several components at once was read,
@@ -1595,7 +1675,13 @@ func (c *Config) Summary() string {
 			"the device; the self-fence timeout and margin above only bound the slot rearm\n",
 			EnvFenceTLSCert, EnvFenceTLSKey, EnvFenceTLSCA)
 	}
-	fmt.Fprintf(&b, "reaper           = every %s, batch %d, gap floor %s, watching %s\n",
+	// "watching" understates what the list does, and the understatement is how
+	// a health component gets added to it. An outage of any name printed here
+	// is refunded to every live lease, so the line says so where an operator
+	// comparing two deployments will read it.
+	fmt.Fprintf(&b, "reaper           = every %s, batch %d, gap floor %s, watching %s "+
+		"(renewal path only: an outage of any of these extends every live lease by "+
+		"its length)\n",
 		c.Reaper.Interval, c.Reaper.Batch, c.Reaper.GapFloor,
 		strings.Join(c.Reaper.Components, ","))
 	// Set or unset is the whole of what may be said about the token. Its
@@ -1793,6 +1879,42 @@ func onRenewalPath(component string) bool {
 	switch component {
 	case "api", "scheduler", "reaper", "jobrunner":
 		return true
+	}
+	return false
+}
+
+// healthPlaneComponents lists the farm.component_heartbeat keys this binary
+// writes that are NOT on the renewal path: the ones whose downtime must never
+// move a lease deadline. It is what FARM_REAPER_COMPONENTS refuses.
+//
+// Derived from roleComponents rather than written out, so a component added to
+// a role is refused from the watch list on the day it is added rather than on
+// the day somebody remembers this list. The names are per-role bases; the
+// caller compares the part before ":", since the per-host components beat under
+// a suffixed key.
+func healthPlaneComponents() []string {
+	off := make(map[string]struct{})
+	for _, names := range roleComponents {
+		for _, name := range names {
+			if !onRenewalPath(name) {
+				off[name] = struct{}{}
+			}
+		}
+	}
+	return slices.Sorted(maps.Keys(off))
+}
+
+// watchedAs reports whether the reaper's watch list names a component, under
+// its own spelling or under the per-host key it really beats with. It is used
+// only for the health-plane refusals, where a match must be found however the
+// name was written; the renewal-path assertion deliberately keeps its exact
+// comparison, because those components beat under an unsuffixed name and an
+// entry like "api:x" would be a name farm.reaper_arm finds no row for.
+func watchedAs(list []string, component string) bool {
+	for _, entry := range list {
+		if base, _, _ := strings.Cut(entry, ":"); base == component {
+			return true
+		}
 	}
 	return false
 }

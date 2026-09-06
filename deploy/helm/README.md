@@ -2,9 +2,13 @@
 
 The control plane belongs in a cluster. The thing it controls does not.
 
-This directory holds a Helm chart for the seven control-plane roles — `api`,
-`scheduler`, `reaper`, `recovery`, `jobrunner`, `janitor`, `watchdog` — plus
-the schema migration that has to succeed before any of them start. The eighth
+This directory holds a Helm chart for the eight control-plane roles — `api`,
+`scheduler`, `reaper`, `recovery`, `jobrunner`, `janitor`, `chargepolicy`,
+`watchdog` — plus the schema migration that has to succeed before any of them
+start. `chargepolicy` was missing from this sentence while its Deployment
+shipped, and the count still read seven because a default install renders no
+watchdog at all: `hosts[]` is empty, and the watchdog is one Deployment per
+registered host. The ninth
 role, `node`, belongs on the machine the phones are plugged into; the chart
 renders it only if you ask for it, off by default, and the first section below
 is the argument for leaving it off.
@@ -156,6 +160,20 @@ FARM_HOST_ID=h01
 # THIS STRING, so it must be routable from there — not 127.0.0.1.
 FARM_ADB_ENDPOINT=10.20.0.11:5037
 
+# NOT OPTIONAL, and the agent refuses to start without it. The node endpoint
+# can cut power to a port holding a live lease, so it must never be reachable
+# unauthenticated — node.New demands a token whenever an address is set, and an
+# address is ALWAYS set: an empty FARM_NODE_ADDR reads as unset and falls back
+# to :8082. Copying this file without the next line gives a unit that exits
+# immediately with "Config.Token is required whenever Config.Addr is set", and
+# Restart=always turns that into a five-second loop.
+#
+# It must be the SAME value the control plane carries as FARM_NODE_TOKEN. With
+# them disagreeing, recovery tiers 3 and 4 and operator slot power answer 401
+# rather than being refused with a reason, and the charge policy observes
+# without being able to hold a port.
+FARM_NODE_TOKEN=<the same secret the chart puts in auth/the node token Secret>
+
 # These two MUST match the chart's config.lease.slotRearm and
 # config.node.selfFenceTimeout. The relationship between them is the assertion
 # that keeps one phone from being handed to two jobs: a reclaimed slot must
@@ -221,6 +239,7 @@ that variable and `hosts[].adbEndpoint` should name the same endpoint.
 | Deployment | `janitor` | Same election. The only thing that closes a `farm.job_steps`, `job_attempts`, `bulk_targets` or `recovery_attempts` row whose process died. A step is an orphan when its **lease** is dead, never when it is slow; the two row kinds that carry no lease go by the run's own timeout and the ladder's own stale threshold. It cannot end a lease: the package does not import `internal/lease`. |
 | Deployment | `recovery` | Serialised per device by a transaction-scoped advisory lock. |
 | Deployment | `jobrunner` | **Scales.** Jobs are claimed with `SKIP LOCKED` plus a per-job advisory lock, and a lease is re-attached by `job_id`, so two replicas never fight over one device. |
+| Deployment | `chargepolicy` | Same advisory-lock election as the reaper. Holds idle devices inside a charge band — 40-80% by default — by asking the node agent to gate the port, and releases the gate at the low mark. It acts ONLY on a device with no live lease and cannot end one; without a node token it observes and holds nothing, and says so at startup. This row was missing while the Deployment shipped. |
 | Deployment ×N | `watchdog` | One per entry in `hosts[]`, replicas pinned at 1: there is no election, and a second replica would only double the probe rate against that host's single ADB server. |
 | Service + EndpointSlice ×N | — | Stable in-cluster names for the bare-metal ADB servers. |
 | DaemonSet | `node` | **Off by default**, behind `node.enabled`, and the first section above is the argument for leaving it off. `hostNetwork`, a required `nodeSelector`, `/sys` read-only; `node.usbReset.enabled` adds `privileged: true` and `/dev/bus/usb` for tier 3 alone — tier 4 refuses in any pod, because uhubctl is not in this image. |

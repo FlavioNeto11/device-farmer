@@ -123,16 +123,23 @@ ci-sql: migrate assertions
 ci-helm:
 	helm lint deploy/helm/device-farmer -f deploy/helm/ci-values.yaml
 	helm template ci deploy/helm/device-farmer -n device-farmer -f deploy/helm/ci-values.yaml > /dev/null
-	helm template ci deploy/helm/device-farmer -n device-farmer --set database.dsn=postgres://farm@pg:5432/device_farmer > /dev/null
+	helm template ci deploy/helm/device-farmer -n device-farmer \
+		--set database.dsn=postgres://farm@pg:5432/device_farmer \
+		--set auth.tokens=ci-token:operator:ci > /dev/null
 	helm template ci deploy/helm/device-farmer -n device-farmer -f deploy/helm/ci-values.yaml \
 		--set database.dsn="" --set database.existingSecret=farm-postgres \
 		--set auth.tokens="" --set auth.existingSecret=farm-api-tokens > /dev/null
-	@for role in api scheduler reaper recovery jobrunner janitor watchdog; do \
+	@roles="$$(sed -n 's/^[[:space:]]*"all":[[:space:]]*{\(.*\)},$$/\1/p' internal/config/config.go | tr -d '"' | tr ',' ' ')"; \
+	test "$$(echo $$roles | wc -w)" -ge 8 || { echo "could not read roleComponents[all]"; exit 1; }; \
+	for role in $$roles; do \
 		helm template ci deploy/helm/device-farmer -n device-farmer -f deploy/helm/ci-values.yaml -s "templates/$$role.yaml" \
 			| grep -q '^kind: Deployment$$' || { echo "templates/$$role.yaml renders no Deployment"; exit 1; }; \
 	done
 	@! helm template ci deploy/helm/device-farmer -n device-farmer > /dev/null 2>&1 || \
 		{ echo "the chart rendered with no database configured"; exit 1; }
+	@! helm template ci deploy/helm/device-farmer -n device-farmer \
+		--set database.dsn=postgres://farm@pg:5432/device_farmer > /dev/null 2>&1 || \
+		{ echo "the chart rendered a release whose api cannot start"; exit 1; }
 	@! helm template ci deploy/helm/device-farmer -n device-farmer -f deploy/helm/ci-values.yaml \
 		--set database.existingSecret=farm-postgres > /dev/null 2>&1 || \
 		{ echo "the chart rendered with database.dsn AND database.existingSecret"; exit 1; }

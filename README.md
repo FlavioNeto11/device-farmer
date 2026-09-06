@@ -105,6 +105,8 @@ be running a different commit than the scheduler it races with.
 | `reaper` | Suspect sweep, and the **only** automatic release path in the system. |
 | `watchdog` | Device health only. It can never touch a lease. |
 | `recovery` | The recovery ladder. Acts for a holder that keeps its device. |
+| `janitor` | Closes rows whose process died. A step is an orphan when its **lease** is dead, never when it is slow. It cannot end a lease — the package does not import `internal/lease`. |
+| `chargepolicy` | Holds idle devices inside a 40-80% charge band. Acts only on a device with no live lease, and can never end one. It is the one fire mitigation software can reach. |
 | `node` | Host agent: USB discovery, enrollment, and the hardware rungs. |
 | `ctl` | Operator CLI, over the HTTP API rather than the database. |
 | `all` | Every control-plane role in one process — laptop or single node. |
@@ -185,8 +187,14 @@ still means the same thing when it resumes tomorrow.
 ```
 
 ```bash
+# ctl defaults to http://127.0.0.1:8080, which is where a locally run `farmd
+# api` listens. Compose publishes the same listener on 8420, so point ctl at it
+# — otherwise these commands reach whatever else is on 8080, which on a
+# developer's machine is rarely nothing.
+export FARM_API_URL=http://127.0.0.1:8420
+
 farmd ctl validate -f spec.json     # every problem, not the first
-farmd ctl submit  -f spec.json --pool default --expect-duration 6h
+farmd ctl submit  -f spec.json --pool default --queue soak --tenant acme --expect-duration 6h
 farmd ctl jobs
 ```
 
@@ -308,10 +316,29 @@ topology discovery, scheduling, leasing, job execution with checkpoint and
 resume, file transfer, the recovery ladder, bulk exec, the dashboard and the
 CLI.
 
-Not yet done, and deliberately: **authentication** is a stub that runs open and
-says so loudly at startup, there is **no Helm chart**, and the **mTLS fence
-proxy** that would enforce the fence at the resource is unbuilt — today the
-fence is enforced in the database and honoured by the client.
+All three things this section used to name as missing have since shipped, and
+the paragraph outlived them. What is true at HEAD:
+
+- **Authentication is wired.** `api.AuthenticatorFor` builds a static bearer
+  list from `FARM_API_TOKENS` with role levels and a constant-time compare, and
+  it REFUSES to start an open control plane on a listener the network can
+  reach. Open is reachable on loopback, or by saying so — that is what the
+  packaged demo does. Ask the running server which authenticator it installed
+  rather than trusting a values file: `GET /api/v1/capabilities` reports
+  `auth.open`.
+- **A Helm chart ships**, at `deploy/helm/device-farmer`: eight control-plane
+  roles, the migration as a pre-install hook, a ServiceMonitor, a
+  PrometheusRule with runbook links, and a values file that refuses nine
+  combinations it cannot install correctly. `deploy/helm/README.md` is the
+  operator's page; `bash scripts/k8s-up.sh` is the evaluation cluster.
+- **The fence proxy's host half is integrated**, not unbuilt: `internal/fenceproxy`
+  serves it and `farmd node` wires it. What remains is the CLIENT half
+  (`FARM_FENCE_CLIENT_*`), which is why a farm without it still enforces the
+  fence in PostgreSQL and relies on the holder to honour it at the socket.
+
+What is genuinely not done is `REC-03`: recovery tiers 3 and 4 —
+`USBDEVFS_RESET` and cutting VBUS — have never run against a handset. Nothing
+in this repository has met real hardware.
 
 `internal/node` and `internal/topo` are Linux-only by nature and have not been
 exercised against real hardware. They compile everywhere and refuse clearly

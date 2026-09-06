@@ -30,9 +30,32 @@ this chart is rendered once per role:
 {{- printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
 
-{{/* Full name of one role's workload, e.g. release-device-farmer-scheduler. */}}
+{{/*
+Full name of one role's workload, e.g. release-device-farmer-scheduler.
+
+The 63-character cut falls on the FULLNAME, never on the component, and that is
+the whole point of this helper. The usual `printf | trunc 63` idiom cuts the
+TAIL — which here is the only part of the string that says which role, or which
+host, this object belongs to. Measured against ci-values.yaml: at a 48-character
+release name all nine Deployments and all four Services rendered under one
+identical 62-character name, and `helm template` exited 0 while doing it. At 41
+only the second host's watchdog disappeared, which is quieter and worse — that
+is exactly the outcome checkHosts refuses a duplicate host id to prevent,
+reached from the other end. Helm's own release-name limit is 53, so both are
+legal input.
+
+Trimming the prefix keeps every suffix intact, so the names stay distinct at any
+release-name length Helm will accept. A component that cannot fit on its own is
+refused rather than trimmed, because a trimmed suffix is the failure this helper
+exists to stop.
+*/}}
 {{- define "device-farmer.componentName" -}}
-{{- printf "%s-%s" (include "device-farmer.fullname" .ctx) .component | trunc 63 | trimSuffix "-" -}}
+{{- $component := .component | toString -}}
+{{- $room := sub 62 (len $component) | int -}}
+{{- if lt $room 1 -}}
+{{- fail (printf "\ndevice-farmer: the name suffix %q is %d characters, and a Kubernetes name stops at 63.\n\nEven one character of the release name will not fit in front of it, so this\nobject cannot be given a name that is both complete and distinct from its\nsiblings. Shorten what the suffix is built from — a hosts[].id, almost\ncertainly.\n" $component (len $component)) -}}
+{{- end -}}
+{{- printf "%s-%s" (include "device-farmer.fullname" .ctx | trunc $room | trimSuffix "-") $component -}}
 {{- end -}}
 
 {{- define "device-farmer.selectorLabels" -}}
@@ -156,6 +179,35 @@ FARM_API_TOKENS
 {{- end -}}
 
 {{/*
+The statement, if any, by which this release asks to serve an OPEN API — or
+nothing, which is the answer for every release that did not ask.
+
+internal/api/auth_wiring.go accepts exactly three things as permission to
+install the allow-all authenticator: FARM_API_ALLOW_ANONYMOUS=true,
+FARM_API_AUTH=allow-all, and a loopback listener. The first two arrive through
+config.extra, because templates/configmap.yaml owns the environment and there
+is no auth.* value that reaches it. The third cannot be reached from this chart
+at all: the ConfigMap pins FARM_API_ADDR to 0.0.0.0 so the api answers more than
+its own probes, and openModeAllowed reads the socket rather than a promise about
+it.
+
+A FARM_API_ALLOW_ANONYMOUS that is neither true nor false is deliberately NOT
+counted as a statement here. anonymousRequested refuses it by name and quotes
+the value back, which sends the operator to the variable they actually mistyped
+— better than a render-time refusal that talks about tokens they never touched.
+*/}}
+{{- define "device-farmer.openOnPurpose" -}}
+{{- $extra := .Values.config.extra | default dict -}}
+{{- $anon := get $extra "FARM_API_ALLOW_ANONYMOUS" | toString | trim | lower -}}
+{{- $mode := get $extra "FARM_API_AUTH" | toString | trim | lower -}}
+{{- if has $anon (list "true" "t" "1") -}}
+config.extra.FARM_API_ALLOW_ANONYMOUS={{ $anon }}
+{{- else if eq $mode "allow-all" -}}
+config.extra.FARM_API_AUTH=allow-all
+{{- end -}}
+{{- end -}}
+
+{{/*
 The same refusal as requireDatabase, for the same reason.
 
 authSecretName prefers existingSecret, so a release with both would mount the
@@ -164,15 +216,32 @@ than the database one: an operator who edits auth.tokens to REVOKE a leaked
 credential would see a clean upgrade, believe the token was withdrawn, and
 leave it working. Nothing downstream can report the token that was never
 rendered.
+
+The other two refusals here are about a release that configured no credentials
+at all. This chart cannot render one that works: the api role reads
+internal/api/auth_wiring.go, which will not install the allow-all authenticator
+on a listener the whole network can reach, and the ConfigMap gives it exactly
+that listener. Rendering it anyway costs five minutes of `--wait` and then
+"Available: 0/2", with nothing in the timeout that mentions a token — the
+message an operator needs is in a pod log they have to know to go and read.
 */}}
 {{- define "device-farmer.checkAuth" -}}
+{{- $configured := or .Values.auth.tokens .Values.auth.existingSecret -}}
+{{- $open := include "device-farmer.openOnPurpose" . -}}
 {{- if and .Values.auth.tokens .Values.auth.existingSecret -}}
 {{- fail (printf "\ndevice-farmer: auth.tokens and auth.existingSecret are both set.\n\n  auth.existingSecret = %s\n  auth.tokens         = (set, and WOULD BE IGNORED)\n\nThe api reads FARM_API_TOKENS from %q. auth.tokens would render into no Secret\nand reach no pod, so editing it — to add a token, or to revoke one — would\nchange nothing while looking like it had.\n\nKeep the Secret and drop auth.tokens, or drop auth.existingSecret and let the\nchart write the Secret:\n\n  --set auth.tokens=\"\"                     # keep %s\n  --set auth.existingSecret=\"\"             # let the chart own the tokens\n" .Values.auth.existingSecret .Values.auth.existingSecret .Values.auth.existingSecret) -}}
+{{- end -}}
+{{- if and (not $configured) (not $open) -}}
+{{- fail (printf "\ndevice-farmer: no API credentials, and this is not a deployment where running\nopen is safe.\n\n  auth.tokens         = (empty)\n  auth.existingSecret = (empty)\n  FARM_API_ADDR       = 0.0.0.0:%v   (set by templates/configmap.yaml)\n\nThe api would not start. It refuses to serve an unauthenticated control plane on\na listener the network can reach, so every api pod would be in\nCrashLoopBackOff while `helm install --wait` sat there until its own timeout.\n\nChoose one of three, all of which install:\n\n  # tokens, written by the chart into a Secret of its own\n  --set auth.tokens='<token>:operator:ci'\n\n  # tokens you already keep somewhere else, under the key FARM_API_TOKENS\n  --set auth.existingSecret=farm-api-tokens\n\n  # an OPEN control plane, on purpose — an evaluation farm, a demo, a laptop\n  --set config.extra.FARM_API_ALLOW_ANONYMOUS=true\n\nA list of more than one token belongs in a values file: helm's --set splits on\ncommas, so the second entry arrives as a key with no value.\n\nThe third is a real answer and not a formality, but write it knowing what it\ngrants. With no authenticator every caller that can reach port %v holds the\noperator role: it can revoke a live lease, cancel somebody's job, drain a host\nand cut power to a USB port that is holding a running job. That is the one\nconfiguration in which a stranger ends six hours of work, so it is spelled out\nrather than reached by leaving a value empty.\n" .Values.api.service.port .Values.api.service.port) -}}
+{{- end -}}
+{{- if and $configured $open -}}
+{{- fail (printf "\ndevice-farmer: this release lists API credentials AND asks for an open API.\n\n  %s\n  %s\n\nfarmd refuses that pair at startup rather than picking a winner, and the chart\nrefuses it here for the same reason one CrashLoopBackOff earlier: whichever half\nloses is silently ignored, and half the time the half that loses is the one\nasking for authentication.\n\nDrop the opt-in to require credentials, or drop the credentials to serve open:\n\n  --set config.extra.FARM_API_ALLOW_ANONYMOUS=null\n  --set auth.tokens=\"\" --set auth.existingSecret=\"\"\n" (ternary (printf "auth.existingSecret = %s" (.Values.auth.existingSecret | toString)) "auth.tokens         = (set)" (ne (.Values.auth.existingSecret | toString) "")) $open) -}}
 {{- end -}}
 {{- end -}}
 
 {{/*
-FARM_API_TOKENS, only where it is read. Absent, the API runs open — NOTES.txt
+FARM_API_TOKENS, only where it is read. Absent, this release asked for an open
+API by name — checkAuth refuses every other way of arriving here — and NOTES.txt
 makes that impossible to miss.
 */}}
 {{- define "device-farmer.authEnv" -}}
@@ -232,6 +301,20 @@ in the database and illegal in Kubernetes are ordinary, not hypothetical.
 {{- end -}}
 {{- if has $host.id $seen -}}
 {{- fail (printf "device-farmer: host id %q appears twice in hosts[]. Both entries render the same Deployment name and the same Service name, so one of the two hosts silently loses its watchdog and stops being probed at all. Give each physical machine one entry." $host.id) -}}
+{{- end -}}
+{{/*
+The same collision, arrived at by length rather than by typo.
+
+device-farmer.componentName trims the release prefix instead of the suffix so
+that two hosts can never share a name, which needs the suffix plus a joining
+dash plus at least one character of prefix to fit in 63 — a suffix of 61. The
+longest suffix an id produces is the watchdog Deployment's, so that is the one
+checked here, and it is checked whether or not watchdog.enabled is on: an id is
+supposed to survive turning the watchdog back on.
+*/}}
+{{- $idMax := sub 61 (len "watchdog-") | int -}}
+{{- if gt (len $host.id) $idMax -}}
+{{- fail (printf "device-farmer: hosts[%d].id is %d characters and the limit is %d. It becomes the tail of a Deployment name (%q) and of a Service name, and a Kubernetes name stops at 63 — so past %d characters the id itself is what gets cut, and two hosts whose ids differ only after the cut land on one Deployment and one Service. That is the duplicate-id failure above, reached by length. Give the machine a shorter id in farm.hosts and in its FARM_HOST_ID." $i (len $host.id) $idMax (printf "watchdog-%s" $host.id) $idMax) -}}
 {{- end -}}
 {{- $seen = append $seen $host.id -}}
 {{- if not $host.adbEndpoint -}}
@@ -366,6 +449,76 @@ renders cleanly and leaves a farm that LOOKS fenced:
 {{- end -}}
 
 {{/*
+The two ends of the metrics wire, which come from different places and can
+disagree with nothing to notice.
+
+templates/configmap.yaml sets FARM_METRICS_ADDR as the literal ":9090" — it
+reads no value — while templates/metrics-service.yaml renders both port and
+targetPort from metricsService.port. Moving the value moves the Service and
+leaves every farmd process on 9090: with a ServiceMonitor in front of it every
+target goes up == 0, every farm_* series stops, and the render, the lint and
+the other guards all say nothing. Silence is what observability looks like when
+it is broken, which is why this one is refused rather than warned about.
+
+IF THE CONFIGMAP EVER READS metricsService.port, DELETE THIS FIRST HALF in the
+same edit: it exists only because that line is a literal, and left behind it
+would refuse a release that had become correct.
+
+The second half is the same shape one level up. A ServiceMonitor selects
+app.kubernetes.io/component=metrics, and the only object that ever carries that
+label is the headless Service; without it the monitor sits in the cluster
+selecting nothing. Prometheus discovers zero targets, so not even up == 0 fires
+— there is no target to be down — and every rule in the PrometheusRule returns
+no data, which reads exactly like a quiet farm.
+*/}}
+{{- define "device-farmer.checkMetrics" -}}
+{{- if .Values.metricsService.enabled -}}
+{{- $port := .Values.metricsService.port | int -}}
+{{- if ne $port 9090 -}}
+{{- fail (printf "\ndevice-farmer: metricsService.port is %d, and every farmd process would still be\nlistening on 9090.\n\n  metricsService.port          = %d   (Service port and targetPort)\n  FARM_METRICS_ADDR            = :9090 (a literal in templates/configmap.yaml)\n\nThe two ends of that wire come from different places. The Service would point\nat a port nothing binds, every ServiceMonitor target would go up == 0, and all\nfarm_* series would stop — with no error anywhere, because a scrape that finds\nnothing looks the same as a farm with nothing to say.\n\nLeave metricsService.port at 9090. If your site needs another number, it has to\nchange in templates/configmap.yaml too, and then this guard is what to delete.\n" $port $port) -}}
+{{- end -}}
+{{- end -}}
+{{- if and .Values.serviceMonitor.enabled (not .Values.metricsService.enabled) -}}
+{{- fail "\ndevice-farmer: serviceMonitor.enabled is true and metricsService.enabled is false.\n\nThe ServiceMonitor selects the Service labelled app.kubernetes.io/component=metrics,\nand that Service is the one metricsService renders. Without it the monitor is an\nobject in the cluster that selects nothing: Prometheus discovers zero targets, so\nno up == 0 fires either — there is no target to be down — and every rule in the\nPrometheusRule returns no data. Coverage that reads as coverage and is not.\n\nTurn metricsService.enabled back on, or turn serviceMonitor.enabled off and\nscrape these pods whichever way your cluster already does.\n" -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+The two things about the migration hook that render cleanly and then fail in the
+cluster with nothing readable to go on.
+
+NAME. templates/migrate-job.yaml builds "<fullname>-migrate" whole — it is the
+one name in this chart that is not trimmed to fit — and Kubernetes copies a
+Job's name into a job-name label on its pod template. Label VALUES stop at 63
+where names do not, so past that the API server rejects the Job at admission
+("spec.template.labels: Invalid value: ...: must be no more than 63 bytes") and
+the install dies at the hook, with an error that names a label rather than a
+release.
+
+ORDER. Helm runs hooks in weight order and the Secret carrying the DSN is the
+string literal "-10" in templates/secret.yaml, so it cannot move with this
+value. A Job that does not sort strictly after it has a secretKeyRef that
+resolves to nothing: the pod sits in CreateContainerConfigError, no container
+ever starts, and `kubectl logs` has nothing at all to show while Helm waits out
+its hook timeout. Equal weights are refused along with lower ones, because at
+equal weight the order is Helm's to choose and a coin flip is not an ordering.
+The constraint only exists when the chart owns that Secret — with
+database.existingSecret the credential is already in the namespace before any
+hook runs and the weights are free.
+*/}}
+{{- define "device-farmer.checkMigrate" -}}
+{{- if .Values.migrate.enabled -}}
+{{- $job := printf "%s-migrate" (include "device-farmer.fullname" .) -}}
+{{- if gt (len $job) 63 -}}
+{{- fail (printf "\ndevice-farmer: the migration hook Job would be named\n\n  %s\n\nwhich is %d characters. Kubernetes copies a Job's name into a job-name label on\nits pod template, and a label value stops at 63 even though a name does not — so\nthe API server rejects the Job at admission and the install fails at the hook,\nbefore any schema is touched, with an error that talks about a label.\n\nThe name is <fullname>-migrate, so the release name (or fullnameOverride) has to\nleave room for those %d characters: a fullname of %d or fewer. Every other name\nin this chart trims the release prefix to fit; this one is built whole.\n" $job (len $job) (len "-migrate") (sub 63 (len "-migrate") | int)) -}}
+{{- end -}}
+{{- if and (not .Values.database.existingSecret) (le (.Values.migrate.hookWeight | int) -10) -}}
+{{- fail (printf "\ndevice-farmer: migrate.hookWeight is %d, and the Secret carrying the DSN is -10.\n\nHelm runs hooks in weight order, so the Job would not be guaranteed to come\nafter the Secret its DATABASE_URL is read from — below -10 it certainly does\nnot, and at -10 the order is Helm's to pick. Whenever it loses, the secretKeyRef\nresolves to nothing: the pod stops at CreateContainerConfigError with no\ncontainer and therefore no logs, and Helm fails the release once its hook\ntimeout runs out, having migrated nothing and left nothing to read.\n\nThat -10 is a literal in templates/secret.yaml and cannot follow this value.\nUse a weight above -10; the default is -5.\n" (.Values.migrate.hookWeight | int)) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
 Every cross-value assertion, in one call.
 
 configmap.yaml includes this, and configmap.yaml is the one template that
@@ -380,6 +533,8 @@ because the checksum annotations re-render this template once per workload.
 {{- include "device-farmer.checkHosts" . -}}
 {{- include "device-farmer.checkDrainWindow" . -}}
 {{- include "device-farmer.checkFence" . -}}
+{{- include "device-farmer.checkMetrics" . -}}
+{{- include "device-farmer.checkMigrate" . -}}
 {{- end -}}
 
 {{/* Everything that is not a credential, shared by every role. */}}

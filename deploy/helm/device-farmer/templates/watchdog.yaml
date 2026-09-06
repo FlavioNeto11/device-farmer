@@ -31,7 +31,7 @@ resource names out of the very same ids.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ printf "%s-watchdog-%s" (include "device-farmer.fullname" $) $host.id | trunc 63 | trimSuffix "-" }}
+  name: {{ include "device-farmer.componentName" (dict "ctx" $ "component" (printf "watchdog-%s" $host.id)) }}
   namespace: {{ $.Release.Namespace }}
   labels:
     {{- include "device-farmer.labels" (dict "ctx" $ "component" "watchdog") | nindent 4 }}

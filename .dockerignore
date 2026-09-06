@@ -1,0 +1,77 @@
+# What the image build is allowed to see.
+#
+# Docker does not read .gitignore, and there was no .dockerignore here at all.
+# On a working tree with the parallel agents' worktrees checked out, BuildKit
+# transferred 340.50 MB in 23.3 s before this file existed and 6.75 MB in 0.5 s
+# after it. The 334 MB difference is 224 MB of .claude/worktrees/<agent>/, which
+# is a complete copy of this repository per branch in flight, 94 MB of bin/, and
+# a 14 MB stale farmd.exe at the root — every byte of it gitignored, and every
+# byte of it being shipped to the daemon. Worse than the transfer: `COPY . .`
+# keys its layer on the checksum of the whole context, so one write under any of
+# those paths — an agent saving a file, `go build` touching bin/ — invalidated
+# the copy and forced a full recompile of the tree, vet and tests included.
+# Measured: rewriting 1 MB of a file under bin/ turned a 2.0 s no-op rebuild
+# into a full re-run of go build, go vet and go test.
+#
+# This is an allowlist, and the inversion is deliberate. A denylist fails open:
+# someone adds a directory, nobody remembers to exclude it, and the context
+# grows back silently. An allowlist fails closed — forget to name something the
+# build reads and the BUILD breaks, on the machine of whoever forgot, in the
+# same minute. That trade is worth taking here because of what is at stake two
+# files over: the binary embeds the migrations and the dashboard, and an image
+# that shipped the binary without the SQL would migrate to version 0 and report
+# success against an empty database. A silently thinner context is exactly how
+# that ships.
+#
+# `*` matches one path segment, so it excludes every top-level entry without
+# excluding anything beneath one; re-including a directory below re-includes
+# everything under it.
+*
+
+# The module graph. `go mod download` runs off these two alone, in their own
+# earlier layer, so a source-only change does not re-download the module cache.
+!go.mod
+!go.sum
+
+# The four directories `go list ./...` reports packages in — 27 of them, all
+# here. `go build ./cmd/farmd` needs 25; `go vet ./...` and `go test ./...` in
+# the build stage need all four:
+#
+#   internal    also carries internal/ui/assets — the embedded dashboard, the
+#               16 485 bytes an operator actually looks at.
+#   migrations  //go:embed *.sql, and the pattern is a compile error when it
+#               matches nothing, so a missing migrations/ fails the build rather
+#               than producing the empty-schema image described above.
+#   test        test/e2e, test/fakeadb and test/testpki are packages the suite
+#               compiles, and internal/recovery's fidelity tests read
+#               test/assertions_v13.sql by path.
+!cmd
+!internal
+!migrations
+!test
+
+# internal/ui/requirements_sync_test.go reads ../../REQUIREMENTS.md and calls
+# t.Fatal when it cannot. It reconciles the register on disk against the copy
+# rendered in the Docs tab, which has drifted twice; leaving the file out does
+# not skip that reconciliation, it fails it.
+!REQUIREMENTS.md
+
+# .git is NOT re-included, on purpose, and the Dockerfile builds with
+# -buildvcs=false to say so out loud.
+#
+# It used to be in the context and Go's VCS stamping quietly read it, so the
+# image printed a commit that no --build-arg had supplied. That made the commit
+# a property of the directory the build ran in rather than of the build, and it
+# made this file dangerous to write: the obvious .dockerignore erases the stamp
+# and no test anywhere notices. The identity now comes from --build-arg COMMIT,
+# which `make docker` passes and then verifies by running the image.
+#
+# It also costs nothing to leave out and a lot to keep: a commit rewrites
+# .git/index and the refs, and BuildKit keys COPY on content, so every commit
+# between two builds would force a full recompile of a tree that had not moved —
+# the same problem this file exists to fix, arriving from the one directory
+# nobody thinks of as source.
+#
+# .env stays out for a second reason. It carries no secret today, but HANDOFF.md
+# names it as the file someone will paste a DATABASE_URL with a password into,
+# and a build context is copied into an intermediate image layer.

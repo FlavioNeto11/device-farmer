@@ -9,7 +9,14 @@ SHELL       := /bin/bash
 BIN         := bin
 VERSION     ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 COMMIT      ?= $(shell git rev-parse --short HEAD 2>/dev/null)
-LDFLAGS     := -X main.version=$(VERSION) -X main.commit=$(COMMIT)
+# The commit's own date, never now(). Two builds of the same tree then stamp the
+# same thing, so `farmd version` and org.opencontainers.image.created answer
+# "what is in this" rather than "when did somebody type make" — a wall clock
+# makes every rebuild a different artifact that differs in nothing that matters.
+# VERSION already carries `-dirty` when the tree does, which is where an
+# uncommitted change shows up.
+BUILD_DATE  ?= $(shell git log -1 --format=%cI 2>/dev/null)
+LDFLAGS     := -X main.version=$(VERSION) -X main.commit=$(COMMIT) -X main.buildDate=$(BUILD_DATE)
 EXE         := $(if $(findstring Windows,$(OS)),.exe,)
 
 # The throwaway cluster the demo uses. Override to point at your own.
@@ -142,10 +149,30 @@ demo: build migrate
 all: build migrate
 	FARM_API_ADDR=$${FARM_API_ADDR:-127.0.0.1:8420} $(BIN)/farmd$(EXE) all
 
-## docker: build the container image
+## docker: build the container image, then run it to prove the stamps arrived
+#
+# All three build args are passed, and COMMIT is no longer optional.
+# .dockerignore keeps .git out of the build context and the Dockerfile builds
+# with -buildvcs=false, so Go's VCS stamping has nothing to read: the commit in
+# `farmd version` and in org.opencontainers.image.revision is what this line
+# hands over and nothing else. That is the fix — it used to be whatever .git
+# happened to be lying in the context — but it also means an image built with an
+# empty COMMIT cannot say what it is, so this refuses rather than shipping one.
+#
+# Then it runs what came out. Nothing else in this repository executes the
+# image, and the image is the only artifact where the binary can be right and
+# the packaging wrong: an allowlist entry lost in a merge, a build arg that
+# never reached the linker. `version` answers before config.Load, so it needs no
+# database, no network and no shell — there is no shell in distroless — which
+# makes it the cheapest proof that the thing starts at all.
 docker:
+	@test -n "$(COMMIT)" || { echo "COMMIT is empty: pass COMMIT=<sha>. An image that cannot name its commit is not one to deploy"; exit 1; }
 	docker build --build-arg VERSION=$(VERSION) --build-arg COMMIT=$(COMMIT) \
+		--build-arg BUILD_DATE=$(BUILD_DATE) \
 		-t device-farmer/farmd:$(VERSION) -t device-farmer/farmd:latest .
+	@docker run --rm device-farmer/farmd:$(VERSION) version | grep -q '$(COMMIT)' || \
+		{ echo "the image does not report commit $(COMMIT): the build args never reached the binary"; exit 1; }
+	@echo "built device-farmer/farmd:$(VERSION)  commit $(COMMIT)"
 
 ## up: docker compose, schema and demo, on http://localhost:8420
 up:

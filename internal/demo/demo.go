@@ -897,6 +897,16 @@ func installShellScripts(srv *fakeadb.Server, devs []*simDevice) {
 	for _, s := range shellSteps {
 		srv.Respond("", adbwire.ShellService(s.cmd), shellV2(s.out, 0))
 	}
+
+	// The detached status probe, which is how a wait_for that names a handle
+	// reads what a shell_detached command exited with. It has to be scripted
+	// explicitly: the catch-all above answers a bare newline, which is not one
+	// of the three answers the probe understands, and a soak whose status can
+	// never be parsed would sit in its wait for the whole six hours the spec
+	// allows. The fake has no filesystem, so it reports what the catch-all
+	// already implies about every other command — the run finished, and it
+	// finished well.
+	srv.Respond("", adbwire.ShellService("if [ -f "), shellV2("done\n0\n", 0))
 }
 
 // batteryDump renders one handset's answer to the watchdog's battery probe.
@@ -1024,7 +1034,14 @@ func (r *Runner) submitJob(ctx context.Context) error {
 			}},
 			{ID: "soak/await", Timeout: jobspec.Duration(6 * time.Hour),
 				Payload: jobspec.WaitFor{
-					Probe:    "test -f " + result,
+					// The handle, not "test -f "+result. Waiting for the file
+					// to APPEAR is satisfied by an exit status of 137 exactly
+					// as readily as by 0, so a soak that was killed at hour
+					// four would pass — and `cat result` afterwards would not
+					// catch it either, because cat exits 0 whatever the file
+					// says. Naming the handle makes the runner read the status
+					// the wrapper published and judge it.
+					Handle:   "soak",
 					Interval: jobspec.Duration(r.scale(5 * time.Second)),
 					Timeout:  jobspec.Duration(6 * time.Hour),
 				}},

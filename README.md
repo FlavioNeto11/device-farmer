@@ -177,10 +177,9 @@ still means the same thing when it resumes tomorrow.
                         "result_path": "/data/local/tmp/.farm/soak.result",
                         "handle": "soak"}},
     {"id": "await", "kind": "wait_for", "timeout": "6h",
-     "wait_for": {"probe": "test -f /data/local/tmp/.farm/soak.result",
-                  "interval": "30s", "timeout": "6h"}},
+     "wait_for": {"handle": "soak", "interval": "30s", "timeout": "6h"}},
     {"id": "collect", "kind": "pull",
-     "pull": {"remote": "/data/local/tmp/.farm/soak.result", "name": "result"}}
+     "pull": {"path": "/data/local/tmp/.farm/soak.result", "artifact": "result"}}
   ]
 }
 ```
@@ -192,8 +191,15 @@ farmd ctl jobs
 ```
 
 Long work runs **detached** on the device, with its output and exit code going
-to a device-side file that `wait_for` polls. That is what lets a six-hour job
-survive a ten-minute partition: no socket is the source of truth for anything.
+to a device-side file. That is what lets a six-hour job survive a ten-minute
+partition: no socket is the source of truth for anything.
+
+The `wait_for` above names the detached step's `handle` rather than probing for
+its result file, and the difference is the job's verdict. `test -f …result` is
+true the instant the wrapper publishes a status, and it publishes `137` exactly
+as eagerly as `0`; `cat …result` exits 0 whatever the file says. Naming the
+handle makes the runner read that status and compare it, so a soak killed at
+hour four fails the job instead of passing it.
 
 ### Reset tiers
 

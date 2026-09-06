@@ -219,7 +219,16 @@ func stepDetail(st jobspec.Step) map[string]any {
 	case jobspec.ShellDetached:
 		d["command"], d["result_path"], d["handle"] = p.Command, p.ResultPath, p.Handle
 	case jobspec.WaitFor:
-		d["probe"], d["wait_timeout"] = p.Probe, p.Timeout.String()
+		d["wait_timeout"] = p.Timeout.String()
+		// One of the two, never both: a wait_for names either a detached
+		// handle or a probe of its own, and jobspec refuses a step that sets
+		// both. Writing the empty one anyway would put a key in the step row
+		// that reads as "the author wrote an empty probe".
+		if p.Handle != "" {
+			d["handle"] = p.Handle
+		} else {
+			d["probe"] = p.Probe
+		}
 	case jobspec.Pull:
 		d["path"], d["artifact"] = p.Path, p.Artifact
 	case jobspec.Assert:
@@ -651,6 +660,68 @@ func (e *env) readPID(ctx context.Context, hp detachedPaths) string {
 	return ""
 }
 
+// workerState is what the device says about the process the launch started.
+type workerState string
+
+const (
+	workerAlive workerState = "alive" // its /proc entry is there
+	workerGone  workerState = "gone"  // it is not, and /proc is definitely readable
+
+	// workerUnknown covers every way the question could not be answered: no
+	// pid was recorded, the pid file holds something that is not a pid, /proc
+	// is hidden, or the call did not complete. It is the answer a caller must
+	// conclude nothing from — a wait that treated "I could not tell" as "it is
+	// gone" would fail a running soak over an unreadable file.
+	workerUnknown workerState = "unknown"
+)
+
+// probeWorker asks whether the worker shell a detached launch started is still
+// on the device, in one round trip, and returns its pid for the message that
+// will name it.
+//
+// The check is /proc, not `kill -0`. A shell without signal 0 answers a
+// `kill -0` exactly like a shell reporting a dead process — both non-zero —
+// and the caller would then declare every running soak vanished on any device
+// whose shell lacks it. A directory either is in /proc or is not.
+//
+// The pid's shape is checked ON THE DEVICE, before it is interpolated: the
+// file is written by our own wrapper, but a half-truncated or half-overwritten
+// pid file is exactly the kind of thing a dying phone produces, and `[ -d
+// "/proc/$p" ]` over an arbitrary string would answer "not a directory" —
+// which reads as "gone". Anything that is not digits is reported as no pid at
+// all, which concludes nothing.
+//
+// The fallback `[ -d "/proc/$$" ]` is the same guard one level up. A device
+// where /proc is not visible to the shell would answer "not a directory" for
+// every pid, so the shell asks about ITSELF: a process that is certainly
+// running. If its own entry is missing, /proc is telling us nothing and the
+// answer is unknown.
+//
+// Every failure — a dropped socket, a shell that never reported a status, an
+// answer nobody can parse — is workerUnknown rather than an error. This is a
+// best-effort second opinion about a run whose real answer is the status file;
+// it must be able to say nothing, and it must never be the thing that ends a
+// wait it could not see.
+func (e *env) probeWorker(ctx context.Context, hp detachedPaths) (workerState, string) {
+	out, err := e.dev.Shell(ctx, fmt.Sprintf(
+		`p=$(cat %s 2>/dev/null); case "$p" in ''|*[!0-9]*) echo nopid;; `+
+			`*) if [ -d "/proc/$p" ]; then echo alive $p; elif [ -d "/proc/$$" ]; then echo gone $p; else echo noproc; fi;; esac`,
+		dq(hp.pid)))
+	if err != nil || !out.Exited {
+		return workerUnknown, ""
+	}
+	fields := strings.Fields(string(out.Stdout))
+	if len(fields) == 2 && pidRe.MatchString(fields[1]) {
+		switch workerState(fields[0]) {
+		case workerAlive:
+			return workerAlive, fields[1]
+		case workerGone:
+			return workerGone, fields[1]
+		}
+	}
+	return workerUnknown, ""
+}
+
 // detachedCommand builds the one-liner that launches a command the device owns:
 //
 //	mkdir -p <dir> || exit 1; rm -f <result> <tmp> <pid>
@@ -704,17 +775,23 @@ func detachedCommand(prefix string, hp detachedPaths, command string) string {
 // wait_for
 // ---------------------------------------------------------------------------
 
-// execWaitFor polls a device-side probe until it succeeds.
+// execWaitFor waits for a condition on the device, in one of the two forms
+// jobspec.WaitFor defines: a shell probe of the operator's own, or the exit
+// status of a shell_detached command named by its handle. The handle form is
+// [execWaitForDetached]; the rest of this function is the probe form.
 //
-// A poll that fails on the wire is COUNTED AND IGNORED. That is the whole
-// point of asking the device about a file the device wrote: the connection may
-// come and go while the answer sits there waiting to be read. The only thing
-// that ends the wait unsatisfied is the condition's own timeout, which the
-// spec wrote down.
+// Both share the property that matters. A poll that fails on the wire is
+// COUNTED AND IGNORED. That is the whole point of asking the device about
+// something the device wrote: the connection may come and go while the answer
+// sits there waiting to be read. The only thing that ends the wait unsatisfied
+// is the condition's own timeout, which the spec wrote down.
 func execWaitFor(ctx context.Context, e *env, st jobspec.Step) (*Result, error) {
 	p, err := payloadOf[jobspec.WaitFor](st)
 	if err != nil {
 		return nil, err
+	}
+	if p.Handle != "" {
+		return execWaitForDetached(ctx, e, st, p)
 	}
 	interval := p.Interval.Std()
 	if interval <= 0 {
@@ -793,6 +870,230 @@ func execWaitFor(ctx context.Context, e *env, st jobspec.Step) (*Result, error) 
 			return last, nil
 		case <-time.After(interval):
 		}
+	}
+}
+
+// execWaitForDetached waits for a detached command's own verdict.
+//
+// This is the THIRD place a detached run's exit status is read, and it is the
+// one that covers the ordinary lifecycle. execShellDetached probes once
+// immediately after the launch, and reattachDetached probes once on a resume,
+// so before this existed the only failures anyone ever saw were the fast death
+// and the eviction. A soak that started cleanly, ran for four hours and was
+// then killed by the OOM killer produced a green shell_detached step and a
+// green wait_for: the 137 was on the phone, in a file, and after the launch
+// nothing looked at that file again.
+//
+// It cannot be done with an operator-written probe, which is why the handle is
+// in the spec rather than in a shell one-liner:
+//
+//   - `test -f /data/local/tmp/farm/soak.result` becomes true the instant the
+//     wrapper publishes a status, and it publishes 137 exactly as eagerly as
+//     it publishes 0.
+//   - `cat …soak.result` with expect_exit [0] judges CAT, not the soak. cat
+//     exits 0 whether the file holds "0" or "137".
+//
+// The status has to be read and compared, and where the wrapper wrote it is
+// the runner's business — detachedPathsFor builds those paths, not the spec.
+//
+// Everything else about the wait is unchanged, and deliberately so. A poll
+// that cannot reach the device is counted and ignored, because the answer is a
+// file on a device that is still holding this job's work and nothing that
+// happens to a socket can change what that file says. Only the condition's own
+// timeout ends the wait unsatisfied, and a status the device HAS published
+// wins even if the deadline expired while it was being read.
+func execWaitForDetached(ctx context.Context, e *env, st jobspec.Step, p jobspec.WaitFor) (*Result, error) {
+	sd, ok := e.spec.DetachedByHandle(p.Handle)
+	if !ok {
+		// jobspec refuses a spec whose wait_for names a handle no
+		// shell_detached step declares, so reaching this is a document that
+		// was never validated — a runner bug, not something a device can
+		// answer. Retrying it against a phone would only spend the step's
+		// budget rediscovering the same missing step.
+		return nil, notRetryablef(
+			"step %q waits on detached handle %q, which no shell_detached step in this spec declares",
+			st.ID, p.Handle)
+	}
+	hp := detachedPathsFor(sd)
+
+	interval := p.Interval.Std()
+	if interval <= 0 {
+		interval = e.poll
+	}
+
+	// The condition's deadline is its own, and shorter than the step's. When it
+	// expires the step has a verdict — "the command never finished" — rather
+	// than an error, so it is not retried.
+	wait := ctx
+	if to := p.Timeout.Std(); to > 0 {
+		var cancel context.CancelFunc
+		wait, cancel = context.WithTimeout(ctx, to)
+		defer cancel()
+	}
+
+	res := &Result{}
+	d := res.detail()
+	d["handle"] = p.Handle
+	d["result_path"] = hp.result
+	d["log_path"] = hp.log
+	d["pid_path"] = hp.pid
+
+	polls, blips := 0, 0
+	// The last thing the device actually said. It is what separates "the
+	// command was still running when the clock ran out" from "there was no
+	// trace of it on the device at all", and those two send an operator to
+	// look at completely different things: a soak that needs longer, versus a
+	// wrapper that never execed.
+	var seen detachedState
+
+	// judge turns a published status into the step's verdict. It is a closure
+	// because there are two ways to reach a published status — the ordinary
+	// poll, and the confirming read after the worker was found gone — and a
+	// second copy of the comparison is a second place for the two to disagree
+	// about what counts as success.
+	judge := func(code int) *Result {
+		d["polls"], d["poll_blips"] = polls, blips
+		d["detached_state"] = string(detachedDone)
+		d["exit_code"] = code
+		res.ExitCode = &code
+		res.Output = fmt.Sprintf("detached handle %s finished with exit status %d; its output is on the device at %s",
+			p.Handle, code, hp.log)
+
+		want := detachedExpectExit(e)
+		if !containsInt(want, code) {
+			// The command ran to completion and said no. That is a verdict
+			// about the WORK — the thing this form of wait_for exists to
+			// surface — and no retry can change a status already written to a
+			// file.
+			res.Failure = fmt.Sprintf(
+				"the detached command for handle %s finished with exit status %d (expected %s); "+
+					"it ran to completion, so this is the command's own verdict and not a transport failure — "+
+					"its output is on the device at %s",
+				p.Handle, code, formatInts(want), hp.log)
+		}
+		return res
+	}
+
+	for {
+		polls++
+		pr, err := probeDetached(wait, e, hp)
+		switch {
+		case err == nil && pr.state == detachedDone:
+			// A published status is an answer, and it stays an answer even if
+			// the condition's deadline expired while it was being read.
+			// Testing the deadline first would report "never finished" about a
+			// command that had in fact finished, which is the one wrong
+			// verdict this step can produce.
+			return judge(pr.exitCode), nil
+
+		case err == nil && pr.state == detachedRunning:
+			seen = pr.state
+			// "Running" is inferred from the LOG, which the launch's
+			// redirection creates and nothing ever removes. So a worker killed
+			// from outside — the OOM killer taking the whole process group, a
+			// reboot, somebody's `am kill` — leaves exactly the marks of a
+			// six-hour soak in its third hour, and a wait that could not tell
+			// them apart would spend the entire timeout its author wrote for
+			// the soak on a process that no longer exists.
+			//
+			// The pid file is what tells them apart, and it was written for
+			// this: execShellDetached captures $$ from inside the worker shell
+			// precisely so a wait_for can notice a process that vanished
+			// without writing a result.
+			if state, pid := e.probeWorker(wait, hp); state == workerGone {
+				// Confirm before concluding. The worker publishes its status
+				// and THEN exits, so nothing can appear after its /proc entry
+				// is gone — but that entry and this read are a round trip
+				// apart, and the status may have landed in between.
+				confirm, cerr := probeDetached(wait, e, hp)
+				switch {
+				case cerr != nil:
+					// The confirming read did not happen. Nothing is concluded
+					// from a question that was not answered; the loop asks
+					// again, inside the lease.
+					blips++
+				case confirm.state == detachedDone:
+					return judge(confirm.exitCode), nil
+				default:
+					d["polls"], d["poll_blips"] = polls, blips
+					d["detached_state"] = string(confirm.state)
+					d["pid"] = pid
+					d["worker_gone"] = true
+					res.Output = fmt.Sprintf(
+						"detached handle %s vanished: pid %s is gone from /proc and no status was published",
+						p.Handle, pid)
+					res.Failure = fmt.Sprintf(
+						"the detached command for handle %s is gone from the device without publishing an exit status: "+
+							"its worker shell (pid %s) is no longer in /proc and %s still holds no status, "+
+							"so there is no verdict to read. Something outside the command ended it — the OOM killer, "+
+							"a reboot, a manual kill — and whatever it printed first is on the device at %s",
+						p.Handle, pid, hp.result, hp.log)
+					return res, nil
+				}
+			}
+
+		case err == nil:
+			seen = pr.state
+
+		case wait.Err() != nil:
+			// A deadline expired while the probe was in flight, so the error in
+			// hand describes a cancelled call rather than a device. The select
+			// below turns it into the right verdict.
+
+		case !isRetryable(err):
+			// The Result goes back with the error: it carries the paths and
+			// the poll counts, and a step row that says how long we had been
+			// waiting is worth more than an empty one.
+			d["polls"], d["poll_blips"] = polls, blips
+			return res, err
+
+		default:
+			// Unreachable device, dropped stream, an answer that did not
+			// parse: the question was not answered. What became of the command
+			// is unaffected, and the file is still on the device.
+			blips++
+			if blips%10 == 1 {
+				e.log.Warn("wait_for could not read the detached command's status; "+
+					"the DEVICE keeps the answer, so the wait continues",
+					"step", st.ID, "handle", p.Handle, "blips", blips, "reason", err.Error())
+			}
+		}
+
+		select {
+		case <-wait.Done():
+			d["polls"], d["poll_blips"] = polls, blips
+			if seen != "" {
+				d["detached_state"] = string(seen)
+			}
+			if ctx.Err() != nil {
+				// The STEP was ended (fencing, shutdown, step timeout), not
+				// just this condition.
+				return res, abortErr(ctx)
+			}
+			res.Output = fmt.Sprintf("detached handle %s had not finished after %d status reads",
+				p.Handle, polls)
+			res.Failure = fmt.Sprintf(
+				"the detached command for handle %s had not finished within %s: "+
+					"the status probe ran %d times, %d of which could not reach the device, and %s. Its log is on the device at %s",
+				p.Handle, p.Timeout, polls, blips, describeDetachedState(seen), hp.log)
+			return res, nil
+		case <-time.After(interval):
+		}
+	}
+}
+
+// describeDetachedState renders what the device last said, for the one message
+// that has to carry it: the timeout. The three answers mean three different
+// next moves, and "condition not met" alone would hide which one this was.
+func describeDetachedState(s detachedState) string {
+	switch s {
+	case detachedRunning:
+		return "the command was still running"
+	case detachedAbsent:
+		return "the device carried no trace of the command — neither its log nor its status file, " +
+			"so check whether the wrapper ever started"
+	default:
+		return "the device never gave a readable answer at all, so nothing is known about the command"
 	}
 }
 

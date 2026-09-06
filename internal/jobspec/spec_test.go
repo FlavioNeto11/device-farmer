@@ -192,6 +192,12 @@ func TestRoundTripIsByteIdentical(t *testing.T) {
 		spec Spec
 	}{
 		{"every kind", fullSpec()},
+		{"a wait on a detached handle", specOf(
+			Step{ID: "soak/start", Payload: ShellDetached{
+				Command: "sh /data/local/tmp/soak.sh", ResultPath: "/data/local/tmp/soak.result", Handle: "soak"}},
+			Step{ID: "soak/await", Payload: WaitFor{
+				Handle: "soak", Interval: Duration(30 * time.Second), Timeout: Duration(time.Hour)}},
+		)},
 		{"minimal", New(Step{ID: "only", Timeout: Duration(time.Minute), Payload: Shell{Command: "true"}})},
 		{"no defaults", Spec{Version: SpecVersion, Steps: []Step{
 			{ID: "s", Timeout: Duration(time.Second), Payload: Sleep{Duration: Duration(time.Second)}},
@@ -689,6 +695,62 @@ func TestValidate(t *testing.T) {
 			hints: []string{"cut the probe short"},
 		},
 		{
+			// The whole point of the handle form: the wait judges a detached
+			// command's published exit status instead of an operator's
+			// `test -f`, which is true for 137 as readily as for 0.
+			name: "wait_for on a detached handle declared above it",
+			spec: specOf(
+				Step{ID: "soak/start", Timeout: Duration(time.Minute), Payload: ShellDetached{
+					Command: "sh /data/local/tmp/soak.sh", ResultPath: "/data/local/tmp/soak.result", Handle: "soak"}},
+				Step{ID: "soak/await", Timeout: Duration(time.Minute), Payload: WaitFor{
+					Handle: "soak", Interval: Duration(time.Second), Timeout: Duration(30 * time.Second)}},
+			),
+		},
+		{
+			name: "wait_for told to wait for two different things",
+			spec: specOf(
+				Step{ID: "soak/start", Timeout: Duration(time.Minute), Payload: ShellDetached{
+					Command: "true", ResultPath: "/data/local/tmp/soak.result", Handle: "soak"}},
+				Step{ID: "soak/await", Timeout: Duration(time.Minute), Payload: WaitFor{
+					Probe: "true", Handle: "soak", Interval: Duration(time.Second), Timeout: Duration(30 * time.Second)}},
+			),
+			want:  []string{"steps[1].wait_for"},
+			hints: []string{"Keep one"},
+		},
+		{
+			name: "wait_for told to wait for nothing at all",
+			spec: specOf(Step{ID: "a", Timeout: Duration(time.Minute), Payload: WaitFor{
+				Interval: Duration(time.Second), Timeout: Duration(30 * time.Second)}}),
+			want:  []string{"steps[0].wait_for.probe"},
+			hints: []string{"or set \"handle\" instead"},
+		},
+		{
+			name: "wait_for naming a handle nothing declares",
+			spec: specOf(Step{ID: "a", Timeout: Duration(time.Minute), Payload: WaitFor{
+				Handle: "soak", Interval: Duration(time.Second), Timeout: Duration(30 * time.Second)}}),
+			want:  []string{"steps[0].wait_for.handle"},
+			hints: []string{"no shell_detached step in this spec declares"},
+		},
+		{
+			// Above the step that starts the work, the wait would find no
+			// trace of it on the device and burn its entire timeout.
+			name: "wait_for placed above the detached step it waits on",
+			spec: specOf(
+				Step{ID: "soak/await", Timeout: Duration(time.Minute), Payload: WaitFor{
+					Handle: "soak", Interval: Duration(time.Second), Timeout: Duration(30 * time.Second)}},
+				Step{ID: "soak/start", Timeout: Duration(time.Minute), Payload: ShellDetached{
+					Command: "true", ResultPath: "/data/local/tmp/soak.result", Handle: "soak"}},
+			),
+			want:  []string{"steps[0].wait_for.handle"},
+			hints: []string{"runs after this step"},
+		},
+		{
+			name: "wait_for whose handle could not name a file",
+			spec: specOf(Step{ID: "a", Timeout: Duration(time.Minute), Payload: WaitFor{
+				Handle: "soak; reboot", Interval: Duration(time.Second), Timeout: Duration(30 * time.Second)}}),
+			want: []string{"steps[0].wait_for.handle"},
+		},
+		{
 			name: "pull with a bad path and a bad name",
 			spec: specOf(Step{ID: "a", Timeout: Duration(time.Minute),
 				Payload: Pull{Path: "relative/file", Artifact: "../escape"}}),
@@ -852,6 +914,36 @@ func TestValidateReportsEveryProblem(t *testing.T) {
 	}
 }
 
+// Problems come back in step order, and a cross-step rule must not break that.
+//
+// A wait_for's handle can only be resolved against the whole step list, and
+// the obvious way to write that — walk everything, then resolve — appends the
+// handle problems after every other step's. An editor highlighting the list
+// would then jump backwards, and Error() truncates at renderedProblems, so on
+// a spec with many problems the deferred ones would be the first to be lost.
+// collectHandles runs BEFORE the walk instead, so the rule is decided in place.
+func TestProblemsAreInStepOrder(t *testing.T) {
+	t.Parallel()
+
+	spec := specOf(
+		Step{ID: "wait", Timeout: Duration(time.Minute), Payload: WaitFor{
+			Handle: "nothing-declares-this", Interval: Duration(time.Second), Timeout: Duration(30 * time.Second)}},
+		Step{ID: "push", Timeout: Duration(time.Minute), Payload: Push{SHA256: "nope", Dest: "relative"}},
+	)
+	var ve *ValidationError
+	if !errors.As(Validate(spec), &ve) {
+		t.Fatal("Validate accepted a spec with a dangling handle and a broken push")
+	}
+	got := make([]string, 0, len(ve.Problems))
+	for _, p := range ve.Problems {
+		got = append(got, p.Path)
+	}
+	want := []string{"steps[0].wait_for.handle", "steps[1].push.sha256", "steps[1].push.dest"}
+	if !slices.Equal(got, want) {
+		t.Errorf("problem order\n got %q\nwant %q", got, want)
+	}
+}
+
 func TestParse(t *testing.T) {
 	t.Parallel()
 
@@ -890,6 +982,19 @@ func TestSpecAccessors(t *testing.T) {
 	}
 	if _, _, ok := spec.StepByID("nope"); ok {
 		t.Error("StepByID found a step that does not exist")
+	}
+
+	// A wait_for carries only a handle; the paths its status probe reads come
+	// from the detached payload, which is the only place they are written
+	// down.
+	if d, ok := spec.DetachedByHandle("soak"); !ok || d.ResultPath != "/data/local/tmp/farm/soak.result" {
+		t.Errorf("DetachedByHandle(soak) = %+v, %v; want the soak step's result path", d, ok)
+	}
+	if _, ok := spec.DetachedByHandle("nope"); ok {
+		t.Error("DetachedByHandle found a handle nothing declares")
+	}
+	if _, ok := spec.DetachedByHandle(""); ok {
+		t.Error("DetachedByHandle matched the empty handle, which every non-detached step has")
 	}
 
 	// A step's own timeout wins; otherwise the spec default applies.

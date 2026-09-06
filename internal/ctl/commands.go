@@ -1490,6 +1490,12 @@ func stepDetail(st jobspec.Step) string {
 	case jobspec.ShellDetached:
 		return p.Command + "  (handle " + p.Handle + ")"
 	case jobspec.WaitFor:
+		// A wait on a handle has no probe to show; rendering its empty string
+		// would print a blank cell where the interesting fact is which
+		// detached command this step is judging.
+		if p.Handle != "" {
+			return "detached handle " + p.Handle
+		}
 		return p.Probe
 	case jobspec.Pull:
 		return p.Path + " -> artifact " + p.Artifact

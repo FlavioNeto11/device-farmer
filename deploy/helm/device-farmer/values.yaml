@@ -35,6 +35,14 @@ image:
 
 imagePullSecrets: []
 
+# Every object in this release is named <fullname>-<something>, and <fullname>
+# is this override, or "<release>-device-farmer", or just the release name when
+# it already contains "device-farmer". Keep it to 55 characters: the migration
+# hook Job is named <fullname>-migrate and nothing trims it, while Kubernetes
+# copies a Job's name into a label whose values stop at 63. Past 55 the render
+# is refused rather than the install failing at the hook on an error about a
+# label. The other names trim the release prefix and keep their suffix, so the
+# nine roles stay distinguishable at any length.
 nameOverride: ""
 fullnameOverride: ""
 
@@ -80,12 +88,30 @@ auth:
   #
   #   tokens: "s3cr3t:operator:ci,readonly:tenant:dash"
   #
-  # WITHOUT THIS, THE CONTROL PLANE IS OPEN: every caller is granted the
-  # operator role, which can revoke leases, drain hosts and cut power to a USB
-  # port that is holding a live job. NOTES.txt says so again, louder, and
-  # deploy/helm/README.md explains how to ask the server which authenticator
-  # it actually installed — a build that has the token wiring in place refuses
-  # to start on a network listener instead of serving open.
+  # LEAVING BOTH OF THESE EMPTY IS REFUSED at render time, and the refusal names
+  # the third way out. Without a token list the api has no authenticator to
+  # install, and it will not serve an open control plane on a listener the
+  # network can reach — templates/configmap.yaml pins FARM_API_ADDR to 0.0.0.0,
+  # so that is the only listener this chart has. The pods would be in
+  # CrashLoopBackOff and `helm install --wait` would sit there until its own
+  # timeout, whose message mentions no token at all.
+  #
+  # To serve an OPEN control plane on purpose — an evaluation farm, a demo, a
+  # laptop — say so instead of leaving these empty:
+  #
+  #   config:
+  #     extra:
+  #       FARM_API_ALLOW_ANONYMOUS: "true"
+  #
+  # That is the variable internal/api/auth_wiring.go reads, and it goes through
+  # config.extra because the environment is the ConfigMap's to own. Every caller
+  # that can then reach the api holds the operator role: it can revoke a live
+  # lease, cancel a job, drain a host and cut power to a port that is holding a
+  # running job. Setting it AND a token list is refused too — farmd refuses that
+  # pair at startup rather than guess which half the operator meant.
+  #
+  # deploy/helm/README.md explains how to ask the server which authenticator it
+  # actually installed, which is a property of the image and not of these values.
   #
   # SETTING THIS *AND* existingSecret IS REFUSED at render time. existingSecret
   # would win and this value would reach no pod, so editing it to revoke a
@@ -271,13 +297,30 @@ migrate:
   enabled: true
   # Hook weights. The hook Secret carrying the DSN is -10, the Job is -5, so
   # the credential exists before the Job that needs it.
+  #
+  # ANYTHING AT OR BELOW -10 IS REFUSED at render time. That -10 is a literal in
+  # templates/secret.yaml and cannot follow this value, so a Job that does not
+  # sort strictly after it starts with a secretKeyRef pointing at nothing: the
+  # pod stops at CreateContainerConfigError, no container runs, and there are no
+  # logs to read while Helm waits out its hook timeout.
   hookWeight: -5
   # A failed migration must stop the rollout: Helm aborts the release and no
   # workload is ever pointed at a schema it does not understand. The failed
   # Job and its pod are kept so `kubectl logs` still has something to show;
   # the next attempt deletes them before creating its own.
   backoffLimit: 1
-  # Overall deadline for the run, passed to `farmd migrate -timeout`.
+  # Overall deadline for the run, passed to `farmd migrate -timeout`. It is the
+  # binary's own default surfaced here, not a chart choice.
+  #
+  # BOTH DEADLINES BELOW SIT OUTSIDE HELM'S. `helm install/upgrade` waits on
+  # hooks with --timeout, which defaults to 5m, so a migration that runs longer
+  # than five minutes is reported as a failed release while it is still running
+  # and would still have succeeded. Worse, the obvious next move makes it real:
+  # a retry deletes the running Job through before-hook-creation
+  # (templates/migrate-job.yaml), which garbage-collects its pod mid-statement.
+  # No migration this project ships today comes close — they are DDL against an
+  # empty schema — but if one ever does, pass `--timeout` above
+  # activeDeadlineSeconds rather than lowering these.
   timeout: 10m
   # How long to wait for the migration advisory lock. Two farmd migrate Jobs
   # racing in one cluster serialise on it rather than both trying to
@@ -645,6 +688,13 @@ fenceProxy:
 # other role's counters at a permanent 0.
 metricsService:
   enabled: true
+  # Fixed at 9090, and CHANGING IT IS REFUSED at render time. This renders the
+  # Service's port and targetPort; the other end of the wire is the literal
+  # FARM_METRICS_ADDR ":9090" in templates/configmap.yaml, which reads no value.
+  # Moving this alone points the Service at a port nothing binds — every scrape
+  # target goes up == 0 and all farm_* series stop, with nothing in the render or
+  # the lint to say so. A site that needs another number has to change the
+  # ConfigMap too, and then the guard in _helpers.tpl is what to delete.
   port: 9090
   labels: {}
   annotations: {}
@@ -653,7 +703,10 @@ serviceMonitor:
   # Requires the Prometheus Operator CRDs. Scrapes the headless metrics Service,
   # which covers EVERY role — one target per pod, each series labelled with the
   # role that produced it. See the comment in templates/servicemonitor.yaml.
-  # Needs metricsService.enabled.
+  #
+  # Needs metricsService.enabled, and turning this on without it IS REFUSED: the
+  # monitor selects a Service nobody rendered, Prometheus discovers no targets,
+  # and not even up == 0 fires, because there is no target to be down.
   enabled: false
   namespace: ""
   interval: 30s

@@ -33,7 +33,7 @@ been refused before this file builds a name out of it.
 {{- $ := . }}
 {{- range $host := .Values.hosts }}
 {{- if and $host.service $host.service.enabled }}
-{{- $svc := printf "%s-%s-adb" (include "device-farmer.fullname" $) $host.id | trunc 63 | trimSuffix "-" }}
+{{- $svc := include "device-farmer.componentName" (dict "ctx" $ "component" (printf "%s-adb" $host.id)) }}
 {{- $port := default 5037 $host.service.port }}
 {{- $addr := $host.service.address }}
 {{/* The same classifier the guard used, so the object and the check cannot disagree. */}}

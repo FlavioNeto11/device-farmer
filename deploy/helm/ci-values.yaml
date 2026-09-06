@@ -8,6 +8,10 @@
 database:
   dsn: postgres://farm:ci@postgres.ci.svc:5432/device_farmer?sslmode=disable
 
+# Not decoration: a release with neither auth.tokens nor auth.existingSecret is
+# refused unless it asks for an open control plane by name, because the api
+# would not start. This is the shape a real farm installs with, so it is the
+# shape CI renders.
 auth:
   tokens: "ci-token:operator:ci,ci-dash:tenant:dashboard"
 

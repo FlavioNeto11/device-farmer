@@ -4,6 +4,13 @@ The schema migration ran as a pre-install/pre-upgrade hook. If you are reading
 this, it succeeded: `farmd migrate up` exited 0 before any workload was
 created or updated.
 
+The workloads themselves have only been APPLIED. Unless you passed --wait, Helm
+prints this the moment the API server accepts the manifest — before an image is
+pulled and before any farmd process has read its configuration — so nothing
+below is a report that the farm is serving. This is:
+
+  kubectl -n {{ .Release.Namespace }} rollout status deploy/{{ include "device-farmer.componentName" (dict "ctx" $ "component" "api") }}
+
 REACH THE DASHBOARD
 {{- $svc := printf "%s-api" (include "device-farmer.fullname" .) }}
 {{- if .Values.api.ingress.enabled }}
@@ -44,10 +51,15 @@ REACH THE DASHBOARD
   ############################################################################
   ############################################################################
   ##                                                                        ##
-  ##   THIS CONTROL PLANE IS OPEN. NO API TOKENS WERE CONFIGURED.           ##
+  ##   THIS CONTROL PLANE IS OPEN. THIS RELEASE ASKED FOR IT BY NAME.       ##
   ##                                                                        ##
   ############################################################################
   ############################################################################
+
+  {{ include "device-farmer.openOnPurpose" . }}
+
+  That is the only way to get here: a release with no tokens and no such
+  statement is refused at render time, because the api would not have started.
 
   Every caller that can reach port {{ .Values.api.service.port }} is granted the OPERATOR role.
   That is not a read-only dashboard. An operator can:
@@ -63,16 +75,26 @@ REACH THE DASHBOARD
   In a farm running multi-hour jobs, one unauthenticated request destroys
   hours of work on a phone somebody else is using.
 
-  Fix it now:
+  Close it. Withdraw the opt-in in the SAME command that adds the credentials —
+  farmd refuses a manifest that both lists tokens and asks to run open, so the
+  two edits do not work one at a time:
 
     helm upgrade {{ .Release.Name }} <chart> --reuse-values \
-      --set auth.tokens='<token>:operator:ci,<token>:tenant:dashboard'
+      --set config.extra.FARM_API_ALLOW_ANONYMOUS=null \
+      --set config.extra.FARM_API_AUTH=null \
+      --set auth.tokens='<token>:operator:ci'
 
-  or, keeping the tokens out of your values and your shell history:
+  One token per --set: helm splits that flag's value on commas, so a second
+  entry written inline arrives as a key with no value and the upgrade fails
+  before it starts. A list belongs in a values file.
+
+  Or keep the tokens out of your values and your shell history entirely:
 
     kubectl -n {{ .Release.Namespace }} create secret generic farm-api-tokens \
       --from-literal=FARM_API_TOKENS='<token>:operator:ci'
     helm upgrade {{ .Release.Name }} <chart> --reuse-values \
+      --set config.extra.FARM_API_ALLOW_ANONYMOUS=null \
+      --set config.extra.FARM_API_AUTH=null \
       --set auth.existingSecret=farm-api-tokens
 
   Until then, treat port {{ .Values.api.service.port }} as privileged: keep the Service ClusterIP

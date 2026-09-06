@@ -1,4 +1,4 @@
-# Scrape config for the split-role compose deployment.
+# Scrape config for the compose deployment — both shapes of it.
 #
 # Every farmd role serves /metrics on 9090 inside the compose network — not
 # only the api. Before that was true, the api process was the only scrape
@@ -10,8 +10,35 @@
 # present.
 #
 # The roles are listed one job each rather than one job with six targets, so a
-# rule can say "the reaper" without a label matcher, and so a role that is not
-# deployed is a missing job rather than a target that never comes up.
+# rule can say "the reaper" without a label matcher.
+#
+# EVERY job is DNS service discovery, including the ones with a single target,
+# and that is the whole reason this file can be one file. It is bind-mounted
+# unparameterised, identical under every profile, and the profiles are
+# exclusive: `--profile farm --profile metrics` has no demo service and
+# `--profile demo --profile metrics` has none of the roles. A static_config
+# naming a service that this profile did not start is a target that is red
+# forever — and a permanently red /targets page teaches an operator to stop
+# reading it, which is the exact habit docs/runbooks/alerting-blind.md argues
+# against. A dns_sd job whose name does not resolve contributes NO target at
+# all, so there is nothing to read as broken and up{job="farmd-reaper"} is
+# genuinely absent, which is what absent() is for. Measured:
+# `--profile demo --profile metrics` shows exactly one target, farmd-demo, up;
+# `--profile farm --profile metrics` shows nine, all up, and no red row.
+#
+# The cost is log noise, and it is worth knowing the size of. Docker's embedded
+# resolver does not answer NXDOMAIN for a service it does not have — the query
+# times out — so each unresolved job costs one WARN ("DNS resolution failed …
+# i/o timeout") per 30s discovery refresh in the PROMETHEUS container's log,
+# and nothing in farmd's. On a farm that is two lines every thirty seconds
+# (farmd-demo and farmd-node); on the demo it is nine, which is the shape where
+# a Prometheus is optional anyway.
+#
+# dns_sd also gets the replica case right for free: compose's DNS returns every
+# container behind a service name, so a scaled role is scraped once per
+# process rather than once per round-robin answer. That matters for every
+# farm_* counter, which are per process — verified with jobrunner at two
+# replicas, which appears as two targets under one job.
 
 global:
   scrape_interval: 15s
@@ -19,35 +46,52 @@ global:
 
 scrape_configs:
   - job_name: farmd-api
-    static_configs:
-      - targets: ["api:9090"]
-        labels: { role: api }
+    dns_sd_configs:
+      - names: ["api"]
+        type: A
+        port: 9090
+    relabel_configs:
+      - target_label: role
+        replacement: api
 
   - job_name: farmd-scheduler
-    static_configs:
-      - targets: ["scheduler:9090"]
-        labels: { role: scheduler }
+    dns_sd_configs:
+      - names: ["scheduler"]
+        type: A
+        port: 9090
+    relabel_configs:
+      - target_label: role
+        replacement: scheduler
 
   - job_name: farmd-reaper
-    static_configs:
-      - targets: ["reaper:9090"]
-        labels: { role: reaper }
+    dns_sd_configs:
+      - names: ["reaper"]
+        type: A
+        port: 9090
+    relabel_configs:
+      - target_label: role
+        replacement: reaper
 
   - job_name: farmd-recovery
-    static_configs:
-      - targets: ["recovery:9090"]
-        labels: { role: recovery }
+    dns_sd_configs:
+      - names: ["recovery"]
+        type: A
+        port: 9090
+    relabel_configs:
+      - target_label: role
+        replacement: recovery
 
   - job_name: farmd-watchdog
-    static_configs:
-      - targets: ["watchdog:9090"]
-        labels: { role: watchdog }
+    dns_sd_configs:
+      - names: ["watchdog"]
+        type: A
+        port: 9090
+    relabel_configs:
+      - target_label: role
+        replacement: watchdog
 
-  # Scaled to two replicas in docker-compose.yml. Compose's DNS returns every
-  # container behind the service name, and dns_sd_configs follows all of them,
-  # so both jobrunners are scraped rather than whichever one the round robin
-  # happened to answer with. That matters for farm_jobrunner_* counters, which
-  # are per process.
+  # Scaled to two replicas in docker-compose.yml, and the one job that always
+  # needed DNS discovery rather than a name and a port.
   - job_name: farmd-jobrunner
     dns_sd_configs:
       - names: ["jobrunner"]
@@ -57,16 +101,47 @@ scrape_configs:
       - target_label: role
         replacement: jobrunner
 
-  # Present in the compose file only when the janitor service is deployed; a
-  # missing job here is louder than a target that never answers.
   - job_name: farmd-janitor
-    static_configs:
-      - targets: ["janitor:9090"]
-        labels: { role: janitor }
+    dns_sd_configs:
+      - names: ["janitor"]
+        type: A
+        port: 9090
+    relabel_configs:
+      - target_label: role
+        replacement: janitor
+
+  # The charge policy is the software half of the lithium mitigation, and it
+  # runs in the farm profile and inside the demo's single process. Scraped
+  # under its own job so farm_chargepolicy_skipped_total{reason="no_client"} —
+  # the counter that says the loop is running and holding nothing — is
+  # readable without knowing which shape produced it.
+  - job_name: farmd-chargepolicy
+    dns_sd_configs:
+      - names: ["chargepolicy"]
+        type: A
+        port: 9090
+    relabel_configs:
+      - target_label: role
+        replacement: chargepolicy
+
+  # Behind its own profile and off by default, so on almost every farm this
+  # job resolves to nothing. See the node service in docker-compose.yml.
+  - job_name: farmd-node
+    dns_sd_configs:
+      - names: ["node"]
+        type: A
+        port: 9090
+    relabel_configs:
+      - target_label: role
+        replacement: node
 
   # The laptop path: one process running every loop. Scraped under its own job
   # so a demo's numbers are never mistaken for a farm's.
   - job_name: farmd-demo
-    static_configs:
-      - targets: ["demo:9090"]
-        labels: { role: demo }
+    dns_sd_configs:
+      - names: ["demo"]
+        type: A
+        port: 9090
+    relabel_configs:
+      - target_label: role
+        replacement: demo

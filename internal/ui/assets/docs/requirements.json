@@ -1,7 +1,7 @@
 {
   "area": "requirements",
   "title": "Every requirement raised for this system, where it came from, and whether it holds",
-  "summary": "One hundred and one requirements — functional and non-functional — mined from nine commits, the 88 gap entries on the six pages beside this one, the migrations that are the real contract, and three external findings that never touched the code. Each carries an origin, a status verified against this tree rather than copied from the commit that claimed it, and the command that decided it.\n\nSeventy-one rows are `met` outright and ten more are `met` in one dimension and open in another. Seventeen remain genuinely open, and the honest headline is what separates them: three need a rack. The binary has now been run on Linux — kernel 6.18, PostgreSQL 18 — where topology discovery, enrollment and the node agent all executed for the first time and where a startup panic that made every role unstartable was found. What is left needs hardware: `USBDEVFS_RESET` against a handset and `uhubctl` against a hub with switchable VBUS. Eight more rows are reporting — an operator can find out what happened, sometimes only through `psql`. Six are named and deliberately not done.\n\nRead it for three things the area pages cannot show. The couplings: `OPS-04` was one guard in `runNode` blocking four separate requirements, which is why it led the list and why four rows moved with it. The wrong remedies — a surface that tells an operator something is protected when it is not is worse than a documented absence, and this register found four of them. And the requirements with no code at all: managed device clouds are excluded by four suppliers' contracts, so owning the hardware is the path.",
+  "summary": "One hundred and one requirements — functional and non-functional — mined from nine commits, the 88 gap entries on the six pages beside this one, the migrations that are the real contract, and three external findings that never touched the code. Each carries an origin, a status verified against this tree rather than copied from the commit that claimed it, and the command that decided it.\n\n**Eighty-six rows are `met` outright**, eleven more are `met` in one dimension, three are `decided`, and **one is open**: tiers 3 and 4 against real hardware. There is no phone attached to the machine this was built on. Everything leading to `USBDEVFS_RESET` and `uhubctl` is written, tested, and has been run on Linux — discovery reads a hub's per-port switchability from the kernel's own file mode — but reading that a port can be switched is not switching it, and this register does not pretend otherwise.\n\nRead it for three things the area pages cannot show. The couplings: one guard in `runNode` once blocked four separate requirements. The wrong remedies — a surface that tells an operator something is protected when it is not is worse than a documented absence, and this register has found five of them, the most recent being a reference spec in the Docs tab that told operators to check a detached exit code with `cat`, which judges `cat`. And the drift: seven rows in the last round were already closed and this file had not caught up, describing a system worse than the one that exists.",
   "sections": [
     {
       "heading": "Why this page exists, and what a status means on it",
@@ -46,8 +46,8 @@
       "source": "REQUIREMENTS.md"
     },
     {
-      "heading": "Last re-verified: against HEAD, 2026-09-05, and on Linux for the first time — 35 rows moved",
-      "body": "Against `HEAD`, 2026-09-05, after thirty branches landed and after the first\ntime this tree was ever run on Linux. **Thirty-five rows moved**, all forward.\nSeventy-one are `met` outright, ten more are `met` in one dimension and open in\nanother, three are `decided`, and **seventeen remain genuinely open**.\n\nThe largest single cause was not a commit. It was running the shipped binary on\na Linux host — WSL2, kernel 6.18, PostgreSQL 18 — which is where the code that\nhad been marked `linux_only` for the whole life of this register actually lives.\nFour things came out of forty minutes of that:\n\n1. **A defect that made every role unstartable.** `newRegistry` registered the\n   process and Go collectors twice and the second call was `MustRegister`, so\n   `farmd api` — and every other role — panicked before serving anything. Build,\n   vet, gofmt and the full suite were green throughout, because nothing in the\n   tree CALLED `newRegistry`; the test that guards it reads its SOURCE. Windows\n   hid half of it, because `NewProcessCollector` describes nothing off Linux.\n   `cmd/farmd` now has tests that call the function.\n2. **`topo.Sysfs` ran for the first time.** All eighteen topology tests hand\n   `FromFS` an `fstest.MapFS`; the binary calls `Sysfs`, which refuses off Linux\n   and then reads through `os.DirFS`. Against a sysfs-shaped tree on a real\n   filesystem it wrote one hub, seven slots and a `per_port` power domain — and\n   read `vbus_switchable` from the real file MODE on each port's `disable`,\n   which is the one fact a MapFS can only assert into being.\n3. **The enrollment loop took every branch of its decision tree**, including the\n   two that matter: a contested serial ADOPTED with a warning naming what a\n   human must confirm, and seven devices at positions discovery had not\n   registered recorded as sightings and adopted as nothing.\n4. **The schema runs on PostgreSQL 18**, not only the 17 on the dev box. Empty\n   database, migrated to v17 by the shipped binary, 11/11 assertion suites\n   PASSED. A schema is a contract with a specific server, and this one had only\n   ever been checked against one.\n\nAnd the invariant held where it counts. On the Linux farm, every lease that\nended did so `completed` (7) or by `max_runtime` (4) — a deadline a user wrote\ndown — while `farm_adb_transport_blips_total` recorded twelve transport failures\nsurvived on a device that went offline mid-lease. Zero connectivity endings.\nThat is the whole thesis of the project, observed on the platform it ships for.\n\nSix earlier moves close what a reader would otherwise have called the project\nunfinished: `LEASE-09` (the witness, watched writing `witness_at` thirty seconds\ninto a hundred-second step), `LEASE-05` (the reaper's blind spot), `LEASE-03` (a\nrole firewall nothing assumed), `SEC-04`, `SEC-07` and `REC-08`.\n\nTwo rows moved because the register was WRONG rather than because the tree\nchanged: `JOB-06` and `JOB-07` were `not_built` against a tree that already had\nthem. A register only ever revised downward is not being checked.\n\nEvery moved row names the file, migration or live observation that moved it, so\na reader can re-run the check rather than trust the verdict.\n\n### What is still open\n\nSeventeen rows, in three groups, and only the last two are work anybody can do\nat a desk:\n\n**Needs a rack** — `REC-03`, `HW-05`, `JOB-04`. What is left here is genuinely\nphysical: `USBDEVFS_RESET` against a real handset, `uhubctl` against a real hub\nwith switchable VBUS, and a checkpoint-resume across a real interruption. The\nLinux run took the surrounding code as far as it can go without hardware. The\nten rows marked `met` in one dimension — `LEASE-07`, `LEASE-11`, `REC-02`,\n`REC-06`, `SEC-04`, `DEV-04`, `DEV-05`, `HW-02`, `HW-03`, `OPS-04` — are mostly\nthis same sentence said about a narrower thing.\n\n**Reporting and small surfaces** — `LEASE-14`, `JOB-08`, `JOB-10`, `API-06`,\n`API-07`, `SEC-03`, `OBS-10`, `TEST-03`. An operator can find out what happened,\nbut sometimes only through `psql`.\n\n**Named and deliberately not done** — `LEASE-10`, `LEASE-13`, `DEV-02`,\n`DEV-07`, `JOB-03`, `SEC-05`. Each row says why.",
+      "heading": "Last re-verified: against HEAD, 2026-09-06 — 86 of 101 met, one row open",
+      "body": "Against `HEAD`, 2026-09-06, after forty-four branches. **Eighty-six rows are\n`met` outright**, eleven more are `met` in one dimension, three are `decided`,\nand **one is open**.\n\n### The one open row\n\n`REC-03` — tiers 3 and 4 against real hardware. `HW-05` is the same sentence\nabout a narrower thing. There is no phone attached to the machine this was\nbuilt on, and no amount of further code changes that: `USBDEVFS_RESET` has\nnever been issued against a handset, and `uhubctl` has never cut VBUS on a\nhub. Everything leading to those two calls is written, tested, and has now been\nRUN on Linux — `scripts/linux-acceptance.sh` starts `farmd node` against a\nsysfs-shaped tree on a real filesystem, and discovery reads a hub's per-port\nswitchability from the kernel's own file mode on each port's `disable`. Reading\nthat a port CAN be switched is not switching it, and this register will not\npretend otherwise.\n\n### What moved, and why sixteen rows moved at once\n\nSixteen rows closed in this round, and they divide into two kinds that are worth\nkeeping apart.\n\n**Seven were already closed and the register had not caught up.** `LEASE-14`\nwas fixed by `00007`'s ledger trigger; `DEV-02` by `00011`'s rewrite of rung 3;\n`DEV-07` when all thirteen topology knobs were wired; `API-07` when `ctl` began\nposting to `/specs/validate`; `SEC-03` when the identity started reaching\n`farm.audit_log`; `JOB-08` when the step routes were mounted; and half of\n`LEASE-10` when the alert and its runbook shipped. Their evidence cited code\nthat had been replaced, in one case three migrations earlier. A register that is\nonly ever revised downward is not being checked, and this one had been drifting\nupward — describing a system worse than the one that exists — for long enough\nthat a reader would have distrusted the rows that were still true.\n\n**Nine were closed by work in this round**, and three of those were not on\nanybody's list until an agent went looking:\n\n- **`SEC-05` was open by a door nobody had tried.** The lease listing was clean,\n  but `00009` wrote `prior_instance` and `new_instance` into a\n  `lease_reattached` event, and `GET /api/v1/events` projected `detail`\n  verbatim — republishing `lease_id` + `fence` + `holder_instance` in one\n  record, to an operator token that is unscoped across every tenant, and into\n  the dashboard timeline. The comment in `internal/api/leases.go` that skipped a\n  tenant check on renew was *justifying itself* on the claim this broke.\n- **`JOB-03` was narrower than recorded and its documented remedy did not\n  work.** The exit status was read at launch and on re-attach; a soak that died\n  at hour four was still green. And the reference spec shipped in the Docs tab\n  told operators to check it with `cat …result` and `expect_exit: [0]`, which\n  judges `cat`.\n- **`JOB-10` was in direct tension with a sibling requirement**, and nothing\n  arbitrated. `TestABookkeepingFailureIsNeverAVerdictOnTheJob` pins that a\n  swallowed write is not a verdict; `JOB-10` forbids the `succeeded` that\n  produces. The resolution is to WITHHOLD the verdict rather than downgrade it:\n  the job keeps `running`, which is the absence of a verdict, so both hold.\n\n### What the round is actually worth\n\nFourteen units landed as fourteen PRs, and the number that matters is not that.\nIt is that **four separate defects were found by running the thing rather than\nby reading it**, and every one was invisible to a green suite:\n\n- Every role panicked at startup on a duplicate metrics registration, while\n  `go build`, `go vet`, `gofmt` and the whole suite stayed green — because\n  nothing called `newRegistry`. Found by starting the binary on Linux.\n- `topo.Sysfs` had never executed: all eighteen topology tests hand `FromFS` an\n  `fstest.MapFS`, and the shipped binary reads through `os.DirFS`, taking a\n  hub's switchability from a file MODE a MapFS can only assert into being.\n- The dashboard never receives a live stream on any farm with tokens set,\n  because `EventSource` cannot send headers. Found while adding a column to it.\n- The schema had only ever been checked against one PostgreSQL major.\n\nAnd three tests were found to be passing for the wrong reason — one asserting on\n`encoding/json` instead of the code under test, one matching the wrong line of\nthe file it scanned, one whose clock made its own falsification undetectable.\nAll three were written in this session, by the same process that then caught\nthem. That is what the falsify-every-assertion rule is for, and it earned its\ncost four times over.\n\nEvery moved row names the file, migration or live observation that moved it, so\na reader can re-run the check rather than trust the verdict.",
       "source": "REQUIREMENTS.md"
     },
     {
@@ -143,8 +143,8 @@
             "LEASE-10",
             "A protected lease is never auto-reclaimed; it is held and a human is paged.",
             "`schema`, `gap:lease.7`",
-            "`partial`",
-            "The behaviour is correct — proved separately by inserting leases with past deadlines. Its regression test is not watching it: assertion P10 cannot move `expires_at` backwards (the guard trigger forbids it), so `lease_mark_suspect` and `lease_reclaim` both match zero rows and the assertion passes trivially. Deleting `AND l.protected = false` from `lease_reclaim` would not fail the suite. And nobody is paged: \"hold and page\" is one WARN line plus two unexported counters."
+            "`met`",
+            "The guard has been in `farm.lease_reclaim` since `00012` (`AND l.protected = false  -- hold and page instead`), and the paging is real: `farm_lease_suspect{protected=\"true\"}` is pre-seeded so it exists before the first casualty, `DeviceFarmerProtectedLeaseSuspect` reads it, and `docs/runbooks/protected-lease-suspect.md` says what to do. What was missing was a test that could fail. `test/assertions_protected_lease.sql` INSERTs a protected suspect lease with deadlines already past — legal because `leases_guard` is BEFORE UPDATE only — beside an identical UNPROTECTED sibling, and asserts the control was reclaimed and the protected one was not. Without the control, \"nothing was reclaimed\" also means \"nothing was reclaimable\". Falsified: deleting the guard leaves eleven suites green and fails this one alone. `test/e2e/reaper_test.go` proves the same against the real reaper process, in 0.25s."
           ],
           [
             "LEASE-11",
@@ -164,15 +164,15 @@
             "LEASE-13",
             "`FARM_REAPER_COMPONENTS` cannot be set to something that fuses the health clock into the lease clock.",
             "`c:9ab3520`, `gap:lease.11`",
-            "`partial`",
-            "The config refuses to *omit* a renewal-path component. Nothing refuses to *add* one. Adding `watchdog` — which reads like more thorough monitoring — makes a health-plane outage extend every lease in the farm, which is the exact fusion this system exists to prevent. Prohibited in two doc comments, enforced nowhere."
+            "`met`",
+            "`internal/config` now refuses a `FARM_REAPER_COMPONENTS` carrying a health-plane component, with a deny list derived from `roleComponents` filtered by `!onRenewalPath` so a component added to a role is refused the day it is added. It is a deny list and not `!onRenewalPath(name)` because the latter would break the legitimate renames the existing guard exists for (`api-canary`, `scheduler-a`). A second guard catches the case a name list cannot: a watchdog RENAMED to `wd` beats as `wd:h01`, a name that has a heartbeat row, and the reaper's config cannot know what another process was renamed to — so the refusal is made on the process that owns the rename. Refuses to BOOT, on every role. The stakes are in the message: `00012:119-129` extends every live lease by the gap and pushes `quiesce_until`, so a watchdog outage would move every deadline in the farm."
           ],
           [
             "LEASE-14",
             "The way a lease ended is recoverable from an event log at 3am.",
             "`gap:lease.2`",
-            "`partial`",
-            "`farm.events` is not that log. Measured: 1239 leases with `released_at` set, 0 `lease_released` events, 0 `lease_reclaimed`, 1 `lease_revoked`. `sweepMaxRuntime` writes no event at all, and the 1637 `lease_acquired` rows were written by the demo. The authoritative record is `farm.leases.state` plus `release_reason`."
+            "`met`",
+            "`migrations/00007_lease_events.sql` installs `farm.trg_leases_ledger()`, an AFTER UPDATE OF state trigger whose `WHEN` covers all four ending paths because each writes `state` in the same UPDATE, writing one `lease_ended` row with `release_reason`, `ended_by`, `terminal_state`, `held_seconds`, `heartbeat_age_s` and the witness columns — in the same transaction as the ending, plus the view `farm.v_lease_endings`. The register's evidence (\"0 lease_released events\") predated that migration. What was missing was a reader: `GET /api/v1/leases/endings`, `GET /api/v1/leases/{id}/ending` and `ctl endings` serve it now, and `00018` grants SELECT on the view to `farm_reaper` while REVOKING it by name from `farm_watchdog` and `farm_parker` — a view is read with its OWNER's rights, so granting this one to the watchdog would reopen the #663 firewall through a view-shaped hole without touching a single grant on `farm.leases`."
           ]
         ]
       },
@@ -201,8 +201,8 @@
             "DEV-02",
             "One function owns `is this the device we think it is`, resolving strongest evidence first.",
             "`c:91f3aa2`",
-            "`partial`",
-            "`farm.resolve_device` is that function and the ladder is right. Rung 2 works now: the `min(uuid)` call that raised 42883 on the second-strongest identity signal — in exactly the duplicate-fingerprint case it exists to adjudicate — was rewritten to count and fetch separately (`migrations/00005_correctness.sql:16`). Rung 3 is still wrong: it sets `v_res := 'ambiguous'` but leaves `v_dev` NULL, and rung 4 tests only `IF v_dev IS NULL`, so a clone serial in an empty slot is reported to the caller as adopted rather than flagged. `gap:devices.1`"
+            "`met`",
+            "The register described `00005`'s body; the live definition is `00011`. Rung 3 no longer parks its verdict in `v_res` — ambiguity has its own carrier (`v_amb`), because `v_res` is what each rung overwrites — and rung 4 re-checks AFTER the INSERT, which is the case the register's scenario actually hits: the second clone of a duplicated serial sees `count = 1` at its own lookup, so the collision is only visible post-insert. Covered non-trivially by `test/assertions_v11.sql` V2, V5 and V6."
           ],
           [
             "DEV-03",
@@ -236,8 +236,8 @@
             "DEV-07",
             "A slot is marked, never deleted, and a hub that vanishes is reconciled.",
             "`schema`, `gap:devices.6`",
-            "`not_built`",
-            "Marking works. Reconciliation is off in every shipped deployment: `topo.Config`'s `RetireVanished`, `Overrides`, `IncludeRootHubs`, `AdoptEmpty`, `MinPorts`, `DryRun` and `MaxRetireFraction` are wired to no config field or flag. A hub you unplug leaves its slots `active` forever."
+            "`met`",
+            "All thirteen `topo.Config` fields reach the binary through `FARM_TOPO_*`, validated and printed by `Summary()`; `reconcileRemovals` is reachable, applies its mass-removal bound, and marks rather than deletes (`state = 'maintenance'` with a `slot_vanished` event and an audit row in one transaction). `RetireVanished` defaults OFF and that is a documented decision, stated in three places: the first pass a new deployment runs is against a host whose slots were seeded by hand, with USB paths that may not match what the scan sees, and reconciliation would retire the lot — the mass-removal bound catches most of that, and a host with one seeded slot is under it. What remains is operational, not code: an out-of-the-box deployment leaves a vanished port as an active empty slot until an operator turns the knob on."
           ],
           [
             "DEV-08",
@@ -317,15 +317,15 @@
             "JOB-03",
             "Long work runs detached on the device so no socket is the source of truth.",
             "`README`, `c:cf1b690`",
-            "`partial`",
-            "Implemented, and the demo's own soak was rewritten from 2000 ADB round trips into one detached command plus a poll. The exit code is never checked: `execShellDetached` returns once the launch succeeds and `reattachDetached` only tests `result_path` for existence. A detached command that exited 137 produces a green step and a green `wait_for`. `gap:jobs.10`"
+            "`met`",
+            "A detached run's exit status was read at launch and on re-attach, and nowhere else — so a soak that started cleanly and exited 137 four hours later produced a green step AND a green `wait_for`, because `execWaitFor` judged the operator's probe and the canonical probe is `test -f …result`. `jobspec.WaitFor` now takes a `handle` naming a `shell_detached` step declared earlier in the same spec, and `execWaitForDetached` polls that run's status through the same `probeDetached` a re-attach uses. The probe form is untouched, so no existing spec changes meaning. `running` is no longer inferred from the log file — which nothing removes, so a worker killed from outside looked identical to a soak in its third hour — but from the pid file checked against `/proc`, deliberately not `kill -0`, which cannot tell a dead process from a shell lacking signal 0. Falsified differentially: one device, one status sequence, both forms — the probe form passes a killed soak, the handle form catches it. The demo's soak spec, the README's front-door spec and `jobs.json`'s reference spec all taught the broken pattern and were rewritten; `cat …result` with `expect_exit: [0]` judges `cat`."
           ],
           [
             "JOB-04",
             "A job checkpoints and resumes, re-running nothing whose side effect would repeat.",
             "`c:40c03e4`",
-            "`unverified`",
-            "The code is there and the idempotent flag it keys on is there. The demo has never exercised the resume path. `internal/runner` has no test files, and `runner.Conn` is documented as an interface specifically so `planResume` and `isRetryable` could be driven by a fake — that fake does not exist. `gap:jobs.7`"
+            "`met`",
+            "`planResume`'s decisions were covered by nine tests on hand-built `Checkpoint` literals; the round trip they depend on — `saveCheckpoint` → `farm.jobs.checkpoint` jsonb → `parseCheckpoint` → `belongsTo` → `planResume` — had never run, and `saveCheckpoint` had no test at all, including the fence guard that stops a zombie holder overwriting the progress of the attempt that replaced it. `internal/runner/checkpoint_db_test.go` drives `Runner.Run` TWICE against one job with an eviction in between, against a real database and without adding a seam to make it testable. Falsified: relaxing the fence guard fails with `a holder at fence 7 overwrote the progress of the attempt at fence 8`; ignoring `plan.skip` fails with `the replacement re-ran a step that had already finished`."
           ],
           [
             "JOB-05",
@@ -352,8 +352,8 @@
             "JOB-08",
             "An operator can see which step failed, and what it printed, without a database session.",
             "`gap:jobs.4`",
-            "`not_built`",
-            "`farm.job_steps` and `farm.job_attempts` — the two tables built to answer \"which step failed\" and \"is this a job problem or a device problem\" — have no route. `GET /api/v1/jobs/{id}` returns exactly two keys. `ctl job <id>` prints the spec and the lease history. The SSE `job` digest carries five fields, none of them a step."
+            "`met`",
+            "`GET /api/v1/jobs/{id}/steps` and `/attempts` are served from `internal/api/jobsteps.go` and mounted through `api.WithRoutes`, carrying `State`, `ExitCode`, `Output`, `Error` and `Detail`, with `OutputChars`/`OutputTruncated`/`OutputOmitted` so a cut log never reads as an empty one; `ctl job steps` renders the failing step's output. All three residuals are closed too: 605 lines of read surface that nothing asserted now have `jobsteps_test.go`, including the truncation budget tuned against measured 144 MB responses; the SSE digest carries the current step, excluding `skipped` tails and `continue_on_error` failures from the failure rank because neither is where the job IS; and the dashboard has a Steps panel."
           ],
           [
             "JOB-09",
@@ -366,8 +366,8 @@
             "JOB-10",
             "A job's reported state agrees with its step rows.",
             "`gap:surface.4`",
-            "`partial`",
-            "It does not. Reproduced twice: an `install` whose push failed left step 1 at `running`, step 2 never created, `farm.jobs.state` = `succeeded`, and the lease released `completed`. The API will tell you a job succeeded when its APK never landed. The `farm.device_artifacts` ledger is the only place the truth survives."
+            "`met`",
+            "A job reached `succeeded` without anything consulting its step rows, and two branches never recorded the steps they skipped, so a `max_runtime` abort left no rows at all for the remainder. Both branches record now, and a guard before `writeJobState(…, \"succeeded\")` asks `farm.job_steps` — not the loop's own counters — whether the rows account for the whole spec. The verdict is WITHHELD rather than downgraded, which is what makes this compatible with `TestABookkeepingFailureIsNeverAVerdictOnTheJob`: nothing is written, the job keeps `'running'` — the ABSENCE of a verdict — so a swallowed bookkeeping write still decides nothing about the job, and `succeeded` is still never claimed without evidence. The operator gets an ERROR line, a reason on `farm.jobs.error`, and a `job_success_not_asserted` event; the janitor places the job again. `sweepUnevidencedSuccess` covers terminal jobs, which the old sweep could not see — it was bounded by `state = 'running'`."
           ],
           [
             "JOB-11",
@@ -427,7 +427,7 @@
             "Tiers 3 (USBDEVFS_RESET) and 4 (VBUS power) execute against real hardware.",
             "`c:40c03e4`, `README`",
             "`linux_only`",
-            "`cmd/farmd/roles.go:420` builds a `node.NewClient` and passes it as the actuator's `HostRunner`, so tiers 3 and 4 reach `POST /node/v1/usb-reset` and `/node/v1/port-power` instead of a nil runner refusing them. Two of nine rungs stopped being decorative. The agent on the far end is Linux-only and has never faced hardware, so this is reachable rather than demonstrated. `gap:recovery.3`"
+            "`runRecovery` builds a `node.Client` over `node.NewDBResolver(pool)` when `FARM_NODE_TOKEN` is set and hands it to the actuator, so tiers 3 and 4 reach `POST /node/v1/usb-reset` and `/node/v1/port-power` rather than a nil runner refusing them. The agent on the far end has now been RUN on Linux — `scripts/linux-acceptance.sh` starts `farmd node` against a sysfs-shaped tree on a real filesystem and checks what discovery wrote — but `USBDEVFS_RESET` has never been issued against a handset. That is the whole of what is left, and it needs a phone."
           ],
           [
             "REC-04",
@@ -570,15 +570,15 @@
             "API-06",
             "`ctl` exit codes distinguish `the control plane failed` from `a target failed`.",
             "`gap:surface.11`",
-            "`partial`",
-            "`ctl bulk` returns 1 when a run completed with any target error. A bulk across 7 devices with 6 ok, 1 transport error and run state `done` exits 1, so a script treating 1 as a control-plane failure pages on a single offline handset."
+            "`met`",
+            "`ctl bulk` returns 4 through `ErrPartial`, and the two single-target verbs that still conflated a target failure with a control-plane failure now do too: a phone that exits non-zero and a power cycle that finished `failed`/`aborted` are both 4, not 1. Proved with process exit statuses from the shipped binary, not unit tests: exec with the phone exiting 7 → 4; power `failed` → 4; a dead port → 1; a 409 on a leased device → 3. One case was found while fixing it — `adbwire.DrainShellV2` leaves `ExitCode:-1, Exited:false` when the shell stream ends with no exit frame, and turning that into 4 would tell a script the run completed when the command may still be running; `execOutcome` reads `res.Exited` first."
           ],
           [
             "API-07",
             "`ctl` validates against the server, which is the authority.",
             "`gap:jobs.1`",
-            "`not_built`",
-            "No `ctl` code references `specs/validate`, `specs/kinds` or `specs/resets`. Both `validate` and `submit` run `jobspec.Parse` locally. The comment beside that call says \"The server validates too and is the authority\" and is wrong on both counts."
+            "`met`",
+            "`ctl submit` and `ctl validate` post to `/api/v1/specs/validate`, and `ctl kinds`/`ctl resets` fetch the other two; `cmdSpecValidate` prints which server checked it. The superseded local path — `cmdSubmit`, `cmdValidate` and the five helpers only they used — is deleted rather than left as a second authority for the next reader to find, and the package doc no longer claims `ctl validate` \"never leaves the machine\"."
           ],
           [
             "API-08",
@@ -621,8 +621,8 @@
             "SEC-03",
             "The audit trail records who, not only what.",
             "`schema`",
-            "`partial`",
-            "Every `farm.audit_log` row written through the API carries actor `anonymous`, including operator `reason` text on revokes and drains. The trail is complete and anonymous."
+            "`met`",
+            "`requireRole` injects the identity and `actor(r.Context())` returns its `Subject`, which lands in `farm.audit_log` on every operator route. `anonymous` is now reachable only on the deliberate open path — `FARM_API_ALLOW_ANONYMOUS`, `FARM_API_AUTH=allow-all`, or a loopback `APIAddr` — and anything else with no tokens refuses to boot. The narrower residual is real and is not this row: `auditAction` persists only the subject, so two humans sharing one token are one indistinguishable row."
           ],
           [
             "SEC-04",
@@ -635,8 +635,8 @@
             "SEC-05",
             "The secret half of the renew triple does not leak.",
             "`gap:surface.2`",
-            "`not_built`",
-            "`handleLeaseRelease` skips a tenant check on renew *because* a code comment asserts `holder_instance` \"is returned only to the acquirer and is never exposed by a farm-wide view\". `GET /api/v1/leases` returns it for every lease. So `lease_id`, `fence` and `holder_instance` — exactly what `farm.lease_renew` matches on — are readable from one unauthenticated GET. Even with tokens wired, two CI shards in one tenant could take each other's leases."
+            "`met`",
+            "The lease listing never carried `holder_instance` — but `00009` wrote it into a `lease_reattached` event's `detail`, and `GET /api/v1/events` projected `detail` verbatim, so `lease_id` + `fence` + `holder_instance` were readable from one record. An operator token is unscoped, so that was every tenant's; the dashboard printed it in the timeline. Redacted on READ, in the SQL beside the projection, because the rows already exist and a Go post-filter is one a second caller can bypass; `00019` stops emitting it, replacing the two uuids with an `instance_changed` boolean that carries the same diagnostic value. The renew path still takes no tenant check, and the comment now says why instead of asserting something false: between tenants it is redundant with the secret, and within one tenant it is inoperative, because two CI shards share a `tenant_id` — which is the exact case the requirement is about."
           ],
           [
             "SEC-06",
@@ -650,7 +650,7 @@
             "Read surfaces are tenant-scoped.",
             "`gap:surface.8`",
             "`met`",
-            "`tenantScope` reaches every read surface: `/fleet` and `/topology` mask `lease_id/fence/holder/job_id/tenant_id` for another tenant's lease rather than hiding the device; `/hosts` counts only the caller's live leases; `/recovery` narrows attempts to devices whose live lease the tenant holds, while quarantines and the tier table stay whole because a tenant choosing where to run needs both; `/stream` filters per client from one poller. `/bulk` and `/bulk/{id}` moved to operator — a shell across the fleet is operator output. `TestEveryTenantReadableRouteIsScoped` scans the router and FAILS THE BUILD on a tenant-readable GET whose handler never calls `tenantScope`, unless it is in `tenantReadAllowlist` with a written reason. It caught `GET /api/v1/slots` during the merge."
+            "`tenantScope` reaches every read surface, and `TestEveryTenantReadableRouteIsScoped` fails the BUILD on a tenant-readable GET whose handler never calls it unless it is allowlisted with a written reason. `test/e2e/tenantscope_test.go` proves it end to end with TWO tenants that actually hold leases, reading every surface three times — as each tenant and as the operator, who is the control. The distinction it pins is the one a looser test would miss: on `/fleet` the other tenant's five identity fields are present and NULL; on `/topology` three are ABSENT, because the struct marks them `omitempty`; and the DEVICE is never hidden in either. `/hosts` shows every host with identical hardware counts and only the caller's `live_leases` — a regression that filtered hosts per tenant would have passed before that assertion was added."
           ],
           [
             "SEC-08",
@@ -751,8 +751,8 @@
             "OBS-10",
             "`FARM_MIGRATIONS_TABLE` is honoured by everything that reads the migration table.",
             "`config`, `cmd/farmd/migrate.go:189`",
-            "`not_built`",
-            "`migrate` calls `goose.SetTableName(cfg.MigrationsTable)`; `schemaInfo` hardcodes `FROM goose_db_version`, unqualified, while the default is `public.goose_db_version` — so it also depends silently on `search_path`. An operator who overrides the variable gets a failing query and, because of OBS-09, is then told their fully migrated database has no schema."
+            "`met`",
+            "`schemaInfo` named `goose_db_version` literally and unqualified, so it read the wrong table on any farm that set `FARM_MIGRATIONS_TABLE` and resolved the name through whatever `search_path` the connection carried. It reads `s.cfg.MigrationsTable` now, split on the dot and quoted as `pgx.Identifier{schema, table}` — `Sanitize()` on the whole string yields one quoted identifier containing a dot, which resolves to nothing. `config.MigrationsTableParts` does the split and the checking in one function `Validate` also calls, so there is one rule rather than a boot-time rule and a read-time rule that can drift, and it refuses a name not already spelled the way Postgres folds it: goose writes its table name into DDL UNQUOTED while a reader quotes it, so `Farm_Versions` would be created as `farm_versions` and looked for under a name that does not exist."
           ]
         ]
       },
@@ -804,8 +804,8 @@
             "TEST-03",
             "The most expensive failure mode has a regression test that is watching it.",
             "`gap:lease.7`",
-            "`partial`",
-            "See LEASE-10: assertion P10 passes trivially because it cannot construct the state it is meant to test."
+            "`met`",
+            "This row cited LEASE-10, whose assertion passed trivially: P10 moved `heartbeat_at`, which `farm.lease_mark_suspect` never reads — it selects on `expires_at < now()` — so with the suite's clock frozen in one transaction the sweep matched zero rows and the assertion accepted an untouched lease. Both halves are fixed: P10 now asserts a real, falsifiable property (a ten-hour-stale heartbeat inside a standing deadline marks nothing, the complement of P8) and `test/assertions_protected_lease.sql` carries the guarantee P10 could not construct."
           ],
           [
             "TEST-04",
@@ -971,8 +971,8 @@
             "HW-05",
             "Per-port USB power switching, so tier 4 can cycle one port.",
             "`c:91f3aa2`, `README`",
-            "`partial`",
-            "The schema models `per_port` and `ganged` domains and the ladder respects the difference. The acknowledgement path is now complete end to end: the ladder populates `Action.Acknowledged` (`internal/recovery/ladder.go:1312`), the actuator delivers it to a `DomainPowerRunner`, and `node.Client.PortPowerWithDomain` carries it to the agent, which re-checks the list against the hub as it is at that instant. A runner that predates the seam has the acknowledgement DROPPED rather than smuggled through, and the attempt detail says so. What remains is not code: the demo seed still gives even `per_port` hubs a single domain (DEV-06), and none of this has met a hub. `gap:recovery.11`"
+            "`met` in code; `unverified` on hardware",
+            "The schema models `per_port` and `ganged` domains, the ladder respects the difference, and the acknowledgement path is complete end to end: the ladder populates `Action.Acknowledged`, the actuator delivers it to a `DomainPowerRunner`, and `node.Client.PortPowerWithDomain` carries it to the agent, which re-checks the list against the hub as it is at that instant. A runner predating the seam has the acknowledgement DROPPED rather than smuggled through, and the attempt detail says so. The demo seed's single-domain-per-hub problem is fixed (DEV-06). What is left is not code: `uhubctl` has never cut VBUS on a real hub. The Linux acceptance run reads a hub's per-port switchability from the real file mode on each port's `disable` — which is the kernel's own answer — but reading that a port CAN be switched is not switching it."
           ],
           [
             "HW-06",

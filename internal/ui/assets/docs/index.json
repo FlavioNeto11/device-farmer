@@ -8,7 +8,7 @@
       "summary": "A lease ends when the job says so, when a deadline the user wrote down elapses, or when a human takes it back. Nothing else — not a socket error, not a probe timeout, not a device going offline, not a pod dying. The invariant is enforced in four independent places: a CHECK constraint with no word for connectivity, four guard-trigger rules, a Postgres role with SELECT revoked on the health table, and a one-way package dependency with a test behind it. All fifteen assertions in test/assertions.sql pass against a database migrated from this tree, and every example below was run against the live farm or a scratch database migrated from it. What is NOT enforced is named in Gaps: there is no host-side fence proxy, the max_runtime sweep ignores protected and ignores the reaper's kill switch, and the witness loop is written and tested end to end while nothing on a placement path starts it. Four things this page used to name here are closed, and are recorded with what closed them rather than deleted: authentication can be turned on, farm.events is a ledger of endings written by a trigger in the same transaction as the ending, the max_runtime sweep fences and rearms like every other ending, and farm_lease_suspect is armed at zero on a fresh process.",
       "sections": 17,
       "examples": 39,
-      "gaps": 4
+      "gaps": 3
     },
     {
       "area": "jobs",
@@ -17,7 +17,7 @@
       "title": "Jobs: the step vocabulary, execution, checkpoint and resume",
       "summary": "A job is an ordered list of steps drawn from a closed ten-kind vocabulary the database owns (farm.step_kinds), run against one leased device by internal/runner. Only three things end a step badly: its own timeout, an error nothing can retry, or the job's max_runtime. A dropped ADB socket is none of those — it is retried inside the lease with no attempt cap, bounded only by a deadline the job's author wrote down. Long work belongs in a shell_detached step, because that is the only kind whose result lives on the device instead of in a socket the control plane happens to be holding.",
       "sections": 15,
-      "examples": 38,
+      "examples": 39,
       "gaps": 1
     },
     {
@@ -58,7 +58,7 @@
       "summary": "farmd is one static binary with thirteen subcommands; every role is a subcommand so a reaper can never run a different commit than the scheduler it races with. This page is the authoritative configuration reference — 28 variables in internal/config plus 7 read elsewhere, four of which are validated at boot and then ignored — and the honest inventory of what is not wired. Four entries that used to head that inventory are closed: authentication is chosen by configuration, `farmd node` starts, the recovery ladder has a client for the host agent, and a Helm chart ships. What remains is the metrics gap, and it is worse than it used to read: /metrics carries no package's own series at all, because cmd/farmd/roles.go calls obs.RegisterAll with no collector groups and the tree's single Collectors() call site sits in a branch farmd never takes. The one thing to carry away: SIGTERM drains work and releases nothing, deliberately.",
       "sections": 12,
       "examples": 23,
-      "gaps": 3
+      "gaps": 2
     },
     {
       "area": "requirements",
@@ -67,7 +67,7 @@
       "sections": 17,
       "examples": 8,
       "gaps": 4,
-      "summary": "One hundred and one requirements — functional and non-functional — mined from nine commits, the 88 gap entries on the six pages beside this one, the migrations that are the real contract, and three external findings that never touched the code. Each carries an origin, a status verified against this tree rather than copied from the commit that claimed it, and the command that decided it.\n\nSeventy-one rows are `met` outright and ten more are `met` in one dimension and open in another. Seventeen remain genuinely open, and the honest headline is what separates them: three need a rack. The binary has now been run on Linux — kernel 6.18, PostgreSQL 18 — where topology discovery, enrollment and the node agent all executed for the first time and where a startup panic that made every role unstartable was found. What is left needs hardware: `USBDEVFS_RESET` against a handset and `uhubctl` against a hub with switchable VBUS. Eight more rows are reporting — an operator can find out what happened, sometimes only through `psql`. Six are named and deliberately not done.\n\nRead it for three things the area pages cannot show. The couplings: `OPS-04` was one guard in `runNode` blocking four separate requirements, which is why it led the list and why four rows moved with it. The wrong remedies — a surface that tells an operator something is protected when it is not is worse than a documented absence, and this register found four of them. And the requirements with no code at all: managed device clouds are excluded by four suppliers' contracts, so owning the hardware is the path.",
+      "summary": "One hundred and one requirements — functional and non-functional — mined from nine commits, the 88 gap entries on the six pages beside this one, the migrations that are the real contract, and three external findings that never touched the code. Each carries an origin, a status verified against this tree rather than copied from the commit that claimed it, and the command that decided it.\n\n**Eighty-six rows are `met` outright**, eleven more are `met` in one dimension, three are `decided`, and **one is open**: tiers 3 and 4 against real hardware. There is no phone attached to the machine this was built on. Everything leading to `USBDEVFS_RESET` and `uhubctl` is written, tested, and has been run on Linux — discovery reads a hub's per-port switchability from the kernel's own file mode — but reading that a port can be switched is not switching it, and this register does not pretend otherwise.\n\nRead it for three things the area pages cannot show. The couplings: one guard in `runNode` once blocked four separate requirements. The wrong remedies — a surface that tells an operator something is protected when it is not is worse than a documented absence, and this register has found five of them, the most recent being a reference spec in the Docs tab that told operators to check a detached exit code with `cat`, which judges `cat`. And the drift: seven rows in the last round were already closed and this file had not caught up, describing a system worse than the one that exists.",
       "title": "Every requirement raised for this system, where it came from, and whether it holds"
     }
   ],

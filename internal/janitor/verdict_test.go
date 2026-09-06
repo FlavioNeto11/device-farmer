@@ -368,7 +368,7 @@ func TestTheVerdictWindowBoundsWhatThePassLooksAt(t *testing.T) {
 }
 
 // The window is only a bound if the index behind it can be used, and whether it
-// can turns on successClock being spelled exactly as migration 00018 spells the
+// can turns on successClock being spelled exactly as migration 00020 spells the
 // expression jobs_recent_success is built on. Nothing about a drift between the
 // two is visible at runtime: the sweep keeps working, just by reading the whole
 // job history every thirty seconds until it outgrows CallTimeout and stops.
@@ -428,7 +428,7 @@ func TestTheVerdictScanCanUseItsIndex(t *testing.T) {
 		!strings.Contains(cond, "COALESCE(finished_at, started_at, created_at)") {
 		t.Fatalf("the verdict scan's window is not pushed into jobs_recent_success, so it "+
 			"reads every succeeded job ever run, every cycle. successClock and the "+
-			"expression in migration 00018 have to match exactly.\nplan:\n%s", plan.String())
+			"expression in migration 00020 have to match exactly.\nplan:\n%s", plan.String())
 	}
 }
 

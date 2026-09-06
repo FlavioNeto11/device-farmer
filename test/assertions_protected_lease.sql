@@ -39,7 +39,7 @@
 -- two leases: a suite that asserted farm-wide totals would fail against any
 -- database that already had overdue leases in it, which is most of them.
 --
--- Run:  psql -v ON_ERROR_STOP=1 -f test/assertions_v18.sql
+-- Run:  psql -v ON_ERROR_STOP=1 -f test/assertions_protected_lease.sql
 -- Every assertion raises an exception on failure, so a clean run is the proof.
 
 \set ON_ERROR_STOP on
@@ -310,7 +310,7 @@ BEGIN
   RAISE NOTICE 'H7  ok  protection alone was holding it: cleared, it is reclaimed at once';
 
   RAISE NOTICE '--------------------------------------------------';
-  RAISE NOTICE 'ALL v18 ASSERTIONS PASSED';
+  RAISE NOTICE 'ALL PROTECTED-LEASE ASSERTIONS PASSED';
 END $$;
 
 ROLLBACK;

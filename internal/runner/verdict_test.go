@@ -125,15 +125,20 @@ RETURNING id::text, fence`,
 	return p
 }
 
-// stepRow is one farm.job_steps row as these tests read it.
-type stepRow struct {
+// verdictStepRow is one farm.job_steps row as these tests read it.
+// verdictStepRow is this suite's view of farm.job_steps: the state and the
+// reason, which is what a verdict is argued from. checkpoint_db_test.go has
+// its own stepRow carrying detail and error text for a different question.
+// Two readers of one table, deliberately not merged here: unifying them is a
+// change to two suites at once and belongs in its own commit.
+type verdictStepRow struct {
 	Index  int
 	ID     string
 	State  string
 	Reason string
 }
 
-func readSteps(t *testing.T, pool *pgxpool.Pool, jobID string, attempt int) []stepRow {
+func readSteps(t *testing.T, pool *pgxpool.Pool, jobID string, attempt int) []verdictStepRow {
 	t.Helper()
 	rows, err := pool.Query(t.Context(), `
 SELECT step_index, step_id, state, COALESCE(detail->>'reason', '')
@@ -145,9 +150,9 @@ SELECT step_index, step_id, state, COALESCE(detail->>'reason', '')
 	}
 	defer rows.Close()
 
-	var out []stepRow
+	var out []verdictStepRow
 	for rows.Next() {
-		var s stepRow
+		var s verdictStepRow
 		if err := rows.Scan(&s.Index, &s.ID, &s.State, &s.Reason); err != nil {
 			t.Fatalf("scanning step rows: %v", err)
 		}
@@ -156,7 +161,7 @@ SELECT step_index, step_id, state, COALESCE(detail->>'reason', '')
 	return out
 }
 
-func wantStates(t *testing.T, got []stepRow, want ...string) {
+func wantStates(t *testing.T, got []verdictStepRow, want ...string) {
 	t.Helper()
 	if len(got) != len(want) {
 		t.Fatalf("%d step row(s), want %d: %+v", len(got), len(want), got)
@@ -168,7 +173,7 @@ func wantStates(t *testing.T, got []stepRow, want ...string) {
 	}
 }
 
-func jobStateOf(t *testing.T, pool *pgxpool.Pool, jobID string) string {
+func verdictJobState(t *testing.T, pool *pgxpool.Pool, jobID string) string {
 	t.Helper()
 	var state string
 	if err := pool.QueryRow(t.Context(),
@@ -335,7 +340,7 @@ func TestARefusedResumeRecordsTheStepsItWillNeverRun(t *testing.T) {
 	if len(rows) != 3 {
 		t.Fatalf("%d step row(s), want the refused step and the two after it: %+v", len(rows), rows)
 	}
-	for i, want := range []stepRow{{Index: 1, State: "failed"}, {Index: 2, State: "skipped"}, {Index: 3, State: "skipped"}} {
+	for i, want := range []verdictStepRow{{Index: 1, State: "failed"}, {Index: 2, State: "skipped"}, {Index: 3, State: "skipped"}} {
 		if rows[i].Index != want.Index || rows[i].State != want.State {
 			t.Fatalf("row %d = %+v, want index %d in state %q", i, rows[i], want.Index, want.State)
 		}
@@ -549,7 +554,7 @@ func TestSucceededIsWrittenOnlyWhenTheStepRowsSupportIt(t *testing.T) {
 			t.Fatalf("out = %+v; every step ran, so the ATTEMPT succeeded either way", out)
 		}
 		_ = logs
-		return out, jobStateOf(t, pool, job.jobID), job
+		return out, verdictJobState(t, pool, job.jobID), job
 	}
 
 	t.Run("rows agree", func(t *testing.T) {

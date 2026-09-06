@@ -1,0 +1,44 @@
+# Layered on top of deploy/helm/local-values.yaml when scripts/k8s-up.sh runs
+# in its default mode, the one that puts simulated hardware on the cluster.
+#
+#   helm upgrade --install df deploy/helm/device-farmer \
+#     -f deploy/helm/local-values.yaml -f deploy/local/demo-values.yaml
+#
+# Two Deployments go to zero replicas while `farmd demo` is running, and this
+# is a correctness requirement, not a way to save a pod.
+#
+# `farmd demo` binds its fake ADB servers to 127.0.0.1 inside its own pod and
+# writes those loopback addresses to farm.hosts.adb_endpoint. Everything that
+# reaches a device dials that column:
+#
+#   jobrunner   claims any job in state 'running' that has a live lease and no
+#               open attempt. The demo's feeder queues exactly such jobs, so a
+#               jobrunner in another pod WOULD claim them, dial 127.0.0.1 in
+#               its own container, get connection refused, and fail the step —
+#               destroying the simulation's work with a runner that is behaving
+#               correctly. The demo runs its own jobrunner, in the pod where
+#               those sockets exist.
+#
+#   recovery    walks the ladder for unhealthy devices, and the demo makes
+#               devices unhealthy on purpose. Tiers 1 and 2 are ADB-level and
+#               would dial the same loopback; tiers 3 and 4 need `farmd node`
+#               on a physical host, which no cluster has. A recovery pod here
+#               would record a farm's worth of failed recoveries against
+#               hardware that is fine. The demo runs its own.
+#
+# The roles that stay up are the ones whose duplicates cost nothing: scheduler,
+# reaper, janitor and chargepolicy each elect one leader through a Postgres
+# session advisory lock, so the demo's copy and the chart's copy contend for
+# the lock and exactly one of them acts. api is deliberately duplicated — the
+# chart's is the one the dashboard is served from, and the demo's answers
+# nobody, because no Service selects it.
+#
+# THE DEPLOYMENTS ARE SCALED TO ZERO, NOT DELETED, and that is the point of
+# doing it this way: `kubectl -n df-local get deploy` shows jobrunner 0/0 and
+# recovery 0/0, which is a visible, askable fact about this cluster. A chart
+# rendered without them would show a farm that never had them.
+jobrunner:
+  replicaCount: 0
+
+recovery:
+  replicaCount: 0

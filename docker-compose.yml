@@ -89,7 +89,15 @@ services:
     ports:
       # Exposed for psql and for the assertions in test/assertions.sql. Drop
       # this line for anything that is not a laptop.
-      - "127.0.0.1:55433:5432"
+      #
+      # Parameterised because the only fixed host port in this file was also the
+      # only thing stopping two compose PROJECTS from coexisting — a demo farm
+      # and a real one on the same machine, which is an ordinary thing to want
+      # and which every other published port already allowed via FARM_PORT and
+      # FARM_METRICS_PORT. Loopback stays hardcoded: this is a database with a
+      # trust-adjacent password in a tracked file, and it has no business
+      # listening anywhere a network can reach.
+      - "127.0.0.1:${POSTGRES_PORT:-55433}:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U farm -d device_farmer"]
       interval: 2s

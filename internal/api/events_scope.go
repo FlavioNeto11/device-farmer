@@ -86,6 +86,61 @@ const (
 	maxEventFilterLen = 256
 )
 
+// detailRedactionKeys names what redactedDetail removes from every detail
+// column this file projects, and the pair is the other half of the prohibition
+// stated in leases.go.
+//
+// farm.lease_renew matches on the triple (id, fence, holder_instance). The
+// first two are published — /api/v1/fleet and the event stream carry lease_id
+// and fence for every live lease — so holder_instance is the whole secret, and
+// leaseColumns withholds it from every lease listing for that reason.
+//
+// farm.events handed it back out. 00009_reattach_auth.sql writes a
+// lease_reattached row whose detail carries 'prior_instance' (the displaced
+// holder's) and 'new_instance' (the one that will answer every renewal from
+// here on), on a row that already carries lease_id in its own column and the
+// fence in the same jsonb. One record, all three members, projected verbatim by
+// GET /api/v1/events and rendered into the dashboard timeline. An operator
+// token is unscoped, so it read every tenant's; a tenant token passes the
+// ownership test below for its own leases, so two CI shards in one tenant could
+// take each other's — which is precisely the failure the register named.
+//
+// 00019 stops writing the two keys, but a migration cannot unwrite the rows a
+// farm already has, and those rows are exactly the ones an incident review
+// reads. So the exclusion lives HERE, in the SQL, next to the projection it
+// constrains, in the same shape and for the same reason as leaseColumns: a Go
+// post-filter over the scanned rows would be one caller's habit rather than the
+// query's property, and the second caller would not inherit it.
+//
+// The fence STAYS. It is a description of the lease, it is already published in
+// two other places, and dropping it here would cost an incident review the one
+// number that identifies which incarnation of a lease a row is about while
+// removing nothing an attacker did not already have.
+//
+// Both halves of the union carry it. Nothing writes holder_instance into
+// farm.audit_log today; applying the same subtraction there costs one jsonb
+// operator per row and makes the guarantee a property of the response field
+// rather than of one table's current writers.
+//
+// The jsonb_typeof guard is not decoration. `jsonb - text[]` deletes keys from
+// an object and RAISES 22023 on a scalar, and while every writer in this
+// repository intends an object, nothing enforces it: internal/topo's
+// insertEvent and insertAudit json.Marshal their map straight into the column,
+// and a nil map marshals to `null`, which is a scalar. One such row — or one
+// hand-written one, which the migration docs explicitly contemplate — would
+// turn GET /api/v1/events into a 500 for every caller, and it is the endpoint
+// somebody opens precisely when things are already wrong. A scalar has no keys
+// to withhold, so passing it through unchanged withholds nothing.
+const detailRedactionKeys = `'{prior_instance,new_instance}'::text[]`
+
+// redactedDetail renders one detail column as this timeline is allowed to
+// return it. Pass the qualified column, e.g. redactedDetail("e.detail").
+func redactedDetail(col string) string {
+	return "CASE WHEN jsonb_typeof(" + col + ") = 'object'" +
+		" THEN " + col + " - " + detailRedactionKeys +
+		" ELSE " + col + " END"
+}
+
 // EventScope is a resolved request for the merged timeline: who is asking, and
 // what they asked for.
 //
@@ -328,20 +383,22 @@ func (s EventScope) Query() (string, []any) {
 				" OR EXISTS (SELECT 1 FROM farm.leases l WHERE l.id = e.lease_id AND l.tenant_id = "+p+"))")
 	}
 
-	const eventHalf = `
+	// Neither half projects its detail column raw: see redactedDetail. A
+	// projection added without it re-opens SEC-05.
+	eventHalf := `
   (SELECT e.at, 'event'::text AS source, e.kind AS action, coalesce(e.actor,'') AS actor,
           coalesce(e.device_id::text,'') AS device_id, e.slot_id,
           coalesce(e.lease_id::text,'') AS lease_id, coalesce(e.job_id::text,'') AS job_id,
-          ''::text AS subject, ''::text AS reason, e.detail
+          ''::text AS subject, ''::text AS reason, ` + redactedDetail("e.detail") + ` AS detail
      FROM farm.events e
     %s
     ORDER BY e.at DESC
     LIMIT $1)`
 
-	const auditHalf = `
+	auditHalf := `
   (SELECT a.at, 'audit'::text, a.action, a.actor,
           ''::text, NULL::bigint, ''::text, ''::text,
-          a.subject, coalesce(a.reason,''), a.detail
+          a.subject, coalesce(a.reason,''), ` + redactedDetail("a.detail") + `
      FROM farm.audit_log a
     %s
     ORDER BY a.at DESC

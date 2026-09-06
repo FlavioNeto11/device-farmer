@@ -175,6 +175,57 @@ func TestLeaseListDoesNotBroadcastHolderInstance(t *testing.T) {
 	}
 }
 
+// TestEventDetailWithholdsTheRenewSecret is the same prohibition as the test
+// above, one table across.
+//
+// farm.events.detail is free-form jsonb that GET /api/v1/events returns
+// verbatim, and 00009 wrote the lease_reattached row's prior_instance and
+// new_instance into it — beside the lease_id the row carries in its own column
+// and the fence in the same document. Withholding holder_instance from every
+// lease listing while publishing it in the timeline is not withholding it.
+//
+// This asserts on the rendered SQL, which is where the exclusion lives; the
+// value itself is asserted on in events_redaction_db_test.go, against a row
+// written by the function that used to leak it. The two are a pair: this one
+// catches a projection added without the redaction even when no database is
+// reachable, and it fails on the NEXT caller as well as the current one.
+func TestEventDetailWithholdsTheRenewSecret(t *testing.T) {
+	// A redaction that named nothing would satisfy every check below.
+	for _, key := range []string{"prior_instance", "new_instance"} {
+		if !strings.Contains(detailRedactionKeys, key) {
+			t.Errorf("the redaction no longer removes %q: %s", key, detailRedactionKeys)
+		}
+	}
+
+	// Both scopes, because the audit half exists only for an unscoped caller
+	// and a redaction applied to one half is a redaction applied to whichever
+	// half the reviewer happened to look at.
+	for name, scope := range map[string]EventScope{
+		"operator": {},
+		"tenant":   {Tenant: "acme"},
+	} {
+		q, _ := scope.Query()
+		// The arithmetic below is satisfied by a query that projects no
+		// detail at all, and an empty timeline is not the fix.
+		if !strings.Contains(q, redactedDetail("e.detail")) {
+			t.Errorf("%s scope: the event half projects no redacted detail:\n%s", name, q)
+		}
+		for _, col := range []string{"e.detail", "a.detail"} {
+			// Every mention of the column must belong to a redacted
+			// projection, so an added one is caught rather than only the
+			// two that exist today. redactedDetail names the column three
+			// times, which is what makes the arithmetic a check and not a
+			// coincidence.
+			redacted := strings.Count(q, redactedDetail(col))
+			if got, want := strings.Count(q, col), redacted*strings.Count(redactedDetail(col), col); got != want {
+				t.Errorf("%s scope: %s appears %d time(s) but only %d belong to a redacted "+
+					"projection, so the renew secret reaches the timeline:\n%s",
+					name, col, got, want, q)
+			}
+		}
+	}
+}
+
 // TestLeaseColumnsMatchScanTargets keeps the projection and the scan in step.
 // scanLease passes positional pointers, so a column removed from one and not
 // the other is a scan error on every list request rather than a build failure.

@@ -47,12 +47,15 @@ import (
 //     a holder_instance; the only way to prove you are the holder is to present
 //     the very value you would be asking for.
 //
-// The handling of release, below, already states this as a fact it relies on —
-// that renew "additionally requires holder_instance, which is returned only to
-// the acquirer and is never exposed by a farm-wide view". Selecting it into
-// every list response made that sentence false. Nothing about withholding it
-// can end or shorten a lease: renewal EXTENDS a deadline, and the holder that
-// legitimately renews already has the value.
+// The handling of release, below, relies on this: it is the reason renew is
+// allowed to skip the tenant check release pays for. Selecting the column into
+// every list response made that reliance false, and so did farm.events, whose
+// lease_reattached detail carried the same value until redactedDetail in
+// events_scope.go stopped projecting it and 00019 stopped writing it. Those two
+// places and this one are the whole enforcement; there is no third.
+//
+// Nothing about withholding it can end or shorten a lease: renewal EXTENDS a
+// deadline, and the holder that legitimately renews already has the value.
 type leaseView struct {
 	ID               string     `json:"id"`
 	Fence            int64      `json:"fence"`
@@ -536,10 +539,49 @@ func (s *Server) handleLeaseRelease(w http.ResponseWriter, r *http.Request) {
 	// The check is a plain read because a lease's tenant_id never changes: the
 	// row is inserted by farm.lease_acquire and nothing in the schema updates
 	// that column, so there is no window between reading it and acting on it.
-	// Renew needs no equivalent — it additionally requires holder_instance,
-	// which is returned only to the acquirer and is never exposed by a
-	// farm-wide view — and adding a second round trip to the renewal path
-	// would slow the one request whose failure costs a device.
+	//
+	// RENEW STILL HAS NO EQUIVALENT, AND THE REASON IS NOT THE ONE THIS COMMENT
+	// USED TO GIVE. It said holder_instance "is returned only to the acquirer
+	// and is never exposed by a farm-wide view", stated as a property of the
+	// system rather than as something a handful of projections happen to do.
+	// Two projections had already broken it: the lease listing selected the
+	// column outright, and farm.events wrote it into the lease_reattached
+	// detail blob that GET /api/v1/events returns verbatim — beside the
+	// lease_id in the row's own column and the fence in the same jsonb, which
+	// is the whole triple in one record. A justification resting on an
+	// assumption nothing enforces is worth less than no justification at all.
+	//
+	// It now rests on the enforcement. holder_instance appears in exactly one
+	// response, the acquire that minted it, and is withheld by leaseColumns
+	// (see leaseView) and by redactedDetail in events_scope.go, both guarded
+	// by tests that fail on the value rather than on the code that hides it.
+	//
+	// A tenant check here would not be a second lock on that door. It is the
+	// wrong shape for both halves of the threat:
+	//
+	//   - Between tenants it is redundant with the secret. To renew another
+	//     tenant's lease a caller must already hold its holder_instance, and
+	//     since lease_id and fence are published, any leak of holder_instance
+	//     is a leak of the whole triple. The repair for that is to stop leaking
+	//     it — which is what the two projections above are — not to add a
+	//     second predicate that only bites after the first one has failed.
+	//   - Within one tenant it is inoperative. The failure the register
+	//     actually names — two CI shards of one tenant taking each other's
+	//     leases — passes any tenant_id comparison, because both shards carry
+	//     the same tenant_id. holder_instance is the only thing that tells the
+	//     two of them apart, and a check that cannot see the case it was added
+	//     for is a comment pretending to be a control.
+	//
+	// Release is the opposite situation, which is why it pays for the round
+	// trip above: its only guard is the fence, and the fence is published by
+	// /fleet and by the stream, so without the tenant check there is no secret
+	// in the request at all. The costs differ by the same margin. A lease is
+	// released once; it is renewed every few seconds for as long as it lives,
+	// by every live lease in the farm, and a renewal that fails costs a device.
+	// The damage differs too, though it does not excuse anything: a stolen
+	// renewal EXTENDS a deadline, so it cannot end a run the way a stolen
+	// release can — it pins a device to a job whose holder has stopped asking
+	// for it, which is capacity destroyed rather than work destroyed.
 	if tenant := tenantScope(r.Context()); tenant != "" {
 		var owner string
 		err := s.pool.QueryRow(r.Context(),

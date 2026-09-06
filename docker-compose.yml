@@ -103,6 +103,16 @@ services:
       interval: 2s
       timeout: 3s
       retries: 30
+    # Every farmd role inherits unless-stopped from x-farmd and this service did
+    # not, so the one process none of them can work without was the one that
+    # stayed down. Measured: after a Docker Desktop restart all nine roles came
+    # back and postgres did not, leaving a farm whose every container was
+    # retrying against a database that no longer existed — and the roles' own
+    # restart policy made that loop indefinitely and look busy.
+    #
+    # It matters more now that Docker Desktop starts with Windows: without this,
+    # the state a reboot leaves behind is exactly that farm.
+    restart: unless-stopped
 
   # Schema first, as a one-shot. Everything else waits for it to succeed, so a
   # failed migration stops the rollout instead of starting a control plane

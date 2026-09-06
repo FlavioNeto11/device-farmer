@@ -10,7 +10,6 @@ package node
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -41,11 +40,6 @@ type linuxPlatform struct{}
 var sysfsUSBDevices = "/sys/bus/usb/devices"
 
 const (
-	// devBusUSB holds the usbfs nodes the ioctl is issued against, laid out as
-	// /dev/bus/usb/<busnum>/<devnum> with both numbers zero-padded to three
-	// digits by the kernel's own device naming.
-	devBusUSB = "/dev/bus/usb"
-
 	// resetReturnWindow caps how long tier 3 waits for the device to come
 	// back. A USBDEVFS_RESET re-enumerates in place and is done in a second or
 	// two; a phone still missing after ten is not going to be repaired by this
@@ -380,19 +374,15 @@ func (linuxPlatform) usbReset(ctx context.Context, devpath string, o opsConfig) 
 
 // resetNode opens the usbfs node and issues the ioctl.
 //
-// The node is opened write-only because usbfs requires write access for the
-// commands that change device state; a read-only descriptor gets EACCES from
-// the ioctl rather than from the open, which is a confusing place to discover
-// a permissions problem.
+// The open and what its failures mean are in usbfs.go, outside this file's
+// build tag, because whether a denied open is a refusal or a rung that ran and
+// failed is the contract's decision and has to be provable on a machine with
+// no USB bus. Getting that wrong sends the ladder up to tier 4 over a file
+// mode.
 func resetNode(node usbNode) error {
-	f, err := os.OpenFile(node.path(), os.O_WRONLY, 0)
+	f, err := usbfsOpen(node.path())
 	if err != nil {
-		if errors.Is(err, os.ErrPermission) {
-			return fmt.Errorf("node: cannot open %s for writing: %w — the agent needs "+
-				"write access to usbfs, which is normally a udev rule putting the "+
-				"device nodes in the farm's group", node.path(), err)
-		}
-		return fmt.Errorf("node: open %s: %w", node.path(), err)
+		return err
 	}
 	defer f.Close()
 

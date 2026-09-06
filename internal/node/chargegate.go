@@ -144,6 +144,14 @@ const (
 	// every remaining port stays dark. Stopping at a minute leaves room for
 	// the rest of Run's shutdown and guarantees the ports that did not get
 	// their turn are NAMED in the log rather than lost in a SIGKILL.
+	//
+	// That 90 is systemd's default, NOT what this project's own unit grants:
+	// the unit in deploy/helm/README.md sets TimeoutStopSec=60, which is under
+	// this budget and under [Agent.opBudget]'s 73s — the two run side by side
+	// on the way out and take the same hardware mutex. The node DaemonSet asks
+	// for 150 and refuses to render below 133 for exactly this arithmetic. On a
+	// host that grants less, the log naming the ports left without power is the
+	// last thing this process gets to do.
 	chargeGateShutdownBudget = 60 * time.Second
 
 	// maxChargeGateBody bounds a request body. A gate request is a few hundred

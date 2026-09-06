@@ -298,6 +298,23 @@ api:
     # nodePort: 30080
     annotations: {}
     labels: {}
+    # sessionAffinity pins one client to one api pod. Empty leaves Kubernetes
+    # at "None"; the only other value is "ClientIP".
+    #
+    # It exists for the dashboard's event stream. EventSource cannot send a
+    # header, so the page authenticates it with a single-use ticket minted by a
+    # separate request, and the ticket lives in the memory of the replica that
+    # minted it (internal/api/stream_ticket.go). With replicaCount above 1 the
+    # two requests can land on different pods; the page notices and mints
+    # again, so the cost is a retry, not an outage.
+    #
+    # Off by default because the cure is usually worse. ClientIP affinity is
+    # keyed on the source address the Service sees, and behind an ingress
+    # controller that is the ingress pods — a handful of addresses, which pins
+    # nearly all API traffic onto as few api pods, including the renewal path
+    # that must never queue behind a dashboard query. Turn it on when clients
+    # reach this Service directly.
+    sessionAffinity: ""
 
   ingress:
     enabled: false

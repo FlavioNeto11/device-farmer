@@ -647,7 +647,16 @@ function apiURL(path, params) {
 /* The API authenticates with a bearer token. The token lives in sessionStorage
  * for this tab only and is attached as a header — never as a query parameter,
  * where it would land in access logs, in the URL bar and in anything the
- * operator pastes into a ticket. */
+ * operator pastes into a ticket.
+ *
+ * That rule has exactly one consequence worth naming here, because it is the
+ * one that looks like a reason to break it: EventSource cannot send a header,
+ * so the live stream cannot present this token at all. It is not presented
+ * anyway. connectStream mints a short-lived single-use ticket over a request
+ * that CAN carry the header, and puts that in the stream's URL instead — a
+ * capability worth one read-only connection for a few seconds, rather than the
+ * credential that can revoke a lease. internal/api/stream_ticket.go is where
+ * that trade is argued in full. */
 const TOKEN_KEY = 'device-farmer.api-token';
 
 function readToken() {
@@ -2195,7 +2204,8 @@ function openTokenDialog() {
   const input = $('#token-input');
   input.value = apiToken;
   $('#token-note').textContent = apiToken
-    ? 'A token is set for this tab. The live stream cannot carry it (EventSource sends no headers), so a token-protected deployment updates by polling.'
+    ? 'A token is set for this tab. It is sent as a header on every request, including the one that mints the ' +
+      'single-use ticket the live stream opens with — EventSource sends no headers of its own.'
     : 'No token is set for this tab.';
   $('#dlg-token').showModal();
   input.focus();
@@ -2461,6 +2471,32 @@ let esFailures = 0;
 let esRetry = null;
 let pollTimer = null;
 
+/* esGeneration is which connect attempt owns `es`.
+ *
+ * Opening the stream is no longer synchronous: a ticket has to be minted
+ * first, and anything that happens while that request is in flight — the
+ * operator saving a token, a retry firing — starts a newer attempt. The
+ * generation is checked after every await, so an older attempt that finally
+ * gets its ticket drops it instead of installing a second EventSource behind
+ * the current one. */
+let esGeneration = 0;
+
+/* A ticket is single-use and lives in the memory of the api replica that
+ * minted it, so a redeem that lands on a different replica fails once and
+ * succeeds on the next try with a fresh one. That is the ordinary case on a
+ * farm running more than one replica, and it must not look like an outage: a
+ * stream that never opened is retried at once, a few times, before the page
+ * starts announcing that it is polling.
+ *
+ * Five, not two, because the cost is asymmetric. Each attempt is an
+ * independent draw — one in N replicas — so five turns a 25% chance of a
+ * visible flip to "polling" at two replicas into under 2%, while the farm
+ * where the retries are wasted is the one whose mint is ALSO failing, and
+ * there the loop never starts: a failed mint goes straight to the backoff
+ * below without spending any of this. */
+const STREAM_TICKET_RETRIES = 5;
+let ticketRetries = 0;
+
 function setConn(mode, text) {
   state.conn.mode = mode;
   const box = $('#conn');
@@ -2486,7 +2522,24 @@ function stopPolling() {
   pollTimer = null;
 }
 
-function connectStream() {
+/* connectStream opens the event stream, authenticated.
+ *
+ * The API is header-only and EventSource sends no headers, which is why every
+ * token-protected farm used to watch its dashboard fall back to polling within
+ * two failed connects. So the credential does not travel on this request at
+ * all: an ordinary POST — a fetch, with the Authorization header on it — mints
+ * a short-lived single-use ticket for this caller's identity, and the ticket is
+ * what the EventSource URL carries. The token stays in a header, which is the
+ * rule stated next to readToken and the one thing this must not break.
+ *
+ * The server names the query parameter in its own answer rather than this page
+ * hard-coding it, so the two cannot drift apart.
+ *
+ * Taking over reconnection is the price. A ticket is spent the moment it is
+ * redeemed, so the browser's own retry — which replays the same URL — would
+ * present a ticket this connection already burned. Every error therefore
+ * rebuilds the stream around a freshly minted one, with the backoff below. */
+async function connectStream() {
   if (!('EventSource' in window)) {
     setConn('polling', 'no SSE — polling');
     startPolling();
@@ -2495,46 +2548,81 @@ function connectStream() {
   // Never leave an old stream open behind a new one: an orphaned EventSource
   // keeps a connection slot on the control plane and keeps delivering events
   // into handlers nothing will ever close.
+  const gen = ++esGeneration;
   if (es) { try { es.close(); } catch (_) { /* already closed */ } es = null; }
+  setConn('connecting');
+
+  let ticket, param;
   try {
-    es = new EventSource(apiURL('stream').toString());
+    // A failed mint is a failed stream and nothing more: request() has already
+    // raised the banner that offers the token box on a 401, and the poll below
+    // keeps the screen truthful meanwhile.
+    const minted = await api.post('stream/ticket');
+    ticket = pick(minted, 'ticket');
+    param = pick(minted, 'param') || 'ticket';
+    if (!ticket) throw new Error('the control plane minted no stream ticket');
+  } catch (err) {
+    if (gen !== esGeneration) return;
+    onStreamFailure();
+    return;
+  }
+  if (gen !== esGeneration) return;
+
+  let opened = false;
+  try {
+    es = new EventSource(apiURL('stream', { [param]: ticket }).toString());
   } catch (err) {
     onStreamFailure();
     return;
   }
-  setConn('connecting');
-  es.addEventListener('open', () => {
+  // Named, because every handler below must act on the EventSource IT was
+  // attached to rather than on whatever `es` points at by the time it fires.
+  const source = es;
+  source.addEventListener('open', () => {
+    opened = true;
     esFailures = 0;
+    ticketRetries = 0;
     setConn('live');
     stopPolling();
     refreshAll();
   });
   for (const name of ['fleet', 'lease', 'recovery', 'job', 'alert']) {
-    es.addEventListener(name, (ev) => onStreamEvent(name, ev));
+    source.addEventListener(name, (ev) => onStreamEvent(name, ev));
   }
-  es.addEventListener('message', (ev) => onStreamEvent('message', ev));
-  es.addEventListener('error', () => {
-    // EventSource retries by itself while CONNECTING; only a CLOSED stream
-    // needs us to rebuild it.
-    if (es && es.readyState === EventSource.CLOSED) {
-      try { es.close(); } catch (_) { /* already closed */ }
-      es = null;
-      onStreamFailure();
-    } else {
-      onStreamFailure(true);
+  source.addEventListener('message', (ev) => onStreamEvent('message', ev));
+  source.addEventListener('error', () => {
+    // A newer attempt already owns the stream; this one is a ghost.
+    if (gen !== esGeneration) { try { source.close(); } catch (_) { /* already closed */ } return; }
+    try { source.close(); } catch (_) { /* already closed */ }
+    es = null;
+    // Never opened, and a ticket was minted for it: the likely reason is that
+    // the redeem reached a different api replica from the mint, which the next
+    // ticket fixes. Retry at once rather than declaring the stream down.
+    if (!opened && ticketRetries < STREAM_TICKET_RETRIES) {
+      ticketRetries += 1;
+      connectStream();
+      return;
     }
+    onStreamFailure();
   });
 }
 
 function restartStream() {
   if (esRetry) { clearTimeout(esRetry); esRetry = null; }
+  esGeneration += 1;
   if (es) { try { es.close(); } catch (_) { /* already closed */ } es = null; }
   esFailures = 0;
+  ticketRetries = 0;
   connectStream();
 }
 
-function onStreamFailure(retrying) {
+function onStreamFailure() {
   esFailures += 1;
+  // Each backoff cycle gets its own budget of immediate ticket retries: the
+  // replica mismatch they exist for is a coin toss per attempt, not a state
+  // the farm stays in, so spending the budget once must not disarm it for the
+  // rest of the page's life.
+  ticketRetries = 0;
   if (esFailures >= 2) {
     startPolling();
     // "API unreachable" outranks "stream down": when every request is failing,
@@ -2543,7 +2631,6 @@ function onStreamFailure(retrying) {
   } else if (state.conn.mode !== 'down') {
     setConn('connecting', 'reconnecting');
   }
-  if (retrying) return;                       // the browser is already retrying
   if (esRetry) return;
   const wait = Math.min(30000, 1000 * Math.pow(2, Math.min(esFailures, 5)));
   esRetry = setTimeout(() => { esRetry = null; connectStream(); }, wait);

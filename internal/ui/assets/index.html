@@ -296,9 +296,9 @@
      no way to know that token, so the operator pastes it here once per tab. It
      is kept in sessionStorage — never in the URL, never in a cookie, gone when
      the tab closes — and it is attached only to requests to this same origin's
-     API. EventSource cannot carry a header, so on a token-protected deployment
-     the live stream will not open and the page falls back to polling, which
-     can. -->
+     API. EventSource cannot carry a header, so the live stream is opened with a
+     single-use ticket minted by a request that can: the token never leaves the
+     header. -->
 <dialog id="dlg-token" aria-labelledby="token-title">
   <form id="token-form" method="dialog">
     <h2 id="token-title">API bearer token</h2>

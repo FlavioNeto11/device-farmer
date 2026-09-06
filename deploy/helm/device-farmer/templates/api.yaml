@@ -164,6 +164,9 @@ metadata:
   {{- end }}
 spec:
   type: {{ .Values.api.service.type }}
+  {{- with .Values.api.service.sessionAffinity }}
+  sessionAffinity: {{ . }}
+  {{- end }}
   ports:
     - name: http
       port: {{ .Values.api.service.port }}

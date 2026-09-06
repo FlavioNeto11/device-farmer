@@ -451,7 +451,12 @@ func (f *fixture) janitorWith(t *testing.T, tweaks ...func(*Config)) *Janitor {
 		// window that silently protected everything would make every assertion
 		// below pass for the wrong reason.
 		Settle: time.Nanosecond,
-		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		// The verdict pass is spaced out in production because a healthy farm
+		// pays its full cost; a test runs one cycle and asserts on it, so here
+		// it is due every time. Left at the default, every such assertion after
+		// the first cycle would be an assertion about a pass that did not run.
+		VerdictInterval: time.Nanosecond,
+		Logger:          slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 	for _, tweak := range tweaks {
 		tweak(&cfg)

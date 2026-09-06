@@ -51,6 +51,28 @@
 // the job's terminal state (a stale holder must not mark 'failed' a job that
 // somebody else is now running successfully). Both guards are WHERE clauses;
 // zero rows updated is an ordinary, logged outcome, not an error.
+//
+// # 'succeeded' is a claim about rows, not about a loop
+//
+// A job is reported succeeded only when farm.job_steps says the whole spec ran.
+// Two halves make that true. Every ending that reaches the step loop and stops
+// inside it writes the steps it never reached (see [Runner.recordSkipped]), so
+// a step list does not trail off at the point of the failure; and the verdict
+// itself is checked against the rows before it is written (see
+// [Runner.attemptStepsAgree]). When the rows disagree the verdict is WITHHELD
+// rather than downgraded — nothing is written, the job keeps the state it had,
+// and the reason lands in the log, on the job's error, and in farm.events.
+// [Runner.refuseUnevidencedSuccess] explains why withholding is the only move
+// that keeps this property and "a bookkeeping failure is never a verdict on the
+// job" at the same time.
+//
+// Note the scope of the first half. A placement refused BEFORE the loop starts
+// — a spec that does not parse, an exhausted attempt budget, a max_runtime that
+// had already elapsed, a work directory the device would not create — writes no
+// step rows at all, and this package does not pretend otherwise. Those endings
+// are never a success, so they cannot produce the status JOB-10 is about, but a
+// four-step job that failed to prepare its device does still read as a job with
+// no steps.
 package runner
 
 import (
@@ -102,6 +124,10 @@ const (
 	// pushed APKs — lives on the device. /data/local/tmp is the one path the
 	// shell user can reliably write and execute from on a stock device.
 	DefaultWorkRoot = "/data/local/tmp/device-farmer"
+
+	// agreementTries bounds the one read this package retries. See
+	// [Runner.attemptStepsAgree] for why that read is the exception.
+	agreementTries = 3
 )
 
 // Endings the runner distinguishes. They are also, exactly, the vocabulary of
@@ -229,8 +255,20 @@ type Outcome struct {
 	Skipped int
 
 	// Error is the human-readable reason the attempt did not succeed, as
-	// written to farm.job_attempts.error.
+	// written to farm.job_attempts.error — or, when VerdictWithheld is set, the
+	// reason the job's state was not written at all.
 	Error string
+
+	// VerdictWithheld means the runner DELIBERATELY did not write the job's
+	// terminal state, and no supervisor may write one on its behalf.
+	//
+	// It is set on exactly one path: an attempt that ran every step it was
+	// given, whose farm.job_steps rows do not support reporting the JOB as
+	// succeeded. A safety net that wrote 'succeeded' here because the runner's
+	// write "did not land" would undo the whole point of the refusal — see
+	// [Runner.refuseUnevidencedSuccess] — so a caller that mirrors verdicts
+	// must check this before it writes one.
+	VerdictWithheld bool
 
 	// Fenced is true when the lease was lost mid-run. The device is not ours
 	// any more; do not release it, do not touch it.
@@ -492,6 +530,23 @@ func (r *Runner) Run(ctx context.Context, h Holder, p Placement, dev Conn) (Outc
 
 	switch out.State {
 	case StateSucceeded:
+		// ctx, not work: the retries inside stop when the PROCESS is shutting
+		// down, and losing the lease is not that. A fenced holder never reaches
+		// this branch — execute would have classified it as abandoned — so the
+		// only thing work adds here is a way to cut the read short for a
+		// cancellation that has nothing to say about the database.
+		if why := r.attemptStepsAgree(book, ctx, log, p, attempt, len(spec.Steps)); why != "" {
+			// The lease still goes back as 'completed', deliberately. The
+			// release reason describes what this PLACEMENT did with the device
+			// — it ran every step it was given and is done with it — and is not
+			// a verdict on the job; the job's verdict is farm.jobs.state, which
+			// is precisely what has just been withheld. Releasing as 'failed'
+			// would put a claim about the work into the lease history to
+			// describe a gap in the bookkeeping.
+			out.VerdictWithheld, out.Error = true, why
+			r.refuseUnevidencedSuccess(book, log, p, attempt, why)
+			break
+		}
 		r.writeJobState(book, log, p, "succeeded", "", false)
 	case StateFailed:
 		// A job with attempts left goes back on the queue rather than to
@@ -543,6 +598,14 @@ func (r *Runner) execute(
 			st := spec.Steps[plan.refusedIndex]
 			r.recordStep(book, log, p, out.Attempt, plan.refusedIndex, st, "failed",
 				nil, nil, err.Error(), map[string]any{"resume_refused": true})
+			// The refusal ends the attempt exactly as a failed step does, and
+			// permanently: the job will not be placed again. Everything after
+			// the refused step is work nobody will ever do, so it is recorded
+			// as such. Without this the step list of a refused resume stops at
+			// the step that was in flight, and a reader who does not have the
+			// spec in front of them cannot tell that from a job that was only
+			// ever that long.
+			r.recordSkipped(book, log, p, out.Attempt, spec.Steps, plan.refusedIndex, endedByRefusal)
 		}
 		return execResult{permanent: true}
 	}
@@ -624,7 +687,20 @@ func (r *Runner) execute(
 			}
 			r.recordStep(book, log, p, out.Attempt, i, st, state,
 				exitOf(result), outputOf(result), err.Error(), detail)
-			return r.classifyAbort(ctx, h, log, err, out, "step "+st.ID)
+
+			res := r.classifyAbort(ctx, h, log, err, out, "step "+st.ID)
+			// The tail is recorded only once classifyAbort has said which of
+			// the three aborts this was, because two of them are not endings.
+			// A fenced or shut-down attempt keeps its checkpoint and is resumed
+			// at the SAME attempt number, rewriting these very rows — so
+			// 'skipped' there would tell an operator that work about to happen
+			// never will. An elapsed max_runtime is the ending: the user's own
+			// clock has been spent, the job goes to 'failed', and without these
+			// rows the step list stops dead at the step that was interrupted.
+			if out.State != StateAbandoned {
+				r.recordSkipped(book, log, p, out.Attempt, spec.Steps, i, endedByStop)
+			}
+			return res
 
 		case err != nil:
 			// Step timeout, or something no retry could fix. This is the step
@@ -645,7 +721,7 @@ func (r *Runner) execute(
 			out.Error = fmt.Sprintf("step %d (%s/%s): %v", i, st.ID, st.Kind(), err)
 			out.ReleaseReason = lease.ReasonFailed
 			log.Error("step failed", "step", st.ID, "kind", string(st.Kind()), "err", err)
-			r.recordSkipped(book, log, p, out.Attempt, spec.Steps, i)
+			r.recordSkipped(book, log, p, out.Attempt, spec.Steps, i, endedByFailure)
 			// Deliberately not permanent, even for a non-retryable error. The
 			// same failure on four different devices is what tells an operator
 			// this is a job problem, and farm.job_attempts is the table that
@@ -674,7 +750,7 @@ func (r *Runner) execute(
 			out.ReleaseReason = lease.ReasonFailed
 			log.Error("step reported failure", "step", st.ID, "kind", string(st.Kind()),
 				"failure", result.Failure)
-			r.recordSkipped(book, log, p, out.Attempt, spec.Steps, i)
+			r.recordSkipped(book, log, p, out.Attempt, spec.Steps, i, endedByFailure)
 			return execResult{}
 
 		default:
@@ -1176,24 +1252,58 @@ type skippedRow struct {
 	Detail map[string]any
 }
 
-// skippedAfter lists the steps after the one at failed, each carrying the
-// reason it was not run. It is pure so the reason can be checked without a
-// database: detail.reason is the sentence an operator reads, and
-// detail.failed_step is what a dashboard links.
-func skippedAfter(steps []jobspec.Step, failed int) []skippedRow {
-	if failed < 0 || failed+1 >= len(steps) {
+// stepEnding is how the step that ended the attempt ended, in the words an
+// operator reads on every step after it.
+//
+// It is a parameter rather than one fixed sentence because the three endings
+// are not the same event and this package may not blur them. "failed" is a
+// verdict on the work; a run cut short by the job's own max_runtime did not
+// fail at the step it was standing on, and a resume this package refused was
+// never run at all. Writing "failed" over all three would put a verdict in the
+// ledger for something that was merely stopped — the small version of the
+// mistake the whole package is shaped against.
+type stepEnding string
+
+const (
+	// endedByFailure: the step ran and ended badly — a timeout, a refusal from
+	// the device, a non-zero verdict the spec does not tolerate.
+	endedByFailure stepEnding = "failed and ended the attempt"
+
+	// endedByStop: the step was still running when the run was ended out from
+	// under it and the attempt cannot be resumed — in practice the job's own
+	// max_runtime, the one user-supplied clock that ends a run.
+	endedByStop stepEnding = "was stopped mid-run and ended the attempt"
+
+	// endedByRefusal: a resume that would have repeated a side effect. The step
+	// was not run a second time and nothing after it was reached.
+	endedByRefusal stepEnding = "could not be resumed safely and ended the attempt"
+)
+
+// skippedAfter lists the steps after the one at ended, each carrying the reason
+// it was not run. It is pure so the reason can be checked without a database:
+// detail.reason is the sentence an operator reads, and detail.failed_step is
+// what a dashboard links.
+//
+// failed_step and failed_step_index keep those names for all three endings. The
+// key is a link target in a ledger that already holds rows written under the
+// old, failure-only spelling, and one fact reachable under two key names
+// depending on when the row was written is worse for the reader than a key
+// whose name is a shade broader than its contents. detail.reason is where the
+// ending is stated precisely.
+func skippedAfter(steps []jobspec.Step, ended int, how stepEnding) []skippedRow {
+	if ended < 0 || ended+1 >= len(steps) {
 		return nil
 	}
-	cause := steps[failed]
-	reason := fmt.Sprintf("not run: step %d (%s/%s) failed and ended the attempt",
-		failed, cause.ID, cause.Kind())
-	out := make([]skippedRow, 0, len(steps)-failed-1)
-	for i := failed + 1; i < len(steps); i++ {
+	cause := steps[ended]
+	reason := fmt.Sprintf("not run: step %d (%s/%s) %s",
+		ended, cause.ID, cause.Kind(), how)
+	out := make([]skippedRow, 0, len(steps)-ended-1)
+	for i := ended + 1; i < len(steps); i++ {
 		st := steps[i]
 		d := stepDetail(st)
 		d["reason"] = reason
 		d["failed_step"] = cause.ID
-		d["failed_step_index"] = failed
+		d["failed_step_index"] = ended
 		out = append(out, skippedRow{Index: i, ID: st.ID, Kind: string(st.Kind()), Detail: d})
 	}
 	return out
@@ -1205,9 +1315,17 @@ func skippedAfter(steps []jobspec.Step, failed int) []skippedRow {
 // Without these rows a job that failed at step 2 of 4 shows two rows, and a
 // reader has to know the spec to learn that two more were never reached: the
 // dashboard's count and `ctl job steps` both looked like a job with two steps
-// that ran one of them. Each row names the step whose failure is its reason,
+// that ran one of them. Each row names the step whose ending is its reason,
 // because 'skipped' on its own is also what a resumed attempt writes for a
 // step that already completed, and the reason is what tells the two apart.
+//
+// Every branch that ends an attempt for good calls this — a failure, a refused
+// resume, and a run cut short by max_runtime alike — because a complete step
+// list is what [Runner.attemptStepsAgree] checks before this package will
+// report a job as succeeded. An attempt that is merely ABANDONED does not call
+// it: the same attempt number resumes from the checkpoint, so its remaining
+// steps are work somebody is about to do, and writing 'skipped' over them
+// would state the opposite of what is about to happen.
 //
 // They are 'skipped' and never 'pending'. pending and running are the two
 // states the janitor sweeps and the job_steps_live index covers, and a row
@@ -1221,9 +1339,9 @@ func skippedAfter(steps []jobspec.Step, failed int) []skippedRow {
 // from an earlier run of this same attempt, and what it says about that run
 // is no longer what happened to this one.
 func (r *Runner) recordSkipped(ctx context.Context, log *slog.Logger, p Placement,
-	attempt int, steps []jobspec.Step, failed int) {
+	attempt int, steps []jobspec.Step, ended int, how stepEnding) {
 
-	rows := skippedAfter(steps, failed)
+	rows := skippedAfter(steps, ended, how)
 	if len(rows) == 0 {
 		return
 	}
@@ -1255,11 +1373,257 @@ ON CONFLICT (job_id, attempt, step_index) DO UPDATE
 	defer cancel()
 
 	if _, err := r.cfg.Pool.Exec(cctx, q, p.JobID, attempt, indexes, ids, kinds, details); err != nil {
-		log.Error("could not record the steps that were not run", "after", steps[failed].ID,
+		log.Error("could not record the steps that were not run", "after", steps[ended].ID,
 			"count", len(rows), "err", err)
 		return
 	}
-	log.Info("steps after the failure recorded as skipped", "after", steps[failed].ID, "count", len(rows))
+	log.Info("steps after the ending recorded as skipped", "after", steps[ended].ID,
+		"how", string(how), "count", len(rows))
+}
+
+// attemptStepsAgree asks farm.job_steps whether this attempt's own rows support
+// reporting the job as succeeded. It returns "" when they do, and otherwise the
+// sentence an operator needs to understand why the job is not finished.
+//
+// It asks the DATABASE rather than out.Steps and out.Skipped on purpose. Those
+// two counters are incremented by the same loop that decides the verdict, so
+// comparing them against len(spec.Steps) would only prove the loop agrees with
+// itself — including on the run where every recordStep failed on the wire and
+// the job's step list is empty. The rows are the thing the API shows and the
+// thing JOB-10 is about, so the rows are what gets asked.
+//
+// Two disagreements are recognised, and the first is the one that produced
+// JOB-10: an install whose push failed left step 1 at 'running' — inserted by
+// recordStepStart, never overwritten, because recordStep's failure is logged
+// and swallowed — the loop carried on, and the job was written 'succeeded'
+// beside a step row that still said it was executing.
+//
+// want is len(spec.Steps): rows outside that range are not counted as evidence,
+// because a row at an index the current spec does not have is a leftover from a
+// run this verdict is not about.
+//
+// stepBeliesSuccess below is spelled character for character as
+// internal/janitor's constant of the same name, and the two must never diverge.
+// They are the same question asked from two sides — this one before a success
+// is written, that one over successes already written — so a row this function
+// accepted and that one rejects is a job the runner reports succeeded and the
+// next sweep silently reverses, with each of them logging that the other must
+// be at fault. The duplication is deliberate: internal/janitor imports nothing
+// that could end a lease, and it is not going to start importing this package
+// to share a string.
+// ctx is the bookkeeping context, which by design does not cancel: the read has
+// to happen even though the work is over. stop is the process's own context and
+// gates only the RETRIES — see the loop below.
+func (r *Runner) attemptStepsAgree(ctx, stop context.Context, log *slog.Logger, p Placement,
+	attempt, want int) string {
+
+	const stepBeliesSuccess = `(s.state IN ('pending','running','aborted')
+        OR (s.state = 'failed' AND COALESCE(s.detail->>'tolerated', '') <> 'true'))`
+
+	// The whole query is confined to the spec's own index range, in the WHERE
+	// rather than in each FILTER, so no count can read a row the others cannot.
+	// A row outside it is a leftover from a run against a different step list;
+	// counting it as evidence would let it stand in for a step that is missing,
+	// and counting it as a contradiction would withhold this job's verdict on
+	// every attempt for the rest of its life, with nothing an operator could do
+	// about it.
+	const q = `
+SELECT count(*) FILTER (WHERE s.state IN ('pending','running')),
+       COALESCE((array_agg(s.step_id ORDER BY s.step_index)
+                   FILTER (WHERE s.state IN ('pending','running')))[1], ''),
+       count(*) FILTER (WHERE ` + stepBeliesSuccess + `),
+       COALESCE((array_agg(s.step_id ORDER BY s.step_index)
+                   FILTER (WHERE ` + stepBeliesSuccess + `))[1], ''),
+       count(*)
+  FROM farm.job_steps s
+ WHERE s.job_id = $1::uuid AND s.attempt = $2
+   AND s.step_index >= 0 AND s.step_index < $3::int`
+
+	var live, belies, have int
+	var liveStep, beliesStep string
+
+	// Retried, alone among this package's bookkeeping calls, and for a reason
+	// that is about consequence rather than importance.
+	//
+	// Every other write here logs its failure and carries on because the job's
+	// verdict must not depend on a database blip. This one is a READ whose
+	// failure withholds the verdict — and a withheld verdict costs the job a
+	// whole re-execution on another device, side effects included, since a
+	// fresh placement does not resume from a checkpoint that belongs to the old
+	// lease. Spending three round trips to avoid re-running a six-hour job
+	// because one query lost a socket is not a close call.
+	//
+	// It is bounded and small: the alternative to succeeding here is not
+	// failure, it is the re-run, so there is nothing to gain from trying
+	// harder. If the database is genuinely gone, writeJobState is about to fail
+	// too and the job is re-queued either way.
+	//
+	// The retries — and only the retries — stop when stop is cancelled. The
+	// FIRST read always runs on the bookkeeping context, because a SIGTERM
+	// arriving in the middle of it must not turn a healthy database into a
+	// withheld verdict. What the guard prevents is the other shape: a pod being
+	// drained against a database that is already gone, spending three call
+	// timeouts here on top of the ones closeAttempt and writeJobState are about
+	// to spend, and being SIGKILLed for it partway through.
+	var err error
+	for try := 1; ; try++ {
+		func() {
+			cctx, cancel := r.db(ctx)
+			defer cancel()
+			err = r.cfg.Pool.QueryRow(cctx, q, p.JobID, attempt, want).
+				Scan(&live, &liveStep, &belies, &beliesStep, &have)
+		}()
+		if err == nil || try >= agreementTries || stop.Err() != nil {
+			break
+		}
+		log.Warn("the step-row read a 'succeeded' verdict rests on failed; retrying rather "+
+			"than costing the job a whole re-run over one blip", "try", try, "err", err)
+		select {
+		case <-stop.Done():
+		case <-time.After(r.cfg.RetryBase):
+		}
+	}
+	if err != nil {
+		// Not knowing is not agreement. The database is the only witness to
+		// what this attempt recorded, and a verdict of 'succeeded' written
+		// without reading it would be the exact claim this function exists to
+		// stop — so an unreadable ledger withholds the verdict too.
+		log.Error("could not read the step rows that a 'succeeded' verdict rests on", "err", err)
+		return fmt.Sprintf("the step rows of attempt %d could not be read (%v), "+
+			"so nothing here can say the whole spec ran", attempt, err)
+	}
+
+	switch {
+	case live > 0:
+		return fmt.Sprintf("%d step row(s) of attempt %d still say 'pending' or 'running' (%s); "+
+			"a job has not succeeded while a step of it is still recorded as executing",
+			live, attempt, liveStep)
+	case belies > 0:
+		// A step this attempt ran and did not finish cannot be here: every
+		// branch that produces one returns before the loop can reach the end.
+		// So this is a row from an earlier run of the same attempt number that
+		// the current run should have overwritten and could not — which is
+		// exactly as much of an unevidenced success as a missing row is.
+		return fmt.Sprintf("%d step row(s) of attempt %d record work that did not finish (%s); "+
+			"this attempt ran to the end, so those rows are from an earlier run of it that "+
+			"was never overwritten", belies, attempt, beliesStep)
+	case have < want:
+		return fmt.Sprintf("attempt %d recorded a verdict for %d of the spec's %d step(s); "+
+			"%d step(s) left no record of what happened to them",
+			attempt, have, want, want-have)
+	}
+	return ""
+}
+
+// refuseUnevidencedSuccess is what happens INSTEAD of writing 'succeeded' when
+// the step rows do not support it.
+//
+// # The tension this arbitrates
+//
+// [Runner.recordStep] and [Runner.recordStepStart] log their failures and carry
+// on, deliberately, and TestABookkeepingFailureIsNeverAVerdictOnTheJob pins
+// that: a database blip must never become a verdict on a job. But that same
+// tolerance is what lets one failed write leave step i at 'running' while the
+// loop runs to the end — and JOB-10 requires that a job's reported state agree
+// with its step rows. Both properties are real and they pull opposite ways.
+//
+// They are reconciled by REFUSING rather than by downgrading. Nothing is
+// written here at all: farm.jobs keeps the state it already had, which is
+// 'running'. That is the absence of a verdict, not a new one, so the blip has
+// still decided nothing about the job — and 'succeeded' has still not been
+// claimed without evidence. Downgrading to 'failed' would have satisfied
+// JOB-10 by breaking the other property, saying a job failed when every step of
+// it ran; leaving 'succeeded' would have kept the other property by breaking
+// JOB-10. Withholding is the only move that keeps both, and it is available
+// only because a job at 'running' is already a state this system knows how to
+// resolve.
+//
+// # What the operator sees
+//
+//   - this ERROR line, naming the job, the attempt and which rows disagree;
+//   - a job_success_not_asserted event on the job in farm.events carrying the
+//     same sentence, so "why is this job not finished?" is answerable from the
+//     API rather than from one pod's logs;
+//   - farm.job_attempts still records this attempt as 'succeeded', because it
+//     did succeed: every step this process ran, ran. The attempt's own truth
+//     was never what was in doubt, and the row is written before this point;
+//   - the reason on farm.jobs.error, without touching farm.jobs.state, so the
+//     job's own page answers "why is this still running?" while it waits;
+//   - then the job goes where a 'running' job with no live lease goes.
+//     internal/janitor's job sweep puts it back on the queue while its own
+//     max_attempts allows. Running the spec again on another device is the
+//     same disposition this package already gives a failed attempt, and it is
+//     the only one that can produce the evidence that is missing.
+//
+// # What happens when the budget is spent
+//
+// Say it plainly, because the withholding above does not make it go away: when
+// the withheld attempt was the job's LAST, the janitor's job sweep has nowhere
+// left to place it and records it 'failed'. A job cannot stay 'running'
+// forever, and the schema has no state for "this cannot be evidenced".
+//
+// That is not the property TestABookkeepingFailureIsNeverAVerdictOnTheJob
+// protects arriving by a side door. That test is about a process declaring a
+// verdict it has no standing to declare, in the moment, on a job somebody else
+// may still be running — and none of that happens here: nothing is written, the
+// lease goes back, and every remaining attempt in the user's own budget is
+// spent on the job before anything terminal is said about it. What is left at
+// the end is a job whose success genuinely cannot be evidenced after every
+// attempt it was allowed, which is a fact about the job and not an opinion
+// about a database blip. The job_success_not_asserted events on the way there
+// are what tell an operator which of the two they are looking at.
+//
+// Outcome.VerdictWithheld carries the refusal out to the supervisor, whose
+// finalize is a safety net for a verdict that did not land. This one did not
+// land because it was not sent.
+func (r *Runner) refuseUnevidencedSuccess(ctx context.Context, log *slog.Logger,
+	p Placement, attempt int, why string) {
+
+	log.Error("REFUSING to report this job as succeeded: its step rows do not support it. "+
+		"The job's state is left alone rather than downgraded — a bookkeeping failure "+
+		"must not become a verdict either way — and the janitor will place it again "+
+		"while its max_attempts allows",
+		"attempt", attempt, "disagreement", why)
+
+	r.noteJobError(ctx, log, p, fmt.Sprintf(
+		"attempt %d ran every step it was given, but its farm.job_steps rows do not support "+
+			"reporting this job as succeeded: %s. The verdict was withheld rather than "+
+			"guessed, so this job is still running and will be placed again while its "+
+			"max_attempts allows.", attempt, why))
+
+	r.event(ctx, log, p, "job_success_not_asserted", map[string]any{
+		"attempt": attempt, "reason": why,
+	})
+}
+
+// noteJobError records why a job is not finished, WITHOUT touching its state.
+//
+// It carries the same fence guard writeJobState does and for the same reason: a
+// stale holder must not scribble on a job a newer placement is running. What it
+// deliberately does not carry is a state, so nothing it writes is a verdict —
+// the whole point of the path that calls it is that no verdict is being made.
+//
+// The text is transient by design. The janitor overwrites farm.jobs.error when
+// it re-queues the job, which is correct: by then the reason the job is moving
+// is the sweeper's, not this one's. The durable trail is the
+// job_success_not_asserted event, which is per-attempt and is never overwritten.
+func (r *Runner) noteJobError(ctx context.Context, log *slog.Logger, p Placement, text string) {
+	const q = `
+UPDATE farm.jobs j
+   SET error = $2
+ WHERE j.id = $1::uuid
+   AND j.state NOT IN ('succeeded','failed','cancelled')
+   AND EXISTS (SELECT 1 FROM farm.leases l
+                WHERE l.job_id = j.id AND l.fence = $3
+                  AND l.state IN ('held','suspect'))`
+
+	cctx, cancel := r.db(ctx)
+	defer cancel()
+
+	if _, err := r.cfg.Pool.Exec(cctx, q, p.JobID, text, p.Fence); err != nil {
+		log.Warn("could not record why the job's verdict was withheld; the log line above "+
+			"and the audit event are the trail", "err", err)
+	}
 }
 
 // writeJobState moves farm.jobs.state, fenced.

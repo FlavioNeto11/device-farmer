@@ -26,9 +26,9 @@ func TestStepsAfterAFailureAreListedAsSkippedNamingTheFailure(t *testing.T) {
 	t.Parallel()
 
 	steps := fourSteps()
-	rows := skippedAfter(steps, 1)
+	rows := skippedAfter(steps, 1, endedByFailure)
 	if len(rows) != 2 {
-		t.Fatalf("skippedAfter(steps, 1) = %d rows, want the two steps after the install", len(rows))
+		t.Fatalf("skippedAfter(steps, 1, endedByFailure) = %d rows, want the two steps after the install", len(rows))
 	}
 	for i, row := range rows {
 		want := steps[i+2]
@@ -57,12 +57,12 @@ func TestStepsAfterAFailureAreListedAsSkippedNamingTheFailure(t *testing.T) {
 	// The last step failing leaves nothing to skip, and nonsense indexes
 	// produce nothing rather than a panic.
 	for _, failed := range []int{3, 4, -1} {
-		if got := skippedAfter(steps, failed); got != nil {
-			t.Fatalf("skippedAfter(steps, %d) = %v, want nothing", failed, got)
+		if got := skippedAfter(steps, failed, endedByFailure); got != nil {
+			t.Fatalf("skippedAfter(steps, %d, endedByFailure) = %v, want nothing", failed, got)
 		}
 	}
-	if got := skippedAfter(nil, 0); got != nil {
-		t.Fatalf("skippedAfter(nil, 0) = %v, want nothing", got)
+	if got := skippedAfter(nil, 0, endedByFailure); got != nil {
+		t.Fatalf("skippedAfter(nil, 0, endedByFailure) = %v, want nothing", got)
 	}
 }
 
@@ -93,7 +93,7 @@ VALUES ($1::uuid, 1, 3, 'collect', 'pull', 'running', now() - interval '1 hour',
 	r.recordStep(ctx, r.log, p, 1, 0, steps[0], "ok", nil, nil, "", nil)
 	r.recordStepStart(ctx, r.log, p, 1, 1, steps[1])
 	r.recordStep(ctx, r.log, p, 1, 1, steps[1], "failed", nil, nil, "blob missing", nil)
-	r.recordSkipped(ctx, r.log, p, 1, steps, 1)
+	r.recordSkipped(ctx, r.log, p, 1, steps, 1, endedByFailure)
 
 	type row struct {
 		index         int
@@ -172,7 +172,7 @@ SELECT count(*) FROM farm.job_steps
 
 	// Writing the tail again — a resumed run of the same attempt failing at
 	// the same place — is the same four rows, not eight and not an error.
-	r.recordSkipped(ctx, r.log, p, 1, steps, 1)
+	r.recordSkipped(ctx, r.log, p, 1, steps, 1, endedByFailure)
 	check(read())
 	if n := logs.count("could not record the steps"); n != 0 {
 		t.Fatalf("recording the tail was logged as failing %d time(s)", n)
@@ -180,7 +180,7 @@ SELECT count(*) FROM farm.job_steps
 
 	// The last step failing writes nothing and says nothing.
 	before := len(read())
-	r.recordSkipped(ctx, r.log, p, 1, steps, 3)
+	r.recordSkipped(ctx, r.log, p, 1, steps, 3, endedByFailure)
 	if after := len(read()); after != before {
 		t.Fatalf("a failure at the last step wrote %d row(s)", after-before)
 	}

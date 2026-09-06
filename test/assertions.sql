@@ -76,7 +76,6 @@ DECLARE
   v_cnt       int;
   v_ok        boolean;
   v_gap       interval;
-  v_reclaimed int;
 BEGIN
   -- ============================================================
   -- P1  ACQUIRE grants a device and marks a 6h job protected.
@@ -197,24 +196,41 @@ BEGIN
   RAISE NOTICE 'P9  ok  renew resets the witness extension counter';
 
   -- ============================================================
-  -- P10 Protected leases are never auto-reclaimed, even when
-  --     long expired. Hold and page instead.
+  -- P10 SILENCE IS NOT A DEADLINE. The holder has not been heard
+  --     from in ten hours, and its lease deadline still stands
+  --     because P4's renew pushed it out. farm.lease_mark_suspect
+  --     selects on expires_at and never reads heartbeat_at, so the
+  --     staleness on its own moves nothing: the lease does not even
+  --     reach 'suspect', let alone become a reclaim candidate.
+  --
+  --     What this block is NOT is the protection guarantee, and
+  --     saying so is the point of this comment. That guarantee needs
+  --     a lease already suspect with its deadlines elapsed, and this
+  --     suite cannot build one: it is a single transaction, so now()
+  --     is frozen, and farm.trg_leases_guard forbids walking a
+  --     renewed deadline back behind it. Every reclaim candidate
+  --     condition fails here for reasons that have nothing to do with
+  --     `protected` — which is exactly how an earlier version of this
+  --     block, which called farm.lease_reclaim and declared the
+  --     survivor proof of protection, stayed green while the
+  --     protection line was deleted from the function. The guarantee
+  --     is asserted against an unprotected positive control in
+  --     test/assertions_v18.sql.
   -- ============================================================
   UPDATE farm.leases
      SET heartbeat_at = now() - interval '10 hours'
    WHERE id = v_lease;
-  -- Move the deadlines forward-only is enforced, so expire via the
-  -- guard-legal route: they are already in the past relative to a
-  -- shifted clock, so drive the sweep directly.
-  UPDATE farm.reaper_state SET quiesce_until = now() - interval '1 second';
 
-  PERFORM farm.lease_mark_suspect(500);
-  SELECT count(*) INTO v_reclaimed FROM farm.lease_reclaim(100, interval '35 seconds');
-  PERFORM 1 FROM farm.leases WHERE id = v_lease AND state IN ('held','suspect');
-  IF NOT FOUND THEN
-    RAISE EXCEPTION 'P10 FAILED: protected lease was reclaimed';
+  SELECT count(*) INTO v_cnt FROM farm.lease_mark_suspect(500);
+  IF v_cnt <> 0 THEN
+    RAISE EXCEPTION 'P10 FAILED: a stale heartbeat alone marked % lease(s) suspect', v_cnt;
   END IF;
-  RAISE NOTICE 'P10 ok  protected lease survives reclaim (hold and page)';
+  PERFORM 1 FROM farm.leases
+    WHERE id = v_lease AND state = 'held' AND released_at IS NULL;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'P10 FAILED: a ten-hour silence disturbed a lease inside its deadline';
+  END IF;
+  RAISE NOTICE 'P10 ok  ten hours of silence inside the deadline marks nothing';
 
   -- ============================================================
   -- P11 Release is the normal end, and it bumps the device floor

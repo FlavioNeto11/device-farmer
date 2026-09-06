@@ -13,6 +13,8 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	// Registers the "pgx" database/sql driver. goose speaks database/sql, so
 	// this is the one place in the binary that opens a non-pool connection.
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -54,8 +56,18 @@ var migrationsFS fs.FS
 const firstMigration = "00001_core.sql"
 
 // migrationLockKey guards concurrent migrators. Two farmd migrate Jobs racing
-// in the same cluster would otherwise both try to CREATE SCHEMA farm and one
-// would fail the deploy for no real reason.
+// against the same database would otherwise both try to CREATE SCHEMA farm and
+// one would fail the deploy for no real reason.
+//
+// Against the SAME DATABASE, and no wider: pg_advisory_lock is scoped to the
+// database the session is connected to, and this command is only ever given
+// one DSN. It therefore cannot serialise the cluster-wide DDL in the migration
+// set — the NOLOGIN roles of 00002_lease.sql and 00008_parked.sql, which every
+// database in the cluster shares — because a migrator working on another
+// database takes its lock there and the two never meet. Those statements are
+// made collision-proof where they are issued instead; 00002_lease.sql explains
+// the idiom, and it protects goose called from a test harness or a psql run
+// too, neither of which comes through this function.
 const migrationLockKey int64 = 0x6466_6d69_6772_0001 // "df" + "migr" + version
 
 func runMigrate(ctx context.Context, args []string, stdout, stderr io.Writer) error {
@@ -215,6 +227,36 @@ func runMigrate(ctx context.Context, args []string, stdout, stderr io.Writer) er
 		defer unlock()
 	}
 
+	// Before goose is asked anything at all: every action below reads the
+	// version first, and reading it CREATES the version table when it is
+	// missing — goose.GetDBVersion falls back to createVersionTable — so the
+	// schema half of FARM_MIGRATIONS_TABLE has to exist by now. On a fresh
+	// database it does not: migration 00001 is what creates farm, and it has
+	// not run yet. That is what made FARM_MIGRATIONS_TABLE=farm.schema_version
+	// work on an established farm and refuse on a new one, which is backwards
+	// — the moment an operator picks the ledger's name is the moment they
+	// create the database.
+	//
+	// status included, deliberately. It is read-only about the FARM, which is
+	// what the lock comment above means, but it has never been read-only about
+	// the ledger: goose creates the version table underneath it just the same.
+	// Refusing to make room for that table on the one action that would still
+	// go on to create it would mean status failing where up succeeds, with two
+	// different answers to "where is this database's ledger".
+	//
+	// It is worth knowing what that costs, because status holds no lock. A
+	// status whose ledger schema is missing, run at the same moment as an `up`
+	// on the same database, can create schema farm inside the microseconds
+	// between that migrator's CREATE SCHEMA IF NOT EXISTS probing the catalog
+	// and inserting into it — IF NOT EXISTS is not atomic — and abort its
+	// 00001. The migration is transactional and the migrator is a Job that
+	// retries, so the cost is a retry; taking the lock here instead would cost
+	// status its whole reason for existing, which is to answer while a
+	// migration is in flight.
+	if err := prepareMigrationLedger(ctx, db, cfg.MigrationsTable, stdout); err != nil {
+		return err
+	}
+
 	current, err := goose.GetDBVersionContext(ctx, db)
 	if err != nil {
 		return fmt.Errorf("read schema version: %w", err)
@@ -237,6 +279,41 @@ func runMigrate(ctx context.Context, args []string, stdout, stderr io.Writer) er
 					"phones; nothing in the control plane will know. Re-run with -yes if that\n"+
 					"is genuinely what you want.", current, target)
 		}
+		// A ledger inside the farm schema cannot survive its own rollback, and
+		// -yes must not be read as consent to that: 00001's Down is
+		// `DROP SCHEMA IF EXISTS farm CASCADE`, which takes the version table
+		// with it, and goose then deletes its version row inside the same
+		// transaction and gets 42P01. That migration alone rolls back, leaving
+		// the database at version 1 with 00002 upward already undone — a
+		// half-applied schema, which is the state 00001's own header exists to
+		// prevent. Refused here, before anything is dropped, because there is
+		// nothing useful to say once the run is halfway through.
+		//
+		// Only when a rollback would actually happen (target < current, which
+		// implies the ledger already exists), so a `down-to 0` against a
+		// database that has nothing to roll back stays the no-op it always
+		// was, and no refusal is ever reported by a run that created something
+		// on its way to it.
+		if target < 1 && target < current {
+			schema, err := ledgerSchema(ctx, db, cfg.MigrationsTable)
+			if err != nil {
+				return err
+			}
+			if schema == farmSchema {
+				return fmt.Errorf(
+					"refusing to migrate down to %d while the ledger lives in schema %s "+
+						"(%s=%q).\n00001's Down drops schema %s CASCADE, which destroys the "+
+						"version table itself, so goose cannot record the rollback it just "+
+						"performed: the run stops at version 1 with everything above it "+
+						"already undone.\nThere is no rollback past 00001 for a ledger kept "+
+						"in this schema. Drop the database if the whole farm is meant to go. "+
+						"A partial rollback keeps the ledger, but note that 00015's Down "+
+						"revokes role memberships that are CLUSTER-wide: it stops every other "+
+						"farm on this server from assuming its runtime roles.",
+					target, farmSchema, config.EnvMigrationsTable, cfg.MigrationsTable,
+					farmSchema)
+			}
+		}
 		if err := goose.DownToContext(ctx, db, ".", target); err != nil {
 			return fmt.Errorf("migrate down-to %d: %w", target, err)
 		}
@@ -255,6 +332,199 @@ func runMigrate(ctx context.Context, args []string, stdout, stderr io.Writer) er
 	}
 	fmt.Fprintf(stdout, "schema version: %d (was %d), source %s\n", final, current, origin)
 	return nil
+}
+
+// farmSchema is the schema migration 00001 creates and its Down drops.
+// farmSentinel is the first table 00001 creates inside it, and therefore the
+// first thing a replay of 00001 would collide with.
+//
+// Two decisions turn on them — whether a database has already been migrated,
+// and whether rolling back would destroy the ledger — and both are about where
+// the ledger lives rather than about anything in the farm, which is why the
+// names are spelled out here rather than derived from the migration files.
+// TestFarmSchemaMatchesTheMigrations holds them against 00001's own statements,
+// because the two guards below degrade to silence rather than to an error if
+// they ever stop matching.
+const (
+	farmSchema   = "farm"
+	farmSentinel = "farm.racks"
+)
+
+// prepareMigrationLedger makes sure the table named by FARM_MIGRATIONS_TABLE
+// can be created where it was asked for, creating its schema when that is the
+// only thing missing and refusing when creating it would start a SECOND
+// ledger on a database that already has one.
+//
+// Creating the schema, rather than refusing with "create it first, here is the
+// statement", is a choice between two defensible answers. The case against is
+// that this is a write nobody asked for. The case that wins is that they did
+// ask, in the only place the request can be made: this command's entire job is
+// to take a database from nothing to a farm schema, four cluster roles and
+// several dozen tables, and the single object it was refusing to create was
+// the ledger that records it did so. CREATE SCHEMA is also strictly smaller
+// than the next statement goose runs, and migration 00001 issues that very
+// statement for farm moments later.
+//
+// The refusal survives where it is the better answer, and what it asks about
+// is the LEDGER, not its schema. goose treats a database with no ledger as a
+// database at version 0 and replays 00001 into it, so pointing this variable
+// at a table that does not exist yet, on a database that has already been
+// migrated, ends in 42P07 and leaves a second ledger behind. Whether the new
+// ledger's schema happens to exist changes nothing about that — naming
+// farm.schema_version on a farm migrated under the default ledger is the same
+// mistake as naming ops.schema_version — which is why the schema half is not
+// the question here.
+//
+// "Already migrated" is asked as "does farm.racks exist", not as "does schema
+// farm hold anything", and the difference is a database an operator can no
+// longer migrate at all. `migrate status` creates the ledger where it was
+// pointed, so a status run against a fresh database with a qualified name
+// leaves schema farm holding exactly one table — the ledger — with nothing
+// applied. A guard that counted that as a farm would then refuse every value
+// of the variable, including the default, on a database that has never run a
+// migration. An empty farm schema is not a farm, and neither is one holding
+// only a ledger; the sentinel is a table only 00001 creates.
+//
+// What the choice still costs is a typo on a database that IS fresh:
+// FARM_MIGRATIONS_TABLE=farmm.schema_version leaves an empty farmm schema
+// behind and puts the ledger in it, and nothing downstream contradicts that,
+// because from goose's point of view a fresh ledger is a database at version
+// 0. That is why a created schema is announced: one line naming a schema the
+// operator did not mean to name is the cheapest place to catch it, and the
+// only place before the migrations start running.
+//
+// The existence checks are not an optimisation. CREATE SCHEMA checks CREATE on
+// the database before it checks whether the schema is already there, so
+// issuing it unconditionally would make every ordinary migration of an
+// established farm demand a privilege it has never needed. Reading the
+// catalogs demands none.
+func prepareMigrationLedger(ctx context.Context, db *sql.DB, table string, stdout io.Writer) error {
+	quoted, schema, err := quoteMigrationsTable(table)
+	if err != nil {
+		return err
+	}
+
+	// One round trip for all three facts. to_regclass resolves a name the way
+	// goose will — through search_path when it is unqualified — and returns
+	// NULL rather than raising when any part of it is missing.
+	var ledgerExists, migrated, schemaExists bool
+	if err := db.QueryRowContext(ctx, `
+		SELECT to_regclass($1) IS NOT NULL,
+		       to_regclass($2) IS NOT NULL,
+		       EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = $3)`,
+		quoted, farmSentinel, schema).Scan(&ledgerExists, &migrated, &schemaExists); err != nil {
+		return fmt.Errorf("looking for the migration ledger %s, named by %s (%q): %w",
+			quoted, config.EnvMigrationsTable, table, err)
+	}
+	if ledgerExists {
+		return nil
+	}
+	if migrated {
+		return fmt.Errorf(
+			"%s (%q) names a migration ledger this database does not have, and the database "+
+				"has already been migrated: %s exists.\nStarting a ledger now would call a "+
+				"migrated database version 0 and replay 00001 into tables that exist, which "+
+				"fails on the first CREATE TABLE and leaves two ledgers behind.\nPoint %s at "+
+				"the ledger this database already carries — %q unless it was moved — or look "+
+				"for a typo in the one you set.",
+			config.EnvMigrationsTable, table, farmSentinel,
+			config.EnvMigrationsTable, config.DefaultMigrationsTable)
+	}
+	if schema == "" || schemaExists {
+		// Nothing to create: either the name is unqualified, and goose will
+		// resolve it through search_path exactly as the query above did, or
+		// the schema is already there and only the table is missing — which
+		// on a database with no farm in it is an ordinary first migration.
+		return nil
+	}
+
+	// Quoted and concatenated, because a schema name is an identifier and not
+	// a value. MigrationsTableParts has already refused every spelling
+	// Postgres would fold differently, so Sanitize only adds the quotes.
+	//
+	// Plain CREATE SCHEMA rather than IF NOT EXISTS, so that reaching the
+	// print below means this process is the one that created it. IF NOT
+	// EXISTS would swallow a lost race silently and the line would claim a
+	// creation that happened somewhere else, which is the one claim the typo
+	// check above rests on.
+	quotedSchema := pgx.Identifier{schema}.Sanitize()
+	if _, err := db.ExecContext(ctx, "CREATE SCHEMA "+quotedSchema); err != nil {
+		// Losing a race for this schema produced the schema we wanted, which
+		// is not a failure. Both codes are load-bearing, and the second is the
+		// one a real race raises: 42P06 duplicate_schema once the other
+		// session has committed, 23505 from pg_namespace's unique index while
+		// it has not and this statement blocked on its uncommitted row. Both
+		// are reachable from `status`, which deliberately takes no lock.
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && (pgErr.Code == "42P06" || pgErr.Code == "23505") {
+			return nil
+		}
+		return fmt.Errorf("creating schema %q, which %s (%q) names as the home of the "+
+			"migration ledger: %w\nIf this user is not meant to hold CREATE on the "+
+			"database, create the schema once by hand and re-run: CREATE SCHEMA %s;",
+			schema, config.EnvMigrationsTable, table, err, quotedSchema)
+	}
+	fmt.Fprintf(stdout, "created schema %s, which %s names as the home of the migration ledger\n",
+		schema, config.EnvMigrationsTable)
+	return nil
+}
+
+// ledgerSchema reports the schema the migration ledger ACTUALLY lives in, or
+// "" when the table does not exist.
+//
+// Asked of Postgres rather than parsed out of FARM_MIGRATIONS_TABLE, because
+// the two can differ and the difference is invisible in the variable: an
+// unqualified name is resolved through search_path, and a DSN carrying
+// `options=-csearch_path%3Dfarm` — or a login role with that search_path set —
+// puts a ledger called goose_db_version inside the farm schema. A guard that
+// read the variable would not see that, and it is the case where the guard
+// matters most.
+func ledgerSchema(ctx context.Context, db *sql.DB, table string) (string, error) {
+	quoted, _, err := quoteMigrationsTable(table)
+	if err != nil {
+		return "", err
+	}
+	var schema string
+	err = db.QueryRowContext(ctx, `
+		SELECT n.nspname
+		  FROM pg_class c
+		  JOIN pg_namespace n ON n.oid = c.relnamespace
+		 WHERE c.oid = to_regclass($1)`, quoted).Scan(&schema)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("locating the migration ledger %s, named by %s (%q): %w",
+			quoted, config.EnvMigrationsTable, table, err)
+	}
+	return schema, nil
+}
+
+// quoteMigrationsTable renders FARM_MIGRATIONS_TABLE as a quoted SQL
+// identifier and hands back its schema half, "" for an unqualified name.
+//
+// The rule that matters — how the name splits, and which spellings are
+// refused because goose folds them and a reader quotes them — lives in
+// config.MigrationsTableParts and is shared with internal/api, which quotes
+// the same value to read the applied version back. Only the two lines of
+// quoting are restated here, and they are restated rather than exported
+// because the api's copy also carries a Config it may have been handed in
+// code; a shared helper would have to take both callers' fallbacks with it.
+//
+// Both cfg.MigrationsTable and -table have been through MigrationsTableParts
+// already inside cfg.Validate, so the error is defensive. It is still
+// returned rather than ignored: this is the function whose output is
+// concatenated into DDL, and a name nobody validated is exactly what must
+// never reach it.
+func quoteMigrationsTable(table string) (quoted, schema string, err error) {
+	schema, name, err := config.MigrationsTableParts(table)
+	if err != nil {
+		return "", "", fmt.Errorf("%s (%q) %w", config.EnvMigrationsTable, table, err)
+	}
+	if schema == "" {
+		return pgx.Identifier{name}.Sanitize(), "", nil
+	}
+	return pgx.Identifier{schema, name}.Sanitize(), schema, nil
 }
 
 // lockMigrations takes a session-scoped advisory lock. The lock lives on one
@@ -396,7 +666,13 @@ const migrateUsage = `Usage: farmd migrate <up | down-to VERSION | status> [flag
   down-to VERSION  roll back to VERSION (requires -yes when it moves backwards)
   status           list migrations and whether they are applied
 
-A session-scoped advisory lock serialises concurrent migrators, so it is safe
-to run this as a Kubernetes Job with more than one replica or a retrying
-init container.
+A session-scoped advisory lock serialises concurrent migrators of this
+database, so it is safe to run this as a Kubernetes Job with more than one
+replica or a retrying init container.
+
+When FARM_MIGRATIONS_TABLE names a schema, that schema is created if it is
+missing: goose writes its version table before the first migration runs, and
+on a fresh database nothing else has created it yet. On a database that is
+already a farm, a ledger that does not exist is refused instead — starting one
+there would replay the whole set into tables that already exist.
 `

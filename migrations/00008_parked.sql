@@ -225,8 +225,12 @@ COMMENT ON TABLE farm.device_parks IS
 -- +goose StatementBegin
 DO $$
 BEGIN
+  -- Check for the login user that has no CREATEROLE, catch for the migrator
+  -- creating this same cluster-wide role against another database at the
+  -- same moment. 00002_lease.sql says why both halves at length.
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'farm_parker') THEN
-    CREATE ROLE farm_parker NOLOGIN;
+    BEGIN CREATE ROLE farm_parker NOLOGIN;
+    EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END;
   END IF;
 END $$;
 -- +goose StatementEnd

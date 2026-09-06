@@ -37,14 +37,44 @@
 -- +goose StatementBegin
 DO $$
 BEGIN
+  -- Check AND catch. Both halves are load-bearing, and the check alone was
+  -- what this used to have.
+  --
+  -- The check is for the deployment whose roles a DBA created by hand: a
+  -- login user without CREATEROLE cannot issue CREATE ROLE at all, because
+  -- Postgres tests that privilege BEFORE it looks the name up, so an
+  -- unconditional CREATE would fail 42501 on a cluster where the role is
+  -- already there and correct.
+  --
+  -- The catch is for the gap the check leaves. A role is CLUSTER-wide while
+  -- this migration is per-database, so a migrator applying 00002 to ANOTHER
+  -- database can create the role between our SELECT and our CREATE, and
+  -- nothing local serialises that: pg_advisory_lock is per-database too.
+  -- Both codes appear — 42710 once the other migrator has committed, 23505
+  -- from pg_authid's unique index while it has not and this statement blocks
+  -- on its uncommitted row. Either way the role we wanted now exists.
+  --
+  -- The membership GRANT below needs no such guard, and neither do the table
+  -- grants: see 00015_runtime_roles.sql, which says why at length.
+  --
+  -- This block was edited after 00002 had been applied, which is otherwise
+  -- not done here. It is the only place the fix can go: goose never re-runs
+  -- an applied migration, so a new migration could not reach the statement
+  -- that races, and the race only happens while THIS one runs. A database
+  -- that already has these roles is unaffected either way — both forms end
+  -- with the three roles existing — so the edit changes no schema anywhere,
+  -- only what happens to the next database created on a cluster.
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'farm_reaper') THEN
-    CREATE ROLE farm_reaper NOLOGIN;
+    BEGIN CREATE ROLE farm_reaper NOLOGIN;
+    EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END;
   END IF;
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'farm_scheduler') THEN
-    CREATE ROLE farm_scheduler NOLOGIN;
+    BEGIN CREATE ROLE farm_scheduler NOLOGIN;
+    EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END;
   END IF;
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'farm_watchdog') THEN
-    CREATE ROLE farm_watchdog NOLOGIN;
+    BEGIN CREATE ROLE farm_watchdog NOLOGIN;
+    EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END;
   END IF;
 END $$;
 -- +goose StatementEnd

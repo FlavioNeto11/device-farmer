@@ -6,6 +6,25 @@ that serves POST /api/v1/leases/{id}/renew: the one request in this system
 whose failure costs a device. Everything below exists to keep that request
 answerable during ordinary cluster churn.
 */}}
+{{/*
+The lame-duck pause is spent OUT OF the drain window, not beside it.
+
+_helpers.tpl's checkDrainWindow refuses a terminationGracePeriodSeconds that
+does not exceed config.shutdownGrace. api.preStopSleepSeconds runs before farmd
+is signalled at all, and the kubelet counts it against the same grace period, so
+a window that passed that check can still leave the drain short. This covers the
+range checkDrainWindow cannot see — a window larger than the drain and no larger
+than the drain plus the pause in front of it — and the two conditions are
+disjoint, so exactly one of them can ever fire.
+*/}}
+{{- $grace := include "device-farmer.durationSeconds" .Values.config.shutdownGrace -}}
+{{- if $grace -}}
+{{- $window := .Values.api.terminationGracePeriodSeconds | int -}}
+{{- $lame := .Values.api.preStopSleepSeconds | int -}}
+{{- if and (gt $window ($grace | int)) (le $window (add ($grace | int) $lame)) -}}
+{{- fail (printf "\ndevice-farmer: the api's lame-duck pause eats the drain it exists to protect.\n\n  api.terminationGracePeriodSeconds = %d seconds\n  api.preStopSleepSeconds           = %d seconds, spent BEFORE farmd is signalled\n  config.shutdownGrace              = %s (%d seconds)\n\nThe kubelet counts the preStop pause against the termination grace period, so\nfarmd would be left %d seconds to drain and SIGKILLed with requests still open.\nOn a rolling deploy the one most likely to be open is\nPOST /api/v1/leases/{id}/renew, a round trip from success: no lease ends from\nlosing it, but the holder pays TTL for a deploy that should have cost nothing.\n\nRaise api.terminationGracePeriodSeconds above %d, or lower api.preStopSleepSeconds\nor config.shutdownGrace.\n" $window $lame .Values.config.shutdownGrace ($grace | int) (sub $window $lame) (add ($grace | int) $lame)) -}}
+{{- end -}}
+{{- end -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -87,6 +106,29 @@ spec:
             - name: http
               containerPort: {{ .Values.api.service.port }}
               protocol: TCP
+          {{- if gt (int .Values.api.preStopSleepSeconds) 0 }}
+          lifecycle:
+            preStop:
+              # THE LAME-DUCK WINDOW, and it is not a second drain: farmd has
+              # not been signalled yet while this runs, so nothing is draining
+              # and nothing is being released.
+              #
+              # Endpoint removal is asynchronous with the SIGTERM. The kubelet
+              # signals the container while kube-proxy, the ingress and every
+              # other reader of the EndpointSlice are still being told this pod
+              # is gone — and farmd closes its listener the moment it is
+              # signalled, so a request that arrives inside that gap is met
+              # with a reset instead of a 200. A renewal answered that way ends
+              # no lease, but it costs the holder a retry on every deploy, once
+              # per replica, which is a bill nobody chose to pay.
+              #
+              # sleep, not exec: the image is distroless and has no shell to
+              # run one in. The field is Kubernetes 1.29 and newer (GA in
+              # 1.30); an older API server prunes it and the shutdown behaves
+              # exactly as it did before this existed.
+              sleep:
+                seconds: {{ .Values.api.preStopSleepSeconds }}
+          {{- end }}
           envFrom:
             {{- include "device-farmer.envFrom" . | nindent 12 }}
           env:

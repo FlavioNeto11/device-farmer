@@ -92,11 +92,17 @@ spec:
           args: ["janitor"]
           securityContext:
             {{- toYaml .Values.containerSecurityContext | nindent 12 }}
-          # No probes: this role serves no HTTP. Its liveness is
-          # farm.component_heartbeat, and "janitor" is deliberately NOT in
-          # FARM_REAPER_COMPONENTS: it is not on the lease renewal path, so
-          # its downtime refunds nothing to anyone — an orphan simply waits
+          # No livenessProbe. This role serves /metrics and /healthz on
+          # FARM_METRICS_ADDR like every long-running role, and neither of them
+          # knows whether the sweep is running — see templates/reaper.yaml for
+          # why that endpoint is the wrong thing to restart a role over.
+          # Liveness is farm.component_heartbeat, and "janitor" is deliberately
+          # NOT in FARM_REAPER_COMPONENTS: it is not on the lease renewal path,
+          # so its downtime refunds nothing to anyone — an orphan simply waits
           # for the next leader.
+          {{- with (include "device-farmer.startupProbe" (dict "ctx" $ "component" "janitor")) }}
+          {{- . | nindent 10 }}
+          {{- end }}
           envFrom:
             {{- include "device-farmer.envFrom" . | nindent 12 }}
           env:

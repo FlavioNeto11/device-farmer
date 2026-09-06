@@ -87,9 +87,15 @@ spec:
           args: ["jobrunner"]
           securityContext:
             {{- toYaml .Values.containerSecurityContext | nindent 12 }}
-          # No probes: this role serves no HTTP, and a probe that failed while
-          # a job was mid-step would restart a process that is holding real
-          # work. Liveness is farm.component_heartbeat.
+          # No livenessProbe. This role serves /metrics and /healthz on
+          # FARM_METRICS_ADDR like every long-running role, so the probe would
+          # render — and a probe that failed while a job was mid-step would
+          # restart a process that is holding real work, over an endpoint that
+          # cannot see the step either way. See templates/reaper.yaml.
+          # Liveness is farm.component_heartbeat.
+          {{- with (include "device-farmer.startupProbe" (dict "ctx" $ "component" "jobrunner")) }}
+          {{- . | nindent 10 }}
+          {{- end }}
           envFrom:
             {{- include "device-farmer.envFrom" . | nindent 12 }}
           env:
@@ -113,3 +119,36 @@ spec:
         {{- with .Values.extraVolumes }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
+{{- if .Values.jobrunner.podDisruptionBudget.enabled }}
+---
+{{/*
+The rolling-update strategy above protects a DEPLOY. This protects a DRAIN,
+which is a different event and the one that can take every runner at once:
+`kubectl drain` on one node followed immediately by another, or a node-image
+upgrade walking the fleet, evicts both replicas within seconds while the
+Deployment controller is perfectly happy.
+
+Nothing is released when that happens — the abandon branch in internal/jobrunner
+holds the lease for the replacement to re-attach by job_id at the same fence,
+and the spread constraint is ScheduleAnyway so replacements do schedule. What
+it costs is that every job in flight stops making progress until one of them
+claims it again, and the tenant is charged for that stall out of its own TTL.
+A budget makes the second eviction wait for a replacement instead of racing it.
+
+maxUnavailable and not minAvailable, deliberately: at replicaCount 1 a
+minAvailable of 1 blocks every voluntary disruption in the cluster forever,
+and this role's outage costs a re-attach rather than a device.
+*/}}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "device-farmer.componentName" (dict "ctx" $ "component" "jobrunner") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "device-farmer.labels" (dict "ctx" $ "component" "jobrunner") | nindent 4 }}
+spec:
+  maxUnavailable: {{ .Values.jobrunner.podDisruptionBudget.maxUnavailable }}
+  selector:
+    matchLabels:
+      {{- include "device-farmer.selectorLabels" (dict "ctx" $ "component" "jobrunner") | nindent 6 }}
+{{- end }}

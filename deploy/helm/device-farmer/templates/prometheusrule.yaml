@@ -54,22 +54,25 @@ was the api's hand-driven renew endpoint. DeviceFarmerLeaseFenced could fire
 for a curl and not for a job. internal/jobrunner/renewal.go wires the hooks,
 so the kind="fenced" page below now reads the holders that carry the work.
 
-templates/servicemonitor.yaml scrapes the api Service and nothing else, because
-the other roles serve no HTTP — FARM_METRICS_ADDR is read by internal/config and
-listened on by nobody. In a split deployment (this chart's default) the api's
-registry therefore holds the other roles' gauges at their zero-filled seed
-values forever, and the pages that read them cannot fire. That is not a
-hypothetical; it is this chart's default topology.
+WHAT IS ACTUALLY BEING SCRAPED
 
-Two things follow, and both are load bearing:
+Every long-running role binds FARM_METRICS_ADDR and serves /metrics on it —
+cmd/farmd wraps them in withMetrics — and templates/servicemonitor.yaml selects
+the headless metrics Service, which is one target per POD. So each gauge in the
+table above is published by a process that something can reach, and the rules
+over them can fire.
 
-  1. DeviceFarmerAlertingBlind, near the bottom of this file, watches for
-     exactly that state and says so out loud. It is the rule that stops the
-     silence from being mistaken for good news.
-  2. Until the other roles serve FARM_METRICS_ADDR, either run one process with
-     every role in it (`farmd all`, one registry, everything published where the
-     api serves it) or scrape the other pods some other way. If you do neither,
-     DeviceFarmerAlertingBlind will tell you what you are not covering.
+Can, not do: it takes serviceMonitor.enabled, or an equivalent scrape config of
+your own. Two things follow, and both are load bearing:
+
+  1. Turning prometheusRule.enabled on while nothing scrapes these pods ships
+     rules that return no data and therefore never fire, which reads as coverage
+     and is not. DeviceFarmerAlertingBlind, near the bottom of this file, watches
+     for exactly that state and says so out loud.
+  2. The `job` label these rules match on is assigned by whatever scrapes them.
+     With this chart's ServiceMonitor it is the metrics Service's name for EVERY
+     role, and the role is told apart by the `role` label the ServiceMonitor
+     lifts off each pod — which is why DeviceFarmerAPIDown asks for both.
 
 SEVERITY
 
@@ -83,7 +86,30 @@ disabling the quiesce gate, and disabling the quiesce gate is how a
 control-plane restart mass-reclaims a farm.
 */}}
 {{- $rb := trimSuffix "/" .Values.prometheusRule.runbookBaseURL -}}
-{{- $apiJob := default (include "device-farmer.componentName" (dict "ctx" $ "component" "api")) .Values.prometheusRule.apiJob -}}
+{{/*
+The target selector for the api, which is NOT one fixed string, because the
+label Prometheus assigns depends on what is doing the scraping.
+
+The Prometheus Operator's default job label is the SERVICE's name. This chart's
+ServiceMonitor scrapes the headless metrics Service — every role through one
+Service — so with it enabled the api's job label is that Service's name and the
+api is picked out of it by role="api", the label the ServiceMonitor lifts off
+each pod. Defaulting to the api Service's name in that shape names a job nothing
+produces, and the absent() half below then fires this critical page permanently
+on a healthy farm.
+
+With the ServiceMonitor off, somebody else's scrape config is pointed at the api
+Service and the api Service's name is the right default again. An explicit
+prometheusRule.apiJob replaces the whole selector, for a scrape config that
+assigns something neither branch can predict.
+*/}}
+{{- $apiTarget := printf "job=%q" (include "device-farmer.componentName" (dict "ctx" $ "component" "api")) -}}
+{{- if .Values.serviceMonitor.enabled -}}
+{{- $apiTarget = printf "job=%q, role=\"api\"" (include "device-farmer.componentName" (dict "ctx" $ "component" "metrics")) -}}
+{{- end -}}
+{{- with .Values.prometheusRule.apiJob -}}
+{{- $apiTarget = printf "job=%q" . -}}
+{{- end -}}
 {{- $t := .Values.prometheusRule.thresholds -}}
 {{- $hubSlots := "H{{ reReplaceAll \"-\" \".\" $labels.hub }}-P*" -}}
 apiVersion: monitoring.coreos.com/v1
@@ -195,22 +221,24 @@ spec:
     - name: device-farmer.control-plane
       interval: {{ $t.evaluationInterval }}
       rules:
-        # If this fires, every other rule in this file is also blind, because
-        # the api Service is the only thing templates/servicemonitor.yaml
-        # scrapes. It is listed first for that reason.
+        # Listed first because the api is the target every operator watches, and
+        # because a selector that misses it is the failure this whole file is
+        # least able to survive.
         #
         # The `or absent(...)` half covers the target disappearing from service
         # discovery entirely, which `up == 0` cannot see. It has a second use:
-        # if prometheusRule.apiJob does not match the job label your Prometheus
-        # actually assigns, this fires immediately and permanently — a wrong
-        # selector announces itself instead of disarming the rule in silence.
+        # if the selector does not match the labels your Prometheus actually
+        # assigns, this fires immediately and permanently — a wrong selector
+        # announces itself instead of disarming the rule in silence. That is
+        # also why the selector is derived rather than fixed; see the comment on
+        # $apiTarget at the top of this file.
         #
         # Leases do NOT end because the API is down. Holders cannot renew, so
         # they burn TTL, and farm.reaper_arm refunds that TTL to every live
         # lease when the reaper next arms. Nobody has to hurry in a way that
         # risks the database.
         - alert: DeviceFarmerAPIDown
-          expr: up{job="{{ $apiJob }}"} == 0 or absent(up{job="{{ $apiJob }}"})
+          expr: up{ {{ $apiTarget }} } == 0 or absent(up{ {{ $apiTarget }} })
           for: {{ $t.apiDownFor }}
           labels:
             severity: critical
@@ -568,10 +596,14 @@ spec:
         # read. Everything above that reads farm_device_health,
         # farm_lease_suspect, farm_recovery_attempts_total or
         # farm_control_plane_gap_seconds depends on the process that PUBLISHES
-        # that gauge being scraped. In this chart's default split deployment it
-        # is not: only the api Service is scraped, and the api registers those
-        # gauges without ever publishing into them, so they sit at their
-        # zero-filled seeds and every page over them is permanently disarmed.
+        # that gauge being scraped. Every role now binds FARM_METRICS_ADDR and
+        # the chart's ServiceMonitor reaches all of them, so that dependency is
+        # ordinarily satisfied — but it is satisfied by configuration, not by
+        # construction. A ServiceMonitor no Prometheus selects, a scrape config
+        # pointed at the api Service alone, a NetworkPolicy that admits only the
+        # api's port: each leaves those gauges at the zero-filled seeds that
+        # cmd/farmd registers in every process, and every page over them
+        # permanently disarmed while looking exactly like a quiet farm.
         #
         # The witness is the watchdog's device census. obs.SetDeviceHealth
         # publishes one row per (host, hub) unconditionally, every cycle, on any
@@ -602,10 +634,12 @@ spec:
             description: >-
               farm_api_* is present, so an api pod is being scraped, but
               farm_device_health carries only its zero-filled placeholder. The
-              watchdog publishes that census, so the watchdog is not being
-              scraped — and every hub, quarantine, lease-suspect and recovery
-              alert in this rule set is reading a seed value and cannot fire.
-              Alerting is not covering this farm.
+              watchdog publishes that census, so either no watchdog is being
+              scraped or none is running at all — hosts[] empty with
+              watchdog.superviseAllHosts false renders none. Either way every
+              hub, quarantine, lease-suspect and recovery alert in this rule set
+              is reading a seed value and cannot fire. Alerting is not covering
+              this farm.
             runbook_url: {{ $rb }}/alerting-blind.md
 {{- if .Values.prometheusRule.roleScrape }}
 
@@ -636,9 +670,16 @@ spec:
         # failing is what a component looks like on its way to becoming a gap —
         # and while it is failing, min(beat_at) is sliding backwards and the next
         # reaper_arm will refund that whole interval onto every live lease.
+        #
+        # Aggregated by `role` as well as by job: with the chart's ServiceMonitor
+        # every role is scraped through one Service, so `job` is the same string
+        # for all of them and it is `role` — lifted off the pod's
+        # app.kubernetes.io/component — that says which loop stopped beating. A
+        # scrape config of your own that assigns no `role` still groups by
+        # instance, which is one pod.
         - alert: DeviceFarmerComponentBeatFailing
           expr: |-
-            sum by (job, instance) (
+            sum by (job, role, instance) (
               rate({__name__=~"farm_(reaper|scheduler|jobrunner|recovery|watchdog|janitor|chargepolicy|node)_heartbeat_failures_total"}[10m])
             ) > 0
           for: 10m
@@ -647,7 +688,8 @@ spec:
             component: control-plane
           annotations:
             summary: >-
-              {{ `{{ $labels.job }}` }} cannot write its component heartbeat
+              {{ `{{ $labels.role }}` }} on {{ `{{ $labels.instance }}` }} cannot
+              write its component heartbeat
             description: >-
               farm.component_beat is failing on {{ `{{ $labels.instance }}` }}.
               If this role is in FARM_REAPER_COMPONENTS — reaper, api,

@@ -73,9 +73,16 @@ spec:
           args: ["recovery"]
           securityContext:
             {{- toYaml .Values.containerSecurityContext | nindent 12 }}
-          # No probes: this role serves no HTTP. It beats as "recovery", and
-          # that name is deliberately NOT in FARM_REAPER_COMPONENTS — a
-          # recovery outage must not move any lease deadline.
+          # No livenessProbe. This role serves /metrics and /healthz on
+          # FARM_METRICS_ADDR like every long-running role; restarting the
+          # ladder on that endpoint would interrupt a rung mid-tier for a
+          # signal that cannot see the ladder at all. See templates/reaper.yaml.
+          # It beats as "recovery", and that name is deliberately NOT in
+          # FARM_REAPER_COMPONENTS — a recovery outage must not move any lease
+          # deadline.
+          {{- with (include "device-farmer.startupProbe" (dict "ctx" $ "component" "recovery")) }}
+          {{- . | nindent 10 }}
+          {{- end }}
           envFrom:
             {{- include "device-farmer.envFrom" . | nindent 12 }}
           env:

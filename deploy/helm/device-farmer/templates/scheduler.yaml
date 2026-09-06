@@ -73,11 +73,18 @@ spec:
           args: ["scheduler"]
           securityContext:
             {{- toYaml .Values.containerSecurityContext | nindent 12 }}
-          # No probes: this role serves no HTTP, and the image has no shell to
-          # exec into. Its liveness is farm.component_heartbeat — visible on
-          # the dashboard, and the same signal the reaper uses for gap
-          # accounting. A probe invented for it here would be a second opinion
-          # about liveness that nothing else in the system shares.
+          # No livenessProbe. This role does serve HTTP — /metrics and /healthz
+          # on FARM_METRICS_ADDR, like every long-running role — but /healthz
+          # answers from a goroutine that knows nothing about the allocation
+          # loop, so a probe invented for it here would be a second opinion
+          # about liveness that nothing else in the system shares, and it would
+          # restart the allocator over a fault the binary survives on purpose.
+          # See templates/reaper.yaml for the argument in full. Liveness is
+          # farm.component_heartbeat — visible on the dashboard, and the same
+          # signal the reaper uses for gap accounting.
+          {{- with (include "device-farmer.startupProbe" (dict "ctx" $ "component" "scheduler")) }}
+          {{- . | nindent 10 }}
+          {{- end }}
           envFrom:
             {{- include "device-farmer.envFrom" . | nindent 12 }}
           env:

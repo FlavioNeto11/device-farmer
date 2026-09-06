@@ -360,6 +360,29 @@ api:
   # cost nobody chose.
   terminationGracePeriodSeconds: 60
 
+  # The lame-duck window: how long the pod keeps answering AFTER Kubernetes has
+  # decided to remove it and BEFORE farmd is signalled.
+  #
+  # Endpoint removal and the SIGTERM are concurrent, not ordered. The kubelet
+  # signals the container while kube-proxy, the ingress and everything else
+  # watching the EndpointSlice are still learning the pod is gone, and farmd
+  # closes its listener as soon as it is signalled — so requests that were
+  # already on their way are answered with a connection reset. It ends no lease
+  # (a failed renewal ends nothing) but it makes every deploy cost some holder a
+  # retry, once per replica, for no reason.
+  #
+  # This is NOT a second drain. config.shutdownGrace is what bounds draining,
+  # and it starts after this pause finishes. Keep this to single-digit seconds —
+  # long enough for the removal to propagate, and no longer — and note that it
+  # is spent out of api.terminationGracePeriodSeconds, which the chart REFUSES
+  # to render unless it exceeds this plus config.shutdownGrace.
+  #
+  # It renders lifecycle.preStop.sleep, which needs Kubernetes 1.29 or newer
+  # (GA in 1.30). An older API server drops the field and shutdown behaves as it
+  # did before this option existed; there is no fallback, because the image is
+  # distroless and has no shell for an exec handler to run. 0 disables it.
+  preStopSleepSeconds: 5
+
   probes:
     liveness:
       # /healthz answers from process state and NEVER touches the database.
@@ -406,8 +429,36 @@ scheduler:
   # only the winner allocates; the rest idle and keep beating. Raise this for
   # a warm standby that takes over in milliseconds instead of on a pod
   # reschedule — allocation is never duplicated, only the lock holder acts.
+  #
+  # There is no PodDisruptionBudget for this role, nor for any of the other
+  # single-replica ones, and that is a decision rather than an omission: at one
+  # replica minAvailable 1 forbids every voluntary disruption in the cluster
+  # forever, and maxUnavailable 1 permits exactly the eviction it would be
+  # asked to prevent. Neither is a budget; they are decoration. What protects
+  # an elected singleton is being rescheduled promptly — and, for the reaper,
+  # farm.reaper_arm refunding the gap it was blind for before it sweeps again.
   replicaCount: 1
   terminationGracePeriodSeconds: 60
+
+  # A startupProbe on the metrics port, and deliberately no livenessProbe:
+  # templates/reaper.yaml carries the argument, and templates/_probes.tpl
+  # carries the mechanics. In short — /healthz on FARM_METRICS_ADDR is real
+  # (every long-running role serves it) but it answers from a goroutine that
+  # knows nothing about the loop, so it is the wrong thing to restart a role
+  # over; a startupProbe is never evaluated again once it passes, so all it can
+  # do is refuse to call a boot finished that never reached the listener.
+  #
+  # The chart drops the probe by itself when FARM_METRICS_ADDR is overridden in
+  # config.extra or in this role's extraEnv, because a probe aimed at a port
+  # nobody bound is a crash loop.
+  startupProbe:
+    enabled: true
+    # 60 seconds. The listener is bound after the configuration preflight and
+    # the first database connection, and that connection is already bounded by
+    # config.db.connectTimeout (10s) — a role that cannot reach Postgres exits
+    # on its own rather than waiting here.
+    periodSeconds: 2
+    failureThreshold: 30
   resources:
     requests:
       cpu: 50m
@@ -430,6 +481,13 @@ reaper:
   # restoration.
   replicaCount: 1
   terminationGracePeriodSeconds: 60
+  # See scheduler.startupProbe. This is the role the argument was written for:
+  # a livenessProbe here would restart the only automatic release path in the
+  # system over a metrics bind that cmd/farmd survives on purpose.
+  startupProbe:
+    enabled: true
+    periodSeconds: 2
+    failureThreshold: 30
   resources:
     requests:
       cpu: 50m
@@ -452,6 +510,11 @@ janitor:
   # the lease renewal path, so its downtime refunds nothing to a lease.
   replicaCount: 1
   terminationGracePeriodSeconds: 60
+  # See scheduler.startupProbe.
+  startupProbe:
+    enabled: true
+    periodSeconds: 2
+    failureThreshold: 30
   resources:
     requests:
       cpu: 50m
@@ -473,6 +536,11 @@ recovery:
   # by throughput.
   replicaCount: 1
   terminationGracePeriodSeconds: 60
+  # See scheduler.startupProbe.
+  startupProbe:
+    enabled: true
+    periodSeconds: 2
+    failureThreshold: 30
   resources:
     requests:
       cpu: 50m
@@ -499,7 +567,40 @@ jobrunner:
   # driving phones; give its in-flight step time to finish reporting before
   # the process goes away. It still releases nothing on the way out — the
   # replacement re-attaches by job_id at the same fence.
+  #
+  # This number is a comfort, NOT a correctness boundary, and nothing should
+  # ever be built on top of it as though it were one. If SIGKILL arrives
+  # mid-unwind the cost is an attempt row left open for the janitor and a
+  # marker file left on the phone; releasing is reached only on the branch
+  # that carries a release reason, and an abandoned run does not take it. Set
+  # this to 10 out of a stateless-service habit and you degrade the logs, not
+  # the invariant.
   terminationGracePeriodSeconds: 120
+
+  podDisruptionBudget:
+    # The one non-api workload with replicas to protect. The rolling-update
+    # strategy above covers a DEPLOY and says nothing about a drain: two
+    # `kubectl drain`s in quick succession, or a node-image upgrade walking the
+    # fleet, can take every runner within seconds of each other. No lease ends
+    # when that happens — an abandoned run releases nothing and the replacement
+    # re-attaches by job_id at the same fence — but every job in flight stalls
+    # until something claims it again, and the tenant pays that stall out of
+    # its own TTL.
+    enabled: true
+    # maxUnavailable, never minAvailable: at replicaCount 1 a minAvailable of 1
+    # blocks every node drain in the cluster forever, which is a far worse
+    # trade than the re-attach it would be preventing. (NOTES.txt says the same
+    # thing about the api's budget, which is minAvailable because the api's
+    # failure costs a renewal rather than a re-attach.)
+    maxUnavailable: 1
+
+  # See scheduler.startupProbe. No livenessProbe here for the additional reason
+  # that a restart taken while a step was mid-flight would abandon work that
+  # was fine.
+  startupProbe:
+    enabled: true
+    periodSeconds: 2
+    failureThreshold: 30
   resources:
     requests:
       cpu: 100m
@@ -672,11 +773,12 @@ serviceMonitor:
 # installs the chart.
 #
 # READ templates/prometheusrule.yaml BEFORE ENABLING. It documents which farmd
-# role publishes each series these rules read, and the fact that in this chart's
-# default split deployment only the api Service is scraped — which leaves the
-# lease, device-health and recovery gauges at their zero-filled seed values and
-# the pages over them unable to fire. DeviceFarmerAlertingBlind exists to say so
-# out loud rather than let the silence read as good news, and
+# role publishes each series these rules read, and every one of those roles has
+# to be SCRAPED before the page over it can fire. That is satisfied by
+# serviceMonitor.enabled, or by an equivalent scrape config of your own reaching
+# the metrics Service; enabling these rules without one ships pages that return
+# no data, never fire, and read as coverage. DeviceFarmerAlertingBlind exists to
+# say so out loud rather than let the silence pass for good news, and
 # docs/runbooks/alerting-blind.md is what to do about it.
 # -----------------------------------------------------------------------------
 prometheusRule:
@@ -694,11 +796,20 @@ prometheusRule:
   # wiki. Every alert names a file that exists there.
   runbookBaseURL: https://github.com/flaviopadilha/device-farmer/blob/main/docs/runbooks
 
-  # The `job` label DeviceFarmerAPIDown matches on. Empty means the api Service
-  # name, which is what the Prometheus Operator uses by default when a
-  # ServiceMonitor sets no jobLabel. Override it if your scrape config assigns
-  # something else — and note that a WRONG value here makes DeviceFarmerAPIDown
-  # fire permanently rather than go quiet, which is deliberate.
+  # The `job` label DeviceFarmerAPIDown matches on. Setting it replaces the
+  # rule's whole target selector with job="<value>".
+  #
+  # Empty is not one fixed answer, because the label depends on what is doing
+  # the scraping. The Prometheus Operator's default job label is the SERVICE's
+  # name: with serviceMonitor.enabled the chart scrapes the headless metrics
+  # Service — every role through one Service — so the job is that Service's name
+  # and the api is picked out of it by role="api"; with the ServiceMonitor off,
+  # a scrape config of your own is pointed at the api Service and its name is
+  # the answer. The rule renders whichever of the two this release is in.
+  #
+  # A WRONG value here makes DeviceFarmerAPIDown fire permanently rather than go
+  # quiet, which is deliberate: absent() announces a selector that matches
+  # nothing instead of disarming the rule in silence.
   apiJob: ""
 
   # Rules over the per-role metrics (farm_reaper_*, farm_scheduler_*,
@@ -874,6 +985,11 @@ chargepolicy:
     # nothing and two hand the port back to the agent's dead-man's switch.
     # farmd refuses anything above half the agent's 30m hold cap.
     interval: 2m
+  # See scheduler.startupProbe.
+  startupProbe:
+    enabled: true
+    periodSeconds: 2
+    failureThreshold: 30
   resources:
     requests:
       cpu: 50m

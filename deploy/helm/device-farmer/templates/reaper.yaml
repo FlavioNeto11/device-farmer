@@ -76,10 +76,40 @@ spec:
           args: ["reaper"]
           securityContext:
             {{- toYaml .Values.containerSecurityContext | nindent 12 }}
-          # No probes: this role serves no HTTP. Its liveness is
-          # farm.component_heartbeat, and "reaper" is in FARM_REAPER_COMPONENTS
-          # so its own downtime is refunded to the leases it would otherwise
-          # have reclaimed the moment it came back.
+          # NO livenessProbe — AND THE REASON IS NOT THAT NOTHING LISTENS.
+          #
+          # This is the file the other roles point at, so the argument is
+          # written out once here. Every long-running role serves GET /metrics
+          # and GET /healthz on FARM_METRICS_ADDR (cmd/farmd wraps them in
+          # withMetrics), so a livenessProbe against it would render and would
+          # pass. It is still wrong, in both directions at once:
+          #
+          #   - It fires on a fault the binary deliberately survives. A metrics
+          #     bind that fails is NOT fatal, and cmd/farmd/roles.go says why in
+          #     as many words: a reaper that will not start is the only
+          #     automatic release path gone. A livenessProbe on that port turns
+          #     that survivable monitoring fault into a CrashLoopBackOff of the
+          #     one component that can end a lease at all.
+          #   - It proves nothing about the sweep. /healthz is answered from a
+          #     separate goroutine on its own mux and touches neither the loop
+          #     nor Postgres, so a reaper wedged on a session that never returns
+          #     answers 200 for exactly as long as it is wedged. The deadlock
+          #     that makes somebody want this probe is the one case it cannot
+          #     see.
+          #
+          # Liveness for this role is farm.component_heartbeat — the dashboard
+          # and GET /api/v1/capabilities read it, and with prometheusRule.enabled
+          # and prometheusRule.roleScrape on, DeviceFarmerComponentBeatFailing
+          # pages on it. "reaper" is in FARM_REAPER_COMPONENTS, so its own
+          # downtime is refunded to the leases it would otherwise have reclaimed
+          # the moment it came back.
+          #
+          # The startupProbe below is a different question and is safe for the
+          # reason templates/_probes.tpl gives: it is never evaluated again once
+          # it passes, so it cannot restart a reaper that is sweeping.
+          {{- with (include "device-farmer.startupProbe" (dict "ctx" $ "component" "reaper")) }}
+          {{- . | nindent 10 }}
+          {{- end }}
           envFrom:
             {{- include "device-farmer.envFrom" . | nindent 12 }}
           env:

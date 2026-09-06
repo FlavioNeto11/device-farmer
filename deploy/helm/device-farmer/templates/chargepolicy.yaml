@@ -87,9 +87,16 @@ spec:
           args: ["chargepolicy"]
           securityContext:
             {{- toYaml .Values.containerSecurityContext | nindent 12 }}
-          # No probes: this role serves no HTTP. It beats as "chargepolicy",
-          # and that name must NOT be added to FARM_REAPER_COMPONENTS — a
-          # charge limiter's downtime may not move a lease deadline.
+          # No livenessProbe. This role serves /metrics and /healthz on
+          # FARM_METRICS_ADDR like every long-running role, and a restart it
+          # did not need would let every held gate lapse until the replacement
+          # re-asserts it — see templates/reaper.yaml for why that endpoint is
+          # not evidence of anything. It beats as "chargepolicy", and that name
+          # must NOT be added to FARM_REAPER_COMPONENTS — a charge limiter's
+          # downtime may not move a lease deadline.
+          {{- with (include "device-farmer.startupProbe" (dict "ctx" $ "component" "chargepolicy")) }}
+          {{- . | nindent 10 }}
+          {{- end }}
           envFrom:
             {{- include "device-farmer.envFrom" . | nindent 12 }}
           env:

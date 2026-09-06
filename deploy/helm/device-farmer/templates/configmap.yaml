@@ -35,14 +35,26 @@ data:
   # The api role listens here. 0.0.0.0 rather than a loopback default, because
   # a container that binds 127.0.0.1 answers its own probes and nothing else.
   FARM_API_ADDR: "0.0.0.0:{{ .Values.api.service.port }}"
-  # These two are parsed and validated by internal/config, and NOTHING BINDS
-  # THEM in the roles this chart deploys: /metrics is served on FARM_API_ADDR
-  # by the api role, and FARM_NODE_ADDR belongs to `farmd node`, which runs on
-  # the bare-metal hosts. They are set so the value is one place if a listener
-  # ever appears; do not point a scrape or a NetworkPolicy at :9090 expecting
-  # an answer. See the comment in templates/servicemonitor.yaml for what is
-  # and is not observable today.
-  FARM_METRICS_ADDR: ":9090"
+  # EVERY LONG-RUNNING ROLE IN THIS RELEASE BINDS THIS, and serves both
+  # GET /metrics and GET /healthz on it. cmd/farmd wraps each role in
+  # withMetrics, and internal/config's MetricsListenAddr declines only for
+  # `ctl` and `migrate` (which exit), for the "off" value, and for api/all/demo
+  # when this address is already the API's. So a NetworkPolicy that admits the
+  # api's port alone leaves the whole farm unscraped, and a scrape pointed here
+  # is answered by the reaper, the scheduler, the janitor, the jobrunner, the
+  # recovery ladder, the chargepolicy loop and the watchdog alike — which is
+  # what templates/servicemonitor.yaml relies on.
+  #
+  # The number comes from metricsService.port because the headless Service
+  # dials it as a raw number rather than by a port NAME the pods declare: two
+  # independent numbers here would diverge into a refused connection, and a
+  # refused connection is `up == 0` on every target with nothing anywhere
+  # saying why.
+  FARM_METRICS_ADDR: ":{{ .Values.metricsService.port }}"
+  # FARM_NODE_ADDR is the one address here that nothing in this chart binds:
+  # it belongs to `farmd node`, which needs /dev/bus/usb on the machine the
+  # phones are plugged into and so cannot be a workload. It is set anyway so
+  # the value has one home if a listener ever appears.
   FARM_NODE_ADDR: ":8082"
   # Where `farmd ctl` — and anything else in the cluster — finds this release.
   FARM_API_URL: {{ include "device-farmer.apiURL" . | quote }}

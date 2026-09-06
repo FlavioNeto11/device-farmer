@@ -111,6 +111,62 @@ const (
 	maxJobAttemptLimit     = 2000
 )
 
+// logBudget is maxRenderedLogBytes held in the two pots described above and
+// spent in the order rows arrive — newest attempt first — so the logs that
+// survive a busy job are the recent ones.
+//
+// It is a named type rather than a pair of closures inside the handler because
+// the rule it encodes is the one part of this file that cannot be checked by
+// reading a response: whether an error message survived depends on how many
+// bytes of somebody else's output arrived before it. As a type it can be
+// driven directly, with the exact shape of traffic that broke it — 80 steps
+// carrying 60 KB of output and 2 KB of error apiece — and asserted on without
+// a database, a job, or 5 MB of fixture text.
+type logBudget struct {
+	// shared is what output and detail draw from, and what an error falls back
+	// to once the reserve is gone.
+	shared int
+	// reserved is the share only an error may spend.
+	reserved int
+	// omitted counts fields dropped whole, reported to the caller as
+	// logs_omitted so a missing log never reads as a silent one.
+	omitted int
+}
+
+func newLogBudget() logBudget {
+	return logBudget{
+		shared:   maxRenderedLogBytes - maxReservedErrorBytes,
+		reserved: maxReservedErrorBytes,
+	}
+}
+
+// spend charges n bytes of output or detail to the shared pot, reporting
+// whether the field may be rendered.
+//
+// A field that does not fit is dropped WHOLE and counted. Cutting it to
+// whatever was left would hand back a fragment that looks like a complete log,
+// which is the one outcome worse than saying it is gone.
+func (b *logBudget) spend(n int) bool {
+	if n > b.shared {
+		b.omitted++
+		return false
+	}
+	b.shared -= n
+	return true
+}
+
+// spendError charges n bytes of a step's error, the reserve first.
+//
+// Nothing is wasted on a response with no output to render: once the reserve
+// is exhausted an error competes for the shared pot like anything else.
+func (b *logBudget) spendError(n int) bool {
+	if n <= b.reserved {
+		b.reserved -= n
+		return true
+	}
+	return b.spend(n)
+}
+
 // ---------------------------------------------------------------------------
 // Views
 // ---------------------------------------------------------------------------
@@ -287,26 +343,10 @@ SELECT s.attempt, s.step_index, s.step_id, s.kind, s.state,
 	out := make([]jobStepView, 0, 64)
 	states := map[string]int{}
 
-	// One budget for the whole response, in two pots, spent in arrival order —
-	// newest attempt first — so the logs that survive a busy job are the recent
-	// ones. spend serves output and detail; spendError may also draw on the
-	// reserve the other two cannot reach.
-	shared, reserved, omitted := maxRenderedLogBytes-maxReservedErrorBytes, maxReservedErrorBytes, 0
-	spend := func(n int) bool {
-		if n > shared {
-			omitted++
-			return false
-		}
-		shared -= n
-		return true
-	}
-	spendError := func(n int) bool {
-		if n <= reserved {
-			reserved -= n
-			return true
-		}
-		return spend(n)
-	}
+	// One budget for the whole response, in two pots: spend serves output and
+	// detail; spendError may also draw on the reserve the other two cannot
+	// reach.
+	budget := newLogBudget()
 
 	for rows.Next() {
 		var (
@@ -328,7 +368,7 @@ SELECT s.attempt, s.step_index, s.step_id, s.kind, s.state,
 		if errText != nil {
 			v.ErrorChars = derefInt64(errLen)
 			v.ErrorTruncated = v.ErrorChars > int64(len([]rune(*errText)))
-			if spendError(len(*errText)) {
+			if budget.spendError(len(*errText)) {
 				v.Error = *errText
 			} else {
 				v.ErrorOmitted = true
@@ -341,14 +381,14 @@ SELECT s.attempt, s.step_index, s.step_id, s.kind, s.state,
 			// was not.
 			v.OutputChars = derefInt64(outputLen)
 			v.OutputTruncated = v.OutputChars > int64(len([]rune(*output)))
-			if spend(len(*output)) {
+			if budget.spend(len(*output)) {
 				v.Output = *output
 			} else {
 				v.OutputOmitted = true
 			}
 		}
 		if len(detail) > 0 {
-			if spend(len(detail)) {
+			if budget.spend(len(detail)) {
 				v.Detail = json.RawMessage(detail)
 			} else {
 				v.DetailOmitted = true
@@ -388,7 +428,7 @@ SELECT s.attempt, s.step_index, s.step_id, s.kind, s.state,
 		// the response budget. Non-zero means the steps are all here and some
 		// of their text is not; a narrower ?attempt= or a smaller ?limit
 		// returns it.
-		"logs_omitted": omitted,
+		"logs_omitted": budget.omitted,
 	}
 	if all {
 		body["scope"] = "all"

@@ -388,6 +388,35 @@ func TestFinalizeWritesNothingForAnAbandonedAttempt(t *testing.T) {
 	}
 }
 
+// A withheld verdict is a decision, not a failed write, and this safety net
+// must not "repair" it.
+//
+// internal/runner refuses to report a job as succeeded when farm.job_steps does
+// not support it — the whole of JOB-10 rests on that refusal. finalize exists
+// to catch a verdict whose write did not land, and 'succeeded' is exactly what
+// it would write here, so without this the refusal would be laundered into the
+// claim it declined to make, one function call later.
+func TestFinalizeWritesNothingForAVerdictTheRunnerWithheld(t *testing.T) {
+	t.Parallel()
+
+	jr, logs := testLoop(t, nil)
+	p := runner.Placement{JobID: "job-1", Fence: 9}
+	job := jobRow{State: "running", Attempt: 1, MaxAttempts: 3}
+
+	jr.finalize(context.Background(), jr.log, p, job, runner.Outcome{
+		State: runner.StateSucceeded, Attempt: 1, VerdictWithheld: true,
+		Error: "attempt 1 recorded a verdict for 3 of the spec's 4 step(s)",
+	})
+
+	if n := logs.count("could not write the job's state"); n != 0 {
+		t.Fatalf("%d write(s) of a verdict the runner deliberately withheld", n)
+	}
+	if n := logs.count("withheld this job's verdict"); n != 1 {
+		t.Fatalf("the withheld verdict was logged %d time(s); an operator has to see "+
+			"why the job is not finished", n)
+	}
+}
+
 // The same failure four times on one device is a device problem; four failures
 // on four devices is a job problem, and farm.job_attempts is the table that
 // tells them apart. A job with attempts left therefore goes back on the QUEUE,

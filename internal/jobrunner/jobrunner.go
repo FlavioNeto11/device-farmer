@@ -877,7 +877,16 @@ func (jr *JobRunner) runJob(ctx context.Context, c claim) {
 		// whose it was.
 		wit.remove(context.WithoutCancel(ctx))
 		jr.releaseLease(ctx, log, h, out.ReleaseReason)
-		log.Info("job finished", "state", string(out.State), "attempt", out.Attempt,
+		// The device goes back either way — this placement is over — but the
+		// JOB is only finished when a verdict was written for it. Saying "job
+		// finished" for a withheld verdict would put the lie the runner just
+		// refused to write into the log line an operator greps for instead.
+		msg := "job finished"
+		if out.VerdictWithheld {
+			msg = "placement finished, but the JOB is not: its verdict was withheld and " +
+				"the job is still 'running' for the janitor to place again"
+		}
+		log.Info(msg, "state", string(out.State), "attempt", out.Attempt,
 			"steps", out.Steps, "skipped", out.Skipped, "error", out.Error)
 	}
 }
@@ -987,6 +996,21 @@ func (jr *JobRunner) finalize(ctx context.Context, log *slog.Logger,
 		// below cannot substitute for this one: a re-attach preserves the fence,
 		// so a newer placement's lease is not "at some other fence" and the
 		// NOT EXISTS lets our stale verdict through.
+		return
+	}
+
+	if out.VerdictWithheld {
+		withheldTotal.Inc()
+		// The runner did not fail to write the job's state; it declined to.
+		// The attempt ran every step it was given, and the step rows do not
+		// support reporting the job as succeeded — so writing 'succeeded' here
+		// as a "the write must not have landed" repair would launder the exact
+		// claim the runner refused to make. The job stays 'running' with no
+		// live lease, which is the shape internal/janitor's job sweep resolves
+		// against the user's own max_attempts.
+		log.Error("the runner withheld this job's verdict because its step rows do not "+
+			"support it; this loop will not write one either",
+			"job", p.JobID, "attempt", out.Attempt, "reason", out.Error)
 		return
 	}
 
@@ -1697,6 +1721,19 @@ var (
 		Help: "Attempts by ending: succeeded, failed, cancelled, abandoned.",
 	}, []string{"state"})
 
+	// Deliberately a counter of its own rather than a fifth label on
+	// outcomesTotal: the ATTEMPT succeeded, and that is what that metric
+	// counts. What did not happen is the JOB being reported succeeded, and an
+	// operator alerting on this is asking a different question — "is the
+	// control plane failing to record what its runs did?" — from the one
+	// outcomes_total answers.
+	withheldTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "farm_jobrunner_verdicts_withheld_total",
+		Help: "Attempts that ran every step but whose job verdict internal/runner refused to " +
+			"write, because farm.job_steps did not support it. Flat at zero on a healthy farm; " +
+			"a rising rate means step bookkeeping is failing and jobs are being re-run for it.",
+	})
+
 	releasesTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "farm_jobrunner_releases_total",
 		Help: "Leases released by this loop, by the reason the job produced.",
@@ -1798,7 +1835,7 @@ func Collectors() []prometheus.Collector {
 
 	return []prometheus.Collector{
 		cyclesTotal, claimedTotal, contendedTotal, reattachedTotal,
-		outcomesTotal, releasesTotal, fencedTotal, orphansTotal,
+		outcomesTotal, withheldTotal, releasesTotal, fencedTotal, orphansTotal,
 		unaddressableTotal, panicsTotal, runnerErrors, releaseErrors, writeErrors,
 		pollErrors, beatFailures, atCapacity,
 		runningGauge, placedGauge, deferredGauge,

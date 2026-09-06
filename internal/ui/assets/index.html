@@ -144,6 +144,13 @@
           <span id="jobs-counts" class="counts"></span>
         </div>
         <div id="jobs-body" class="panel-body" aria-busy="true"></div>
+
+        <h2 class="section-h">Steps of the selected job</h2>
+        <p class="hint">Which step a job is on, and what it printed. Pick a job above; the rows come from
+          <span class="mono">GET /api/v1/jobs/{id}/steps</span>, which is the same view <span class="mono">ctl job steps</span>
+          prints. A step that failed carries the exit code, the runner's message and the log it produced, so the answer to
+          &ldquo;which step failed and why&rdquo; needs neither a terminal nor a database session.</p>
+        <div id="job-steps" class="panel-body"></div>
       </div>
 
       <form class="col-side card" id="job-form" autocomplete="off">

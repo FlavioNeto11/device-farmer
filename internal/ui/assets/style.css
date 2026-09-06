@@ -448,6 +448,18 @@ pre.out {
   font: 12px/1.4 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere;
 }
 
+/* A step's error, its output and the runner's detail stack in one cell, each
+   collapsed to its first line: the one worth opening is the one whose summary
+   already looks wrong. The summary keeps its default display so the disclosure
+   marker survives — the parts are spaced instead. */
+.steplogs { display: flex; flex-direction: column; gap: 3px; }
+.steplogs summary > * { margin-right: 6px; }
+.steplogs .out { max-height: 240px; }
+.trunc-wide {
+  display: inline-block; max-width: 34ch; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom;
+}
+
 .exec-row { display: flex; gap: 6px; margin-top: 6px; }
 .exec-row input { flex: 1; }
 .exec-row input, .exec-row button { margin: 0; }

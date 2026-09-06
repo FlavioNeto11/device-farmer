@@ -207,6 +207,21 @@ const TARGET_CLASS = {
   error: 'chip-offline', skipped: 'chip-unknown'
 };
 
+/* farm.job_steps.state. 'skipped' and 'aborted' are deliberately not the same
+ * colour as 'failed': a step that never ran did not break anything, and a panel
+ * that paints the whole tail of a failed attempt red hides the one row that
+ * actually stopped the job. */
+const STEP_CLASS = {
+  pending: 'chip-plain', running: 'chip-held', ok: 'chip-healthy',
+  failed: 'chip-offline', skipped: 'chip-unknown', aborted: 'chip-degraded'
+};
+
+/* A step is a failure worth surfacing, as opposed to one that merely did not
+ * run. This is the predicate the panel highlights on and the one the counts
+ * beside the job use; they must agree, or the row and the tally disagree about
+ * the same attempt. */
+function stepFailed(s) { return s.state === 'failed' || s.state === 'aborted'; }
+
 function healthChip(h) {
   const key = h || 'unknown';
   const glyph = HEALTH_GLYPH[key] || '?';
@@ -351,6 +366,40 @@ function normJob(raw) {
     startedAt: pick(raw, 'started_at'),
     finishedAt: pick(raw, 'finished_at'),
     spec: pick(raw, 'spec')
+  };
+}
+
+/* normStep is one row of farm.job_steps as GET /jobs/{id}/steps renders it.
+ *
+ * The three *_chars / *_truncated / *_omitted triples are carried rather than
+ * flattened into the text, because they are the difference between a step that
+ * printed nothing and one whose log the server could not afford to send. A
+ * panel that dropped them would render both as an empty cell, which is the one
+ * thing this endpoint was careful not to do. */
+function normStep(raw) {
+  return {
+    raw,
+    attempt: pick(raw, 'attempt'),
+    index: pick(raw, 'step_index'),
+    id: pick(raw, 'step_id', 'id'),
+    kind: pick(raw, 'kind'),
+    state: pick(raw, 'state') || 'unknown',
+    startedAt: pick(raw, 'started_at'),
+    finishedAt: pick(raw, 'finished_at'),
+    // Computed by Postgres against now(), so a running step reports how long
+    // it HAS been running. The browser clock never enters this number.
+    durationS: pick(raw, 'duration_s'),
+    exitCode: pick(raw, 'exit_code'),
+    output: pick(raw, 'output'),
+    outputChars: pick(raw, 'output_chars'),
+    outputTruncated: pick(raw, 'output_truncated') === true,
+    outputOmitted: pick(raw, 'output_omitted') === true,
+    error: pick(raw, 'error'),
+    errorChars: pick(raw, 'error_chars'),
+    errorTruncated: pick(raw, 'error_truncated') === true,
+    errorOmitted: pick(raw, 'error_omitted') === true,
+    detail: pick(raw, 'detail'),
+    detailOmitted: pick(raw, 'detail_omitted') === true
   };
 }
 
@@ -518,12 +567,19 @@ const VIEWS = ['fleet', 'leases', 'jobs', 'recovery', 'bulk', 'events', 'docs'];
 const state = {
   view: 'fleet',
   q: '',
-  filters: { host: '', hub: '', health: '', pool: '', lease: '', leaseState: '', jobState: '', eventKind: '', eventLimit: '250' },
+  filters: {
+    host: '', hub: '', health: '', pool: '', lease: '', leaseState: '', jobState: '',
+    // Which attempt the step panel is showing: '' is the newest attempt that
+    // ran, 'all' is every placement, a number pins one. It is the server's own
+    // ?attempt= vocabulary, passed through rather than reinvented here.
+    stepAttempt: '',
+    eventKind: '', eventLimit: '250'
+  },
   data: {
     fleet: null, counts: null, hosts: null, hubs: null, topology: null,
     leases: null, leaseCounts: null, protectedSuspect: 0, jobs: null,
     tiers: null, attempts: null, quarantines: null, bulk: null, bulkRun: null, events: null,
-    capabilities: null, kinds: null
+    capabilities: null, kinds: null, jobSteps: null
   },
   /* Per-resource "the server capped this response". A capped list that does
    * not say so is the worst thing this page can show: it looks like the whole
@@ -532,15 +588,27 @@ const state = {
   errors: {},
   loading: {},
   bulkRunID: null,
+  jobStepsID: null,
   conn: { mode: 'connecting', lastEvent: 0 }
 };
+
+/* liveSteps is which step each job is on, as the event stream last reported it:
+ * job id -> {attempt, index, id, kind, state}.
+ *
+ * It is fed from the "job" frames and never from a fetch, because that is the
+ * point — the jobs list is refetched at most once per coalescing window, and a
+ * step transition should be visible before that. It is rebuilt from scratch on
+ * every snapshot frame, which arrives on connect and on the server's periodic
+ * resync, so a job that has aged out of the stream's window cannot leave a
+ * stale row here forever. */
+const liveSteps = new Map();
 
 /* Which resources each view needs. Used both when switching views and when a
  * live event says a resource changed. */
 const VIEW_NEEDS = {
   fleet: ['fleet', 'hosts'],
   leases: ['leases', 'fleet'],
-  jobs: ['jobs', 'fleet'],
+  jobs: ['jobs', 'jobSteps', 'fleet'],
   recovery: ['recovery', 'fleet'],
   bulk: ['bulk', 'bulkRun', 'fleet'],
   events: ['events'],
@@ -772,6 +840,44 @@ const loaders = {
       state.truncated.jobs = !!pick(resp, 'truncated');
       mark('jobs');
     } catch (e) { if (!current()) return; mark('jobs', e); }
+    render();
+  },
+
+  /* The step log of one job. Nothing is fetched until an operator picks a job:
+   * this is the only read on the page whose response can carry megabytes of
+   * somebody's shell output, and issuing it for every job in the table on every
+   * poll would be a self-inflicted load test on a control plane that is, when
+   * this panel gets opened, usually already having a bad day. */
+  async jobSteps() {
+    if (!state.jobStepsID) {
+      state.data.jobSteps = null;
+      delete state.errors.jobSteps;
+      return;
+    }
+    const id = state.jobStepsID;
+    const current = beginLoad('jobSteps');
+    try {
+      const resp = await api.get('jobs/' + encodeURIComponent(id) + '/steps',
+        { attempt: state.filters.stepAttempt });
+      if (!current()) return;
+      const steps = listOf(resp, 'steps').map(normStep);
+      state.data.jobSteps = {
+        jobID: pick(resp, 'job_id') || id,
+        jobState: pick(resp, 'job_state'),
+        attempt: pick(resp, 'attempt'),
+        maxAttempts: pick(resp, 'max_attempts'),
+        attemptsWithSteps: listOf(resp, 'attempts_with_steps'),
+        scope: pick(resp, 'scope'),
+        states: (resp && !Array.isArray(resp) && resp.states) || null,
+        // logs_omitted is not a detail: it is the server saying the steps are
+        // all here and some of their text is not, which is the difference
+        // between a quiet step and one whose log did not fit.
+        logsOmitted: Number(pick(resp, 'logs_omitted') || 0),
+        steps
+      };
+      state.truncated.jobSteps = !!pick(resp, 'truncated');
+      mark('jobSteps');
+    } catch (e) { if (!current()) return; mark('jobSteps', e); }
     render();
   },
 
@@ -1385,11 +1491,18 @@ function renderJobs() {
 
   const problem = panelState('jobs', rows0, emptyState('No jobs.',
     'Queued and running jobs appear here as soon as one is submitted. Use the form on the right.'));
-  if (problem) { body.replaceChildren(problem); return; }
+  if (problem) { body.replaceChildren(problem); renderJobSteps(); return; }
 
   body.setAttribute('aria-busy', 'false');
   body.replaceChildren(table([
+    {
+      label: '', cls: 'acts', cell: (j) => el('button', {
+        class: 'mini' + (String(j.id) === String(state.jobStepsID) ? ' primary' : ''),
+        onclick: () => selectJobSteps(j.id)
+      }, String(j.id) === String(state.jobStepsID) ? 'Selected' : 'Steps')
+    },
     { label: 'State', cell: (j) => el('span', { class: 'chip ' + (JOB_CLASS[j.state] || 'chip-plain') }, j.state) },
+    { label: 'Step', cell: (j) => liveStepCell(j) },
     { label: 'Job', cls: 'mono', cell: (j) => el('span', { title: String(j.id || '') }, shortId(j.id)) },
     { label: 'Pool', cell: (j) => j.pool || '—' },
     { label: 'Queue', cell: (j) => j.queue || '—' },
@@ -1410,7 +1523,64 @@ function renderJobs() {
         ? el('button', { class: 'mini danger', onclick: () => cancelJob(j) }, 'Cancel')
         : '')
     }
-  ], rows));
+  ], rows, { rowClass: (j) => (String(j.id) === String(state.jobStepsID) ? 'row-held' : null) }));
+
+  renderJobSteps();
+}
+
+/* selectJobSteps opens one job in the panel below. The pinned attempt is
+ * cleared with the selection: ?attempt=3 means something different on the next
+ * job, and carrying it over would answer a question nobody asked. */
+function selectJobSteps(id) {
+  state.jobStepsID = id ? String(id) : null;
+  state.filters.stepAttempt = '';
+  state.data.jobSteps = null;
+  // The expanded-log keys are attempt/index pairs of the job being left.
+  openLogs.clear();
+  delete state.errors.jobSteps;
+  syncHash();
+  loaders.jobSteps();
+  render();
+}
+
+/* liveStepCell is which step the job is on according to the event stream.
+ *
+ * The job list itself does not carry a step — it is farm.jobs, which knows
+ * only that the job is running — so this reads the digest the stream delivers
+ * on every step transition. When no frame has arrived for this job the cell
+ * says so rather than showing an em dash that would read as "no steps". */
+function liveStepCell(j) {
+  const s = liveSteps.get(String(j.id));
+  if (!s) {
+    // No frame for this job. Which of the two reasons it is matters: a browser
+    // that cannot open the stream at all shows an em dash on every row, and an
+    // operator is owed the reason rather than left to conclude the jobs have
+    // no steps.
+    return el('span', {
+      class: 'chip chip-plain',
+      title: state.conn.mode === 'live'
+        ? 'no step frame has arrived for this job on the event stream'
+        : 'this column is fed by the event stream, which is not connected — the page is polling. ' +
+          'Press Steps to read the step log over the API instead.'
+    }, '—');
+  }
+  if (s.index === null || s.index === undefined || s.index < 0) {
+    // -1 is the stream's own spelling of "no step of this attempt has started".
+    const done = ['succeeded', 'failed', 'cancelled'].includes(j.state);
+    return el('span', {
+      class: 'chip chip-plain',
+      title: done
+        ? 'this job reached a terminal state without a single step row: it never got as far as running one'
+        : 'the control plane reports no step of this attempt has started yet'
+    }, done ? 'no steps ran' : 'not started');
+  }
+  return el('span', { class: 'chips' },
+    el('span', {
+      class: 'chip ' + (STEP_CLASS[s.state] || 'chip-plain'),
+      title: 'step ' + s.index + ' "' + s.id + '" (' + (s.kind || 'step') + ') is ' + s.state +
+        ' on attempt ' + s.attempt + ', as of the last event-stream frame'
+    }, String(s.index), ' ', s.state),
+    el('span', { class: 'mono trunc', title: s.id || '' }, s.id || ''));
 }
 
 function readJobForm() {
@@ -1440,6 +1610,229 @@ function readJobForm() {
   const grace = num('#job-grace'); if (grace !== undefined) body.grace_s = grace;
   const by = $('#job-by').value.trim(); if (by) body.created_by = by;
   return body;
+}
+
+/* ------------------------------------------------------------------ *
+ * JOB STEPS
+ *
+ * "Which step failed, and what did it print" — answered on the page rather
+ * than in a terminal. Everything below renders GET /jobs/{id}/steps exactly as
+ * the server sent it, including the three ways that response admits it is not
+ * complete: a truncated step list, a log cut at ?output_chars, and a log
+ * dropped whole for the response budget. Rendering any of those as an empty
+ * cell would tell an operator the step was quiet when it was not.
+ * ------------------------------------------------------------------ */
+
+/* stepTook renders how long a step took, or has been taking.
+ *
+ * Milliseconds below ten seconds, because an adb shell command on a healthy
+ * phone finishes in a few hundred of them: whole seconds renders every one of
+ * those as "0s" and erases the only number in the row that separates a fast
+ * device from one that took twenty seconds to answer. */
+function stepTook(s) {
+  if (s.durationS === null || s.durationS === undefined) return '—';
+  const ms = Number(s.durationS) * 1000;
+  const out = ms < 10000 ? Math.round(ms) + 'ms' : fmtSecs(ms / 1000);
+  // Server-side now() minus started_at: this step has not finished and the
+  // number is still climbing.
+  return s.finishedAt ? out : out + '…';
+}
+
+/* charNote is the true size of a log beside the piece of it that was sent, so
+ * a cut log can never be mistaken for a complete one. */
+function charNote(truncated, chars, rendered) {
+  const n = Number(chars) || 0;
+  if (!n) return '';
+  if (!truncated) return n.toLocaleString() + ' chars';
+  return Array.from(rendered).length.toLocaleString() + ' of ' + n.toLocaleString() + ' chars — cut by the server';
+}
+
+/* openLogs is which log blocks the operator has expanded, keyed by
+ * attempt/index/label.
+ *
+ * The panel is rebuilt from scratch on every refetch, and a running job's step
+ * rows change while somebody is reading one. Without this, the log they opened
+ * re-collapses under them every time the runner moves — which would defeat the
+ * only thing this panel is for. Cleared when another job is selected, because
+ * the keys belong to that job's rows. */
+const openLogs = new Set();
+
+/* logDetails is one collapsed block: a label, a one-line preview, and the whole
+ * of what arrived inside. */
+function logDetails(key, label, bad, summary, note, body) {
+  return el('details', {
+    open: openLogs.has(key) || null,
+    ontoggle: (e) => { if (e.target.open) openLogs.add(key); else openLogs.delete(key); }
+  },
+  el('summary', null,
+    el('span', { class: 'chip ' + (bad ? 'chip-offline' : 'chip-plain') }, label),
+    el('span', { class: 'mono trunc-wide' }, summary),
+    note ? el('span', { class: 'dim' }, note) : null),
+  el('pre', { class: 'out' }, body));
+}
+
+/* logBlock is a stored log — an output or an error — previewed by its first
+ * line and labelled with its true size. */
+function logBlock(key, label, text, chars, truncated, bad) {
+  const body = String(text);
+  const firstLine = body.split('\n')[0].slice(0, 100);
+  const summary = firstLine.trim() === ''
+    ? '(whitespace only, ' + (Number(chars) || 0).toLocaleString() + ' characters stored)'
+    : firstLine;
+  return logDetails(key, label, bad, summary, charNote(truncated, chars, body), body);
+}
+
+/* omittedChip is a log the server dropped for its size budget. The step is
+ * still on screen; only its text is gone, and the remedy is one request. */
+function omittedChip(label, chars, attempt) {
+  const stored = Number(chars) || 0;
+  return el('span', {
+    class: 'chip chip-degraded',
+    title: 'the response had already spent its size budget, so this ' + label + ' was dropped whole ' +
+      'rather than cut to a fragment that would look complete. Show attempt ' + attempt +
+      ' on its own to get it back.'
+  }, el('span', { 'aria-hidden': 'true' }, '▲'),
+    label + ' omitted' + (stored ? ' (' + stored.toLocaleString() + ' chars stored)' : ''));
+}
+
+function stepLogCell(s) {
+  const parts = [];
+  const key = (label) => s.attempt + '/' + s.index + '/' + label;
+  // The error first: it is the field that says WHY the step stopped, and it is
+  // the one the server protects with its own share of the response budget.
+  if (s.error) parts.push(logBlock(key('error'), 'error', s.error, s.errorChars, s.errorTruncated, true));
+  else if (s.errorOmitted) parts.push(omittedChip('error', s.errorChars, s.attempt));
+  if (s.output) parts.push(logBlock(key('output'), 'output', s.output, s.outputChars, s.outputTruncated, false));
+  else if (s.outputOmitted) parts.push(omittedChip('output', s.outputChars, s.attempt));
+
+  const detail = s.detail && typeof s.detail === 'object' ? s.detail : null;
+  if (detail && Object.keys(detail).length) {
+    // Compact on one line as the preview, indented in the body: the preview is
+    // there to be scanned, and pretty-printed JSON begins with a brace.
+    parts.push(logDetails(key('detail'), 'detail', false,
+      JSON.stringify(detail), '', JSON.stringify(detail, null, 2)));
+  } else if (s.detailOmitted) {
+    parts.push(omittedChip('detail', 0, s.attempt));
+  }
+
+  if (!parts.length) {
+    return el('span', {
+      class: 'chip chip-plain',
+      title: s.state === 'pending'
+        ? 'this step has not run'
+        : 'the runner stored no output, no error and no detail for this step'
+    }, s.state === 'pending' ? 'not started' : 'nothing stored');
+  }
+  return el('div', { class: 'steplogs' }, parts);
+}
+
+/* renderJobSteps draws the panel under the jobs table. */
+function renderJobSteps() {
+  const host = $('#job-steps');
+  if (!host) return;
+
+  if (!state.jobStepsID) {
+    host.replaceChildren(emptyState('No job selected.',
+      'Press Steps on a job above to see which step it is on, what it printed, and why it stopped.'));
+    return;
+  }
+  if (state.errors.jobSteps && !state.data.jobSteps) {
+    host.replaceChildren(emptyState('Could not read that job\'s steps.', errText(state.errors.jobSteps)));
+    return;
+  }
+  const data = state.data.jobSteps;
+  if (!data) {
+    host.replaceChildren(emptyState('Loading the step log…',
+      'GET /api/v1/jobs/' + shortId(state.jobStepsID) + '/steps'));
+    return;
+  }
+
+  const scope = el('select', {
+    'aria-label': 'Which attempt of this job to show',
+    onchange: (e) => {
+      state.filters.stepAttempt = e.target.value;
+      state.data.jobSteps = null;
+      syncHash();
+      loaders.jobSteps();
+      render();
+    }
+  });
+  // 'all' is offered even when only one attempt has steps, because the point
+  // of the option is that a retry writes a NEW set of rows: comparing them is
+  // how a job problem is told apart from a device problem.
+  const pinned = state.filters.stepAttempt || '';
+  const known = (data.attemptsWithSteps || []).map((n) => String(n));
+  append(scope, [
+    el('option', { value: '' }, 'newest attempt that ran'),
+    el('option', { value: 'all' }, 'every attempt'),
+    known.map((n) => el('option', { value: n }, 'attempt ' + n)),
+    // A pinned attempt with no rows — ?attempt=7 pasted from a link, or a
+    // number typed into the URL — still needs an option, or assigning it below
+    // silently snaps the control back to "newest" while the panel goes on
+    // rendering the empty attempt 7. The two would then disagree, and the
+    // operator could not click their way out: the control already reads
+    // "newest", so choosing it fires no change event.
+    pinned && pinned !== 'all' && !known.includes(pinned)
+      ? el('option', { value: pinned }, 'attempt ' + pinned + ' (no steps)')
+      : null
+  ]);
+  scope.value = pinned;
+
+  const failed = (data.steps || []).filter(stepFailed).length;
+  const header = el('div', { class: 'toolbar' },
+    el('span', { class: 'mono', title: String(data.jobID || '') }, shortId(data.jobID)),
+    el('span', { class: 'chip ' + (JOB_CLASS[data.jobState] || 'chip-plain') }, data.jobState || 'unknown'),
+    el('span', {
+      class: 'count',
+      title: 'farm.jobs.attempt against max_attempts: how many placements this job has had, and how many it may have'
+    }, 'attempt ', el('b', null, String(data.attempt === undefined ? '?' : data.attempt)),
+      ' of ', String(data.maxAttempts === undefined ? '?' : data.maxAttempts)),
+    el('label', null, 'Showing ', scope),
+    el('span', { class: 'grow' }),
+    el('span', { class: 'counts' },
+      countChips(data.states),
+      failed ? el('span', { class: 'chip chip-offline', title: 'steps in failed or aborted' },
+        el('span', { 'aria-hidden': 'true' }, '✕'), failed + ' failed') : null,
+      data.logsOmitted
+        ? el('span', {
+          class: 'chip chip-degraded',
+          title: 'the server dropped ' + data.logsOmitted + ' log field(s) for its response size budget. ' +
+            'Every step is here; some of their text is not. Pin a single attempt above to get it back.'
+        }, el('span', { 'aria-hidden': 'true' }, '▲'), data.logsOmitted + ' logs omitted')
+        : null,
+      truncChip('jobSteps', 'Pin a single attempt with the selector above.')));
+
+  const empty = emptyState('No steps for this attempt.',
+    (data.attemptsWithSteps || []).length
+      ? 'farm.job_steps has rows for attempt ' + (data.attemptsWithSteps || []).join(', ') +
+        ' of this job, and none for the one selected.'
+      : 'The runner writes a row per step as it executes one. A job that has not been placed on a device yet has none.');
+  const problem = panelState('jobSteps', data.steps, empty);
+  if (problem) { host.replaceChildren(header, problem); return; }
+
+  host.replaceChildren(header, table([
+    {
+      label: 'Attempt', cls: 'num', cell: (s) => el('span', {
+        title: 'the placement this step belongs to; a retry writes a fresh set of rows'
+      }, String(s.attempt === undefined ? '—' : s.attempt))
+    },
+    { label: '#', cls: 'num', cell: (s) => String(s.index === undefined ? '—' : s.index) },
+    { label: 'Step', cls: 'mono', cell: (s) => el('span', { title: String(s.id || '') }, s.id || '—') },
+    { label: 'Kind', cell: (s) => el('span', { class: 'chip chip-plain' }, s.kind || 'unknown') },
+    { label: 'State', cell: (s) => el('span', { class: 'chip ' + (STEP_CLASS[s.state] || 'chip-plain') }, s.state) },
+    {
+      // A NULL exit code on a finished step is not a zero: the step never got
+      // one, which is a different fact and usually the more interesting one.
+      label: 'Exit', cls: 'num', cell: (s) => (s.exitCode === undefined || s.exitCode === null
+        ? el('span', { class: 'dim', title: 'the runner recorded no exit code for this step' }, '—')
+        : String(s.exitCode))
+    },
+    { label: 'Started', cell: (s) => (s.startedAt ? timeCell(s.startedAt) : '—') },
+    { label: 'Took', cls: 'num', cell: (s) => stepTook(s) },
+    { label: 'Log', cell: (s) => stepLogCell(s) }
+  ], data.steps, {
+    rowClass: (s) => (stepFailed(s) ? 'row-refused' : s.state === 'running' ? 'row-held' : null)
+  }));
 }
 
 /* ------------------------------------------------------------------ *
@@ -2182,9 +2575,80 @@ function onStreamEvent(name, ev) {
     case 'fleet': markDirty('fleet', 'topology'); break;
     case 'lease': markDirty('leases', 'fleet'); break;
     case 'recovery': markDirty('recovery', 'fleet', 'bulkRun'); break;
-    case 'job': markDirty('jobs', 'leases'); break;
-    default: markDirty('fleet', 'leases', 'jobs', 'recovery', 'bulk', 'bulkRun', 'events'); break;
+    case 'job': {
+      // The job frame carries which step each job is on, so the Step column
+      // moves with the runner and costs nothing. A refetch is asked for only
+      // when the job itself changed, and the step log below only when the job
+      // it is showing moved — the digest is a pointer at one step, and reading
+      // what that step printed is the one part that needs a request.
+      const ch = takeJobSteps(payload);
+      if (ch.jobsChanged) markDirty('jobs', 'leases');
+      if (ch.selectedChanged) markDirty('jobSteps');
+      if (ch.stepMoved && state.view === 'jobs') render();
+      break;
+    }
+    default: markDirty('fleet', 'leases', 'jobs', 'jobSteps', 'recovery', 'bulk', 'bulkRun', 'events'); break;
   }
+}
+
+/* takeJobSteps reads the step out of a "job" frame into liveSteps, and reports
+ * what kind of change it was.
+ *
+ * The distinction is the whole reason this function returns anything. Before
+ * the digest carried a step, a job frame arrived on a state transition — four
+ * or five times in a job's life — and refetching /jobs and /leases on each was
+ * free. It now also arrives on every step transition, which for a thirty-step
+ * spec is thirty more frames, one every couple of seconds. Refetching the job
+ * list, the lease list and up to two megabytes of step log on each of those
+ * would be a self-inflicted load test on a control plane that is, when this
+ * page is open, usually already having a bad day.
+ *
+ * So a frame that only moved a step moves the Step column and nothing else:
+ * the digest IS the answer to "which step", and no request is needed to render
+ * it. The step log below is refetched only when the job it is showing moved.
+ *
+ * A snapshot frame carries every job the stream is watching, so it REPLACES
+ * the map: a job that has aged out of the server's window must not leave a
+ * step behind that this page would go on rendering as current. Its arrival is
+ * treated as a full change, which is the resync cadence the page already had. */
+function takeJobSteps(payload) {
+  const out = { jobsChanged: false, selectedChanged: false, stepMoved: false };
+  if (!payload || typeof payload !== 'object') return out;
+  const snapshot = payload.snapshot === true;
+  const rows = listOf(payload, snapshot ? 'jobs' : 'changed');
+  if (snapshot) {
+    liveSteps.clear();
+    out.jobsChanged = true;
+    out.selectedChanged = !!state.jobStepsID;
+  }
+  for (const raw of rows) {
+    const id = pick(raw, 'job_id', 'id');
+    if (!id) continue;
+    const key = String(id);
+    // step_index is -1 when nothing of this attempt has started, and 0 is a
+    // real step, so the value is read directly rather than through pick's
+    // "first key that is not null" — which is right for names and wrong here.
+    const idx = raw.step_index === undefined ? pick(raw, 'stepIndex') : raw.step_index;
+    const next = {
+      jobState: pick(raw, 'state') || '',
+      attempt: pick(raw, 'attempt'),
+      index: idx === undefined || idx === null ? null : Number(idx),
+      id: pick(raw, 'step_id') || '',
+      kind: pick(raw, 'step_kind') || '',
+      state: pick(raw, 'step_state') || ''
+    };
+    const prev = liveSteps.get(key);
+    liveSteps.set(key, next);
+    if (snapshot) continue;
+
+    // A job this page has never seen, a state change or a retry is a change to
+    // the job itself; anything else in the frame moved only the step.
+    const known = prev && prev.jobState === next.jobState && prev.attempt === next.attempt;
+    if (!known) out.jobsChanged = true;
+    else out.stepMoved = true;
+    if (key === String(state.jobStepsID)) out.selectedChanged = true;
+  }
+  return out;
 }
 
 /* renderAlert shows one server alert. The text is the server's; only the
@@ -2267,6 +2731,10 @@ function buildHash() {
   }
   if (state.view === 'leases' && f.leaseState) p.set('state', f.leaseState);
   if (state.view === 'jobs' && f.jobState) p.set('state', f.jobState);
+  // The selected job and the attempt within it travel in the URL, so the
+  // answer to "which step failed" is a link somebody can paste into a ticket.
+  if (state.view === 'jobs' && state.jobStepsID) p.set('job', String(state.jobStepsID));
+  if (state.view === 'jobs' && f.stepAttempt) p.set('attempt', f.stepAttempt);
   if (state.view === 'bulk' && state.bulkRunID) p.set('run', String(state.bulkRunID));
   const qs = p.toString();
   return '/' + state.view + (qs ? '?' + qs : '');
@@ -2293,7 +2761,14 @@ function applyHash() {
   f.pool = p.get('pool') || '';
   f.lease = p.get('lease') || '';
   if (view === 'leases') f.leaseState = p.get('state') || '';
-  if (view === 'jobs') f.jobState = p.get('state') || '';
+  if (view === 'jobs') {
+    f.jobState = p.get('state') || '';
+    const job = p.get('job') || '';
+    const attempt = p.get('attempt') || '';
+    if (job !== (state.jobStepsID || '') || attempt !== f.stepAttempt) state.data.jobSteps = null;
+    state.jobStepsID = job || null;
+    f.stepAttempt = attempt;
+  }
   if (view === 'bulk' && p.get('run')) state.bulkRunID = p.get('run');
   syncControls();
   showView(view);

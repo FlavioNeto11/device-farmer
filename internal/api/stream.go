@@ -381,12 +381,38 @@ func (d leaseDigest) digestKey() leaseDigest {
 	return d
 }
 
+// jobDigest carries WHICH STEP the job is on as well as its state, because
+// "running" for forty minutes and "running, on step 7 of a 30-step spec" are
+// the same row to a dashboard and completely different facts to an operator.
+//
+// What is carried is chosen for the diff, not for completeness. Everything
+// here changes only when a step CHANGES: an index, an id, a kind and a state.
+// The obvious extra fields are all excluded on purpose — the step's elapsed
+// time, its started_at against now(), its output length, a percentage — every
+// one of them moves on every poll, and this struct is compared with == to
+// decide whether a job is dirty. One such field would mark every live job
+// changed on every tick, publish a "delta" containing the entire job list
+// several times a second, and cost each connected dashboard a full refetch
+// each time: the delta stream would become a slower full stream. Elapsed time
+// belongs to the client, which already has the job's started_at and can count
+// on its own; the step log belongs to GET /jobs/{id}/steps.
 type jobDigest struct {
 	JobID    string `json:"job_id"`
 	State    string `json:"state"`
 	TenantID string `json:"tenant_id"`
 	QueueID  string `json:"queue_id"`
 	PoolID   string `json:"pool_id"`
+
+	// Attempt is farm.jobs.attempt: which placement of this job the step
+	// belongs to. It is 0 before the job has ever been placed.
+	Attempt int `json:"attempt"`
+
+	// StepIndex is -1 — not 0 — when no step of the current attempt has
+	// started, because step 0 is a real step and "waiting to start" is not it.
+	StepIndex int    `json:"step_index"`
+	StepID    string `json:"step_id,omitempty"`
+	StepKind  string `json:"step_kind,omitempty"`
+	StepState string `json:"step_state,omitempty"`
 }
 
 type recoveryDigest struct {
@@ -552,9 +578,48 @@ SELECT l.id::text, l.state, l.fence, l.device_id::text, coalesce(s.rack_slot,'')
 		return streamState{}, fmt.Errorf("poll leases: %w", err)
 	}
 
+	// The lateral picks the ONE step worth naming, and the furthest-along step
+	// is not it: the runner marks the rest of a failed attempt 'skipped', so
+	// "highest step_index that has a state" answers a failed job with the last
+	// thing it never did. Priority is the failure that STOPPED the job, then
+	// whatever is running, then the furthest step that finished.
+	//
+	// "Stopped the job" is not the same as state='failed'. A step with
+	// continue_on_error is recorded failed and tagged detail.tolerated, and the
+	// runner carries straight on (internal/runner/runner.go). Ranking those
+	// first would pin a 30-step job to the failure it shrugged off at step 1
+	// and never advance again — a job running perfectly well, reported red and
+	// motionless for the rest of its life. A tolerated failure therefore ranks
+	// with the ordinary finished steps and can still be named once it IS the
+	// furthest one.
+	//
+	// Pending rows are excluded entirely: a job whose steps are all still
+	// pending has not started one, and reporting step 0 would be a guess about
+	// what happens next. The step_index tiebreak is descending because the
+	// buckets it decides are the "furthest along" ones; a job stops at its
+	// first untolerated failure, so the first bucket holds a single row.
+	//
+	// It costs a primary-key prefix scan of (job_id, attempt) per live job,
+	// over a row set the spec validator caps at jobspec.MaxSteps, and it runs
+	// only while a dashboard is connected.
 	const jobQuery = `
-SELECT j.id::text, j.state, j.tenant_id, j.queue_id, j.pool_id
+SELECT j.id::text, j.state, j.tenant_id, j.queue_id, j.pool_id, j.attempt,
+       coalesce(st.step_index, -1), coalesce(st.step_id, ''),
+       coalesce(st.kind, ''), coalesce(st.state, '')
   FROM farm.jobs j
+  LEFT JOIN LATERAL (
+       SELECT s.step_index, s.step_id, s.kind, s.state
+         FROM farm.job_steps s
+        WHERE s.job_id = j.id AND s.attempt = j.attempt AND s.state <> 'pending'
+        ORDER BY CASE
+                   WHEN s.state IN ('failed','aborted')
+                        AND coalesce(s.detail->>'tolerated','') <> 'true' THEN 0
+                   WHEN s.state = 'running' THEN 1
+                   ELSE 2
+                 END,
+                 s.step_index DESC
+        LIMIT 1
+  ) st ON true
  WHERE j.state IN ('queued','allocating','running')
     OR j.finished_at > now() - $1::interval`
 
@@ -564,7 +629,8 @@ SELECT j.id::text, j.state, j.tenant_id, j.queue_id, j.pool_id
 	}
 	for rows.Next() {
 		var d jobDigest
-		if err := rows.Scan(&d.JobID, &d.State, &d.TenantID, &d.QueueID, &d.PoolID); err != nil {
+		if err := rows.Scan(&d.JobID, &d.State, &d.TenantID, &d.QueueID, &d.PoolID,
+			&d.Attempt, &d.StepIndex, &d.StepID, &d.StepKind, &d.StepState); err != nil {
 			rows.Close()
 			return streamState{}, fmt.Errorf("poll jobs: %w", err)
 		}

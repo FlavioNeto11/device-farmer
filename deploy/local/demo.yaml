@@ -1,0 +1,133 @@
+# The simulated hardware. This pod is the only thing on the evaluation cluster
+# that is not the real control plane.
+#
+# `farmd demo` starts fake ADB servers in its own process — real TCP sockets
+# speaking the real ADB host protocol, with real ECONNRESETs — seeds 56 devices
+# across two hosts, and runs the shipping scheduler, lease store, reaper and
+# recovery ladder against them. Without it the chart installs correctly and the
+# fleet grid is empty, because nothing has put a device in the database.
+#
+# TWO THINGS FOLLOW FROM WHERE THE SOCKETS ARE, AND BOTH ARE LOAD BEARING.
+#
+# The fake ADB servers bind 127.0.0.1, so the endpoint this process writes to
+# farm.hosts.adb_endpoint is a loopback address that resolves to nothing in any
+# other pod. Anything that dials a device must therefore run in THIS pod:
+#
+#   - deploy/local/demo-values.yaml scales the chart's jobrunner and recovery
+#     Deployments to zero while the demo is up. Both dial devices; both would
+#     dial their own loopback and fail. The demo process runs its own, so the
+#     roles are not missing from the farm — they are inside the pod that owns
+#     the hardware.
+#   - watchdog.superviseAllHosts stays off, for the same reason. The demo runs
+#     one watchdog per host it invented.
+#
+# And there is exactly one of this pod. See the replica comment below.
+#
+# scripts/k8s-up.sh renders this file by substituting the __PLACEHOLDERS__ and
+# piping the result to kubectl. sed is the entire renderer; by hand it is:
+#
+#   sed -e 's|__IMAGE__|device-farmer/farmd:local|g' \
+#       -e 's|__CONFIGMAP__|df-device-farmer-config|g' \
+#       -e 's|__DB_SECRET__|df-device-farmer-db|g' \
+#       -e 's|__AUTH_SECRET__|df-device-farmer-auth|g' \
+#       -e 's|__HOSTS__|2|g' -e 's|__DEVICES__|56|g' \
+#       deploy/local/demo.yaml | kubectl -n df-local apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: device-farmer-demo
+  labels:
+    app.kubernetes.io/name: device-farmer-demo
+    app.kubernetes.io/component: demo
+    app.kubernetes.io/part-of: device-farmer-local
+    app.kubernetes.io/managed-by: k8s-up.sh
+  annotations:
+    device-farmer.io/evaluation-only: >-
+      Simulated hardware. This pod writes devices, hosts, racks and jobs into
+      the same database as the real control plane, and must never run against
+      a farm.
+spec:
+  # ONE, AND THIS ONE DOES NOT SCALE. Two demo pods would seed the same two
+  # host ids and then take turns repointing farm.hosts.adb_endpoint at their
+  # own loopback sockets, so each host's watchdog would be probing a server
+  # inside the other pod's network namespace — i.e. nothing. The simulation is
+  # hardware, and there is one of it.
+  replicas: 1
+  strategy:
+    # Recreate for the same reason: a rolling update overlaps the old pod and
+    # the new one, which is the two-pod case above with a stopwatch on it.
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: device-farmer-demo
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: device-farmer-demo
+        app.kubernetes.io/component: demo
+        app.kubernetes.io/part-of: device-farmer-local
+    spec:
+      automountServiceAccountToken: false
+      # The demo holds leases like any other holder, and SIGTERM must not
+      # release them: the whole demonstration is that a lease outlives the
+      # process holding it. This window only lets in-flight HTTP finish.
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: demo
+          image: __IMAGE__
+          imagePullPolicy: IfNotPresent
+          args: ["demo", "-hosts", "__HOSTS__", "-devices", "__DEVICES__"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          envFrom:
+            # The release's own ConfigMap, unmodified. Every lease knob this
+            # pod runs with is therefore the one the chart's roles run with; a
+            # demo configured apart would be demonstrating a farm nobody has.
+            - configMapRef:
+                name: __CONFIGMAP__
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: __DB_SECRET__
+                  key: DATABASE_URL
+            # `farmd demo` runs an api of its own, on the address the ConfigMap
+            # names, and farmd refuses to serve an unauthenticated control
+            # plane on a network listener. It gets the release's tokens because
+            # it is the release's api code. Nothing routes to it — no Service
+            # selects these labels — so the dashboard you open is served by the
+            # chart's api pods, against the same database.
+            - name: FARM_API_TOKENS
+              valueFrom:
+                secretKeyRef:
+                  name: __AUTH_SECRET__
+                  key: FARM_API_TOKENS
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              memory: 1Gi
+          volumeMounts:
+            # FARM_ARTIFACT_DIR comes from the shared ConfigMap and the root
+            # filesystem is read-only, so the path has to be a volume even
+            # though the generated specs push nothing. This is the chart's
+            # artifacts.dir default, which deploy/helm/local-values.yaml
+            # deliberately does not change; move one and this mount has to
+            # move with it.
+            - name: artifacts
+              mountPath: /var/lib/device-farmer/artifacts
+      volumes:
+        - name: artifacts
+          emptyDir: {}

@@ -1,0 +1,109 @@
+# The values a LOCAL EVALUATION CLUSTER runs with — a laptop, not a farm.
+#
+#   bash scripts/k8s-up.sh          brings all of it up
+#   bash scripts/k8s-down.sh        removes everything it made
+#
+# deploy/local/README.md is the long form. This file is the short one: three
+# defaults in the chart are wrong for a laptop, and each of them fails in a way
+# that names neither itself nor its cure.
+#
+#   image.repository  ghcr.io/flaviopadilha/device-farmer/farmd does not exist.
+#                     Nothing in this repository builds it, pushes it, or
+#                     mentions it outside values.yaml:29. A default install
+#                     therefore ImagePullBackOffs inside the pre-install
+#                     migration hook, and what the operator sees is helm's
+#                     five-minute timeout, which names neither the image nor
+#                     the registry.
+#
+#   auth.tokens       Empty. The api binds 0.0.0.0 in this chart — it has to,
+#                     because a container that binds 127.0.0.1 answers its own
+#                     probes and nothing else — and farmd refuses to serve an
+#                     unauthenticated control plane on a network listener. So
+#                     an install with only a DSN comes up CrashLoopBackOff on
+#                     every api pod, and helm reports "Available: 0/2".
+#
+#   database.dsn      There is no default and there must not be one; a control
+#                     plane silently pointed at the wrong database is worse
+#                     than one that will not start. The DSN below names the
+#                     evaluation Postgres in deploy/local/postgres.yaml, whose
+#                     storage is an emptyDir on purpose.
+#
+# Everything else in the chart is left alone. This file only says what a laptop
+# makes different, so a reader can diff it against values.yaml and see the
+# whole difference between an evaluation and a farm.
+
+image:
+  # The tag scripts/k8s-up.sh builds and side-loads into the cluster's node.
+  # It is deliberately NOT the `dev` tag docker-compose.yml uses: the compose
+  # stack and this one would then share one name for two independently built
+  # images, and rebuilding one would change what the other claims to be
+  # running. The script re-sets both of these from FARM_LOCAL_IMAGE, so the
+  # values here are what makes the file work on its own.
+  repository: device-farmer/farmd
+  tag: local
+  # Already the chart's default, and restated because the whole local path
+  # depends on it: the image is imported into the node's containerd store, not
+  # pulled, and Always would send the kubelet to a registry that has never
+  # heard of it.
+  pullPolicy: IfNotPresent
+
+database:
+  # deploy/local/postgres.yaml, in this namespace. Throwaway credentials for a
+  # database whose storage dies with its pod — see the header of that file for
+  # why the evaluation path answers the Postgres question differently from the
+  # chart, and why nothing here may be carried into a farm.
+  dsn: postgres://farm:farm@evaluation-postgres:5432/device_farmer?sslmode=disable
+
+auth:
+  # A CREDENTIAL WRITTEN DOWN IN A PUBLIC REPOSITORY. That is safe here and
+  # only here: it reaches a cluster on your own machine, through a Service that
+  # is ClusterIP, over a port-forward that binds 127.0.0.1. It is spelled the
+  # way it is so that it cannot survive a copy-paste into anything real —
+  # anyone reading `local-evaluation` in a farm's audit log knows exactly which
+  # file it came from.
+  #
+  # It is set at all because the alternative teaches the wrong lesson twice.
+  # Running open (FARM_API_ALLOW_ANONYMOUS=true) would show a dashboard where
+  # every anonymous caller is an operator, which is not the shape anybody
+  # should learn the system in; and it would hide the one thing an evaluator
+  # most needs to check, which is that the api really does refuse an
+  # unauthenticated call. It does: /api/v1/capabilities answers 401 without
+  # this token and 200 with it, and scripts/k8s-up.sh proves it on every run.
+  tokens: "local-evaluation:operator:local-evaluation"
+
+api:
+  # One replica. The chart defaults to two because the renewal path must
+  # survive a node; there is one node here, so the second replica buys nothing
+  # and costs the dashboard its event stream more often — EventSource cannot
+  # send a header, so the page mints a single-use ticket that lives in the
+  # memory of the replica that minted it, and with two replicas the two
+  # requests can land on different pods.
+  replicaCount: 1
+  podDisruptionBudget:
+    # maxUnavailable, not the chart's default minAvailable: 1. With one
+    # replica, minAvailable: 1 permits zero voluntary disruptions, and
+    # `kubectl drain` on the only node then waits forever. Leases survive an
+    # api outage — they go suspect and farm.reaper_arm refunds the gap — so
+    # there is nothing here worth blocking a drain for.
+    maxUnavailable: 1
+
+jobrunner:
+  # One. The chart defaults to two because job claiming is horizontal by
+  # design; on one node that only doubles the pods watching an idle queue.
+  #
+  # It also keeps the artifact store honest. Without a ReadWriteMany claim the
+  # store is per-pod, so an APK uploaded to the api is invisible to a jobrunner
+  # in another pod — true at one replica as much as at two, and deploy/local
+  # ships no claim. Job specs that install an artifact will fail their install
+  # step on this cluster; the demo's specs deliberately use none.
+  replicaCount: 1
+
+# watchdog.superviseAllHosts is LEFT OFF, and in demo mode that is load
+# bearing rather than a default nobody revisited. `farmd demo` runs its fake
+# ADB servers in its own process on 127.0.0.1, so the endpoint it writes to
+# farm.hosts.adb_endpoint is a loopback address that means nothing in any other
+# pod. A watchdog Deployment switched on here would dial its own loopback,
+# find nothing, and mark all 56 simulated devices unhealthy — health data that
+# is wrong in the one direction an evaluator would believe. The demo pod runs
+# the watchdogs for the hosts it invented, which is the only place they can
+# work from.

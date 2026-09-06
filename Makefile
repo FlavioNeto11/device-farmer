@@ -156,8 +156,23 @@ up:
 down:
 	docker compose down
 
+## k8s-up: the same evaluation farm on Kubernetes, on http://127.0.0.1:8420
+#
+# Not a variant of `up`. It builds the image, side-loads it into the local
+# cluster's node — a local Kubernetes does NOT share the Docker daemon's image
+# store, which is the single most common way a correct chart produces a broken
+# cluster — brings up an evaluation Postgres, installs the chart and holds the
+# port-forward open. `--farm` leaves the simulated hardware out.
+# deploy/local/README.md is the long form.
+k8s-up:
+	@bash scripts/k8s-up.sh
+
+## k8s-down: remove the namespace, the release and the side-loaded image
+k8s-down:
+	@bash scripts/k8s-down.sh
+
 ## clean: remove build output
 clean:
 	rm -rf $(BIN)
 
-.PHONY: help build build-linux test assertions migrate ci ci-go ci-sql ci-helm demo all docker up down clean
+.PHONY: help build build-linux test assertions migrate ci ci-go ci-sql ci-helm demo all docker up down k8s-up k8s-down clean

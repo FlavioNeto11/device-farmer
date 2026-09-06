@@ -132,6 +132,11 @@ type Server struct {
 	stream         *streamHub
 	streamInterval time.Duration
 
+	// tickets are the short-lived, single-use capabilities the dashboard
+	// redeems on GET /api/v1/stream, which EventSource opens without any way
+	// to send a header. See stream_ticket.go.
+	tickets *streamTicketStore
+
 	newExecutor   ExecutorFactory
 	execMaxOutput int
 
@@ -306,6 +311,7 @@ func New(cfg *config.Config, pool *pgxpool.Pool, opts ...Option) (*Server, error
 	}
 
 	s.stream = newStreamHub(s.log, s.metrics)
+	s.tickets = newStreamTicketStore(s.metrics)
 	s.bgCtx, s.bgCancel = context.WithCancel(context.Background())
 	return s, nil
 }
@@ -339,6 +345,7 @@ type httpMetrics struct {
 	streamClients    prometheus.Gauge
 	streamDropped    prometheus.Counter
 	streamPollErrors prometheus.Counter
+	streamTickets    *prometheus.CounterVec
 	execs            *prometheus.CounterVec
 	operatorActions  *prometheus.CounterVec
 	bulkTargets      *prometheus.CounterVec
@@ -372,6 +379,28 @@ func (s *Server) registerMetrics(ownRegistry bool) error {
 			Namespace: "farm", Subsystem: "api", Name: "stream_poll_errors_total",
 			Help: "Failed database polls in the event-stream loop.",
 		}),
+
+		// streamTickets is how "the dashboard says polling" becomes a
+		// diagnosable fact. The failures look identical from a browser — the
+		// page just never goes live — and they have opposite fixes: no mints
+		// at all is a credential problem, while mints answered by "unknown"
+		// redemptions on a farm with more than one api replica is the mint and
+		// the redeem landing on different pods (see stream_ticket.go), which
+		// is a routing problem.
+		//
+		// Mints with no redemptions at all is the third shape and the only
+		// benign one: an open farm authenticates the stream request outright,
+		// so the ticket its dashboard mints is never spent.
+		// misrouted is the one outcome here that is not a health signal: a
+		// ticket presented on a route it does not open is something no client
+		// of this system does by accident, and a rising count is a leaked
+		// ticket being probed against the rest of the API.
+		streamTickets: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "farm", Subsystem: "api", Name: "stream_tickets_total",
+			Help: "Event-stream tickets, by outcome: minted, redeemed, unknown, expired, " +
+				"refused (the store or the caller's share of it was full), misrouted " +
+				"(presented on a route a ticket does not open).",
+		}, []string{"outcome"}),
 		execs: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: "farm", Subsystem: "api", Name: "device_execs_total",
 			Help: "Operator shell commands run against a device, by outcome.",
@@ -406,7 +435,8 @@ func (s *Server) registerMetrics(ownRegistry bool) error {
 
 	own := []prometheus.Collector{
 		m.requests, m.duration, m.inFlight, m.streamClients,
-		m.streamDropped, m.streamPollErrors, m.execs, m.operatorActions, m.bulkTargets,
+		m.streamDropped, m.streamPollErrors, m.streamTickets,
+		m.execs, m.operatorActions, m.bulkTargets,
 		m.authOpen,
 	}
 	for _, c := range own {

@@ -137,6 +137,17 @@ func (s *Server) buildHandler() http.Handler {
 
 	// Audit and live updates.
 	tenant("GET /api/v1/events", s.handleEvents)
+	// The stream is the one route a browser opens without being able to send a
+	// header, because that is what EventSource does. The ticket route is how it
+	// authenticates anyway: an ordinary POST, with the token in the header, that
+	// mints a 30-second single-use capability for the caller's own identity and
+	// for this route alone. stream_ticket.go carries the reasoning, including
+	// why the token itself is still never allowed in the URL.
+	//
+	// Both are tenant-gated: the ticket confers exactly the identity that
+	// minted it, so a route that handed one out more cheaply than the stream
+	// costs would be a way around the stream's own gate.
+	tenant("POST /api/v1/stream/ticket", s.handleStreamTicket)
 	tenant("GET /api/v1/stream", s.handleStream)
 
 	// An unmatched /api/v1/ path gets the JSON envelope rather than the

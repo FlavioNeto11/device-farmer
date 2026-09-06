@@ -368,6 +368,34 @@ func actor(ctx context.Context) string {
 	return "unidentified"
 }
 
+// authenticate identifies the caller: the deployment's authenticator first,
+// and — only for the one route a browser cannot put a header on — a stream
+// ticket it minted earlier for this same identity.
+//
+// The order is what keeps the ticket from becoming an alternative credential.
+// A request that presents a valid Authorization header never touches the
+// store, so curl, the SDK and every non-browser client are authenticated by
+// exactly the code they were authenticated by before, and a ticket is spent
+// only when nothing else identified the caller. streamTicketStore.redeem
+// refuses any request that is not GET on streamPath; see stream_ticket.go for
+// why a ticket may live in a URL when the token may not.
+func (s *Server) authenticate(r *http.Request) (Identity, error) {
+	id, err := s.auth.Authenticate(r)
+	if err == nil {
+		return id, nil
+	}
+	// A fault in the authenticator is not a missing credential, and must not be
+	// answered by falling through to a second mechanism: whatever broke may be
+	// the thing that would have said no.
+	if !errors.Is(err, ErrUnauthenticated) {
+		return Identity{}, err
+	}
+	if id, ok := s.tickets.redeem(r); ok {
+		return id, nil
+	}
+	return Identity{}, err
+}
+
 // requireRole authenticates the request and refuses it unless the caller's
 // role is at least min.
 //
@@ -377,7 +405,7 @@ func actor(ctx context.Context) string {
 // failure forever.
 func (s *Server) requireRole(min Role, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		id, err := s.auth.Authenticate(r)
+		id, err := s.authenticate(r)
 		if err != nil {
 			if !errors.Is(err, ErrUnauthenticated) {
 				s.log.ErrorContext(r.Context(), "authenticator failed",

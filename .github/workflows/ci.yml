@@ -1,21 +1,34 @@
-# Three jobs, one per way this tree can rot without anyone noticing.
+# Five jobs, one per way this tree can rot without anyone noticing.
 #
-#   go     build, vet, gofmt, and the suite with NO database. The SQL-backed
-#          tests skip themselves when DATABASE_URL is unset, and that skip
-#          path has to stay green or the suite stops being run on laptops.
-#   sql    the schema applied from empty, every test/assertions*.sql run to
-#          its PASSED notice, and the suite again WITH a database. The second
-#          run is the one that matters: deploy/helm/README.md shows which
-#          lease-fencing regressions only that run can catch.
-#   helm   lint and render the chart, and prove the render-time guards still
-#          refuse a release that names no database.
+#   go       build, vet, gofmt, and the suite with NO database. The SQL-backed
+#            tests skip themselves when DATABASE_URL is unset, and that skip
+#            path has to stay green or the suite stops being run on laptops.
+#   sql      the schema applied from empty, every test/assertions*.sql run to
+#            its PASSED notice, and the suite again WITH a database. The second
+#            run is the one that matters, and it carries more than its name
+#            suggests: test/e2e skips itself without a DSN, so this is also the
+#            only place the shipped binary runs as a real process. See
+#            deploy/helm/README.md for which lease-fencing regressions only
+#            that run can catch.
+#   helm     lint and render the chart, and prove the render-time guards still
+#            refuse a release that names no database.
+#   image    build the container image and then START it — every control-plane
+#            role, from the image, against a real Postgres, and the compose
+#            demo that docker-compose.yml opens with. The job comment says why
+#            the three above do not cover this.
+#   publish  push that image to GHCR on main and on a tag, and only after the
+#            four above have passed.
 #
-# The Makefile's `ci` target runs the same three locally.
+# The Makefile's `ci` target runs the first three locally. The last two need a
+# Docker daemon and a registry credential, so they exist only here.
 name: ci
 
 on:
   push:
     branches: [main]
+    # Tags build too, and for the same reason `publish` needs `needs`: a
+    # release must not reach the registry on a commit whose suite never ran.
+    tags: ["v*"]
   pull_request:
 
 permissions:
@@ -23,7 +36,10 @@ permissions:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # Only a pull request is safe to cancel. Now that a run publishes, cancelling
+  # one on main or on a tag can leave the registry with no image for a commit
+  # that is already merged, and nothing retries it.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   go:
@@ -120,10 +136,31 @@ jobs:
             --set auth.tokens=""   --set auth.existingSecret=farm-api-tokens > /dev/null
       - name: every control-plane role renders a Deployment
         # The binary had the janitor role long before the chart deployed it,
-        # and nothing said so. A role added to cmd/farmd and not here fails
-        # this step instead of surfacing as orphaned rows in production.
+        # and nothing said so. This step was written to make that impossible
+        # and could not: the role list was typed out here, so it went on
+        # passing after `chargepolicy` was added to the binary and shipped a
+        # template nothing checked. A list you have to remember to edit is the
+        # same hole with more steps.
+        #
+        # So read the list out of the binary instead. roleComponents["all"] is
+        # the set of roles one process runs, which is exactly the set the chart
+        # must deploy — `node` is excluded there for the same reason the chart
+        # excludes it, and `demo` is not a deployment. A role added to that map
+        # and not to the chart now fails here.
+        #
+        # The count check is not decoration. If the map is renamed or reshaped
+        # the sed yields nothing, the loop runs zero times, and a vacuous pass
+        # is exactly the failure this step exists to prevent.
         run: |
-          for role in api scheduler reaper recovery jobrunner janitor watchdog; do
+          set -euo pipefail
+          roles="$(sed -n 's/^[[:space:]]*"all":[[:space:]]*{\(.*\)},$/\1/p' internal/config/config.go | tr -d '"' | tr ',' ' ')"
+          echo "control-plane roles, read from internal/config/config.go: $roles"
+          test "$(echo "$roles" | wc -w)" -ge 8 || {
+            echo "could not read roleComponents[\"all\"] out of internal/config/config.go;"
+            echo "this step cannot check the chart against a list it did not find"
+            exit 1
+          }
+          for role in $roles; do
             helm template ci "$CHART" -n device-farmer -f "$VALUES" -s "templates/$role.yaml" \
               | grep -q '^kind: Deployment$' || { echo "templates/$role.yaml renders no Deployment"; exit 1; }
           done
@@ -138,3 +175,415 @@ jobs:
           if helm template ci "$CHART" -n device-farmer -f "$VALUES" --set config.db.maxConns=1 > /dev/null 2>&1; then
             echo "rendered with config.db.maxConns=1"; exit 1
           fi
+
+  image:
+    name: image — build it, then start it
+    runs-on: ubuntu-latest
+    #
+    # Why this job exists when go, sql and helm are already green.
+    #
+    # Every role in this binary once panicked at startup on a duplicate
+    # metrics collector registration while go build, go vet, gofmt and the
+    # whole suite stayed green, because nothing called newRegistry. The comment
+    # above that call in cmd/farmd/roles.go tells the rest: it was found twice,
+    # independently, and both times by starting the process rather than by
+    # reading it.
+    #
+    # test/e2e now starts the shipped binary inside the sql job, so the hole
+    # left is narrower than "nothing runs the binary" and worth stating exactly:
+    #
+    #   - Nothing runs it FROM THE IMAGE. The distroless runtime stage, the
+    #     static link, the nonroot user and the ENTRYPOINT do not exist on the
+    #     runner where the sql job compiles and runs the same code.
+    #   - Nothing starts every role. test/e2e starts api, scheduler, jobrunner,
+    #     watchdog, reaper and recovery across its scenarios; it never starts
+    #     janitor or chargepolicy, and the collision that panicked was in code
+    #     every role reaches.
+    #   - Nothing brings up docker-compose.yml, which is the first line of its
+    #     own header and one of the three ways README.md offers to start this.
+    #
+    # Two constraints shape every step below. The runtime stage has NO SHELL,
+    # so `docker run … sh -c` and exec-based healthchecks are both impossible:
+    # every probe is made from the runner over TCP. And a bare `docker run`
+    # with no subcommand prints usage and exits 2 on purpose — a deliberate
+    # refusal to start "something plausible" — so the liveness check names a
+    # subcommand instead.
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: farm
+          POSTGRES_PASSWORD: farm
+          POSTGRES_DB: device_farmer
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U farm -d device_farmer"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+    env:
+      IMG: device-farmer/farmd:dev
+      # 127.0.0.1 rather than a service alias: the containers below run with
+      # --network host, so they reach the service container the same way the
+      # runner does.
+      DSN: postgres://farm:farm@127.0.0.1:5432/device_farmer?sslmode=disable
+      # Not a secret and deliberately in the clear. It authenticates one
+      # container, on one ephemeral runner, for about a minute, and it is here
+      # so the step below can prove that the api answers 401 WITHOUT it — an
+      # assertion that needs the credential to be knowable.
+      SMOKE_TOKEN: ci-smoke-token
+    outputs:
+      repo: ${{ steps.meta.outputs.repo }}
+      tags: ${{ steps.meta.outputs.tags }}
+      version: ${{ steps.meta.outputs.version }}
+      date: ${{ steps.meta.outputs.date }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      - name: what this commit's image is called
+        # Computed here rather than in `publish`, and passed down as job
+        # outputs, so that both builds see byte-identical --build-args. They
+        # land in the binary through -ldflags, so a version string that differed
+        # between the two jobs would invalidate the layer publish is trying to
+        # reuse and make every push to main recompile and re-run the in-image
+        # test suite for nothing.
+        #
+        # Never `latest`, and the chart's values.yaml already argues why: on a
+        # mutable tag a node restart can change the lease semantics of a running
+        # farm. Every image gets its commit SHA, which is immutable by
+        # construction. A tag push additionally gets the tag; a main push gets
+        # `main`, which is a moving pointer for anyone who wants one knowingly.
+        #
+        # The repository path is lowercased because GHCR rejects uppercase and
+        # this repository's owner has some, and it is derived rather than typed
+        # so a fork publishes into its own namespace instead of failing on
+        # somebody else's.
+        id: meta
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          repo="ghcr.io/$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')/farmd"
+          short="$(echo "$SHA" | cut -c1-12)"
+          if [ "$REF_TYPE" = tag ]; then
+            version="$REF_NAME"
+            tags="$repo:$SHA,$repo:$REF_NAME"
+          else
+            version="main-$short"
+            tags="$repo:$SHA,$repo:main"
+          fi
+          {
+            echo "repo=$repo"
+            echo "tags=$tags"
+            echo "version=$version"
+            echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          # load, not push. A pull request must be able to run this job with no
+          # registry credential at all; `publish` is where a push happens.
+          load: true
+          push: false
+          # The tag docker-compose.yml resolves ${VERSION:-dev} to, so the
+          # compose step below can run with --no-build.
+          tags: ${{ env.IMG }}
+          # Stated rather than left to the runner's default, so this build and
+          # the one in `publish` share a cache key exactly. That job's comment
+          # explains why linux/amd64 is the whole list.
+          platforms: linux/amd64
+          build-args: |
+            VERSION=${{ steps.meta.outputs.version }}
+            COMMIT=${{ github.sha }}
+            BUILD_DATE=${{ steps.meta.outputs.date }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: the artifact runs and knows which commit it is
+        # `farmd version` is the cheapest possible proof that the binary in the
+        # distroless stage executes at all — a runtime stage that copied it to
+        # the wrong path, or a build that lost CGO_ENABLED=0, fails here and
+        # nowhere else in this file.
+        #
+        # Grepping for the commit is not decoration either: the Dockerfile
+        # stamps it through -ldflags -X, and an image whose ldflags stopped
+        # reaching the binary would still run, still serve, and still lie about
+        # what it is to every operator who asks it.
+        run: |
+          set -euo pipefail
+          docker run --rm "$IMG" version | tee /tmp/version.txt
+          grep -q "${{ github.sha }}" /tmp/version.txt || {
+            echo "::error::the image does not report ${{ github.sha }}; -ldflags -X main.commit did not reach the binary"
+            exit 1
+          }
+
+      - name: migrate up, from the image, against an empty database
+        # The migrations are embedded, so this is also the check that the image
+        # carries its own schema. The Dockerfile says why that matters: a binary
+        # shipped without the SQL migrates to version 0 and reports success.
+        run: docker run --rm --network host -e "DATABASE_URL=$DSN" "$IMG" migrate up
+
+      - name: every control-plane role starts from the image and serves
+        # The role list is read out of the binary's own map for the reason the
+        # helm job gives: a list typed here is a list that stops being true.
+        #
+        # /healthz on the metrics listener is served by every role, api or not,
+        # and answering it proves the whole startup path ran — config preflight,
+        # the pool, newRegistry, and the metrics bind — inside the image.
+        #
+        # The farm_ series floor proves more than "it started". A registry whose
+        # collector registration silently failed still binds, still answers
+        # /healthz, and still exports exactly one farm_ series: the listener
+        # gauge, which is registered before the rest. Roles publish 300-plus
+        # here, so a floor of 100 separates "registered the farm" from "built an
+        # empty registry" without pinning a number that moves with every metric.
+        run: |
+          set -euo pipefail
+          roles="$(sed -n 's/^[[:space:]]*"all":[[:space:]]*{\(.*\)},$/\1/p' internal/config/config.go | tr -d '"' | tr ',' ' ')"
+          echo "control-plane roles, read from internal/config/config.go: $roles"
+          test "$(echo "$roles" | wc -w)" -ge 8 || {
+            echo "could not read roleComponents[\"all\"] out of internal/config/config.go"
+            exit 1
+          }
+          port=9101
+          for role in $roles; do
+            opts=(-e "DATABASE_URL=$DSN" -e "FARM_METRICS_ADDR=0.0.0.0:$port")
+            case "$role" in
+              api)
+                # The api is the one role with a second listener, and it refuses
+                # to serve a non-loopback address with no credentials. That
+                # refusal is the subject of the next step.
+                opts+=(-e "FARM_API_ADDR=0.0.0.0:8080" -e "FARM_API_TOKENS=$SMOKE_TOKEN:operator:ci") ;;
+              watchdog)
+                # The only role that will not start against an empty farm, and
+                # deliberately: with no FARM_HOST_ID it supervises every
+                # registered host, and refuses rather than idle over none. The
+                # chart says the same thing in the other direction — hosts[] is
+                # empty by default and renders no watchdog at all — so naming a
+                # host here is the production shape, one watchdog per host, not
+                # a workaround.
+                opts+=(-e "FARM_HOST_ID=ci-smoke") ;;
+            esac
+            docker run -d --name "smoke-$role" --network host "${opts[@]}" "$IMG" "$role" > /dev/null
+
+            ok=0
+            for _ in $(seq 1 30); do
+              if curl -fsS "http://127.0.0.1:$port/healthz" > /dev/null 2>&1; then ok=1; break; fi
+              sleep 1
+            done
+            state="$(docker inspect -f '{{.State.Status}} exit={{.State.ExitCode}}' "smoke-$role")"
+            if [ "$ok" != 1 ]; then
+              echo "::error::farmd $role never served /healthz from the image ($state)"
+              docker logs "smoke-$role" 2>&1 | tail -40
+              exit 1
+            fi
+            case "$state" in
+              running*) ;;
+              *) echo "::error::farmd $role answered and then stopped ($state)"
+                 docker logs "smoke-$role" 2>&1 | tail -40
+                 exit 1 ;;
+            esac
+
+            curl -fsS "http://127.0.0.1:$port/metrics" -o "/tmp/metrics-$role.txt"
+            series="$(grep -c '^farm_' "/tmp/metrics-$role.txt" || true)"
+            test "$series" -ge 100 || {
+              echo "::error::farmd $role published only $series farm_ series; the registry is nearly empty"
+              exit 1
+            }
+            echo "$role: /healthz ok, $series farm_ series, $state"
+            port=$((port + 1))
+          done
+
+      - name: the api answers, and refuses to answer without a credential
+        # /readyz probes the database, so a 200 here is the image reaching
+        # Postgres and not merely listening. The 401 is the assertion worth
+        # having: this deployment sets tokens, and an api that answers an
+        # operator route to a caller with no credential is a farm where any
+        # stranger can revoke somebody's six-hour run.
+        run: |
+          set -euo pipefail
+          curl -fsS http://127.0.0.1:8080/readyz -o /tmp/readyz.json
+          grep -q '"database":"reachable"' /tmp/readyz.json || {
+            echo "::error::/readyz did not report a reachable database"; cat /tmp/readyz.json; exit 1
+          }
+          code="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/api/v1/capabilities)"
+          test "$code" = 401 || { echo "::error::/api/v1/capabilities answered $code to an unauthenticated caller"; exit 1; }
+          curl -fsS -H "Authorization: Bearer $SMOKE_TOKEN" http://127.0.0.1:8080/api/v1/capabilities -o /tmp/caps.json
+          jq -e '.auth.mode == "bearer" and .auth.open == false' /tmp/caps.json > /dev/null || {
+            echo "::error::the api does not report itself as authenticated"; jq . /tmp/caps.json; exit 1
+          }
+          # The schema version the running api reports, against the highest
+          # migration in the tree. This is the end of the chain the image job
+          # is for: the migrations embedded in the image applied, and the api
+          # embedded in the same image reads the result.
+          want="$(printf '%s\n' migrations/*.sql | sed 's|.*/||; s/_.*//' | sort -n | tail -1 | sed 's/^0*//')"
+          jq -e --argjson want "$want" '.schema.version == $want' /tmp/caps.json > /dev/null || {
+            echo "::error::the api reports schema $(jq -r .schema.version /tmp/caps.json), the tree's highest migration is $want"
+            exit 1
+          }
+          # The dashboard is embedded too, so a farm has an operator interface
+          # with nothing else deployed. A 200 of a few hundred bytes would be an
+          # error page.
+          bytes="$(curl -fsS http://127.0.0.1:8080/ -o /tmp/index.html -w '%{size_download}')"
+          test "$bytes" -ge 8000 || { echo "::error::the dashboard served $bytes bytes"; exit 1; }
+          echo "api: readyz ok, 401 without a token, schema $want, dashboard $bytes bytes"
+
+      - name: stop the role containers
+        # Before compose starts nine more, not in the teardown after. Nothing
+        # collides — compose brings its own database and its own ports — but a
+        # failure in the next step is read out of `docker ps`, and eight roles
+        # still heartbeating into a database nobody is looking at any more is
+        # eight lines between the reader and the one that failed.
+        run: docker ps -aq --filter "name=^smoke-" | xargs -r docker rm -f > /dev/null
+
+      - name: the packaged demo comes up on compose and answers
+        # The first line of docker-compose.yml's own header, and one of the
+        # three ways README.md offers to start this. Until now nothing had ever
+        # run it, and the 56 devices asserted below are the number both of those
+        # pages promise.
+        #
+        # --no-build is load-bearing. The Makefile's `up` target uses --build,
+        # which would recompile everything the build step above just produced;
+        # compose resolves ${VERSION:-dev} to the tag that step wrote, so the
+        # image is already there.
+        run: |
+          set -euo pipefail
+          docker compose up -d --no-build
+          ok=0
+          for _ in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:8420/healthz > /dev/null 2>&1; then ok=1; break; fi
+            sleep 1
+          done
+          test "$ok" = 1 || { echo "::error::the compose demo never served /healthz on 8420"; exit 1; }
+          bytes="$(curl -fsS http://127.0.0.1:8420/ -o /tmp/demo-index.html -w '%{size_download}')"
+          test "$bytes" -ge 8000 || { echo "::error::the demo dashboard served $bytes bytes"; exit 1; }
+          # The demo's whole claim is 56 simulated devices driven by the real
+          # control plane. A dashboard that answers over an empty fleet looks
+          # identical to one that works.
+          curl -fsS http://127.0.0.1:8420/api/v1/fleet -o /tmp/demo-fleet.json
+          jq -e '.counts.total == 56' /tmp/demo-fleet.json > /dev/null || {
+            echo "::error::the demo reports $(jq -r .counts.total /tmp/demo-fleet.json) devices, not 56"; exit 1
+          }
+          # The packaged demo is open ON PURPOSE and says so in a field an
+          # operator can read. Asserting it here pins that decision: this farm
+          # runs open because somebody wrote it down, and the day the compose
+          # file stops saying so, the api refuses to start rather than serving
+          # open by accident — which is what this step would then catch.
+          curl -fsS http://127.0.0.1:8420/api/v1/capabilities -o /tmp/demo-caps.json
+          jq -e '.auth.open == true' /tmp/demo-caps.json > /dev/null || {
+            echo "::error::the demo does not report itself open"; jq .auth /tmp/demo-caps.json; exit 1
+          }
+          echo "demo: dashboard $bytes bytes, 56 devices, auth $(jq -r .auth.mode /tmp/demo-caps.json)"
+
+      - name: what the demo said on its way down
+        # Inline rather than an uploaded artifact: the logs belong next to the
+        # step that failed, and a zip nobody downloads is not evidence.
+        if: failure()
+        run: docker compose logs --no-color --tail 200 || true
+
+      - name: down
+        if: always()
+        run: |
+          docker compose down -v || true
+          docker ps -aq --filter "name=^smoke-" | xargs -r docker rm -f || true
+
+  publish:
+    name: publish — GHCR
+    needs: [go, sql, helm, image]
+    # Pushes only. A pull request from a fork cannot be given a registry
+    # credential, and a pull request from a branch should not be publishing.
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      # Job-scoped, not workflow-scoped. Every other job in this file needs
+      # nothing but the checkout, and a token that can write packages is a
+      # token that can overwrite the image a farm pulls on its next restart.
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          # The repository's own token. No external secret is needed, and none
+          # should be: this pushes to this repository's namespace and nowhere
+          # else, which is also the reason it cannot push to any other owner's.
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ needs.image.outputs.tags }}
+          # linux/amd64 only, and that is a decision rather than an oversight.
+          #
+          # The Dockerfile's build stage is `FROM golang:…` with no
+          # --platform=$BUILDPLATFORM and a `go build` with no GOARCH, so under
+          # buildx the stage is instantiated once per target platform and an
+          # arm64 target runs the whole stage under QEMU — including the
+          # `go vet ./... && go test ./...` the Dockerfile runs there, which is
+          # the expensive part. That is tens of minutes on every push to main
+          # to produce an image no cluster here pulls.
+          #
+          # The fix is one line in the Dockerfile, not here: mark the build
+          # stage `FROM --platform=$BUILDPLATFORM`, declare `ARG TARGETARCH`
+          # and pass `GOARCH=${TARGETARCH}` to the `go build`, which is exactly
+          # what the Makefile's `build-linux` target already does for both
+          # architectures. Then `platforms: linux/amd64,linux/arm64` here costs
+          # one extra cross-compile and no emulation at all.
+          platforms: linux/amd64
+          # Byte-identical to what the image job built and cached, so this is a
+          # cache hit rather than a second compile and a second in-image test
+          # run. A difference of one character here costs about five minutes.
+          build-args: |
+            VERSION=${{ needs.image.outputs.version }}
+            COMMIT=${{ github.sha }}
+            BUILD_DATE=${{ needs.image.outputs.date }}
+          # image.source is the one label with a mechanism behind it rather
+          # than a convention: GHCR uses it to attach the package to this
+          # repository, which is what lets the package inherit the repository's
+          # visibility instead of staying private and unpullable. The other two
+          # are how an operator holding a running container answers "which
+          # commit is this", the same question `farmd version` answers from the
+          # inside and the image job checks.
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.image.outputs.version }}
+          cache-from: type=gha
+
+      - name: say how to deploy it
+        # The chart does not default to this path, and a deployer who reads
+        # only the run log should still be able to install. deploy/helm/README
+        # already shows the --set form with a placeholder registry; this fills
+        # the placeholder in with the image that was just pushed.
+        run: |
+          {
+            echo "### Pushed"
+            echo
+            echo '```'
+            echo "${{ needs.image.outputs.tags }}" | tr ',' '\n'
+            echo '```'
+            echo
+            echo "Install with:"
+            echo
+            echo '```'
+            echo "helm upgrade --install farm deploy/helm/device-farmer -n device-farmer --create-namespace \\"
+            echo "  --set image.repository=${{ needs.image.outputs.repo }} \\"
+            echo "  --set image.tag=${{ github.sha }} \\"
+            echo "  --set database.dsn=... --set auth.tokens=..."
+            echo '```'
+            echo
+            echo "The first push to a GHCR namespace creates a PRIVATE package."
+            echo "Until it is made public, or an imagePullSecret is configured,"
+            echo "a cluster pulling this path gets ImagePullBackOff."
+          } >> "$GITHUB_STEP_SUMMARY"

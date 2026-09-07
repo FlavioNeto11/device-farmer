@@ -131,4 +131,20 @@ stringData:
     {{- $fp.cert | trim | nindent 4 }}
   tls.key: |
     {{- $fp.key | trim | nindent 4 }}
+{{- if and $fp.controlCert $fp.controlKey }}
+  # A SECOND client certificate, for the control class, and it is a second one
+  # because the proxy reads a connection's class from the CERTIFICATE. The api
+  # dials maintenance for POST /devices/{id}/exec — which runs on a device that
+  # may hold no lease, and so has no fence to present — and control for a live
+  # screen, which is refused as malformed without one. One certificate cannot be
+  # both, so promoting the shared one would have broken exec on every free
+  # device rather than widening anything.
+  #
+  # Only the api is given these. Every other role dials maintenance and has no
+  # use for a class it would never present.
+  control.crt: |
+    {{- $fp.controlCert | trim | nindent 4 }}
+  control.key: |
+    {{- $fp.controlKey | trim | nindent 4 }}
+{{- end }}
 {{- end }}

@@ -136,6 +136,20 @@ spec:
             {{- with (include "device-farmer.authEnv" .) }}
             {{- . | nindent 12 }}
             {{- end }}
+            {{- if and .Values.fenceProxy.enabled .Values.fenceProxy.controlCert .Values.fenceProxy.controlKey }}
+            # The control-class certificate, and it is here rather than in the
+            # ConfigMap because only the api presents this class. Every other
+            # role dials maintenance and has no use for a credential it would
+            # never offer — giving it to all of them would put a class that can
+            # drive a phone on eight processes that never should.
+            #
+            # The CA is the shared one from the ConfigMap: it is the same proxy
+            # being verified.
+            - name: FARM_FENCE_CONTROL_CERT
+              value: {{ printf "%s/control.crt" .Values.fenceProxy.mountPath | quote }}
+            - name: FARM_FENCE_CONTROL_KEY
+              value: {{ printf "%s/control.key" .Values.fenceProxy.mountPath | quote }}
+            {{- end }}
             {{- with .Values.api.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

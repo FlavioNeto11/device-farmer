@@ -135,6 +135,15 @@ ci-helm:
 		helm template ci deploy/helm/device-farmer -n device-farmer -f deploy/helm/ci-values.yaml -s "templates/$$role.yaml" \
 			| grep -q '^kind: Deployment$$' || { echo "templates/$$role.yaml renders no Deployment"; exit 1; }; \
 	done
+	@out=$$(helm template ci deploy/helm/device-farmer -n device-farmer \
+		--set database.dsn=postgres://farm@pg:5432/device_farmer --set auth.tokens=ci-token:operator:ci \
+		--set fenceProxy.enabled=true --set fenceProxy.ca=CA --set fenceProxy.cert=CERT --set fenceProxy.key=KEY \
+		--set fenceProxy.controlCert=CTL --set fenceProxy.controlKey=CTLK \
+		--set extraVolumes[0].name=fence --set extraVolumes[0].secret.secretName=ci-device-farmer-fence \
+		--set extraVolumeMounts[0].name=fence --set extraVolumeMounts[0].mountPath=/etc/device-farmer/fence); \
+	echo "$$out" | grep -q FARM_FENCE_CLIENT_CERT || { echo "a fenced farm renders no FARM_FENCE_CLIENT_CERT"; exit 1; }; \
+	test "$$(echo "$$out" | awk '/^# Source:/{src=$$0} /FARM_FENCE_CONTROL_CERT/{print src}' | sort -u)" \
+		= "# Source: device-farmer/templates/api.yaml" || { echo "the control certificate reaches more than the api"; exit 1; }
 	@! helm template ci deploy/helm/device-farmer -n device-farmer > /dev/null 2>&1 || \
 		{ echo "the chart rendered with no database configured"; exit 1; }
 	@! helm template ci deploy/helm/device-farmer -n device-farmer \

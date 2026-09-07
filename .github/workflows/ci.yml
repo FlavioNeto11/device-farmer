@@ -172,6 +172,56 @@ jobs:
             helm template ci "$CHART" -n device-farmer -f "$VALUES" -s "templates/$role.yaml" \
               | grep -q '^kind: Deployment$' || { echo "templates/$role.yaml renders no Deployment"; exit 1; }
           done
+      - name: a fenced farm is told where its certificates are
+        # The chart rendered the Secret, refused every incomplete way of
+        # mounting it, and set no variable pointing at it — so a farm that
+        # configured the fence proxy correctly passed every check and went on
+        # dialling its hosts in the clear, while /api/v1/capabilities advised
+        # setting exactly the variables no chart value set. This step is the
+        # assertion that was missing, not a new requirement.
+        run: |
+          set -euo pipefail
+          cat > /tmp/fence-values.yaml <<'EOF'
+          database:
+            dsn: postgres://farm@pg:5432/device_farmer
+          auth:
+            tokens: ci-token:operator:ci
+          fenceProxy:
+            enabled: true
+            ca: CA
+            cert: CERT
+            key: KEY
+            controlCert: CTLCERT
+            controlKey: CTLKEY
+          extraVolumes:
+            - name: fence
+              secret:
+                secretName: ci-device-farmer-fence
+          extraVolumeMounts:
+            - name: fence
+              mountPath: /etc/device-farmer/fence
+              readOnly: true
+          EOF
+          out=$(helm template ci "$CHART" -n device-farmer -f /tmp/fence-values.yaml)
+          for v in FARM_FENCE_CLIENT_CA FARM_FENCE_CLIENT_CERT FARM_FENCE_CLIENT_KEY; do
+            echo "$out" | grep -q "$v" || { echo "a fenced farm renders no $v, so no process knows where its material is"; exit 1; }
+          done
+          # The control class belongs to the api alone. Every other role dials
+          # maintenance, and a credential that can drive a phone has no business
+          # on eight processes that would never present it.
+          #
+          # Counted by SOURCE TEMPLATE rather than by matching lines. A line
+          # count answers "how many times does this string appear", which is a
+          # different question and was briefly satisfied by a mutation that put
+          # the variable in the shared ConfigMap — reaching every role while the
+          # count still looked plausible.
+          where=$(echo "$out" | awk '/^# Source:/{src=$0} /FARM_FENCE_CONTROL_CERT/{print src}' | sort -u)
+          test "$where" = "# Source: device-farmer/templates/api.yaml" || {
+            echo "FARM_FENCE_CONTROL_CERT is rendered by:"; echo "$where"
+            echo "want exactly device-farmer/templates/api.yaml — the api is the only role that presents this class"
+            exit 1
+          }
+          echo "$out" | grep -q 'control.crt:' || { echo "the fence Secret carries no control.crt"; exit 1; }
       - name: the guards still refuse
         run: |
           if helm template ci "$CHART" -n device-farmer > /dev/null 2>&1; then

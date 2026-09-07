@@ -766,6 +766,23 @@ fenceProxy:
   ca: ""
   cert: ""
   key: ""
+  # A SECOND client certificate, for the live-screen and input routes, rendered
+  # into the same Secret under control.crt / control.key and given to the api
+  # alone. Its farm://<class>/<service> URI SAN must say `control`, where the
+  # one above says `maintenance`.
+  #
+  # Two certificates rather than one because the proxy reads the class from the
+  # certificate: control class must present a devpath and a fence or it is
+  # refused as malformed, and POST /api/v1/devices/{id}/exec runs on devices
+  # that hold no lease. Promoting the shared certificate would have broken exec
+  # on every free device rather than widening anything.
+  #
+  # Leave both empty and the screen routes report themselves unavailable, naming
+  # what is missing. They never fall back to the maintenance certificate: a
+  # screen opened under the wrong class is a screen the proxy refuses at the
+  # first frame, which is a worse way to learn this than a 503.
+  controlCert: ""
+  controlKey: ""
   existingSecret: ""
   # Where the three files land in every pod. Mount the Secret here:
   #

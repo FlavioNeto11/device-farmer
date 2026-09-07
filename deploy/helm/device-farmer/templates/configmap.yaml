@@ -85,6 +85,25 @@ data:
 
   FARM_MIGRATIONS_TABLE: {{ .Values.config.migrationsTable | quote }}
   FARM_ARTIFACT_DIR: {{ .Values.artifacts.dir | quote }}
+
+  {{- if .Values.fenceProxy.enabled }}
+
+  # ---- the client half of the fence proxy ----
+  #
+  # These three were the missing half. The chart rendered the Secret, checkFence
+  # refused every incomplete way of mounting it, and NOTHING TOLD A PROCESS WHERE
+  # THE FILES WERE — so a farm that set fenceProxy.enabled, supplied the PEMs and
+  # mounted them correctly passed every check and went on dialling its hosts in
+  # the clear. GET /api/v1/capabilities reported "unavailable" and advised
+  # setting exactly these variables, which no chart value set.
+  #
+  # The names are the Secret's own keys, and they are the conventional ones
+  # because the Secret is type kubernetes.io/tls; an existingSecret is
+  # documented as holding the same three.
+  FARM_FENCE_CLIENT_CA: {{ printf "%s/ca.crt" .Values.fenceProxy.mountPath | quote }}
+  FARM_FENCE_CLIENT_CERT: {{ printf "%s/tls.crt" .Values.fenceProxy.mountPath | quote }}
+  FARM_FENCE_CLIENT_KEY: {{ printf "%s/tls.key" .Values.fenceProxy.mountPath | quote }}
+  {{- end }}
 {{- range $k, $v := .Values.config.extra }}
   {{ $k }}: {{ $v | quote }}
 {{- end }}

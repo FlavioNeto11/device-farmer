@@ -58,6 +58,7 @@ import (
 	"github.com/flaviopadilha/device-farmer/internal/lease"
 	"github.com/flaviopadilha/device-farmer/internal/obs"
 	"github.com/flaviopadilha/device-farmer/internal/recovery"
+	"github.com/flaviopadilha/device-farmer/internal/screen"
 )
 
 // Tuning constants that are not worth an environment variable.
@@ -139,6 +140,20 @@ type Server struct {
 
 	newExecutor   ExecutorFactory
 	execMaxOutput int
+
+	// The interactive-control path. screens is always non-nil — the routes are
+	// always registered, so that the method-not-allowed table and the
+	// operator-only guard test do not depend on how this farm is configured —
+	// and screenStore is nil on a process with no artifact store, which the
+	// routes report as a 503 naming what to set.
+	//
+	// A screen session holds three ADB transports and an encoder on a phone.
+	// Manager.Close is wired into the shutdown path in Shutdown: without it,
+	// http.Server.Shutdown waits out the entire drain grace period on every
+	// deploy, because a spliced video response is a response nothing ends.
+	screens         *screen.Manager
+	screenStore     screenArtifacts
+	newScreenDevice screenDeviceFactory
 
 	// hostRunner reaches the farmd-node agents, for the one operator action
 	// that needs hardware only a process on the device host can touch:
@@ -272,6 +287,35 @@ func WithExecutorFactory(f ExecutorFactory) Option {
 	}
 }
 
+// WithScreenArtifacts gives the interactive-control path the artifact store it
+// needs to put the server jar on a device.
+//
+// It takes a store rather than building one because the api role already opens
+// one for POST /api/v1/artifacts, and two stores over one directory would be two
+// ledgers disagreeing about which blobs are on which device.
+//
+// Without it the screen routes answer 503 and name FARM_ARTIFACT_DIR. They are
+// still registered: a route that exists only on some deployments is a route
+// whose 405 table and whose operator-only guard depend on configuration.
+func WithScreenArtifacts(store screenArtifacts) Option {
+	return func(s *Server) {
+		if store != nil {
+			s.screenStore = store
+		}
+	}
+}
+
+// WithScreenDeviceFactory replaces the per-session ADB client the screen path
+// dials with. It exists for tests; production takes the default, which presents
+// the control-class certificate and the lease's fence.
+func WithScreenDeviceFactory(f screenDeviceFactory) Option {
+	return func(s *Server) {
+		if f != nil {
+			s.newScreenDevice = f
+		}
+	}
+}
+
 // WithHostRunner supplies the farmd-node client through which
 // POST /api/v1/slots/{id}/power performs its VBUS cycle. It is the same
 // [recovery.HostRunner] the recovery ladder holds, and for the same reason: a
@@ -312,14 +356,16 @@ func New(cfg *config.Config, pool *pgxpool.Pool, opts ...Option) (*Server, error
 	}
 
 	s := &Server{
-		cfg:            cfg,
-		pool:           pool,
-		leases:         lease.NewStore(pool),
-		log:            slog.Default(),
-		streamInterval: defaultStreamInterval,
-		newExecutor:    defaultExecutorFactory(cfg),
-		execMaxOutput:  defaultExecMaxOutput,
-		startedAt:      time.Now(),
+		cfg:             cfg,
+		pool:            pool,
+		leases:          lease.NewStore(pool),
+		log:             slog.Default(),
+		streamInterval:  defaultStreamInterval,
+		newExecutor:     defaultExecutorFactory(cfg),
+		execMaxOutput:   defaultExecMaxOutput,
+		screens:         screen.NewManager(cfg.Screen.MaxSessions, slog.Default()),
+		newScreenDevice: defaultScreenDeviceFactory(cfg),
+		startedAt:       time.Now(),
 	}
 	for _, o := range opts {
 		o(s)
@@ -378,6 +424,14 @@ type httpMetrics struct {
 	operatorActions  *prometheus.CounterVec
 	bulkTargets      *prometheus.CounterVec
 	authOpen         *prometheus.GaugeVec
+
+	// The interactive-control path. screenSessions is a gauge rather than a
+	// counter because the question an operator asks is "how many phones are
+	// being driven right now", and because the session cap is a number this
+	// gauge is compared against.
+	screenSessions  prometheus.Gauge
+	screenInputs    *prometheus.CounterVec
+	screenMisrouted prometheus.Counter
 }
 
 func (s *Server) registerMetrics(ownRegistry bool) error {
@@ -454,6 +508,21 @@ func (s *Server) registerMetrics(ownRegistry bool) error {
 		// can revoke a lease, drain a host and cut power to a USB port
 		// with a live job on it. That is the one configuration in this
 		// system where an anonymous stranger can destroy work.
+		screenSessions: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: "farm", Subsystem: "api", Name: "screen_sessions",
+			Help: "Live interactive-control sessions in this process. Compare against " +
+				"FARM_SCREEN_MAX_SESSIONS: at the cap, the next screen is refused.",
+		}),
+		screenInputs: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "farm", Subsystem: "api", Name: "screen_input_events_total",
+			Help: "Input messages delivered to a handset, by outcome. Counted rather than " +
+				"audited per event: a row per touch would be thousands a minute.",
+		}, []string{"outcome"}),
+		screenMisrouted: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: "farm", Subsystem: "api", Name: "screen_input_misrouted_total",
+			Help: "Input requests for a session this replica does not hold. A non-zero rate " +
+				"here is how an operator discovers they need api.service.sessionAffinity.",
+		}),
 		authOpen: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace: "farm", Subsystem: "api", Name: "auth_open",
 			Help: "1 when the installed authenticator authenticates nothing and grants every " +
@@ -466,6 +535,7 @@ func (s *Server) registerMetrics(ownRegistry bool) error {
 		m.streamDropped, m.streamPollErrors, m.streamTickets,
 		m.execs, m.operatorActions, m.bulkTargets,
 		m.authOpen,
+		m.screenSessions, m.screenInputs, m.screenMisrouted,
 	}
 	for _, c := range own {
 		if err := register(s.reg, c); err != nil {
@@ -614,6 +684,19 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	// are healthy and idle by design, and real in-flight requests would be cut
 	// off when it expired.
 	s.stream.closeAll()
+
+	// Screen sessions are the same problem with a second source. A spliced video
+	// response ends when the handset stops or the viewer goes away, and a healthy
+	// session does neither — so without this, every rolling deploy spends the
+	// whole grace period waiting for a picture somebody is watching, and the real
+	// in-flight requests behind it get cut off when it expires.
+	//
+	// Closing them ENDS BYTES. Three sockets go away and an encoder on a phone
+	// exits. No lease is released, reclaimed or marked: a farm that restarted its
+	// api has not taken anybody's device away, and the comment at the top of this
+	// file lists SIGTERM among the things that do not end a lease precisely so
+	// that this line cannot quietly become an exception.
+	s.screens.Close()
 
 	var err error
 	if s.httpSrv != nil {

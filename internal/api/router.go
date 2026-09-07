@@ -93,6 +93,24 @@ func (s *Server) buildHandler() http.Handler {
 	operator("POST /api/v1/devices/{id}/reslot", s.handleDeviceReslot)
 	operator("POST /api/v1/devices/{id}/rebrand", s.handleDeviceRebrand)
 
+	// A live screen, and a human's finger on it.
+	//
+	// OPERATOR-ONLY, AND THERE IS NO TENANT VARIANT TO ADD. Every tenant-readable
+	// route in this package narrows what it returns by tenant_id, and the masking
+	// nils named fields. A framebuffer has no named fields: the picture is
+	// whatever is on the phone, which may be another tenant's login screen or
+	// another tenant's customer's name. The same argument already made bulk shell
+	// output operator-only. TestScreenRoutesAreOperatorOnly reads this file as
+	// text to keep it that way.
+	//
+	// Registered unconditionally, even on a farm with no screen server pinned, so
+	// that the 405 table and the guard test do not vary with configuration; the
+	// handlers answer 503 and name what to set. Both are long-lived in the sense
+	// isLongLived means — see the comment there, which is the other half of
+	// adding these two lines.
+	operator("GET /api/v1/devices/{id}/screen", s.handleDeviceScreen)
+	operator("POST /api/v1/devices/{id}/input", s.handleDeviceInput)
+
 	// Physical topology and host administration.
 	tenant("GET /api/v1/topology", s.handleTopology)
 	tenant("GET /api/v1/hosts", s.handleHosts)
@@ -217,10 +235,35 @@ func (s *Server) recoverer(next http.Handler) http.Handler {
 	})
 }
 
-// streamPath is the one route whose response is long-lived by design. It is
-// matched by path rather than by pattern because the pattern is not known until
-// the mux has run, and the decision below has to be made before that.
+// streamPath is the event stream. It is matched by path rather than by pattern
+// because the pattern is not known until the mux has run, and the decisions in
+// instrument have to be made before that.
 const streamPath = "/api/v1/stream"
+
+// screenPathSuffix is the other long-lived route. It cannot be a constant path
+// like streamPath because the device id is in the middle of it, and it cannot be
+// matched on r.Pattern for the reason above: instrument runs before the mux.
+const screenPathSuffix = "/screen"
+
+// isLongLived reports whether this request's response is open for minutes or
+// hours by design.
+//
+// There are two such routes and BOTH consequences below apply to both of them,
+// which is why this is a function rather than two comparisons against one
+// constant. The event stream used to be the only one, and the two call sites
+// were written as `r.URL.Path != streamPath`; a screen left open on a wall
+// display would have been counted as in-flight forever and logged at info with
+// a multi-hour duration.
+//
+// The in-flight gauge is the one that matters. It is what an operator reads to
+// decide whether the api is overloaded, and a dashboard showing four phones
+// would have pinned it at four permanently — so the gauge would say "saturated"
+// on a farm doing nothing, and then say the same thing when it really was.
+func isLongLived(r *http.Request) bool {
+	p := r.URL.Path
+	return p == streamPath ||
+		(strings.HasPrefix(p, "/api/v1/devices/") && strings.HasSuffix(p, screenPathSuffix))
+}
 
 // instrument records metrics, assigns a request id, and writes the access log.
 func (s *Server) instrument(next http.Handler) http.Handler {
@@ -239,11 +282,11 @@ func (s *Server) instrument(next http.Handler) http.Handler {
 		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 		start := time.Now()
 
-		// Event streams are excluded from the in-flight gauge. They are open
-		// for hours on purpose, and counting them would make one wall-mounted
-		// dashboard look like permanent saturation on the gauge an operator
-		// reads to decide whether the API is overloaded.
-		if r.URL.Path != streamPath {
+		// Long-lived responses are excluded from the in-flight gauge. They are
+		// open for hours on purpose, and counting them would make one
+		// wall-mounted dashboard look like permanent saturation on the gauge an
+		// operator reads to decide whether the API is overloaded.
+		if !isLongLived(r) {
 			s.metrics.inFlight.Inc()
 			defer s.metrics.inFlight.Dec()
 		}
@@ -254,11 +297,10 @@ func (s *Server) instrument(next http.Handler) http.Handler {
 		s.metrics.requests.WithLabelValues(route, r.Method, strconv.Itoa(rec.status)).Inc()
 		s.metrics.duration.WithLabelValues(route, r.Method).Observe(elapsed.Seconds())
 
-		// The event stream is long-lived by design; logging its completion at
-		// info with a multi-hour duration would look like a stall in every log
-		// search. It is logged at debug instead.
+		// A long-lived response logs its completion at debug: at info, a
+		// multi-hour duration looks like a stall in every log search.
 		level := slog.LevelInfo
-		if r.URL.Path == streamPath {
+		if isLongLived(r) {
 			level = slog.LevelDebug
 		}
 

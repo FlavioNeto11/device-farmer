@@ -417,6 +417,16 @@ func runAPI(ctx context.Context, cfg *config.Config, log *slog.Logger, pool *pgx
 		log.Warn("artifact endpoints are disabled", "err", aerr,
 			"consequence", "jobs with push or install steps will fail at the first artifact")
 	} else {
+		// The same store the artifact routes use, handed to the interactive
+		// control path so it can put the screen server on a handset.
+		//
+		// The same one deliberately: two stores over one blob directory would be
+		// two ledgers disagreeing about which blobs are already on which device,
+		// and the consequence of that disagreement is a skipped push — a
+		// CLASSPATH pointing at a file that is not there, which presents as a
+		// server that exits silently and a socket that never appears.
+		opts = append(opts, api.WithScreenArtifacts(store))
+
 		opts = append(opts, api.WithRoutes(func(srv *api.Server, mux *http.ServeMux) {
 			a, aerr := api.NewArtifactAPI(srv, store)
 			if aerr != nil {

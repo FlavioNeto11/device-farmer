@@ -662,9 +662,17 @@ watchdog:
   enabled: true
   # Only used when hosts[] is empty: one pod that supervises every row in
   # farm.hosts instead of one pod per host. It is the laptop shape — every
-  # host's probes share one process, and hosts enrolled after it started are
-  # not watched until it restarts. Fine while bringing a farm up; move the
+  # host's probes share one process, so one pod restart blinds the whole farm
+  # at once instead of one rack row. Fine while bringing a farm up; move the
   # hosts into hosts[] before it matters.
+  #
+  # It is safe to install this on a farm with nothing in it, which it was not.
+  # The pod reads farm.hosts every config.watchdogInterval and starts a reader
+  # for each host as it is enrolled; an empty table is a cycle that found
+  # nothing, not a startup error, and the pod stays Ready and keeps beating
+  # through it. Before that it exited 1 with "no hosts registered" and
+  # CrashLoopBackOff'd until somebody enrolled a host — on a chart whose whole
+  # purpose is to be installed before the rack is plugged in.
   superviseAllHosts: false
   terminationGracePeriodSeconds: 30
   resources:

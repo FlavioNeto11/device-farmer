@@ -121,10 +121,21 @@ The fallback shape: one pod that supervises every row in farm.hosts, started
 without FARM_HOST_ID.
 
 It is the laptop shape, not the production one. Every host's probes share one
-process and one failure domain, so a pod restart blinds the whole farm at
-once, and the pod discovers its hosts only at startup — a host enrolled later
-is not watched until this Deployment is restarted. Use it while you are
-bringing a farm up, then move the hosts into hosts[] and get one pod each.
+process and one failure domain, so a pod restart blinds the whole farm at once.
+Use it while you are bringing a farm up, then move the hosts into hosts[] and
+get one pod each.
+
+NO FARM_HOST_ID IS SET HERE, and nothing may add one — not this template, not
+watchdog.extraEnv. The absence is what selects the fleet-wide shape, and the
+careless repair of the CrashLoopBackOff this pod used to suffer on a fresh farm
+was to supply one: `farmd watchdog` enumerated farm.hosts once at startup and
+exited 1 on an empty table, which is the normal first state of an installation
+whose hosts have not been enrolled yet. Pinning it to a host id instead would
+have traded a loud crash for a silent farm — one host watched out of however
+many, or none, if the id named a row that does not exist yet. The role now
+re-reads the host list every FARM_WATCHDOG_INTERVAL and adopts each host as it
+is enrolled, so this pod comes up Ready against an empty database and stays up.
+`make ci-helm` renders this branch and fails if FARM_HOST_ID appears in it.
 */}}
 apiVersion: apps/v1
 kind: Deployment

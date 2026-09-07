@@ -222,6 +222,75 @@ jobs:
             exit 1
           }
           echo "$out" | grep -q 'control.crt:' || { echo "the fence Secret carries no control.crt"; exit 1; }
+      - name: the fleet-wide watchdog renders, and nothing pins it to a host
+        # Two assertions about one variable, because FARM_HOST_ID is what
+        # chooses between the chart's two watchdog shapes and the wrong choice
+        # fails silently in both directions.
+        #
+        # The first render is the branch CI had never compiled. ci-values.yaml
+        # sets hosts[], so every other step in this job takes the per-host path
+        # and templates/watchdog.yaml's `else if superviseAllHosts` fallback was
+        # rendered by nothing — which is the hole ci-values.yaml's own header
+        # warns about ("a template that only renders behind a flag is a template
+        # a default render never compiles"). That branch is also the one that
+        # used to CrashLoopBackOff on a fresh farm, because `farmd watchdog`
+        # enumerated farm.hosts once and exited 1 on an empty table. The role
+        # now waits and adopts hosts as they enrol, and the careless repair of
+        # the old crash was to hand the pod a FARM_HOST_ID instead: that trades
+        # a loud crash for a farm where one host is watched and the rest are
+        # not, or none is, if the id names a row nothing has enrolled yet.
+        #
+        # Counted by SOURCE TEMPLATE, exactly like FARM_FENCE_CONTROL_CERT
+        # above and for the same reason: `grep -c` answers "how many lines",
+        # which a mutation that moves the variable into the shared ConfigMap
+        # satisfies while reaching all nine roles. Asking WHICH TEMPLATE set it
+        # catches that, and catches `-s templates/watchdog.yaml`-scoped checking
+        # missing it.
+        #
+        # The second render is the other direction. With hosts[] populated the
+        # production shape is one pinned pod per host, so templates/watchdog.yaml
+        # MUST set FARM_HOST_ID; without this half, deleting the variable
+        # outright would pass the first half and leave every farm on the laptop
+        # shape.
+        #
+        # This half asks only that watchdog.yaml is among the templates that set
+        # it, and does not require it to be the only one. templates/node.yaml
+        # legitimately sets FARM_HOST_ID from spec.nodeName, and an
+        # "and nothing else" form would pass today only because ci-values.yaml
+        # leaves node.enabled false — contradicting that file's own rule that
+        # every optional object is switched ON, and failing the day somebody
+        # follows it. "Nothing else sets it" is the FIRST render's job, where the
+        # node DaemonSet is off and the answer must be zero templates.
+        run: |
+          set -euo pipefail
+          fleet=$(helm template ci "$CHART" -n device-farmer \
+            --set database.dsn=postgres://farm@pg:5432/device_farmer \
+            --set auth.tokens=ci-token:operator:ci \
+            --set watchdog.superviseAllHosts=true)
+          # src is re-evaluated on EVERY Source line, not set once: a counter
+          # that latches would keep counting every Deployment helm happens to
+          # print after this file and answer 9 for a chart that renders one.
+          n=$(echo "$fleet" | awk '/^# Source:/{src = ($0 == "# Source: device-farmer/templates/watchdog.yaml")} /^kind: Deployment$/{if (src) c++} END{print c+0}')
+          test "$n" = 1 || {
+            echo "watchdog.superviseAllHosts=true with hosts[] empty renders $n watchdog Deployments, want 1"
+            echo "a farm installed before its rack is plugged in would have no health plane at all"
+            exit 1
+          }
+          where=$(echo "$fleet" | awk '/^# Source:/{src=$0} /^[[:space:]]*(- name: FARM_HOST_ID$|FARM_HOST_ID:)/{print src}' | sort -u)
+          test -z "$where" || {
+            echo "the fleet-wide watchdog is pinned to a host by:"; echo "$where"
+            echo "FARM_HOST_ID must be set by no template in this shape: it selects one host"
+            echo "out of the farm, and the other hosts would be watched by nobody"
+            exit 1
+          }
+          pinned=$(helm template ci "$CHART" -n device-farmer -f "$VALUES" \
+            | awk '/^# Source:/{src=$0} /^[[:space:]]*(- name: FARM_HOST_ID$|FARM_HOST_ID:)/{print src}' | sort -u)
+          echo "$pinned" | grep -qx "# Source: device-farmer/templates/watchdog.yaml" || {
+            echo "with hosts[] populated, FARM_HOST_ID is rendered by:"; echo "${pinned:-nothing}"
+            echo "templates/watchdog.yaml must be among them — one pinned pod per host is the"
+            echo "production shape, and without the variable every farm gets the laptop one"
+            exit 1
+          }
       - name: the guards still refuse
         run: |
           if helm template ci "$CHART" -n device-farmer > /dev/null 2>&1; then
@@ -422,16 +491,18 @@ jobs:
                 # to serve a non-loopback address with no credentials. That
                 # refusal is the subject of the next step.
                 opts+=(-e "FARM_API_ADDR=0.0.0.0:8080" -e "FARM_API_TOKENS=$SMOKE_TOKEN:operator:ci") ;;
-              watchdog)
-                # The only role that will not start against an empty farm, and
-                # deliberately: with no FARM_HOST_ID it supervises every
-                # registered host, and refuses rather than idle over none. The
-                # chart says the same thing in the other direction — hosts[] is
-                # empty by default and renders no watchdog at all — so naming a
-                # host here is the production shape, one watchdog per host, not
-                # a workaround.
-                opts+=(-e "FARM_HOST_ID=ci-smoke") ;;
             esac
+            # NO per-role exception for the watchdog, and that absence is an
+            # assertion. There used to be one — FARM_HOST_ID=ci-smoke, with a
+            # comment calling it the production shape — because `farmd
+            # watchdog` enumerated farm.hosts once and exited 1 on an empty
+            # table. $DSN is a freshly migrated database with no hosts in it, so
+            # this loop is exactly the test that would have caught that, and the
+            # exception is what stopped it: the farm profile in
+            # docker-compose.yml ships the unpinned shape and restarted forever
+            # for 14 hours on a real machine while this step stayed green. Every
+            # role here now starts against an empty farm, idles, beats and stays
+            # running, and the watchdog is held to the same terms as the rest.
             docker run -d --name "smoke-$role" --network host "${opts[@]}" "$IMG" "$role" > /dev/null
 
             ok=0

@@ -680,42 +680,91 @@ func maintenanceADBOptions(cfg *config.Config) []adbwire.Option {
 	}
 }
 
-// watchdogsForHosts starts one watchdog per registered host. Health is
-// per-host because the ADB server is per-host: one stream, one epoch, one
-// blast radius.
-func watchdogsForHosts(ctx context.Context, cfg *config.Config, log *slog.Logger, pool *pgxpool.Pool) (map[string]func(context.Context) error, error) {
-	rows, err := pool.Query(ctx,
-		`SELECT id, adb_endpoint FROM farm.hosts WHERE admin_state <> 'disabled' ORDER BY id`)
-	if err != nil {
-		return nil, fmt.Errorf("list hosts: %w", err)
+// watchdogConfig builds the health plane's configuration for this process.
+//
+// There is exactly one shape decision in it and hostID makes it: a host id
+// means this process speaks for that host, which is the production shape — one
+// pod per machine, so that losing a pod blinds one rack row and not the farm.
+// Empty means every host in farm.hosts, which is what a laptop, the demo and a
+// single-node farm want.
+//
+// The id is an ARGUMENT rather than a read of cfg.Node.HostID, because two of
+// the three callers must not honour the environment. `all` and `demo`
+// multiplex every loop into one process and pass "" unconditionally; if they
+// read FARM_HOST_ID they would inherit the value docker-compose.yml and
+// deploy/helm/README.md tell an operator to export for the NODE role, on the
+// single-machine farm where the same shell starts both. In `demo` that pins
+// the health plane to h01 and, worse, forces its endpoint to
+// config.DefaultADBEndpoint — 127.0.0.1:5037, where no in-process fake ADB
+// server listens, since demo assigns those ports at runtime. The demo would
+// then show every simulated device with dead health and log nothing at all.
+//
+// Both shapes are ONE watchdog.Watchdog, and that is the whole of the fix for
+// a role that could not start. There used to be a second implementation of
+// host membership here — watchdogsForHosts, which SELECTed farm.hosts once,
+// started a Watchdog per row, and returned an error when the table was empty
+// ("no hosts registered; set FARM_HOST_ID or seed farm.hosts"). A freshly
+// migrated farm has an empty farm.hosts by definition: hosts arrive by
+// enrolment, from a `farmd node` that may be started minutes or days later. So
+// the farm profile in docker-compose.yml and the watchdog.superviseAllHosts
+// shape in the chart both shipped a role that exited non-zero on every start
+// of a new installation, restarted, and did that a few thousand times — while
+// every other loop in this binary treats "nothing to do yet" as a poll that
+// found nothing: the scheduler on an empty queue waits IdleInterval, the
+// reaper, janitor, recovery ladder and charge policy tick on and beat.
+// Exiting also cost the one signal an operator has for the health plane, since
+// a process that is not running writes no farm.component_heartbeat row, so
+// /api/v1/capabilities reported the watchdog dead rather than idle.
+//
+// internal/watchdog already had the behaviour the fatal was standing in for.
+// Watchdog.cycle re-reads the host list every Interval and reconcileWorkers
+// starts a reader for each host that has none and stops the readers of hosts
+// that went away, changed endpoint or bumped their epoch — so an empty table
+// is zero workers and a host enrolled later is adopted within one interval,
+// with no restart. Deleting the duplicate enumeration is therefore not a
+// loosening; it is the role finally using the loop it already shipped.
+//
+// ADBEndpoint is passed ONLY in the pinned shape, and the asymmetry is load
+// bearing. Config.ADBEndpoint overrides farm.hosts.adb_endpoint for every host
+// the process watches, which is right for a node-local pod reaching its own
+// ADB server at 127.0.0.1:5037 whatever address the rest of the fleet uses.
+// Passing it fleet-wide would point every host at one address — and since
+// config.DefaultADBEndpoint makes cfg.Node.ADBEndpoint never empty, "fleet-wide
+// with no FARM_ADB_ENDPOINT set" would mean every host in the farm dialled at
+// 127.0.0.1:5037, which on a control-plane container is nothing at all. The
+// health of the whole farm would then read as one host's, or as silence.
+func watchdogConfig(cfg *config.Config, log *slog.Logger, pool *pgxpool.Pool, hostID string) watchdog.Config {
+	c := watchdog.Config{
+		Pool: pool,
+		// farm.component_heartbeat is keyed by component, so the pinned shape
+		// carries its host id: a constant "watchdog" would have every pod in
+		// the farm overwriting one row and keeping it fresh for the hosts that
+		// are dead. The fleet-wide shape is one process and therefore one row,
+		// which is the bare DefaultComponent the runbooks already name.
+		Component:  cfg.ComponentFor("watchdog"),
+		HostID:     hostID,
+		Interval:   cfg.WatchdogInterval,
+		Battery:    batteryThresholds(cfg),
+		ADBOptions: maintenanceADBOptions(cfg),
+		Logger:     log,
 	}
-	defer rows.Close()
+	if c.HostID != "" {
+		c.Component += ":" + c.HostID
+		c.ADBEndpoint = cfg.Node.ADBEndpoint
+	}
+	return c
+}
 
-	out := make(map[string]func(context.Context) error)
-	for rows.Next() {
-		var id, endpoint string
-		if err := rows.Scan(&id, &endpoint); err != nil {
-			return nil, err
-		}
-		cfgCopy := watchdog.Config{
-			Pool:        pool,
-			Component:   cfg.ComponentFor("watchdog") + ":" + id,
-			HostID:      id,
-			ADBEndpoint: endpoint,
-			Interval:    cfg.WatchdogInterval,
-			Battery:     batteryThresholds(cfg),
-			ADBOptions:  maintenanceADBOptions(cfg),
-			Logger:      log.With("host", id),
-		}
-		out["watchdog:"+id] = func(ctx context.Context) error {
-			w, err := watchdog.New(cfgCopy)
-			if err != nil {
-				return err
-			}
-			return w.Run(ctx)
-		}
+// startWatchdog runs one health plane over the hosts hostID names, or over
+// every host in farm.hosts when it is empty. Split from runWatchdog so that
+// `all` and `demo` can be fleet-wide without consulting the environment; see
+// watchdogConfig for what reading it would cost them.
+func startWatchdog(ctx context.Context, cfg *config.Config, log *slog.Logger, pool *pgxpool.Pool, hostID string) error {
+	w, err := watchdog.New(watchdogConfig(cfg, log, pool, hostID))
+	if err != nil {
+		return err
 	}
-	return out, rows.Err()
+	return w.Run(ctx)
 }
 
 // batteryThresholds carries the U9 knobs from the environment into the
@@ -729,35 +778,11 @@ func batteryThresholds(cfg *config.Config) watchdog.BatteryThresholds {
 	}
 }
 
+// runWatchdog is the standalone role, and the only caller for which
+// FARM_HOST_ID is a shape instruction: this process is a watchdog and nothing
+// else, so the deployment that set the variable set it about this pod.
 func runWatchdog(ctx context.Context, cfg *config.Config, log *slog.Logger, pool *pgxpool.Pool) error {
-	// A single-host watchdog is the production shape: one pod per host, named
-	// by FARM_HOST_ID. Without one, supervise every host in this process.
-	if cfg.Node.HostID != "" {
-		w, err := watchdog.New(watchdog.Config{
-			Pool:        pool,
-			Component:   cfg.ComponentFor("watchdog") + ":" + cfg.Node.HostID,
-			HostID:      cfg.Node.HostID,
-			ADBEndpoint: cfg.Node.ADBEndpoint,
-			Interval:    cfg.WatchdogInterval,
-			Battery:     batteryThresholds(cfg),
-			ADBOptions:  maintenanceADBOptions(cfg),
-			Logger:      log,
-		})
-		if err != nil {
-			return err
-		}
-		return w.Run(ctx)
-	}
-
-	fns, err := watchdogsForHosts(ctx, cfg, log, pool)
-	if err != nil {
-		return err
-	}
-	if len(fns) == 0 {
-		return errors.New("no hosts registered; set FARM_HOST_ID or seed farm.hosts")
-	}
-	log.Info("supervising every registered host", "hosts", len(fns))
-	return runGroup(ctx, fns)
+	return startWatchdog(ctx, cfg, log, pool, cfg.Node.HostID)
 }
 
 // runAll runs the whole control plane in one process. It is the right shape
@@ -776,13 +801,17 @@ func runAll(ctx context.Context, cfg *config.Config, log *slog.Logger, pool *pgx
 		// Charge limiting is the one fire mitigation software can reach; it
 		// acts only on idle devices and can never end a lease.
 		"chargepolicy": func(c context.Context) error { return runChargePolicy(c, cfg, log, pool) },
-	}
-	wds, err := watchdogsForHosts(ctx, cfg, log, pool)
-	if err != nil {
-		return err
-	}
-	for k, v := range wds {
-		fns[k] = v
+		// One entry, not one per host: the watchdog reads farm.hosts every
+		// cycle and starts a reader per host itself. Enumerating them HERE is
+		// what used to make `all` silently watch nothing on a farm whose
+		// first host was enrolled after this process started — the map was
+		// built once, before enrolment, and nothing ever rebuilt it.
+		//
+		// Fleet-wide unconditionally. `all` is one process for the whole
+		// control plane, so an exported FARM_HOST_ID — the one the node role
+		// is started with on a single-machine farm — must not quietly reduce
+		// it to one host dialled at loopback.
+		"watchdog": func(c context.Context) error { return startWatchdog(c, cfg, log, pool, "") },
 	}
 	log.Info("running the full control plane in one process", "roles", len(fns))
 	return runGroup(ctx, fns)
@@ -833,43 +862,27 @@ func runDemo(ctx context.Context, cfg *config.Config, log *slog.Logger, pool *pg
 		// beats, warns once per host that it cannot reach one, and holds
 		// nothing — which is the honest shape of a farm without agents.
 		"chargepolicy": func(c context.Context) error { return runChargePolicy(c, cfg, log, pool) },
-	}
-
-	// Watchdogs are started after the simulation has registered its hosts, so
-	// they find real endpoints to stream from.
-	fns["watchdogs"] = func(c context.Context) error {
-		if err := waitForHosts(c, pool, hosts); err != nil {
-			return err
-		}
-		wds, err := watchdogsForHosts(c, cfg, log, pool)
-		if err != nil {
-			return err
-		}
-		if len(wds) == 0 {
-			return errors.New("demo registered no hosts")
-		}
-		return runGroup(c, wds)
+		// The health plane starts immediately, BEFORE the simulation has
+		// registered a single host, and that is the point rather than a race
+		// left in. This entry used to poll farm.hosts until the seed had
+		// landed and then enumerate it once, because enumerating it once was
+		// all the role could do; the watchdog reads the host list every
+		// Interval and adopts each simulated host as demo.Run writes its
+		// adb_endpoint, so the wait it was guarding against does not exist.
+		// The demo is also the cheapest place that difference is visible: the
+		// farm it starts against is empty for the first second of its life,
+		// exactly like a new installation's.
+		//
+		// Fleet-wide unconditionally, and here that is not a nicety. The
+		// simulated hosts are h01, h02, … and their ADB servers are in-process
+		// fakes on ports assigned at runtime, so a FARM_HOST_ID inherited from
+		// the shell would pin this to h01 AND force its endpoint to
+		// config.DefaultADBEndpoint, where nothing is listening: every
+		// simulated device would show dead health with no error logged.
+		"watchdog": func(c context.Context) error { return startWatchdog(c, cfg, log, pool, "") },
 	}
 
 	return runGroup(ctx, fns)
-}
-
-// waitForHosts blocks until the simulation has registered its ADB endpoints.
-func waitForHosts(ctx context.Context, pool *pgxpool.Pool, want int) error {
-	t := time.NewTicker(500 * time.Millisecond)
-	defer t.Stop()
-	for {
-		var n int
-		if err := pool.QueryRow(ctx,
-			`SELECT count(*) FROM farm.hosts WHERE adb_endpoint <> ''`).Scan(&n); err == nil && n >= want {
-			return nil
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-t.C:
-		}
-	}
 }
 
 // openArtifacts builds the content-addressed artifact store. The blob backend

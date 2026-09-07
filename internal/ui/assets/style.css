@@ -8,7 +8,37 @@
    Colour is never the only signal. Every health and lease state also carries a
    glyph and a word, so the page survives a colour-blind operator, a washed out
    projector and a greyscale screenshot pasted into a ticket. That rule did not
-   change and is not negotiable. */
+   change and is not negotiable.
+
+   # Type
+
+   Every size is an --fs-* token and the floor is --fs-xs: 12px on the
+   comfortable scale that loads, 11px only for an operator who has asked for
+   compact and knows what they traded. There used to be fifty-six literal
+   font-sizes in this file, forty-four of them under 13px and two of them at
+   10px, with no way to raise them together. Sub-12px type is the single
+   loudest thing that made this page read as a terminal rather than as an
+   instrument, and no amount of repainting fixes a page you have to lean
+   towards.
+
+   Monospace is for text an operator will copy, paste, diff or grep: output,
+   command lines, wire text, textareas, and the two deliberate opt-ins .mono and
+   .ident. It is NOT for names. Rendering the name of the thing you just clicked
+   in Consolas is the other half of what made this look like a developer tool,
+   and a name is not improved by having its columns line up. Where digits need
+   to line up — a count, a battery, a right-aligned cell — the answer is
+   font-variant-numeric: tabular-nums, which is what a typewriter face was being
+   used as a proxy for.
+
+   Micro-labels are sentence case. Uppercase survives on exactly one selector,
+   `thead th`, where it separates the header row from the data beneath it. A
+   dozen shouted labels do not make a page authoritative; they make it loud.
+
+   The case of a translated word belongs to i18n.js, not to this file. Four
+   docs labels (.doc-chip-k, .doc-out-label, .doc-src-label, .doc-ex-lang) are
+   stored lowercase because CSS used to uppercase them, and they read correctly
+   lowercase in both languages — "derived from internal/api/auth.go", "bash",
+   "no ar há 2m". The connection pill did not, and says so on its own rule. */
 
 * { box-sizing: border-box; }
 
@@ -51,8 +81,8 @@ body {
   border-bottom: 1px solid var(--line);
 }
 
-.brand { display: flex; align-items: center; gap: 7px; font-weight: 650; letter-spacing: .2px; }
-.brand-mark { color: var(--ok); font-size: 15px; }
+.brand { display: flex; align-items: center; gap: 7px; font-weight: var(--fw-semi); }
+.brand-mark { color: var(--ok); font-size: var(--fs-lg); }
 .brand-name { white-space: nowrap; }
 
 .tabs { display: flex; flex-wrap: wrap; gap: 2px; }
@@ -64,15 +94,19 @@ body {
 .tab:hover { background: var(--panel-2); color: var(--text); }
 .tab[aria-selected="true"] {
   background: var(--panel-2); color: var(--text);
-  border-color: var(--line-2); font-weight: 600;
+  border-color: var(--line-2); font-weight: var(--fw-semi);
 }
+/* The hotkey badge and the count pip were the two 10px rules in this file. A
+   badge nobody can read is not a hint, it is decoration. */
 .tab .key {
-  font: 10px/1 var(--mono); color: var(--dim);
-  border: 1px solid var(--line); border-radius: 3px; padding: 2px 4px;
+  font-size: var(--fs-xs); line-height: var(--lh-tight); color: var(--dim);
+  border: 1px solid var(--line); border-radius: 3px; padding: 0 var(--s-1);
 }
 .tab .pip {
   min-width: 18px; text-align: center;
-  font: 10px/1.6 var(--mono); border-radius: 9px; padding: 0 5px;
+  font-size: var(--fs-xs); line-height: var(--lh); font-weight: var(--fw-semi);
+  font-variant-numeric: tabular-nums;
+  border-radius: 9px; padding: 0 var(--s-1);
 }
 
 .search { flex: 1 1 220px; min-width: 140px; }
@@ -83,10 +117,19 @@ body {
   font: inherit;
 }
 
+/* "Live", not "LIVE" in 11px Consolas. The state is carried by a dot, a word
+   and a colour; shouting the word adds nothing to the three signals.
+   `capitalize` and not "no transform": the strings behind this pill are stored
+   lowercase in i18n.js (`'conn.live': 'live'`) precisely because CSS was doing
+   the casing, so dropping the transform outright leaves a lowercase "live"
+   sitting beside Refresh, Token and PT. The case belongs to whoever owns the
+   strings; until it moves there, this rule keeps it. */
 .conn {
   display: flex; align-items: center; gap: 6px;
-  font: 11px/1 var(--mono); text-transform: uppercase; letter-spacing: .4px;
-  border: 1px solid var(--line); border-radius: 999px; padding: 5px 10px;
+  font-size: var(--fs-sm); font-weight: var(--fw-semi); line-height: var(--lh-tight);
+  text-transform: capitalize;
+  color: var(--txt-2);
+  border: 1px solid var(--line); border-radius: 999px; padding: var(--s-1) var(--s-3);
   white-space: nowrap;
 }
 .conn .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--gray); }
@@ -111,10 +154,10 @@ button {
 }
 button:hover { background: var(--panel-3); }
 button:disabled { opacity: .5; cursor: not-allowed; }
-button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); font-weight: 600; }
-button.danger  { background: var(--bad-bg); border-color: var(--bad); color: var(--bad); font-weight: 600; }
+button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); font-weight: var(--fw-semi); }
+button.danger  { background: var(--bad-bg); border-color: var(--bad); color: var(--bad); font-weight: var(--fw-semi); }
 button.ghost   { background: transparent; }
-button.mini    { padding: 2px 7px; font-size: 12px; }
+button.mini    { padding: var(--s-1) var(--s-2); font-size: var(--fs-xs); }
 
 /* ---------------- banners ---------------- */
 
@@ -139,34 +182,44 @@ main { padding: 8px 12px 40px; }
 
 .toolbar {
   display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
-  padding: 6px 8px; margin-bottom: 8px;
+  padding: var(--pad-toolbar); margin-bottom: 8px;
   background: var(--panel); border: 1px solid var(--line); border-radius: var(--r);
 }
-.toolbar label { display: flex; align-items: center; gap: 5px; color: var(--dim); font-size: 12px; }
+.toolbar label { display: flex; align-items: center; gap: 5px; color: var(--dim); font-size: var(--fs-sm); }
 .toolbar select, .toolbar input {
-  font: inherit; padding: 3px 6px; color: var(--text);
+  font: inherit; padding: var(--s-1) var(--s-2); color: var(--text);
   background: var(--bg); border: 1px solid var(--line); border-radius: 4px;
 }
 .grow { flex: 1; }
 
 .counts { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; }
+/* A count is digits and a word. tabular-nums keeps the digits from jittering as
+   the number changes under the event stream, which is the only thing monospace
+   was buying here. */
 .count {
-  font: 11px/1.6 var(--mono);
-  border: 1px solid var(--line); border-radius: 999px; padding: 1px 8px;
+  font-size: var(--fs-xs); line-height: var(--lh);
+  font-variant-numeric: tabular-nums;
+  border: 1px solid var(--line); border-radius: 999px; padding: 0 var(--s-2);
   background: var(--panel-2); color: var(--dim);
 }
-.count b { color: var(--text); font-weight: 700; }
+.count b { color: var(--text); font-weight: var(--fw-semi); }
 
-.section-h { font-size: 13px; text-transform: uppercase; letter-spacing: .6px; color: var(--dim); margin: 14px 0 6px; }
+.section-h {
+  font-size: var(--fs-sm); font-weight: var(--fw-semi); color: var(--txt-2);
+  margin: var(--gap-section) 0 var(--s-2);
+}
 
 .split { display: grid; grid-template-columns: minmax(0, 1fr) 330px; gap: 12px; align-items: start; }
 @media (max-width: 1100px) { .split { grid-template-columns: minmax(0, 1fr); } }
 
 .card {
   background: var(--panel); border: 1px solid var(--line);
-  border-radius: var(--r); padding: 10px;
+  border-radius: var(--r); padding: var(--pad-tile);
 }
-.card h2 { margin: 0 0 8px; font-size: 13px; text-transform: uppercase; letter-spacing: .6px; color: var(--dim); }
+.card h2 {
+  margin: 0 0 var(--s-2);
+  font-size: var(--fs-sm); font-weight: var(--fw-semi); color: var(--txt-2);
+}
 
 /* ---------------- fleet ---------------- */
 
@@ -176,42 +229,47 @@ main { padding: 8px 12px 40px; }
   padding: 7px 10px; border-bottom: 1px solid var(--line); background: var(--panel-2);
   border-radius: var(--r) var(--r) 0 0;
 }
-.host-name { font: 600 14px/1 var(--mono); }
+/* A host is called rack-b7-host-02. That is a name, and a name reads as a name.
+   It was set in Consolas, which said "this is a shell token you are about to
+   paste somewhere" about the largest label on the page. */
+.host-name { font-size: var(--fs-md); font-weight: var(--fw-semi); line-height: var(--lh-tight); }
 .host-actions { display: flex; gap: 6px; margin-left: auto; }
 
 .hub-block { padding: 6px 10px 10px; border-top: 1px solid var(--line); }
 .hub-block:first-of-type { border-top: none; }
-.hub-head { display: flex; align-items: baseline; gap: 8px; padding: 4px 0 6px; color: var(--dim); font-size: 12px; }
-.hub-name { font: 600 12px/1 var(--mono); color: var(--text); }
+.hub-head { display: flex; align-items: baseline; gap: 8px; padding: 4px 0 6px; color: var(--dim); font-size: var(--fs-xs); }
+.hub-name { font-size: var(--fs-sm); font-weight: var(--fw-semi); line-height: var(--lh-tight); color: var(--text); }
 
 .correlate {
   display: flex; gap: 8px; align-items: flex-start;
   border: 1px solid var(--warn); border-left-width: 4px; background: var(--warn-bg); color: var(--warn);
   padding: 6px 9px; border-radius: var(--r); margin: 0 0 8px;
-  font-weight: 600;
+  font-weight: var(--fw-semi);
 }
 .correlate.correlate-bad { border-color: var(--bad); background: var(--bad-bg); color: var(--bad); }
-.correlate .c-sub { display: block; font-weight: 400; opacity: .95; }
+.correlate .c-sub { display: block; font-weight: var(--fw-normal); opacity: .95; }
 
+/* --tile-min and --gap-grid are the density knobs for this grid; 186px and 6px
+   were their compact values before density existed. */
 .grid {
-  display: grid; gap: 6px;
-  grid-template-columns: repeat(auto-fill, minmax(186px, 1fr));
+  display: grid; gap: var(--gap-grid);
+  grid-template-columns: repeat(auto-fill, minmax(var(--tile-min), 1fr));
 }
 
 .tile {
   position: relative; text-align: left;
-  display: flex; flex-direction: column; gap: 4px;
-  padding: 6px 8px 7px;
+  display: flex; flex-direction: column; gap: var(--s-1);
+  padding: var(--pad-tile);
   background: var(--panel); color: var(--text);
   border: 1px solid var(--line); border-left: 4px solid var(--gray);
   border-radius: var(--r); cursor: pointer;
 }
 .tile:hover { background: var(--panel-2); }
-.tile .slot { font: 700 14px/1.15 var(--mono); letter-spacing: -.2px; }
-.tile .slot .unslotted { color: var(--warn); font-weight: 600; }
-.tile .model { color: var(--dim); font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tile .slot { font-size: var(--fs-md); font-weight: var(--fw-semi); line-height: var(--lh-tight); }
+.tile .slot .unslotted { color: var(--warn); font-weight: var(--fw-semi); }
+.tile .model { color: var(--dim); font-size: var(--fs-xs); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tile .chips { display: flex; flex-wrap: wrap; gap: 4px; }
-.tile .foot { display: flex; align-items: center; gap: 6px; color: var(--dim); font-size: 11px; }
+.tile .foot { display: flex; align-items: center; gap: 6px; color: var(--dim); font-size: var(--fs-xs); }
 
 .h-healthy      { border-left-color: var(--ok); }
 .h-degraded     { border-left-color: var(--warn); }
@@ -224,9 +282,12 @@ main { padding: 8px 12px 40px; }
 .h-retired,
 .h-unknown      { border-left-color: var(--gray); }
 
+/* A chip says "healthy", "leased", "quarantined". Those are words in the
+   operator's language, not tokens from a config file. */
 .chip {
   display: inline-flex; align-items: center; gap: 4px;
-  font: 11px/1.5 var(--mono); border-radius: 3px; padding: 0 5px;
+  font-size: var(--fs-xs); line-height: var(--lh); font-weight: var(--fw-medium);
+  border-radius: 3px; padding: 0 var(--s-2);
   border: 1px solid transparent; white-space: nowrap;
 }
 .chip-healthy      { background: var(--ok-bg);      color: var(--ok);      border-color: var(--ok); }
@@ -251,7 +312,12 @@ main { padding: 8px 12px 40px; }
 .chip-bad          { background: var(--bad-bg);     color: var(--bad);     border-color: var(--bad); }
 .chip-plain        { background: var(--panel-2);    color: var(--dim);     border-color: var(--line); }
 
-.batt { display: inline-flex; align-items: center; gap: 4px; }
+/* The percentage stays sans even inside a mono cell; tabular-nums is what keeps
+   a column of them aligned. */
+.batt {
+  display: inline-flex; align-items: center; gap: 4px;
+  font-family: var(--sans); font-variant-numeric: tabular-nums;
+}
 .batt .meter {
   width: 26px; height: 7px; border: 1px solid var(--line-2); border-radius: 2px;
   overflow: hidden; background: var(--panel-2);
@@ -266,16 +332,29 @@ main { padding: 8px 12px 40px; }
 /* Dense operational tables scroll sideways inside their own panel rather than
    folding every cell into three lines on a narrow window. */
 table { width: 100%; min-width: 900px; border-collapse: collapse; }
+/* The one surviving uppercase in this file. A column head is not read, it is
+   located, and the case change is what separates the header row from the data
+   under it without needing a heavier rule or a louder colour. */
 thead th {
   position: sticky; top: 0; z-index: 1;
-  text-align: left; font-size: 11px; text-transform: uppercase; letter-spacing: .5px;
+  text-align: left;
+  font-size: var(--fs-xs); font-weight: var(--fw-semi);
+  text-transform: uppercase; letter-spacing: .04em;
   color: var(--dim); background: var(--panel-2);
-  padding: 5px 8px; border-bottom: 1px solid var(--line); white-space: nowrap;
+  padding: var(--pad-cell); border-bottom: 1px solid var(--line); white-space: nowrap;
 }
-tbody td { padding: 4px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+tbody td { padding: var(--pad-cell); border-bottom: 1px solid var(--line); vertical-align: top; }
 tbody tr:hover td { background: var(--panel-2); }
-td.num { text-align: right; font-family: var(--mono); }
+/* Aligned digits without a typewriter face: tabular-nums is what a numeric
+   column actually wanted from monospace. */
+td.num { text-align: right; font-variant-numeric: tabular-nums; }
 td.mono, .mono { font-family: var(--mono); }
+
+/* A value deliberately shown AS an identifier: a uuid, a devpath, a column
+   name, a metric label — something an operator copies into a query rather than
+   reads as a name. Mono is the signal that it is machine text, and the smaller
+   dimmer type is the signal that it is not why you are looking at the row. */
+.ident { font-family: var(--mono); font-size: var(--fs-xs); color: var(--txt-3); }
 td.acts { white-space: nowrap; text-align: right; }
 .trunc { display: inline-block; max-width: 22ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom; }
 
@@ -296,7 +375,7 @@ tr.row-refused td { background: var(--bad-bg); }
 }
 .axiom strong { color: var(--text); }
 
-.hint { color: var(--dim); font-size: 12px; margin: 4px 0 8px; }
+.hint { color: var(--dim); font-size: var(--fs-sm); margin: 4px 0 8px; }
 .alerts { display: flex; flex-direction: column; gap: 6px; }
 .alerts:not(:empty) { margin-bottom: 8px; }
 
@@ -307,11 +386,11 @@ tr.row-refused td { background: var(--bad-bg); }
   display: grid; grid-template-columns: 42px minmax(120px, 170px) minmax(0, 1fr) repeat(4, auto);
   gap: 10px; align-items: center;
   background: var(--panel); border: 1px solid var(--line); border-radius: var(--r);
-  padding: 5px 9px;
+  padding: var(--pad-row);
 }
-.rung .tier { font: 700 15px/1 var(--mono); }
-.rung .rname { font: 600 12px/1.3 var(--mono); }
-.rung .rdesc { color: var(--dim); font-size: 12px; }
+.rung .tier { font-size: var(--fs-lg); font-weight: var(--fw-semi); line-height: var(--lh-tight); font-variant-numeric: tabular-nums; }
+.rung .rname { font-size: var(--fs-sm); font-weight: var(--fw-semi); line-height: var(--lh-tight); }
+.rung .rdesc { color: var(--dim); font-size: var(--fs-sm); }
 .rung.disabled { opacity: .55; }
 /* farm.recovery_tiers.blast_radius is device | power_domain | hub | host.
    Every value that reaches past one phone gets the loud border; leaving one of
@@ -337,13 +416,13 @@ dialog {
   max-width: min(900px, 94vw);
 }
 dialog::backdrop { background: rgba(3, 7, 12, .55); }
-dialog h2 { margin: 0 0 8px; font-size: 15px; }
+dialog h2 { margin: 0 0 8px; font-size: var(--fs-lg); }
 #dlg-confirm form, #token-form { padding: 14px 16px 12px; width: min(560px, 92vw); }
 #token-form menu { display: flex; justify-content: flex-end; gap: 8px; margin: 14px 0 0; padding: 0; }
 #token-form button[type="submit"] { width: auto; margin: 0; }
-#dlg-confirm label { display: block; margin: 10px 0 4px; color: var(--dim); font-size: 12px; }
+#dlg-confirm label { display: block; margin: 10px 0 4px; color: var(--dim); font-size: var(--fs-sm); }
 #dlg-confirm input {
-  width: 100%; font: inherit; padding: 6px 8px; color: var(--text);
+  width: 100%; font: inherit; padding: var(--pad-cell); color: var(--text);
   background: var(--bg); border: 1px solid var(--line-2); border-radius: 4px;
 }
 #dlg-confirm menu { display: flex; justify-content: flex-end; gap: 8px; margin: 14px 0 0; padding: 0; }
@@ -353,41 +432,55 @@ dialog h2 { margin: 0 0 8px; font-size: 15px; }
 }
 .impact ul { margin: 6px 0 0; padding-left: 18px; }
 .impact li { margin: 2px 0; }
-.impact .subject { font-family: var(--mono); font-weight: 700; }
+/* The weight stays: the subject of a destructive confirmation is the one word
+   in the dialog that must not be skimmed. The typewriter face does not. */
+.impact .subject { font-weight: 700; }
 
 .dlg-head {
   display: flex; align-items: center; gap: 10px;
   padding: 10px 14px; border-bottom: 1px solid var(--line); background: var(--panel-2);
 }
-.dlg-head h2 { flex: 1; font-family: var(--mono); }
+/* The title of the sheet is the name of the device you clicked. */
+.dlg-head h2 { flex: 1; }
 .dlg-body { padding: 12px 14px; width: min(860px, 94vw); max-height: 74vh; overflow: auto; }
 
 .kv { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 2px 12px; }
-.kv dt { color: var(--dim); font-size: 12px; }
-.kv dd { margin: 0; font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere; }
+.kv dt { color: var(--dim); font-size: var(--fs-sm); }
+/* A definition list holds a mix of names, states and raw identifiers. The list
+   does not decide which; a call site that means "this is an identifier" says so
+   with .ident on the value. */
+.kv dd { margin: 0; font-size: var(--fs-sm); overflow-wrap: anywhere; }
 
 .form-error {
   margin-top: 10px; padding: 8px 10px; border-radius: var(--r);
   border: 1px solid var(--bad); border-left-width: 4px;
   background: var(--bad-bg); color: var(--bad);
 }
-.form-error .fe-detail { display: block; margin-top: 4px; font: 11px/1.4 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; }
+/* Mono: this is the server's own words, and it gets pasted into a ticket. */
+.form-error .fe-detail {
+  display: block; margin-top: 4px;
+  font: var(--fs-xs)/var(--lh) var(--mono);
+  white-space: pre-wrap; overflow-wrap: anywhere;
+}
 
-form label { display: block; margin: 8px 0 3px; color: var(--dim); font-size: 12px; }
+form label { display: block; margin: 8px 0 3px; color: var(--dim); font-size: var(--fs-sm); }
 form input, form select, form textarea {
-  width: 100%; font: inherit; padding: 5px 7px; color: var(--text);
+  width: 100%; font: inherit; padding: var(--pad-cell); color: var(--text);
   background: var(--bg); border: 1px solid var(--line); border-radius: 4px;
 }
-form textarea { font-family: var(--mono); font-size: 12px; resize: vertical; }
+/* Mono: a textarea in this product holds a command, a selector or a JSON body,
+   and every one of those is text somebody will diff. */
+form textarea { font-family: var(--mono); font-size: var(--fs-sm); resize: vertical; }
 form .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 form .chk { display: flex; align-items: flex-start; gap: 6px; margin-top: 10px; }
 form .chk input { width: auto; margin-top: 2px; }
 form button[type="submit"] { margin-top: 12px; width: 100%; }
 
+/* Mono, and not negotiable: this is what the handset said, verbatim. */
 pre.out {
   margin: 6px 0 0; padding: 8px; max-height: 320px; overflow: auto;
   background: var(--bg); border: 1px solid var(--line); border-radius: var(--r);
-  font: 12px/1.4 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere;
+  font: var(--fs-xs)/var(--lh) var(--mono); white-space: pre-wrap; overflow-wrap: anywhere;
 }
 
 /* A step's error, its output and the runner's detail stack in one cell, each
@@ -432,14 +525,18 @@ details summary:focus-visible { outline: 2px solid var(--accent); }
 
    The fix is not a bigger number. It is to set the font FIRST, on the
    container, and let the measure be resolved against that font:
-   `.doc-read` below declares var(--sans) at 17px, so every `ch` measure
-   inside it now refers to THAT font and not to the 13px grid type.
-   80ch resolves to roughly 730px, which is an ordinary reading measure.
+   `.doc-read` below declares var(--sans) at var(--fs-lg), so every `ch`
+   measure inside it now refers to THAT font and not to the grid type.
+   80ch resolves to roughly 690px comfortable, which is an ordinary
+   reading measure, and to about 600px compact — narrower on purpose,
+   because compact is what an operator asks for when the screen is the
+   scarce resource.
 
    If you change the font-size on `.doc-read`, every measure inside it
-   moves with it. That is the point. Do not "fix" a narrow column by
-   raising the ch counts while leaving the font alone — that is exactly
-   how it reached 533px.
+   moves with it. That is the point, and it is now how density reaches
+   the prose at all. Do not "fix" a narrow column by raising the ch
+   counts while leaving the font alone — that is exactly how it reached
+   533px.
 
    ------------------------------------------------------------------
    AND THE 6888px DOCUMENT
@@ -463,27 +560,40 @@ details summary:focus-visible { outline: 2px solid var(--accent); }
    resolved against. It is a class rather than a rule on `#view-docs` so that
    it is obvious at the call site which containers hold prose and which hold
    console chrome: the capability panel, the chips and the live vocabulary
-   tables stay at the 13px dashboard density on purpose, because they are
-   scanned, not read. */
+   tables stay at the dashboard's own size on purpose, because they are
+   scanned, not read.
+   Docs used to run a second type system — a whole `rem` scale, .7 through
+   1.35, that existed nowhere else in the product and made this tab read like a
+   different piece of software. It is on the same --fs-* tokens as the rest of
+   the page now. */
 .doc-read {
   font-family: var(--sans);
-  font-size: 17px;
-  line-height: 1.62;
+  font-size: var(--fs-lg);
+  line-height: var(--lh-prose);
 }
 
 .doc-intro { max-width: 74ch; margin: .25rem 0 1.25rem; }
-.doc-title { font-size: 1.35rem; margin: 0 0 .35rem; }
-.doc-lede  { color: var(--dim); margin: 0; line-height: 1.55; }
+.doc-title { font-size: var(--fs-2xl); margin: 0 0 .35rem; }
+.doc-lede  { color: var(--dim); margin: 0; line-height: var(--lh); }
 
+/* Sentence case and the label weight, like every other shouted label on the
+   page — but NOT the label size. This one is an <h3> over prose: docs.js hangs
+   it on every section heading inside a reference document, and a heading set
+   smaller than the paragraph under it is not quiet, it is broken. It was
+   .95rem (15.2px) before; --fs-lg is the token that means that. Every genuine
+   micro-label in this file was 11-12.5px and is now --fs-sm. */
 .doc-h {
-  font-size: .95rem; text-transform: uppercase; letter-spacing: .06em;
-  color: var(--dim); margin: 1.75rem 0 .6rem; font-weight: 600;
+  font-size: var(--fs-lg); font-weight: var(--fw-semi);
+  color: var(--txt-2); margin: 1.75rem 0 .6rem;
 }
+/* The headings that open a reference section differ by a rule above them and
+   the full text colour, not by size — which is the relationship these two have
+   always had. */
 .doc-h-major {
-  color: var(--text); border-top: 1px solid var(--line);
+  color: var(--txt-1); border-top: 1px solid var(--line);
   padding-top: 1.1rem; margin-top: 2.25rem;
 }
-.doc-sub { color: var(--dim); max-width: 74ch; margin: -.25rem 0 .75rem; line-height: 1.5; }
+.doc-sub { color: var(--dim); max-width: 74ch; margin: -.25rem 0 .75rem; line-height: var(--lh); }
 
 .doc-caps-strip { display: flex; flex-wrap: wrap; gap: .4rem; margin-bottom: .9rem; }
 .doc-chip {
@@ -491,8 +601,8 @@ details summary:focus-visible { outline: 2px solid var(--accent); }
   border: 1px solid var(--line); border-radius: var(--r); padding: .2rem .5rem;
   background: var(--panel-2);
 }
-.doc-chip-k { color: var(--dim); font-size: .78rem; text-transform: uppercase; letter-spacing: .05em; }
-.doc-chip-v { font-size: .85rem; }
+.doc-chip-k { color: var(--txt-2); font-size: var(--fs-sm); font-weight: var(--fw-semi); }
+.doc-chip-v { font-size: var(--fs-sm); }
 .doc-chip.is-bad  { border-color: var(--bad); }
 .doc-chip.is-good { border-color: var(--ok); }
 
@@ -504,14 +614,14 @@ details summary:focus-visible { outline: 2px solid var(--accent); }
   background: var(--warn-bg); padding: .7rem .85rem; margin: .5rem 0 1rem;
   max-width: 90ch;
 }
-.doc-warn-glyph { color: var(--warn); font-weight: 700; line-height: 1.4; }
+.doc-warn-glyph { color: var(--warn); font-weight: 700; line-height: var(--lh-tight); }
 /* The retry on a failed area fetch, and the line explaining why it is worth
    pressing. A transient fetch failure used to be permanent for the tab. */
 .doc-retry {
   margin-top: 0.6rem;
-  padding: 0.3rem 0.75rem;
+  padding: var(--s-1) var(--s-3);
   font: inherit;
-  font-size: 0.85rem;
+  font-size: var(--fs-sm);
   color: var(--text);
   background: var(--panel);
   border: 1px solid var(--line-2);
@@ -519,10 +629,10 @@ details summary:focus-visible { outline: 2px solid var(--accent); }
   cursor: pointer;
 }
 .doc-retry:hover { background: var(--panel-2); }
-.doc-warn-hint { margin-top: 0.35rem; font-size: 0.85rem; opacity: 0.8; }
+.doc-warn-hint { margin-top: 0.35rem; font-size: var(--fs-sm); opacity: 0.8; }
 
-.doc-warn-title { font-weight: 600; margin-bottom: .15rem; }
-.doc-warn-fix   { color: var(--dim); margin-top: .3rem; font-size: .9rem; }
+.doc-warn-title { font-weight: var(--fw-semi); margin-bottom: .15rem; }
+.doc-warn-fix   { color: var(--dim); margin-top: .3rem; font-size: var(--fs-sm); }
 
 /* An area whose Portuguese file does not exist yet, rendered in English.
    Informational blue rather than warning yellow: nothing is broken, the
@@ -531,11 +641,11 @@ details summary:focus-visible { outline: 2px solid var(--accent); }
 .doc-lang-note {
   display: flex; gap: .5rem; align-items: flex-start;
   border: 1px solid var(--info); border-left-width: 3px; border-radius: var(--r);
-  background: var(--info-bg); padding: .5rem .7rem; margin: 0 0 1.1rem;
-  max-width: 90ch; font-size: .85rem; line-height: 1.5;
+  background: var(--info-bg); padding: var(--s-2) var(--s-3); margin: 0 0 1.1rem;
+  max-width: 90ch; font-size: var(--fs-md); line-height: var(--lh);
 }
 .doc-lang-glyph { color: var(--info); font-weight: 700; }
-.doc-lang-title { font-weight: 600; }
+.doc-lang-title { font-weight: var(--fw-semi); }
 
 .doc-roles {
   display: grid; gap: .5rem;
@@ -548,12 +658,12 @@ details summary:focus-visible { outline: 2px solid var(--accent); }
 .doc-role.role-up   { border-left-color: var(--ok); }
 .doc-role.role-down { border-left-color: var(--bad); }
 .doc-role-top { display: flex; align-items: baseline; gap: .45rem; }
-.doc-role-dot { font-size: .7rem; }
+.doc-role-dot { font-size: var(--fs-xs); }
 .role-up   .doc-role-dot { color: var(--ok); }
 .role-down .doc-role-dot { color: var(--bad); }
-.doc-role-name { font-weight: 600; }
-.doc-role-beat { margin-left: auto; color: var(--dim); font-size: .8rem; }
-.doc-role-meaning { color: var(--dim); font-size: .88rem; line-height: 1.45; margin-top: .2rem; }
+.doc-role-name { font-weight: var(--fw-semi); }
+.doc-role-beat { margin-left: auto; color: var(--dim); font-size: var(--fs-xs); }
+.doc-role-meaning { color: var(--dim); font-size: var(--fs-sm); line-height: var(--lh); margin-top: .2rem; }
 
 .doc-feats {
   display: grid; gap: .5rem;
@@ -566,23 +676,23 @@ details summary:focus-visible { outline: 2px solid var(--accent); }
 .doc-feat.feat-not_built,
 .doc-feat.feat-unavailable { border-style: dashed; }
 .doc-feat-top { display: flex; align-items: center; gap: .5rem; margin-bottom: .3rem; }
-.doc-feat-name { font-weight: 600; }
+.doc-feat-name { font-weight: var(--fw-semi); }
 .doc-feat-top .chip { margin-left: auto; }
 /* `how` is a command line often longer than the card is wide, and a card is a
    grid child: without a break rule it widened the whole grid track. */
-.doc-feat-how { color: var(--dim); font-size: .82rem; line-height: 1.4; overflow-wrap: anywhere; }
-.doc-feat-detail { font-size: .88rem; line-height: 1.5; margin-top: .35rem; }
+.doc-feat-how { color: var(--dim); font-size: var(--fs-sm); line-height: var(--lh-tight); overflow-wrap: anywhere; }
+.doc-feat-detail { font-size: var(--fs-md); line-height: var(--lh); margin-top: .35rem; }
 
 .doc-limits { display: flex; flex-wrap: wrap; gap: .4rem; }
 .doc-limit {
   display: inline-flex; gap: .45rem; align-items: baseline;
   border: 1px solid var(--line); border-radius: var(--r); padding: .2rem .55rem;
 }
-.doc-limit-k { color: var(--dim); font-size: .8rem; }
+.doc-limit-k { color: var(--dim); font-size: var(--fs-sm); }
 
 .doc-search {
   width: 100%; max-width: 46rem; margin: .25rem 0 1rem;
-  padding: .45rem .6rem; border: 1px solid var(--line); border-radius: var(--r);
+  padding: var(--pad-cell); border: 1px solid var(--line); border-radius: var(--r);
   background: var(--panel-2); color: var(--text); font: inherit;
 }
 .doc-search:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
@@ -610,13 +720,13 @@ details summary:focus-visible { outline: 2px solid var(--accent); }
 .doc-area.is-open .doc-area-mark { visibility: visible; }
 .doc-area.is-dim  { opacity: .45; }
 .doc-area:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
-.doc-area-label { font-weight: 600; margin-bottom: .15rem; }
-.doc-area-blurb { color: var(--dim); font-size: .88rem; line-height: 1.4; }
-.doc-area-meta  { color: var(--dim); font-size: .76rem; margin-top: .35rem; }
+.doc-area-label { font-weight: var(--fw-semi); margin-bottom: .15rem; }
+.doc-area-blurb { color: var(--dim); font-size: var(--fs-sm); line-height: var(--lh); }
+.doc-area-meta  { color: var(--dim); font-size: var(--fs-xs); margin-top: .35rem; }
 
 .doc-provenance {
-  color: var(--dim); font-size: .85rem; max-width: 80ch;
-  margin: 0 0 1.25rem; line-height: 1.5;
+  color: var(--dim); font-size: var(--fs-sm); max-width: 80ch;
+  margin: 0 0 1.25rem; line-height: var(--lh);
 }
 
 /* An opened area: its table of contents and its prose, side by side once
@@ -631,24 +741,24 @@ details summary:focus-visible { outline: 2px solid var(--accent); }
 }
 .doc-doc { min-width: 0; }
 
-.doc-toc { min-width: 0; font-size: 12.5px; }
+.doc-toc { min-width: 0; font-size: var(--fs-sm); }
 .doc-toc-box {
   border: 1px solid var(--line); border-radius: var(--r); background: var(--panel-2);
 }
 .doc-toc-h {
-  padding: .4rem .6rem; cursor: pointer;
-  font-size: .72rem; font-weight: 700; text-transform: uppercase; letter-spacing: .06em;
-  color: var(--dim);
+  padding: var(--s-2) var(--s-3); cursor: pointer;
+  font-size: var(--fs-sm); font-weight: var(--fw-semi);
+  color: var(--txt-2);
 }
 .doc-toc-h:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
-.doc-toc-count { font-weight: 400; text-transform: none; letter-spacing: 0; }
+.doc-toc-count { font-weight: var(--fw-normal); }
 .doc-toc-list { list-style: none; margin: 0; padding: 0 .35rem .4rem; }
 .doc-toc-list li { margin: 0; }
 .doc-toc-link {
   display: flex; align-items: baseline; gap: .3rem; width: 100%;
   text-align: left; font: inherit; cursor: pointer;
   background: none; border: 1px solid transparent; border-radius: 3px;
-  color: var(--dim); padding: .25rem .3rem;
+  color: var(--dim); padding: var(--s-1);
 }
 .doc-toc-link:hover { background: var(--panel-3); color: var(--text); }
 /* Where you are, said three ways — a marker, a weight and a ground — because
@@ -682,7 +792,7 @@ details summary:focus-visible { outline: 2px solid var(--accent); }
   display: inline-flex; align-items: center; gap: .35rem;
   border: 1px solid var(--line-2); border-radius: 999px;
   background: var(--panel); color: var(--text);
-  padding: .4rem .85rem; font-size: 12.5px;
+  padding: var(--s-2) var(--s-4); font-size: var(--fs-sm);
   box-shadow: 0 4px 14px rgba(0, 0, 0, .28);
 }
 .doc-totop:hover { background: var(--panel-2); }
@@ -693,10 +803,10 @@ details summary:focus-visible { outline: 2px solid var(--accent); }
    [hidden]` further down; there is no third place in this file that sets both. */
 .doc-totop[hidden] { display: none !important; }
 
-.doc-area-title { font-size: 1.15rem; margin: 0 0 .5rem; }
+.doc-area-title { font-size: var(--fs-xl); margin: 0 0 .5rem; }
 .doc-section { margin-bottom: 2rem; max-width: 92ch; min-width: 0; }
 .doc-prose { max-width: 80ch; }
-.doc-prose p { line-height: 1.62; margin: 0 0 .7rem; }
+.doc-prose p { line-height: var(--lh-prose); margin: 0 0 .7rem; }
 
 /* Inline code in prose is where the identifiers live, and some of them are
    longer than a phone: `farm_reaper_suspect_marks_total{protection="protected"}`
@@ -710,7 +820,7 @@ details summary:focus-visible { outline: 2px solid var(--accent); }
 .doc-read code { overflow-wrap: anywhere; }
 .doc-code code, .doc-out code { overflow-wrap: normal; }
 .doc-bullets { max-width: 84ch; margin: .3rem 0 .9rem; padding-left: 1.1rem; }
-.doc-bullets li { line-height: 1.55; margin-bottom: .35rem; }
+.doc-bullets li { line-height: var(--lh-prose); margin-bottom: .35rem; }
 
 .doc-empty { color: var(--dim); padding: 1rem 0; }
 
@@ -724,46 +834,48 @@ details summary:focus-visible { outline: 2px solid var(--accent); }
   padding: .35rem .6rem; border-bottom: 1px solid var(--line);
   background: var(--panel-3);
 }
-.doc-ex-label { font-weight: 600; font-size: .85rem; }
+.doc-ex-label { font-weight: var(--fw-semi); font-size: var(--fs-sm); }
 .doc-ex-lang {
-  font-size: .72rem; text-transform: uppercase; letter-spacing: .05em;
-  color: var(--dim); border: 1px solid var(--line); border-radius: 3px; padding: 0 .3rem;
+  font-size: var(--fs-sm); font-weight: var(--fw-semi);
+  color: var(--txt-2); border: 1px solid var(--line); border-radius: 3px; padding: 0 var(--s-1);
 }
 .doc-ex-head .mini { margin-left: auto; }
 
+/* Mono, and the reason for the whole keep-list: this is a command an operator
+   selects and pastes, and the output it produced. */
 .doc-code, .doc-out {
-  margin: 0; padding: .6rem .7rem; overflow-x: auto;
+  margin: 0; padding: var(--s-2) var(--s-3); overflow-x: auto;
   max-width: 100%; min-width: 0;
-  font-family: var(--mono); font-size: .82rem; line-height: 1.5; white-space: pre;
+  font-family: var(--mono); font-size: var(--fs-sm); line-height: var(--lh); white-space: pre;
 }
 .doc-code { background: var(--panel); }
 .doc-out  { background: var(--panel); color: var(--dim); border-top: 1px dashed var(--line); }
 .doc-out-label {
-  font-size: .7rem; text-transform: uppercase; letter-spacing: .06em;
-  color: var(--dim); padding: .35rem .7rem 0;
+  font-size: var(--fs-sm); font-weight: var(--fw-semi);
+  color: var(--txt-2); padding: var(--s-1) var(--s-3) 0;
 }
 .doc-note {
-  margin: 0; padding: .5rem .7rem; font-size: .87rem; line-height: 1.5;
+  margin: 0; padding: var(--s-2) var(--s-3); font-size: var(--fs-sm); line-height: var(--lh);
   color: var(--dim); border-top: 1px solid var(--line);
 }
 
 /* The scroll box the 6888px document was missing. A docs table is data rather
-   than prose, so it stays at the console's 13px; and the global
+   than prose, so it steps back to the grid's own size; and the global
    `table { min-width: 900px }` is relaxed here, because 900px of forced width
    puts a horizontal scrollbar under a four-column table that would have fit. */
 .doc-table {
   margin: .6rem 0 1rem;
   max-width: 100%; min-width: 0; overflow-x: auto;
-  font-size: 13px; line-height: 1.45;
+  font-size: var(--fs-sm); line-height: var(--lh);
   border: 1px solid var(--line); border-radius: var(--r); background: var(--panel);
 }
 .doc-table table { min-width: 34rem; }
-.doc-table th, .doc-table td { padding: .3rem .55rem; }
+.doc-table th, .doc-table td { padding: var(--pad-cell); }
 .doc-cell-key { white-space: nowrap; }
 
-.doc-src { margin-top: .5rem; font-size: .78rem; color: var(--dim); }
-.doc-src-label { text-transform: uppercase; letter-spacing: .05em; }
-.doc-src code { font-size: .78rem; word-break: break-all; }
+.doc-src { margin-top: .5rem; font-size: var(--fs-sm); color: var(--dim); }
+.doc-src-label { font-weight: var(--fw-semi); color: var(--txt-2); }
+.doc-src code { font-size: var(--fs-xs); word-break: break-all; }
 
 .doc-gaps { display: grid; gap: .55rem; max-width: 92ch; }
 .doc-gap {
@@ -775,15 +887,16 @@ details summary:focus-visible { outline: 2px solid var(--accent); }
 .doc-gap.gap-linux_only,
 .doc-gap.gap-unverified { border-left-color: var(--warn); }
 .doc-gap-head { margin-bottom: .35rem; }
-.doc-gap-body { line-height: 1.55; }
-.doc-gap-cons { margin-top: .35rem; color: var(--dim); line-height: 1.5; font-size: .9rem; }
-.doc-gap-cons-label { font-weight: 600; }
+.doc-gap-body { line-height: var(--lh-prose); }
+.doc-gap-cons { margin-top: .35rem; color: var(--dim); line-height: var(--lh); font-size: var(--fs-sm); }
+.doc-gap-cons-label { font-weight: var(--fw-semi); }
 
 @media (max-width: 700px) {
   .doc-roles, .doc-feats, .doc-areas { grid-template-columns: 1fr; }
   /* At this width the window is the measure, so the larger reading size buys
-     nothing but fewer words per line. Step it back down. */
-  .doc-read { font-size: 15.5px; }
+     nothing but fewer words per line. Step it back down — and note that every
+     `ch` measure in this section steps down with it, which is the point. */
+  .doc-read { font-size: var(--fs-md); }
 }
 
 /* The live screen.
@@ -806,7 +919,7 @@ details summary:focus-visible { outline: 2px solid var(--accent); }
 .screen-panel [hidden] { display: none !important; }
 .screen-controls { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
 .screen-keys { display: flex; gap: 6px; margin-left: auto; }
-.screen-status { margin: 6px 0; font-size: 12px; }
+.screen-status { margin: 6px 0; font-size: var(--fs-sm); }
 .screen-note.screen-ok { color: var(--ok); }
 .screen-note.screen-warn { color: var(--warn); }
 .screen-note.screen-error { color: var(--bad); }
@@ -880,7 +993,7 @@ main, .view, .panel { min-width: 0; }
 /* The tally on a banner that has recurred. Dim and small: the message is the
  * news, the count is a qualifier on it. */
 .b-tally {
-  margin-left: .4rem; color: var(--dim); font-size: .82rem;
+  margin-left: .4rem; color: var(--dim); font-size: var(--fs-sm);
   font-variant-numeric: tabular-nums; white-space: nowrap;
 }
 
@@ -900,18 +1013,20 @@ main, .view, .panel { min-width: 0; }
  * would make them look like one kind. */
 .cmd-panel { margin-top: 6px; }
 .cmd-cat { margin-bottom: 10px; }
-.cmd-cat > summary { font-weight: 600; }
+.cmd-cat > summary { font-weight: var(--fw-semi); }
 .cmd-tier { margin: 10px 0 4px; }
-.cmd-tier-head { font-size: 12px; font-weight: 600; color: var(--text); }
-.cmd-tier-note { margin: 2px 0 6px; color: var(--dim); font-size: 11.5px; max-width: 78ch; line-height: 1.45; }
+.cmd-tier-head { font-size: var(--fs-md); font-weight: var(--fw-semi); color: var(--text); }
+.cmd-tier-note { margin: 2px 0 6px; color: var(--dim); font-size: var(--fs-sm); max-width: 78ch; line-height: var(--lh); }
 .cmd-group { margin-bottom: 8px; }
 .cmd-group-name {
-  color: var(--dim); font-size: 11px; text-transform: uppercase;
-  letter-spacing: .05em; margin-bottom: 3px;
+  color: var(--txt-2); font-size: var(--fs-sm); font-weight: var(--fw-semi);
+  margin-bottom: 3px;
 }
 .cmd-group-items { display: flex; flex-wrap: wrap; gap: 4px; }
+/* The catalogue buttons are prose — "Read the battery", not `dumpsys battery`.
+   The command itself is one line further down, in mono, where it belongs. */
 .cmd-pick {
-  font: 11.5px/1.3 var(--sans); padding: 3px 8px; cursor: pointer;
+  font: var(--fs-sm)/var(--lh-tight) var(--sans); padding: var(--s-1) var(--s-3); cursor: pointer;
   color: var(--text); background: var(--panel-2);
   border: 1px solid var(--line); border-radius: 999px;
 }
@@ -919,28 +1034,32 @@ main, .view, .panel { min-width: 0; }
 
 .cmd-params { display: flex; flex-wrap: wrap; gap: 8px; margin: 6px 0; }
 .cmd-param-wrap { display: flex; flex-direction: column; gap: 2px; }
-.cmd-param-wrap > span { color: var(--dim); font-size: 11px; font-family: var(--mono); }
-.cmd-param { font: 12px/1.3 var(--mono); padding: 3px 6px; color: var(--text);
+/* The label above a parameter box names the parameter to a reader; the box
+   holds what goes on the wire. Only the second one is machine text. */
+.cmd-param-wrap > span { color: var(--dim); font-size: var(--fs-sm); }
+.cmd-param { font: var(--fs-sm)/var(--lh-tight) var(--mono); padding: var(--s-1) var(--s-2); color: var(--text);
   background: var(--bg); border: 1px solid var(--line); border-radius: 4px; }
 
 .cmd-row { display: flex; gap: 6px; margin-top: 4px; }
 .cmd-input {
-  flex: 1; font: 13px/1.4 var(--mono); padding: 6px 8px; color: var(--text);
+  flex: 1; font: var(--fs-md)/var(--lh) var(--mono); padding: var(--pad-cell); color: var(--text);
   background: var(--bg); border: 1px solid var(--line); border-radius: 4px;
 }
-.cmd-chosen { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px; margin-top: 5px; font-size: 11.5px; }
+.cmd-chosen { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px; margin-top: 5px; font-size: var(--fs-sm); }
 .cmd-why { color: var(--dim); }
-.cmd-source { color: var(--ok); font-family: var(--mono); font-size: 11px; }
-.cmd-unverified { color: var(--warn); font-size: 11px; }
-.cmd-note { margin: 4px 0 0; color: var(--dim); font-size: 11.5px; line-height: 1.45; max-width: 78ch; }
+.cmd-source { color: var(--ok); font-size: var(--fs-sm); }
+.cmd-unverified { color: var(--warn); font-size: var(--fs-sm); }
+.cmd-note { margin: 4px 0 0; color: var(--dim); font-size: var(--fs-sm); line-height: var(--lh); max-width: 78ch; }
 
 .cmd-wire { margin-top: 10px; }
 .cmd-wire-head {
-  color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: .05em;
+  color: var(--txt-2); font-size: var(--fs-sm); font-weight: var(--fw-semi);
 }
+/* Mono, and the whole point of the panel: this is the string the handset
+   receives, character for character. */
 .cmd-wire-line {
-  display: block; margin-top: 3px; padding: 6px 8px;
-  font: 12px/1.5 var(--mono); color: var(--text);
+  display: block; margin-top: 3px; padding: var(--pad-cell);
+  font: var(--fs-sm)/var(--lh) var(--mono); color: var(--text);
   background: var(--bg); border: 1px solid var(--line); border-radius: 4px;
   white-space: pre-wrap; overflow-wrap: anywhere;
 }
@@ -949,7 +1068,7 @@ main, .view, .panel { min-width: 0; }
 .cmd-preflight { list-style: none; margin: 3px 0 0; padding: 0; }
 .cmd-pf {
   display: grid; grid-template-columns: 1.2rem minmax(0, 11rem) minmax(0, 1fr);
-  gap: 6px; align-items: baseline; padding: 2px 0; font-size: 11.5px;
+  gap: 6px; align-items: baseline; padding: var(--s-1) 0; font-size: var(--fs-sm);
 }
 .cmd-pf-glyph { text-align: center; }
 .cmd-pf-label { color: var(--text); }
@@ -960,28 +1079,30 @@ main, .view, .panel { min-width: 0; }
 .cmd-pf-unknown .cmd-pf-glyph { color: var(--dim); }
 @media (max-width: 700px) { .cmd-pf { grid-template-columns: 1.2rem minmax(0, 1fr); } }
 
-.cmd-timeout-wrap { display: flex; align-items: baseline; gap: 6px; margin-top: 10px; font-size: 11.5px; color: var(--dim); }
-.cmd-timeout { width: 8rem; font: 12px/1.3 var(--mono); padding: 3px 6px;
+.cmd-timeout-wrap { display: flex; align-items: baseline; gap: 6px; margin-top: 10px; font-size: var(--fs-sm); color: var(--dim); }
+.cmd-timeout { width: 8rem; font: var(--fs-sm)/var(--lh-tight) var(--mono); padding: var(--s-1) var(--s-2);
   color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: 4px; }
 
 .cmd-force {
   margin-top: 10px; padding: 8px 10px;
   border: 1px solid var(--warn); border-radius: var(--r); background: var(--warn-bg);
 }
-.cmd-force-head { font-weight: 600; font-size: 12px; color: var(--warn); }
+.cmd-force-head { font-weight: var(--fw-semi); font-size: var(--fs-md); color: var(--warn); }
 .cmd-force-impact { margin: 4px 0; }
 .cmd-reason-wrap { display: flex; flex-direction: column; gap: 2px; margin-top: 6px; }
-.cmd-reason-wrap > span { color: var(--dim); font-size: 11px; }
-.cmd-reason { font: 12px/1.3 var(--sans); padding: 4px 7px; color: var(--text);
+.cmd-reason-wrap > span { color: var(--dim); font-size: var(--fs-sm); }
+/* A reason is a sentence a person writes for another person to read in an
+   audit six weeks later. Sans, at body size. */
+.cmd-reason { font: var(--fs-md)/var(--lh) var(--sans); padding: var(--s-2) var(--s-3); color: var(--text);
   background: var(--bg); border: 1px solid var(--line); border-radius: 4px; }
 
 .cmd-actions { margin-top: 10px; }
 .cmd-verdict { margin-top: 8px; display: flex; flex-direction: column; gap: 3px; }
-.cmd-v { font-size: 12px; line-height: 1.45; max-width: 82ch; }
+.cmd-v { font-size: var(--fs-sm); line-height: var(--lh); max-width: 82ch; }
 .cmd-v-ok { color: var(--ok); }
 .cmd-v-bad { color: var(--bad); }
 .cmd-v-warn { color: var(--warn); }
-.cmd-v-unknown { color: var(--warn); font-weight: 600; }
+.cmd-v-unknown { color: var(--warn); font-weight: var(--fw-semi); }
 .cmd-v-note { color: var(--dim); }
 .cmd-stderr-head { color: var(--bad); margin-top: 8px; }
 

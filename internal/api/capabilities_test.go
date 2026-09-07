@@ -22,7 +22,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -357,24 +356,31 @@ func TestSchemaVersionComesFromTheConfiguredTable(t *testing.T) {
 }
 
 // oneSessionPool is a pool of exactly one connection, so that a TEMP table
-// created through it is visible to every later query. Temp tables vanish with
-// the session, which lets a migrated development database host these cases
-// without being touched.
+// created through it is visible to every later query.
+//
+// This is the one caller in the package that cannot use the suite's shared
+// testPool: that pool has many connections, and a TEMP table lives in the
+// session that created it, so the CREATE and the SELECT that must find it
+// would land on different connections and the probe would read the real
+// public table instead of the fixture. Hence a second pool of its own, opened
+// on the scratch database's DSN (dbtest_test.go) rather than on DATABASE_URL
+// — a temp table is invisible to other sessions, but CREATE TEMP TABLE is
+// still a write, and this suite writes to the scratch database only.
+//
+// requireDB is called for the skip, not for the pool it returns.
 func oneSessionPool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
-	dsn := strings.TrimSpace(os.Getenv("DATABASE_URL"))
-	if dsn == "" {
-		t.Skip("no DATABASE_URL; this case needs a real, reachable database")
-	}
-	pc, err := pgxpool.ParseConfig(dsn)
+	requireDB(t)
+	pc, err := pgxpool.ParseConfig(testDSN)
 	if err != nil {
-		t.Fatalf("parsing DATABASE_URL: %v", err)
+		t.Fatalf("parsing the scratch DSN: %v", err)
 	}
 	pc.MaxConns = 1
 	pool, err := pgxpool.NewWithConfig(context.Background(), pc)
 	if err != nil {
 		t.Fatalf("connecting: %v", err)
 	}
+	// Closed by this test, not by TestMain: it is not the shared pool.
 	t.Cleanup(pool.Close)
 	return pool
 }

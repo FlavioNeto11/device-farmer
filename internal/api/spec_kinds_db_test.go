@@ -35,8 +35,9 @@ package api
 // sys.boot_completed; a rule that failed on device-side names would be a test
 // blocking correct prose.
 //
-// Needs DATABASE_URL pointing at a MIGRATED database and skips without one.
-// Nothing is written; the only query is the endpoint's own SELECT.
+// Runs against the scratch database TestMain creates from DATABASE_URL
+// (dbtest_test.go) and skips without one. Nothing is written; the only query
+// is the endpoint's own SELECT, over a vocabulary the migrations seeded.
 
 import (
 	"context"
@@ -45,15 +46,12 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"reflect"
 	"regexp"
 	"sort"
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/flaviopadilha/device-farmer/internal/config"
 	"github.com/flaviopadilha/device-farmer/internal/jobspec"
@@ -84,15 +82,7 @@ var snakeToken = regexp.MustCompile(`[a-z][a-z0-9]*(?:_[a-z0-9]+)+`)
 // publishedKinds asks the endpoint the way a client does, once.
 func publishedKinds(t *testing.T) map[string]string {
 	t.Helper()
-	dsn := strings.TrimSpace(os.Getenv("DATABASE_URL"))
-	if dsn == "" {
-		t.Skip("no DATABASE_URL; the published vocabulary lives in the database")
-	}
-	pool, err := pgxpool.New(context.Background(), dsn)
-	if err != nil {
-		t.Fatalf("connect: %v", err)
-	}
-	t.Cleanup(pool.Close)
+	pool := requireDB(t)
 
 	s, err := New(&config.Config{}, pool,
 		WithAuthenticator(bearerFor(t, "op-token:operator:alice")),

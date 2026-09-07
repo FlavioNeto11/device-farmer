@@ -3,8 +3,9 @@ package api
 // The operator surfaces for quarantine and park, driven through the real
 // router against a real schema.
 //
-// Every test here needs DATABASE_URL pointing at a migrated scratch database
-// and skips otherwise. Each seeds its own namespaced topology — one host, one
+// Every test here runs against the scratch database TestMain creates from
+// DATABASE_URL (dbtest_test.go) and skips without one. Each seeds its own
+// namespaced topology — one host, one
 // hub, six slots, three on a ganged power domain and three on a per-port one
 // — and removes it afterwards. The assertions read farm.v_fleet, because that
 // view is what the dashboard, the bulk selector and the lease allocator's
@@ -21,8 +22,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"strings"
 	"testing"
 	"time"
 
@@ -36,15 +35,7 @@ import (
 // with an open authenticator that names every caller "tester".
 func scratchServer(t *testing.T) (*Server, *pgxpool.Pool) {
 	t.Helper()
-	dsn := strings.TrimSpace(os.Getenv("DATABASE_URL"))
-	if dsn == "" {
-		t.Skip("no DATABASE_URL; this case needs a migrated scratch database")
-	}
-	pool, err := pgxpool.New(context.Background(), dsn)
-	if err != nil {
-		t.Fatalf("connecting: %v", err)
-	}
-	t.Cleanup(pool.Close)
+	pool := requireDB(t)
 
 	quiet := slog.New(slog.NewTextHandler(io.Discard, nil))
 	s, err := New(&config.Config{APIAddr: "127.0.0.1:0", Component: "api-test"}, pool,

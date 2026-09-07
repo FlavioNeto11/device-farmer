@@ -10,9 +10,9 @@ package api
 // the two absences — not ended yet, terminal with no ledger row — are told
 // apart rather than collapsed into one 404.
 //
-// These need DATABASE_URL pointing at a MIGRATED database and skip without
-// one. They reuse the tenant-scope fixture, whose rows carry a per-run suffix
-// and are deleted afterwards.
+// These run against the scratch database TestMain creates from DATABASE_URL
+// (dbtest_test.go) and skip without one. They reuse the tenant-scope fixture,
+// whose rows carry a per-run suffix and are deleted afterwards.
 
 import (
 	"net/http"

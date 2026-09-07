@@ -10,8 +10,9 @@ package api
 // HERE with the leaked uuid in the message, not merely fail a string match
 // against a query nobody ran.
 //
-// It needs DATABASE_URL pointing at a MIGRATED database and skips without one,
-// exactly like tenant_scope_db_test.go, whose fixture it reuses.
+// It runs against the scratch database TestMain creates from DATABASE_URL
+// (dbtest_test.go) and skips without one, exactly like tenant_scope_db_test.go,
+// whose fixture it reuses.
 
 import (
 	"encoding/json"

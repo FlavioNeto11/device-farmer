@@ -8,12 +8,9 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // GET /api/v1/recovery exists so an operator can find things at 3am. "Every
@@ -112,26 +109,19 @@ func TestRecoveryFilterRejectsGarbage(t *testing.T) {
 	}
 }
 
-// TestRecoveryFiltersNarrowTheAttempts runs the endpoint against a real
-// database: four attempts on one hub of a throwaway host, then every filter,
-// then every table-backed 400. The host id is unique per run and everything
-// is removed on cleanup.
+// TestRecoveryFiltersNarrowTheAttempts runs the endpoint against the suite's
+// scratch database (dbtest_test.go): four attempts on one hub of a throwaway
+// host, then every filter, then every table-backed 400. The host id is unique
+// per run and everything is removed on cleanup, because the scratch database
+// is shared with every other case in this package and /api/v1/recovery reads
+// the whole table.
 //
 // Falsify: drop the `a.started_at >= now() - $7::interval` arm from the query
 // (since=2h then returns the three-hour-old refusal), or return 200 with an
 // empty list from resolveRecoveryFilter for an unknown tier.
 func TestRecoveryFiltersNarrowTheAttempts(t *testing.T) {
-	dsn := strings.TrimSpace(os.Getenv("DATABASE_URL"))
-	if dsn == "" {
-		t.Skip("no DATABASE_URL; this case needs a real, migrated database")
-	}
+	pool := requireDB(t)
 	ctx := context.Background()
-	pool, err := pgxpool.New(ctx, dsn)
-	if err != nil {
-		t.Fatalf("connecting: %v", err)
-	}
-	// Registered before the row cleanup below, so it runs after it.
-	t.Cleanup(pool.Close)
 
 	host := fmt.Sprintf("u3api%x", time.Now().UnixNano()&0xffffffff)
 	t.Cleanup(func() {

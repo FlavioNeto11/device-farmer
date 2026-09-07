@@ -171,13 +171,49 @@ const (
 	// what it is before it can be adopted. Pooling that with the ladder's blast
 	// radius would make one stolen credential worth both.
 	ClassEnroll Class = "enroll"
+
+	// ClassControl carries a fence AND a whitelist, which no other class does,
+	// and exists because the process that needs it is unlike every other client
+	// here: the API server is the one that faces a network a human is on.
+	//
+	// It was going to be ClassLease. That would have worked — a lease-class
+	// connection may open any device service on the devpath it holds a fence
+	// for — and it would have been three mistakes at once. Lease class consults
+	// no whitelist ([Admit]); its off-target check compares only the devpath, so
+	// host-serial:<devpath>:<any verb> is admitted where maintenance is held to
+	// eight ([refuseOffTarget]); and [Session.audit] deliberately says nothing
+	// about it. Giving the API that credential would have widened its reach and
+	// deleted the record of the reach in one edit.
+	//
+	// So the two bounds are independent here rather than alternatives. The fence
+	// answers "may this connection still touch this device" and brings
+	// [tearDownOnFact] with it; the whitelist answers "and to do what", which
+	// for a screen is a short list of exact strings. A live screen is a
+	// long-lived duplex stream of somebody's phone, and it is worth being the
+	// most bounded thing on this listener rather than the least.
+	ClassControl Class = "control"
 )
 
-// Valid reports whether c is one of the three defined classes. An unknown class
+// Valid reports whether c is one of the defined classes. An unknown class
 // satisfies nothing, which is the safe direction for a typo in a certificate.
 func (c Class) Valid() bool {
 	switch c {
-	case ClassLease, ClassMaintenance, ClassEnroll:
+	case ClassLease, ClassMaintenance, ClassEnroll, ClassControl:
+		return true
+	default:
+		return false
+	}
+}
+
+// CarriesFence reports whether a connection of this class must present a
+// devpath and a fence, and is therefore subject to the fencing rules.
+//
+// It is a property of the class rather than of the preamble on purpose: a
+// client cannot opt out of the fence by omitting it, because a class that
+// carries one and presents none is malformed rather than unfenced.
+func (c Class) CarriesFence() bool {
+	switch c {
+	case ClassLease, ClassControl:
 		return true
 	default:
 		return false
@@ -669,6 +705,59 @@ func DefaultPolicy() Policy {
 		Rules: map[Class]ServiceRules{
 			ClassMaintenance: maintenance,
 			ClassEnroll:      enrol,
+			ClassControl:     control(),
+		},
+	}
+}
+
+// control is the whitelist for [ClassControl]: the three services a live screen
+// needs and nothing else.
+//
+// TWO OF THESE ARE PATTERNS, WHICH IS THE THING THIS TYPE WARNS ABOUT. The
+// spawn is a shell command line, and [ServiceRules] says in its own doc why a
+// PREFIX rule over one is bypassable — ';', '&&', a newline and '$( )' all
+// extend a command that started out looking fine. A whole-string pattern is not
+// a prefix rule, and it is safe here for a reason worth writing down rather than
+// trusting: the alphabet does the work. Every character class below is
+// alphanumerics, dot, slash, underscore, hyphen, equals and space. None of the
+// characters that chain, substitute or redirect can appear anywhere in a string
+// this pattern accepts, so there is no suffix to smuggle and no substitution to
+// hide. Widening any class below — a '.' outside a group, a '+' where a bounded
+// count belongs — is how that stops being true, and it will not look dangerous
+// in the diff.
+//
+// The jar is named by content (twelve hex of its sha256) and the version is a
+// separate argument, because the framing and the command line are coupled to
+// the jar an OPERATOR uploaded: a server that does not recognise its version
+// argument refuses to start and says so, which turns a silent garbage-frame
+// parse into a named error on a stream nobody has to guess about.
+func control() ServiceRules {
+	return ServiceRules{
+		Host: []string{"host:version", "host:features"},
+		// Only the one verb a client needs to learn whether the device is
+		// still there. get-serialno is absent deliberately: this class
+		// addresses by devpath and has no business learning a serial.
+		HostTargetVerbs: []string{"get-state"},
+		Transport:       true,
+		// sync: pushes the server jar. It is the widest thing on this list —
+		// a file write to the device — and it is here because the alternative
+		// is the operator running adb push by hand on every handset.
+		Device: []string{"sync:"},
+		DevicePatterns: []*regexp.Regexp{
+			// Spawning the server.
+			// The counts are bounded rather than open, and not only for safety:
+			// RE2 refuses a pattern whose repeat counts multiply past 1000, so
+			// an unbounded-looking rewrite of this line fails to compile at
+			// init rather than at admission. That is a good failure to have.
+			regexp.MustCompile(`shell,v2,raw:CLASSPATH=/data/local/tmp/scrcpy-server-[0-9a-f]{12}\.jar ` +
+				`app_process / com\.genymobile\.scrcpy\.Server ` +
+				`[0-9]{1,3}\.[0-9]{1,3}(\.[0-9]{1,3})?` +
+				`( [a-z_]{1,24}=[A-Za-z0-9_.-]{1,32}){0,12}`),
+			// The two sockets it publishes. The scid is eight hex digits, and
+			// bounding it here is what stops this entry from being
+			// "localabstract:anything" — which would reach every abstract
+			// socket on the phone, including other apps'.
+			regexp.MustCompile(`localabstract:scrcpy_[0-9a-f]{8}`),
 		},
 	}
 }
@@ -947,28 +1036,51 @@ func Admit(req Request, view View, now time.Time, pol Policy) Decision {
 		}
 	}
 
-	if req.Identity.Class != ClassLease {
-		// A class that carries no fence is bounded by its whitelist and by
-		// nothing else here. Whether a rung is permitted against a live lease's
-		// disruption_policy is a blast-radius decision, and internal/recovery
-		// already makes it against farm.recovery_tiers. Re-litigating it here
-		// would produce two answers that drift.
-		rules, ok := pol.Rules[req.Identity.Class]
-		if !ok || !rules.allows(svc) {
-			return Decision{
-				Outcome: OutcomeRefuseService,
-				Reason: fmt.Sprintf("service %q is not on the %s whitelist",
-					req.Service, req.Identity.Class),
-			}
+	// Two bounds, and they are INDEPENDENT. A class may be held to a service
+	// whitelist, to a fence, or to both; what it may never be held to is
+	// neither. They used to be alternatives — the whitelist branch returned
+	// before the fence was ever consulted — which meant a class could not have
+	// both, and the only class carrying a fence was therefore also the only one
+	// that could open anything. [ClassControl] exists because that was the wrong
+	// shape for a live screen, and separating the axes is what let it exist.
+	//
+	// Whether a rung is permitted against a live lease's disruption_policy is
+	// NOT one of these bounds. That is a blast-radius decision, internal/recovery
+	// already makes it against farm.recovery_tiers, and re-litigating it here
+	// would produce two answers that drift.
+	rules, hasRules := pol.Rules[req.Identity.Class]
+	carriesFence := req.Identity.Class.CarriesFence()
+
+	// Fail closed. A class this proxy has heard of but bounded by nothing is a
+	// wiring mistake — a new class added to Class.Valid and forgotten in
+	// DefaultPolicy — and the safe reading of it is a root shell on every phone
+	// in the rack. Refuse, and name the omission rather than the connection.
+	if !hasRules && !carriesFence {
+		return Decision{
+			Outcome: OutcomeRefuseService,
+			Reason: fmt.Sprintf("class %q is bounded by neither a service whitelist nor a fence; "+
+				"it is in Class.Valid and missing from Policy.Rules", req.Identity.Class),
 		}
+	}
+
+	if hasRules && !rules.allows(svc) {
+		return Decision{
+			Outcome: OutcomeRefuseService,
+			Reason: fmt.Sprintf("service %q is not on the %s whitelist",
+				req.Service, req.Identity.Class),
+		}
+	}
+
+	if !carriesFence {
 		return Decision{Outcome: OutcomeAdmit, Reason: "whitelisted for " + string(req.Identity.Class)}
 	}
 
-	// ---- lease class ---------------------------------------------------
+	// ---- the fence-carrying classes -------------------------------------
 	if req.Claim.Devpath == "" || !req.Claim.HasFence {
 		return Decision{
 			Outcome: OutcomeRefuseMalformed,
-			Reason:  "a lease-class connection must present devpath and fence in its preamble",
+			Reason: fmt.Sprintf("a %s-class connection must present devpath and fence in its preamble",
+				req.Identity.Class),
 		}
 	}
 
@@ -1018,8 +1130,8 @@ func refuseOffTarget(req Request, svc Service, pol Policy) (Decision, bool) {
 		if !contains(pol.LeaseHost, svc.Raw) {
 			return Decision{
 				Outcome: OutcomeRefuseService,
-				Reason: fmt.Sprintf("service %q is not one a lease-class connection may issue; "+
-					"address your own device instead", svc.Raw),
+				Reason: fmt.Sprintf("service %q is not one a %s-class connection may issue; "+
+					"address your own device instead", svc.Raw, req.Identity.Class),
 			}, true
 		}
 	case KindHostTarget, KindTransport:
@@ -1363,15 +1475,28 @@ func (s *Session) refuse(d Decision, service string, upstream net.Conn) error {
 
 // audit records an admission.
 //
-// A maintenance admission is logged at INFO with the exact service string,
-// which is the one place in this design where logging is a control rather than
-// an observation: a class that carries no fence is bounded by its whitelist and
-// by whoever reads this line afterwards.
+// Every admission is logged at INFO with the exact service string EXCEPT the
+// lease class, and the exemption is about volume, not about trust: a job runner
+// opens a transport per step on every device it holds, and a line each would
+// bury the ones below it. What bounds that class instead is the fence, which
+// stops bytes rather than describing them.
+//
+// Everything else is logged, and for the two whitelisted classes this is the
+// one place in the design where logging is a CONTROL rather than an
+// observation: they are bounded by their whitelist and by whoever reads this
+// line afterwards. [ClassControl] is logged too even though it carries a fence,
+// because the fence answers "may this reach the device" and says nothing about
+// who was driving — and a live screen is a human, on a network, holding
+// somebody's phone.
 func (s *Session) audit(ctx context.Context, d Decision, svc string, claim Claim) {
 	if s.Identity.Class == ClassLease {
 		return
 	}
-	s.log().InfoContext(ctx, "admitted a connection carrying no fence",
+	msg := "admitted a connection carrying no fence"
+	if s.Identity.Class.CarriesFence() {
+		msg = "admitted a fenced connection"
+	}
+	s.log().InfoContext(ctx, msg,
 		"class", s.Identity.Class, "subject", s.Identity.Subject,
 		"service", svc, "devpath", claim.Devpath, "outcome", d.Outcome)
 }

@@ -679,6 +679,13 @@ details summary:focus-visible { outline: 2px solid var(--accent); }
  * phone in portrait are both this panel's job and a fixed box would letterbox
  * one of them into uselessness. */
 .screen-panel { margin-top: 6px; }
+
+/* An author `display` beats the user agent's `[hidden] { display: none }` no matter
+ * how specific either is, so every rule below that sets `display` has to opt back
+ * in. Without this, closing a screen leaves the last frame on the page and a row
+ * of key buttons that look live and send nothing — which was exactly what it did
+ * until somebody looked at it in a browser. */
+.screen-panel [hidden] { display: none !important; }
 .screen-controls { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
 .screen-keys { display: flex; gap: 6px; margin-left: auto; }
 .screen-status { margin: 6px 0; font-size: 12px; }

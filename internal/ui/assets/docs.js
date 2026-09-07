@@ -89,6 +89,14 @@
 
   const STR = {
     en: {
+      'docs.role.api': 'serves this page and the HTTP API',
+      'docs.role.scheduler': 'matches queued jobs to free devices; without it nothing is ever placed',
+      'docs.role.jobrunner': 'runs job specs on leased devices; without it jobs sit in running, holding a device each',
+      'docs.role.reaper': 'the only automatic release path; without it an abandoned lease is never reclaimed',
+      'docs.role.recovery': 'the recovery ladder; without it a stuck device stays stuck until a human acts',
+      'docs.role.watchdog': 'device health; without it the fleet view goes stale and quarantine never fires',
+      'docs.role.node': 'host agent on a USB host; without it recovery tiers 3 and 4 are refused',
+      'docs.role.enroll': 'adopts newly plugged devices; without it a new handset never joins the fleet',
       'docs.title': 'How this farm works',
       'docs.lede': 'The top half is measured from this deployment right now. The rest is reference, ' +
         'and every example in it was executed against a running farm before it shipped.',
@@ -167,6 +175,14 @@
         'An area can still be translated even when this list is not.'
     },
     pt: {
+      'docs.role.api': 'serve esta página e a API HTTP',
+      'docs.role.scheduler': 'casa jobs na fila com dispositivos livres; sem ele nada é jamais alocado',
+      'docs.role.jobrunner': 'roda specs de job em dispositivos com lease; sem ele os jobs ficam em running, cada um segurando um dispositivo',
+      'docs.role.reaper': 'o único caminho automático de liberação; sem ele uma lease abandonada nunca é retomada',
+      'docs.role.recovery': 'a escada de recuperação; sem ela um dispositivo travado continua travado até um humano agir',
+      'docs.role.watchdog': 'saúde dos dispositivos; sem ele a visão da frota fica velha e a quarentena nunca dispara',
+      'docs.role.node': 'agente no host USB; sem ele os tiers 3 e 4 da recuperação são recusados',
+      'docs.role.enroll': 'adota dispositivos recém-plugados; sem ele um aparelho novo nunca entra na frota',
       'docs.title': 'Como esta fazenda funciona',
       'docs.lede': 'A metade de cima é medida deste deployment agora. O resto é referência, ' +
         'e todo exemplo nela foi executado contra uma fazenda em operação antes de ser publicado.',
@@ -571,7 +587,22 @@
           el('span', { class: 'doc-role-dot', 'aria-hidden': 'true' }, r.running ? '●' : '○'),
           el('span', { class: 'doc-role-name mono' }, r.component),
           el('span', { class: 'doc-role-beat' }, ago)),
-        el('div', { class: 'doc-role-meaning' }, r.meaning));
+        /* The meaning is prose the API sends, and prose the API sends is
+         * normally left alone — it is data, and the page renders what it was
+         * given. This one is the exception, for the same reason the error codes
+         * are: it is a sentence written FOR A HUMAN READING THIS PAGE, and it is
+         * keyed by something that is not prose at all. The component name is an
+         * identifier, stable, and the same string the process is called in every
+         * log — so it bridges to a translation the way an error code does.
+         *
+         * A component with no entry keeps the server's English. That is the
+         * right fallback: a role added to internal/api/capabilities.go tomorrow
+         * appears here immediately, described, in English, rather than
+         * disappearing because nobody had written a word for it yet. */
+        el('div', { class: 'doc-role-meaning' },
+          tr('docs.role.' + r.component) === 'docs.role.' + r.component
+            ? r.meaning
+            : tr('docs.role.' + r.component)));
     })));
 
     // Features, with the honest state of each.

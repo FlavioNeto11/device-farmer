@@ -40,19 +40,37 @@ import (
 // it found nothing is worse than no test.
 func dictionary(t *testing.T, src, which string) map[string]string {
 	t.Helper()
+	return dictionaryAt(t, src, which, "  ", 40)
+}
 
-	open := regexp.MustCompile(`(?m)^  ` + which + `: \{$`)
+// dictionaryAt is dictionary with the indent and the expected size given,
+// because the strings live in TWO files and the two are indented differently.
+//
+// WHY TWO, which is the thing a reader will want to know. assets/i18n.js holds
+// the application chrome. assets/docs.js holds the Docs page's own strings, in
+// an IIFE at its own indent, reached through a shim that prefers the global t()
+// and falls back to its local table. The split was not designed — the two were
+// written in parallel — and it survives on purpose: docs.js is a self-contained
+// module and must not throw if i18n.js is ever absent.
+//
+// A second hand-maintained copy of a thing is exactly what this file exists to
+// distrust, so BOTH are parsed and both are held to the same rule. Merging them
+// later changes nothing here except which sources the tests below read.
+func dictionaryAt(t *testing.T, src, which, indent string, floor int) map[string]string {
+	t.Helper()
+
+	open := regexp.MustCompile(`(?m)^` + indent + which + `: \{$`)
 	loc := open.FindStringIndex(src)
 	if loc == nil {
-		t.Fatalf("assets/i18n.js has no %q dictionary opening at the expected indent; "+
-			"the file's shape changed and this test is now blind", which)
+		t.Fatalf("no %q dictionary opening at an indent of %d spaces; the file's shape "+
+			"changed and this test is now blind", which, len(indent))
 	}
 
 	// The dictionary ends at the first line that closes it at the same indent.
 	rest := src[loc[1]:]
-	end := regexp.MustCompile(`(?m)^  \},$`).FindStringIndex(rest)
+	end := regexp.MustCompile(`(?m)^` + indent + `\},?$`).FindStringIndex(rest)
 	if end == nil {
-		t.Fatalf("the %q dictionary is not closed at the expected indent", which)
+		t.Fatalf("the %q dictionary is not closed at an indent of %d spaces", which, len(indent))
 	}
 	body := rest[:end[0]]
 
@@ -69,11 +87,87 @@ func dictionary(t *testing.T, src, which string) map[string]string {
 		}
 		out[m[1]] = ""
 	}
-	if len(out) < 40 {
-		t.Fatalf("%s parsed to %d keys, which is far fewer than the dashboard has; the key "+
-			"pattern no longer matches the file and this test is now blind", which, len(out))
+	if len(out) < floor {
+		t.Fatalf("%s parsed to %d keys, fewer than the %d this file is known to hold; the key "+
+			"pattern no longer matches and this test is now blind", which, len(out), floor)
 	}
 	return out
+}
+
+// docsSource is the Docs page's own module, which carries the second dictionary.
+func docsSource(t *testing.T) string {
+	t.Helper()
+	b, err := embedded.ReadFile("assets/docs.js")
+	if err != nil {
+		t.Fatalf("read the embedded assets/docs.js: %v", err)
+	}
+	return string(b)
+}
+
+// TestTheDocsPageStringsExistInBothLanguagesToo holds the second dictionary to
+// the same rule as the first.
+//
+// The Docs page is the largest body of prose in the product and the one the user
+// singled out as unreadable. Its chrome — the table of contents, the
+// back-to-top, the note that says an area has not been translated yet — lives in
+// its own table, and a key missing from the Portuguese half of THAT one is just
+// as visible as one missing from the chrome, and just as invisible to a build
+// that only checked i18n.js.
+//
+// Falsify: delete any single line from either half of STR in assets/docs.js.
+func TestTheDocsPageStringsExistInBothLanguagesToo(t *testing.T) {
+	src := docsSource(t)
+	en := dictionaryAt(t, src, "en", "    ", 30)
+	pt := dictionaryAt(t, src, "pt", "    ", 30)
+
+	var missingPT, missingEN []string
+	for k := range en {
+		if _, ok := pt[k]; !ok {
+			missingPT = append(missingPT, k)
+		}
+	}
+	for k := range pt {
+		if _, ok := en[k]; !ok {
+			missingEN = append(missingEN, k)
+		}
+	}
+	sort.Strings(missingPT)
+	sort.Strings(missingEN)
+
+	if len(missingPT) > 0 {
+		t.Errorf("%d Docs string(s) are in English and not in Portuguese:\n  %s",
+			len(missingPT), strings.Join(missingPT, "\n  "))
+	}
+	if len(missingEN) > 0 {
+		t.Errorf("%d Docs string(s) are in Portuguese and not in English, and English is what "+
+			"every farm falls back to:\n  %s", len(missingEN), strings.Join(missingEN, "\n  "))
+	}
+}
+
+// TestTheTwoDictionariesDoNotDefineTheSameKey.
+//
+// docs.js prefers the global t() and falls back to its own table, so a key
+// defined in both is read from i18n.js and the docs.js copy is dead — silently,
+// and in whatever language it was last edited. Two definitions of one string is
+// how a fix lands in the copy nobody reads.
+//
+// Falsify: copy any 'docs.*' key from docs.js into i18n.js.
+func TestTheTwoDictionariesDoNotDefineTheSameKey(t *testing.T) {
+	chrome := dictionary(t, i18nSource(t), "en")
+	docs := dictionaryAt(t, docsSource(t), "en", "    ", 30)
+
+	var both []string
+	for k := range docs {
+		if _, ok := chrome[k]; ok {
+			both = append(both, k)
+		}
+	}
+	sort.Strings(both)
+	if len(both) > 0 {
+		t.Errorf("%d key(s) are defined in BOTH assets/i18n.js and assets/docs.js:\n  %s\n\n"+
+			"docs.js prefers the global, so its copy is dead and an edit to it changes "+
+			"nothing on screen.", len(both), strings.Join(both, "\n  "))
+	}
 }
 
 func i18nSource(t *testing.T) string {

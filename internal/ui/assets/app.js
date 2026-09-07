@@ -1016,8 +1016,40 @@ function banner(level, text, opts) {
     const existing = bannerKeys.get(o.key);
     if (existing && existing.isConnected) existing.remove();
   }
+
+  /* THE SAME SENTENCE TWICE IS NOT TWO PIECES OF NEWS.
+   *
+   * Only a caller that passed a key was ever deduplicated, and the busiest
+   * source of banners — the event stream — passes none: a farm refusing the
+   * same tier-4 power cycle on three devices raised three identical rows. With
+   * a cap of five that filled the strip, pushed every view below the fold, and
+   * read as a broken page rather than as one recurring fact. It was the first
+   * thing visible on this dashboard and it is what "everything is hard to get
+   * to" looked like.
+   *
+   * So an identical message at the same level increments a count instead. The
+   * count is the honest rendering: three refusals DID happen, and "×3" says so
+   * in one row. The banner is moved to the end as it recurs, because a thing
+   * that just happened again is news about now. */
+  const sameText = String(text);
+  for (const prev of host.children) {
+    if (prev.dataset.level !== level || prev.dataset.text !== sameText) continue;
+    const n = (Number(prev.dataset.count) || 1) + 1;
+    prev.dataset.count = String(n);
+    let tally = prev.querySelector('.b-tally');
+    if (!tally) {
+      tally = el('span', { class: 'b-tally' });
+      prev.querySelector('.b-text').after(tally);
+    }
+    tally.textContent = '×' + n;
+    host.append(prev);
+    return prev;
+  }
   const glyph = level === 'error' ? '✕' : level === 'warn' ? '▲' : level === 'ok' ? '✓' : 'i';
-  const node = el('div', { class: 'banner banner-' + level },
+  const node = el('div', {
+    class: 'banner banner-' + level,
+    dataset: { level: level, text: sameText, count: '1' }
+  },
     el('span', { class: 'b-glyph', 'aria-hidden': 'true' }, glyph),
     el('span', { class: 'b-text' }, text, o.detail ? el('span', { class: 'mono' }, ' ' + o.detail) : null),
     o.action ? el('button', { class: 'mini ghost', onclick: o.action.run }, o.action.label) : null,

@@ -934,3 +934,10 @@ main, .view, .panel { min-width: 0; }
   scrollbar-gutter: stable;
 }
 .tscroll > table { min-width: max-content; }
+
+/* The tally on a banner that has recurred. Dim and small: the message is the
+ * news, the count is a qualifier on it. */
+.b-tally {
+  margin-left: .4rem; color: var(--dim); font-size: .82rem;
+  font-variant-numeric: tabular-nums; white-space: nowrap;
+}

@@ -176,6 +176,25 @@ const STRINGS = {
     'exec.cat.lsTmp.why': 'The directory this project pushes artifacts and markers into.',
     'exec.cat.topOnce.label': 'Top processes, once',
     'exec.cat.topOnce.why': 'A single non-interactive top, so it returns instead of streaming forever.',
+    /* The three steps the panel reads as, and the two things that moved below
+     * them. No command is here, in either dictionary, for the reason stated at
+     * the top of this file. */
+    'exec.step.command': 'The command',
+    'exec.step.send': 'Send it to the device',
+    'exec.pickWhy': 'Twenty-four commands, each one saying where it came from: the file in this repository that sends it, or nothing at all when nobody here has ever run it.',
+    'exec.timeout.head': 'Give up after',
+    'exec.timeout.s10': '10 seconds',
+    'exec.timeout.s30': '30 seconds',
+    'exec.timeout.m1': '1 minute',
+    'exec.timeout.m5': '5 minutes',
+    'exec.timeout.custom': 'Something else…',
+    'exec.timeout.why': 'Five minutes is internal/api\'s own maxExecTimeout, and it clamps anything longer without saying so. The list starts at ten seconds because a request measured in milliseconds comes back as a 502 that reads like a broken handset.',
+    'exec.pf.summaryOk': '{n} checks pass',
+    'exec.pf.summaryOkOne': '1 check passes',
+    'exec.pf.summaryBlockedOne': '1 check blocks this',
+    'exec.pf.summaryBlocked': '{n} checks block this',
+    'exec.pf.summaryUnknown': '{n} cannot be known from here',
+    'exec.idle': 'Nothing has run yet. What the device answers lands here exactly as it sent it, with whether it exited read before what it exited with.',
     /* Header and navigation */
     /* The masthead. "device-farmer" is the repository, the binary and the
      * database owner; it is not what a business calls the thing its fleet runs
@@ -553,6 +572,25 @@ const STRINGS = {
     'exec.cat.lsTmp.why': 'O diretório onde este projeto empurra artefatos e marcadores.',
     'exec.cat.topOnce.label': 'Processos mais pesados, uma vez',
     'exec.cat.topOnce.why': 'Um top único e não interativo, para que ele termine em vez de transmitir para sempre.',
+    /* Os três passos que o painel agora é, e as duas coisas que desceram para
+     * baixo deles. Nenhum comando está aqui, em nenhum dos dois dicionários,
+     * pelo motivo declarado no topo deste arquivo. */
+    'exec.step.command': 'O comando',
+    'exec.step.send': 'Enviar ao aparelho',
+    'exec.pickWhy': 'Vinte e quatro comandos, cada um dizendo de onde veio: o arquivo deste repositório que o envia, ou nada quando ninguém aqui jamais o rodou.',
+    'exec.timeout.head': 'Desistir depois de',
+    'exec.timeout.s10': '10 segundos',
+    'exec.timeout.s30': '30 segundos',
+    'exec.timeout.m1': '1 minuto',
+    'exec.timeout.m5': '5 minutos',
+    'exec.timeout.custom': 'Outro valor…',
+    'exec.timeout.why': 'Cinco minutos é o maxExecTimeout do próprio internal/api, e ele corta qualquer coisa maior sem avisar. A lista começa em dez segundos porque um pedido medido em milissegundos volta como um 502 que parece um aparelho quebrado.',
+    'exec.pf.summaryOk': '{n} verificações passam',
+    'exec.pf.summaryOkOne': '1 verificação passa',
+    'exec.pf.summaryBlockedOne': '1 verificação bloqueia isto',
+    'exec.pf.summaryBlocked': '{n} verificações bloqueiam isto',
+    'exec.pf.summaryUnknown': '{n} não dá para saber daqui',
+    'exec.idle': 'Nada rodou ainda. O que o aparelho responder chega aqui exatamente como ele enviou, com o se saiu lido antes do com quanto saiu.',
     /* Cabeçalho e navegação */
     /* O cabeçalho da marca. Veja a nota no dicionário em inglês: o nome do
      * produto não é o nome do repositório. */

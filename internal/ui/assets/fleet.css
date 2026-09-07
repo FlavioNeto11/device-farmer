@@ -4,3 +4,201 @@
    that repaints under a live event stream, so its rules are separated from the
    rest: a change to how a device reads should not put a reviewer in front of
    the docs typography. */
+
+/* ------------------------------------------------------------------------ *
+ * THE [hidden] TRAP
+ *
+ * An author rule that sets `display:` beats the user agent's
+ * `[hidden] { display: none }` at ANY specificity, so every component in this
+ * file that declares a display must also declare its own [hidden] rule, in the
+ * same commit. This has shipped as a real bug twice — style.css records both,
+ * on .doc-totop and on .screen-panel — and the failure mode is quiet: an
+ * element the JavaScript believes it hid, still on the page.
+ *
+ * The three below are every element in this file that sets display. The
+ * summary strip is the one that is actually hidden (before the first load and
+ * after a failed one); the other two are guarded because the next person to
+ * hide one should not have to rediscover this paragraph.
+ * ------------------------------------------------------------------------ */
+.fleet-summary[hidden],
+.sum-cards[hidden],
+.sum-card[hidden] { display: none !important; }
+
+/* ------------------------------------------------------------------------ *
+ * THE SUMMARY STRIP
+ *
+ * Five cards above the grid. Not five identical grey pills: a number large
+ * enough to read from a doorway, a plain-language label under it, and a glyph
+ * whose meaning does not depend on the colour beside it.
+ *
+ * The cards are buttons and each one applies a filter, so the strip is also
+ * the fastest way into the slice of the farm it is describing. The pressed
+ * one is marked by border, background AND a colour, because aria-pressed is
+ * not something an eye can see.
+ * ------------------------------------------------------------------------ */
+
+.fleet-summary {
+  display: grid;
+  gap: var(--s-2);
+  margin: 0 0 var(--gap-section);
+  min-width: 0;
+}
+
+/* --tile-min is the device card's own minimum, borrowed on purpose: the strip
+   and the grid then breathe together when the density control is thrown, and
+   there is one number to change rather than two that drift. */
+.sum-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(var(--tile-min), 1fr));
+  gap: var(--s-2);
+  min-width: 0;
+}
+
+.sum-card {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--s-1);
+  min-width: 0;
+  padding: var(--pad-tile);
+  text-align: left;
+  cursor: pointer;
+  color: var(--txt-1);
+  background: var(--srf-raised);
+  border: 1px solid var(--brd-subtle);
+  /* The top edge is the card's status band. A border rather than a fill, so a
+     bad number is marked without the whole card turning into an alarm. */
+  border-top: 3px solid var(--brd-strong);
+  border-radius: var(--r);
+}
+
+.sum-card:hover { background: var(--srf-hover); }
+.sum-card:focus-visible { outline: 2px solid var(--brand-600); outline-offset: 2px; }
+
+.sum-card[aria-pressed="true"] {
+  background: var(--brand-50);
+  border-color: var(--brand-600);
+  box-shadow: var(--elev-1);
+}
+
+.sum-n {
+  display: flex;
+  align-items: baseline;
+  gap: var(--s-2);
+  font-variant-numeric: tabular-nums;
+}
+.sum-n b { font: var(--fw-semi) var(--fs-2xl)/var(--lh-tight) var(--sans); }
+.sum-g { font-size: var(--fs-lg); line-height: var(--lh-tight); }
+
+.sum-label { font: var(--fw-semi) var(--fs-md)/var(--lh-tight) var(--sans); }
+.sum-sub   { font: var(--fw-normal) var(--fs-xs)/var(--lh) var(--sans); color: var(--txt-3); }
+
+/* The tones. Only the band, the glyph and the number take the colour; the
+   label and the sub-label stay in the text ramp, because a card whose every
+   word is red is a card whose words are harder to read. */
+.sum-card.tone-cri { border-top-color: var(--cri-fg); }
+.sum-card.tone-cri .sum-g,
+.sum-card.tone-cri .sum-n b { color: var(--cri-fg); }
+
+.sum-card.tone-inf { border-top-color: var(--inf-fg); }
+.sum-card.tone-inf .sum-g,
+.sum-card.tone-inf .sum-n b { color: var(--inf-fg); }
+
+.sum-card.tone-pos { border-top-color: var(--pos-fg); }
+.sum-card.tone-pos .sum-g,
+.sum-card.tone-pos .sum-n b { color: var(--pos-fg); }
+
+/* Quiet is what a zero that is GOOD news looks like, and what Total always
+   looks like. The tick is green; the number is not, because nothing here needs
+   to be looked at. */
+.sum-card.tone-quiet { border-top-color: var(--brd-strong); }
+.sum-card.tone-quiet .sum-g { color: var(--pos-fg); }
+
+/* The note is where the two kinds of number are told apart in words: the cards
+   are what the server counted, this line is what is on the screen.
+
+   .capped is the one case where the note is not a footnote but a warning — the
+   server stopped short of the farm, so every number above it is about a
+   subset. It carries a ▲ as well as the colour, because a caveat that only a
+   colour states is a caveat a greyscale screenshot loses. */
+.sum-note {
+  margin: 0;
+  font: var(--fw-normal) var(--fs-sm)/var(--lh) var(--sans);
+  color: var(--txt-2);
+}
+.sum-note.capped { color: var(--cau-fg); font-weight: var(--fw-medium); }
+
+/* ------------------------------------------------------------------------ *
+ * THE DEVICE GRID
+ *
+ * --tile-min and --gap-grid are density's two knobs on this surface. Reading
+ * them here rather than declaring 186px and 6px is the whole reason the
+ * density control retunes the grid without knowing the grid exists.
+ * ------------------------------------------------------------------------ */
+
+.fleet-body .grid {
+  grid-template-columns: repeat(auto-fill, minmax(var(--tile-min), 1fr));
+  gap: var(--gap-grid);
+}
+
+.fleet-body .tile {
+  gap: var(--s-1);
+  padding: var(--pad-tile);
+  /* A grid child refuses to shrink below its content unless it is told it may,
+     and the model line's ellipsis is inert until it can. Same rule, same
+     reason, as the overflow architecture in style.css. */
+  min-width: 0;
+}
+
+/* The rack slot is the name of the thing you clicked. It was 14px monospace —
+   Consolas, tracking pulled in — which is a large part of why a page about
+   phones on a shelf read as a terminal. Sans, semibold, --fs-lg: the size the
+   type scale reserves for the one word a card is about. */
+.fleet-body .tile .slot {
+  font: var(--fw-semi) var(--fs-lg)/var(--lh-tight) var(--sans);
+  letter-spacing: normal;
+}
+
+.fleet-body .tile .model {
+  font: var(--fw-normal) var(--fs-xs)/var(--lh) var(--sans);
+  color: var(--txt-2);
+}
+
+.fleet-body .tile .chips {
+  gap: var(--s-1);
+  align-items: center;
+}
+
+/* Chips in sans too, and roomier. They are read as words here, not matched
+   against a psql session — the value they carry is still the server's, so the
+   word does not change; only the face it is set in does. */
+.fleet-body .tile .chip {
+  font: var(--fw-medium) var(--fs-xs)/var(--lh) var(--sans);
+  border-radius: var(--r-sm);
+  padding: 0 var(--s-2);
+}
+
+/* The one short sentence about who has this device. It is not a chip and must
+   never become one — the budget is two, and this is the plain-language half
+   that makes the two readable. */
+.fleet-body .tile .avail {
+  font: var(--fw-normal) var(--fs-sm)/var(--lh) var(--sans);
+  color: var(--txt-2);
+}
+
+.fleet-body .tile .foot {
+  gap: var(--s-2);
+  font: var(--fw-normal) var(--fs-xs)/var(--lh) var(--sans);
+  color: var(--txt-3);
+}
+.fleet-body .tile .foot-k { color: var(--txt-3); }
+
+/* Everything the two chips did not have room for, in one mark that opens the
+   sheet. Amber and never red: it is "there is more here", not "this is
+   broken" — what is broken already has a chip of its own. */
+.tile-flag {
+  font-size: var(--fs-sm);
+  line-height: var(--lh-tight);
+  color: var(--cau-fg);
+  cursor: help;
+}

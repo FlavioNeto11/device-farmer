@@ -119,6 +119,11 @@
       <label><span data-i18n="filter.lease">Lease</span>
         <select id="f-lease">
           <option value="" data-i18n="filter.anyLeaseState">any lease state</option>
+          <!-- "live" is held OR suspect: every device somebody is actually on.
+               A suspect lease is not a released one, so `held` alone answers a
+               different question from "how much of the farm is busy", and the
+               summary strip's In use card counts both. -->
+          <option value="live" data-i18n="filter.liveLease">in use (held or suspect)</option>
           <option value="held">held</option>
           <option value="suspect">suspect</option>
           <option value="protected">protected</option>
@@ -129,6 +134,15 @@
       <span class="grow"></span>
       <span id="fleet-counts" class="counts"></span>
     </div>
+    <!-- The summary strip. Five numbers that answer "is the farm OK?" before a
+         single device is read, and five filters that can be clicked.
+
+         It lives OUTSIDE #fleet-body on purpose: that element is replaced
+         wholesale on every repaint, and the one thing on this page that must
+         not flicker two seconds apart is the answer to whether anything is
+         wrong. fleet.js fills it and hides it when nothing has loaded yet. -->
+    <div id="fleet-summary" class="fleet-summary" role="group"
+         data-i18n-attr="aria-label:fleet.sum.region" aria-label="Fleet summary" hidden></div>
     <div id="fleet-alerts" class="alerts"></div>
     <div id="fleet-body" class="fleet-body" aria-busy="true"></div>
   </section>

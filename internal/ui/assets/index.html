@@ -7,11 +7,15 @@
 <!-- Relative hrefs so the dashboard survives being mounted under a prefix. -->
 <link rel="stylesheet" href="style.css">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%23167a4a'/%3E%3Crect x='5' y='3' width='6' height='10' rx='1' fill='%23fff'/%3E%3C/svg%3E">
+<!-- i18n first: it sets document.lang and fills every data-i18n element, so the
+     first paint is already in the reader's language instead of flashing English
+     and correcting itself. -->
+<script src="i18n.js" defer></script>
 <script src="docs.js" defer></script>
 <script src="app.js" defer></script>
 </head>
 <body>
-<a class="skip" href="#main">Skip to fleet</a>
+<a class="skip" href="#main" data-i18n="app.skip">Skip to content</a>
 
 <header class="top">
   <div class="brand">
@@ -19,23 +23,33 @@
     <span class="brand-name">device-farmer</span>
   </div>
 
-  <nav class="tabs" role="tablist" aria-label="Views">
-    <button class="tab" role="tab" id="tab-fleet"    data-view="fleet"    aria-controls="view-fleet"    aria-selected="true"><span class="key" aria-hidden="true">1</span>Fleet</button>
-    <button class="tab" role="tab" id="tab-leases"   data-view="leases"   aria-controls="view-leases"   aria-selected="false"><span class="key" aria-hidden="true">2</span>Leases</button>
-    <button class="tab" role="tab" id="tab-jobs"     data-view="jobs"     aria-controls="view-jobs"     aria-selected="false"><span class="key" aria-hidden="true">3</span>Jobs</button>
-    <button class="tab" role="tab" id="tab-recovery" data-view="recovery" aria-controls="view-recovery" aria-selected="false"><span class="key" aria-hidden="true">4</span>Recovery</button>
-    <button class="tab" role="tab" id="tab-bulk"     data-view="bulk"     aria-controls="view-bulk"     aria-selected="false"><span class="key" aria-hidden="true">5</span>Bulk</button>
-    <button class="tab" role="tab" id="tab-events"   data-view="events"   aria-controls="view-events"   aria-selected="false"><span class="key" aria-hidden="true">6</span>Events</button>
-    <button class="tab" role="tab" id="tab-docs"     data-view="docs"     aria-controls="view-docs"     aria-selected="false"><span class="key" aria-hidden="true">7</span>Docs</button>
+  <nav class="tabs" role="tablist" aria-label="Views" data-i18n-attr="aria-label:nav.views">
+    <button class="tab" role="tab" id="tab-fleet"    data-view="fleet"    aria-controls="view-fleet"    aria-selected="true"><span class="key" aria-hidden="true">1</span><span data-i18n="nav.fleet">Fleet</span></button>
+    <button class="tab" role="tab" id="tab-leases"   data-view="leases"   aria-controls="view-leases"   aria-selected="false"><span class="key" aria-hidden="true">2</span><span data-i18n="nav.leases">Leases</span></button>
+    <button class="tab" role="tab" id="tab-jobs"     data-view="jobs"     aria-controls="view-jobs"     aria-selected="false"><span class="key" aria-hidden="true">3</span><span data-i18n="nav.jobs">Jobs</span></button>
+    <button class="tab" role="tab" id="tab-recovery" data-view="recovery" aria-controls="view-recovery" aria-selected="false"><span class="key" aria-hidden="true">4</span><span data-i18n="nav.recovery">Recovery</span></button>
+    <button class="tab" role="tab" id="tab-bulk"     data-view="bulk"     aria-controls="view-bulk"     aria-selected="false"><span class="key" aria-hidden="true">5</span><span data-i18n="nav.bulk">Bulk</span></button>
+    <button class="tab" role="tab" id="tab-events"   data-view="events"   aria-controls="view-events"   aria-selected="false"><span class="key" aria-hidden="true">6</span><span data-i18n="nav.events">Events</span></button>
+    <button class="tab" role="tab" id="tab-docs"     data-view="docs"     aria-controls="view-docs"     aria-selected="false"><span class="key" aria-hidden="true">7</span><span data-i18n="nav.docs">Docs</span></button>
   </nav>
 
   <div class="search">
-    <label class="sr-only" for="q">Search devices, hosts, jobs and holders</label>
-    <input id="q" type="search" placeholder="Search  ( / )" autocomplete="off" spellcheck="false">
+    <label class="sr-only" for="q" data-i18n="header.searchLabel">Search devices, hosts, jobs and holders</label>
+    <input id="q" type="search" placeholder="Search  ( / )" autocomplete="off" spellcheck="false"
+           data-i18n-attr="placeholder:header.searchPlaceholder">
   </div>
 
-  <button id="refresh" class="ghost" title="Refetch every view now">Refresh</button>
-  <button id="token-btn" class="ghost" title="Set the bearer token this browser sends to the API">Token</button>
+  <button id="refresh" class="ghost" title="Refetch every view now"
+          data-i18n="header.refresh" data-i18n-attr="title:header.refreshTitle">Refresh</button>
+  <button id="token-btn" class="ghost" title="Set the bearer token this browser sends to the API"
+          data-i18n="header.token" data-i18n-attr="title:header.tokenTitle">Token</button>
+
+  <!-- The language switch. A two-state control rather than a select, because
+       there are two languages and a select would cost a click to discover
+       that. It shows the language it would switch TO, which is the thing a
+       reader who cannot read the current one can still recognise. -->
+  <button id="lang-btn" class="ghost lang-btn"
+          data-i18n-attr="title:header.languageTitle aria-label:header.language">PT</button>
 
   <div id="conn" class="conn conn-connecting" role="status" aria-live="polite">
     <span class="dot" aria-hidden="true"></span>
@@ -50,20 +64,20 @@
   <!-- ================= FLEET ================= -->
   <section id="view-fleet" class="view" role="tabpanel" aria-labelledby="tab-fleet" tabindex="-1">
     <div class="toolbar">
-      <label>Host
-        <select id="f-host"><option value="">all hosts</option></select>
+      <label><span data-i18n="filter.host">Host</span>
+        <select id="f-host"><option value="" data-i18n="filter.allHosts">all hosts</option></select>
       </label>
-      <label>Hub
-        <select id="f-hub"><option value="">all hubs</option></select>
+      <label><span data-i18n="filter.hub">Hub</span>
+        <select id="f-hub"><option value="" data-i18n="filter.allHubs">all hubs</option></select>
       </label>
-      <label>Health
+      <label><span data-i18n="filter.health">Health</span>
         <select id="f-health">
-          <option value="">any health</option>
+          <option value="" data-i18n="filter.anyHealth">any health</option>
           <!-- The API reads "unhealthy" as every state except healthy and the
                two that are decisions rather than faults, retired and parked.
                It is the set the Fleet tab's pip counts, so it needs a way to
                be clicked. -->
-          <option value="unhealthy">not healthy (any fault)</option>
+          <option value="unhealthy" data-i18n="filter.anyFault">not healthy (any fault)</option>
           <option value="healthy">healthy</option>
           <option value="degraded">degraded</option>
           <option value="offline">offline</option>
@@ -80,19 +94,19 @@
           <option value="retired">retired</option>
         </select>
       </label>
-      <label>Pool
-        <select id="f-pool"><option value="">all pools</option></select>
+      <label><span data-i18n="filter.pool">Pool</span>
+        <select id="f-pool"><option value="" data-i18n="filter.allPools">all pools</option></select>
       </label>
-      <label>Lease
+      <label><span data-i18n="filter.lease">Lease</span>
         <select id="f-lease">
-          <option value="">any lease state</option>
+          <option value="" data-i18n="filter.anyLeaseState">any lease state</option>
           <option value="held">held</option>
           <option value="suspect">suspect</option>
           <option value="protected">protected</option>
           <option value="free">free</option>
         </select>
       </label>
-      <button id="f-clear" class="ghost">Clear</button>
+      <button id="f-clear" class="ghost" data-i18n="filter.clear">Clear</button>
       <span class="grow"></span>
       <span id="fleet-counts" class="counts"></span>
     </div>
@@ -103,7 +117,7 @@
   <!-- ================= LEASES ================= -->
   <section id="view-leases" class="view" role="tabpanel" aria-labelledby="tab-leases" tabindex="-1" hidden>
     <div class="toolbar">
-      <label>State
+      <label><span data-i18n="filter.state">State</span>
         <select id="l-state">
           <option value="">live (held and suspect)</option>
           <option value="held">held</option>
@@ -129,7 +143,7 @@
     <div class="split">
       <div class="col-main">
         <div class="toolbar">
-          <label>State
+          <label><span data-i18n="filter.state">State</span>
             <select id="j-state">
               <option value="">all states</option>
               <option value="queued">queued</option>
@@ -310,7 +324,7 @@
     <input id="token-input" type="password" autocomplete="off" spellcheck="false">
     <p class="hint" id="token-note"></p>
     <menu>
-      <button type="button" id="token-clear" class="ghost">Clear</button>
+      <button type="button" id="token-clear" class="ghost" data-i18n="filter.clear">Clear</button>
       <button type="button" id="token-cancel" class="ghost">Cancel</button>
       <button type="submit" id="token-save" class="primary">Save</button>
     </menu>

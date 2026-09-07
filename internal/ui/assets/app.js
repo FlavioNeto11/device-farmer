@@ -1038,9 +1038,27 @@ function clearBanner(key) {
   bannerKeys.delete(key);
 }
 
+/* errText renders a failure for a human.
+ *
+ * The API answers in English, always, because its messages are a contract that
+ * scripts and `ctl` read too. So a Portuguese reader would otherwise meet an
+ * English sentence at exactly the moment something went wrong — the worst
+ * possible moment to be handed a language you do not read.
+ *
+ * The bridge is the CODE, which the envelope already carries and which is a
+ * machine token rather than prose. A code this page knows gets a translated
+ * sentence; a code it does not know keeps the server's own words, so a route
+ * added tomorrow degrades to English prose rather than to nothing.
+ *
+ * THE CODE IS ALWAYS SHOWN, in both languages. It is what an operator quotes in
+ * a ticket, greps for in a log, and matches against the API reference — and a
+ * translation that hid it would make this page the only surface in the system
+ * that cannot be cross-referenced with any other. */
 function errText(e) {
-  if (e instanceof ApiError) return e.code + ': ' + e.message;
-  return String((e && e.message) || e);
+  if (!(e instanceof ApiError)) return String((e && e.message) || e);
+  const key = 'error.' + e.code;
+  const known = t(key);
+  return e.code + ': ' + (known === key ? e.message : known);
 }
 
 /* ------------------------------------------------------------------ *
@@ -1088,7 +1106,19 @@ function countChips(obj) {
   for (const k of Object.keys(obj)) {
     const v = obj[k];
     if (v === null || typeof v === 'object') continue;
-    out.push(el('span', { class: 'count' }, k.replace(/_/g, ' '), ' ', el('b', null, String(v))));
+    /* The key names a count the API computed — total, leased, free, unhealthy.
+     * It is looked up as a translatable label and falls back to the key itself
+     * with underscores opened out, which is what it always was.
+     *
+     * The fallback matters more than the lookup: this loop renders WHATEVER the
+     * server put in the object, so a counter added to the API tomorrow appears
+     * here before anybody has written a word for it. Reading `charge_parked` in
+     * an English page is worse than reading "estacionados por carga" and far
+     * better than the counter vanishing because no translation existed. */
+    const label = t('count.' + k);
+    out.push(el('span', { class: 'count' },
+      label === 'count.' + k ? k.replace(/_/g, ' ') : label,
+      ' ', el('b', null, String(v))));
   }
   return out;
 }
@@ -1191,7 +1221,7 @@ function renderFleet() {
   append(counts, [countChips(state.data.counts)]);
   if (all) {
     counts.append(el('span', { class: 'count', title: 'rows currently rendered after filters' },
-      'showing ', el('b', null, String(rows.length)), ' / ' + all.length));
+      t('fleet.showing') + ' ', el('b', null, String(rows.length)), ' / ' + all.length));
   }
   append(counts, [truncChip('fleet', 'Narrow the host, hub or pool filter to see the rest.')]);
 
@@ -1370,10 +1400,16 @@ function deviceTile(d) {
 }
 
 function refreshFilterOptions(rows) {
-  fillSelect($('#f-host'), 'all hosts',
+  /* The "all …" option is rebuilt here rather than left to the data-i18n in
+   * index.html, because this function REPLACES the select's options with what
+   * the API returned — which throws away the marked-up placeholder along with
+   * them. Without this the three filters were the only English left on a
+   * Portuguese page, and only after the first fleet load, which is exactly the
+   * kind of half-translation that looks like a bug in the language switch. */
+  fillSelect($('#f-host'), t('filter.allHosts'),
     unique(rows.map((d) => d.host).filter(Boolean)).concat((state.data.hosts || []).map((h) => h.id).filter(Boolean)),
     state.filters.host);
-  fillSelect($('#f-pool'), 'all pools', unique(rows.map((d) => d.pool).filter(Boolean)), state.filters.pool);
+  fillSelect($('#f-pool'), t('filter.allPools'), unique(rows.map((d) => d.pool).filter(Boolean)), state.filters.pool);
 
   const hubs = [];
   const seen = new Set();
@@ -1384,7 +1420,7 @@ function refreshFilterOptions(rows) {
     hubs.push({ value: k, label: (d.host ? d.host + ' · ' : '') + 'hub ' + (d.hubPath || k) });
   }
   hubs.sort((a, b) => cmp(a.label, b.label));
-  fillSelect($('#f-hub'), 'all hubs', hubs, state.filters.hub);
+  fillSelect($('#f-hub'), t('filter.allHubs'), hubs, state.filters.hub);
 }
 
 function unique(list) {
@@ -1433,7 +1469,7 @@ function renderLeases() {
         ? el('span', { class: 'chip chip-protected', title: 'protected and suspect: the reaper will not reclaim these; a human is expected to look' },
           el('span', { 'aria-hidden': 'true' }, '★'), 'protected suspect ' + state.data.protectedSuspect)
         : null,
-      el('span', { class: 'count' }, 'showing ', el('b', null, String(rows.length))),
+      el('span', { class: 'count' }, t('fleet.showing') + ' ', el('b', null, String(rows.length))),
       truncChip('leases', 'Pick a single lease state to see the rest.')
     ]);
   }
@@ -1494,7 +1530,7 @@ function renderJobs() {
   if (rows0) {
     const by = {};
     for (const j of rows0) by[j.state] = (by[j.state] || 0) + 1;
-    append(counts, [countChips(by), el('span', { class: 'count' }, 'showing ', el('b', null, String(rows.length))),
+    append(counts, [countChips(by), el('span', { class: 'count' }, t('fleet.showing') + ' ', el('b', null, String(rows.length))),
       truncChip('jobs', 'Pick a single job state to see the rest.')]);
   }
 
@@ -2092,7 +2128,7 @@ function renderEvents() {
   counts.replaceChildren();
   if (rows0) {
     append(counts, [
-      el('span', { class: 'count' }, 'showing ', el('b', null, String(rows.length)), ' / ' + rows0.length),
+      el('span', { class: 'count' }, t('fleet.showing') + ' ', el('b', null, String(rows.length)), ' / ' + rows0.length),
       truncChip('events', 'This is the newest page only; raise Show to reach further back.')
     ]);
   }
@@ -2501,10 +2537,10 @@ const SCREEN_MAX_PACKET = 4 * 1024 * 1024;
 /* Android KeyEvent constants. Not a whitelist — the API accepts any keycode —
  * just the four an operator reaches for when a phone is misbehaving. */
 const SCREEN_KEYS = [
-  { label: 'Back', code: 4 },
-  { label: 'Home', code: 3 },
-  { label: 'Recents', code: 187 },
-  { label: 'Power', code: 26 }
+  { labelKey: 'screen.key.back', code: 4 },
+  { labelKey: 'screen.key.home', code: 3 },
+  { labelKey: 'screen.key.recents', code: 187 },
+  { labelKey: 'screen.key.power', code: 26 }
 ];
 
 /* screenSession is the one open panel. One at a time in this tab, because the
@@ -2521,8 +2557,8 @@ function screenPanel(d) {
   const canvas = el('canvas', { class: 'screen-canvas', width: 1, height: 1, hidden: true });
   const status = el('div', { class: 'screen-status' });
   const keys = el('div', { class: 'screen-keys', hidden: true });
-  const openBtn = el('button', { class: 'ghost', type: 'button' }, 'Open screen');
-  const closeBtn = el('button', { class: 'ghost', type: 'button', hidden: true }, 'Close screen');
+  const openBtn = el('button', { class: 'ghost', type: 'button' }, t('screen.open'));
+  const closeBtn = el('button', { class: 'ghost', type: 'button', hidden: true }, t('screen.close'));
 
   const say = (level, text) => {
     status.replaceChildren(el('span', { class: 'screen-note screen-' + level }, text));
@@ -2532,8 +2568,7 @@ function screenPanel(d) {
     /* Said plainly rather than left as a blank rectangle. WebCodecs is the
      * decoder; without it there is no fallback that does not mean transcoding
      * on the control plane, which this feature deliberately does not do. */
-    say('warn', 'This browser has no WebCodecs decoder, so a live screen cannot be shown here. ' +
-      'The stream itself is fine: ctl device screen ' + shortId(d.id) + ' --out screen.h264 records it.');
+    say('warn', t('screen.noWebCodecs', { id: shortId(d.id) }));
     return el('div', { class: 'screen-panel' }, status);
   }
 
@@ -2547,7 +2582,7 @@ function screenPanel(d) {
           { type: 'key', action: 'up', keycode: k.code }
         ]);
       }
-    }, k.label));
+    }, t(k.labelKey)));
   }
 
   const stopped = () => {
@@ -2561,7 +2596,7 @@ function screenPanel(d) {
 
   openBtn.addEventListener('click', async () => {
     openBtn.disabled = true;
-    say('info', 'Starting the server on the device…');
+    say('info', t('screen.starting'));
     try {
       screenSession = await openScreenStream(d, canvas, say, stopped);
       canvas.hidden = false;
@@ -2575,13 +2610,13 @@ function screenPanel(d) {
        * between an operator setting two environment variables and an operator
        * filing a ticket. */
       if (e && e.detail && e.detail.remedy) {
-        status.append(el('div', { class: 'screen-remedy' }, 'Remedy: ' + e.detail.remedy));
+        status.append(el('div', { class: 'screen-remedy' }, t('screen.remedy', { remedy: e.detail.remedy })));
       }
     }
   });
 
   closeBtn.addEventListener('click', () => {
-    if (screenSession) screenSession.stop('closed by the operator');
+    if (screenSession) screenSession.stop(t('screen.closedByOperator'));
   });
 
   wireScreenInput(canvas, () => screenSession);
@@ -2631,8 +2666,7 @@ async function openScreenStream(d, canvas, say, onEnd) {
     ended = true;
     ctrl.abort();
     /* NEVER "the lease ended". See the block at the top of this section. */
-    say('info', 'The stream ended (' + why + '). This says nothing about the lease: a screen ' +
-      'session ends bytes, and the device is exactly as leased as it was before.');
+    say('info', t('screen.ended', { why }));
     onEnd();
   };
 
@@ -2648,7 +2682,7 @@ async function openScreenStream(d, canvas, say, onEnd) {
       } catch (e) {
         /* Input failing is not the stream failing, and it is certainly not the
          * lease failing. Say it once and keep the picture. */
-        say('warn', 'Input was not delivered: ' + errText(e));
+        say('warn', t('screen.inputFailed', { err: errText(e) }));
       }
     }
   };
@@ -2720,8 +2754,7 @@ async function pumpScreen(body, canvas, handle, say, end) {
       /* A rotation invalidates the decoder's configuration, so it is rebuilt
        * from the parameter sets the next key frame carries. */
       closeDecoder();
-      say('ok', 'Streaming ' + handle.width + '×' + handle.height +
-        '. Click and drag on the picture; the buttons below send keys.');
+      say('ok', t('screen.streaming', { w: handle.width, h: handle.height }));
       continue;
     }
 
@@ -2950,7 +2983,7 @@ function closeScreenOnDrawerClose() {
   const dlg = $('#dlg-device');
   if (!dlg) return;
   dlg.addEventListener('close', () => {
-    if (screenSession) screenSession.stop('the device drawer was closed');
+    if (screenSession) screenSession.stop(t('screen.closedDrawer'));
   });
 }
 
@@ -3562,6 +3595,7 @@ function wire() {
   // for nobody. See closeScreenOnDrawerClose.
   closeScreenOnDrawerClose();
 
+  wireLanguage();
   wireConfirm();
   wireToken();
 
@@ -3633,4 +3667,37 @@ if (document.readyState === 'loading') {
   document.addEventListener('DOMContentLoaded', boot);
 } else {
   boot();
+}
+
+/* wireLanguage drives the header's language switch.
+ *
+ * The button shows the language it would switch TO, not the one in use. That is
+ * the only label a reader who cannot read the current language can still act on
+ * — the point of the control is to escape a language you do not understand, and
+ * a button labelled in that language would be part of the problem.
+ *
+ * Switching re-renders the whole view rather than reloading the page: a reload
+ * would drop the event stream, the filters, and any drawer that was open, which
+ * turns "I wanted to read this in Portuguese" into "I lost my place". */
+function wireLanguage() {
+  const btn = $('#lang-btn');
+  if (!btn) return;
+
+  const paint = () => { btn.textContent = currentLang() === 'pt' ? 'EN' : 'PT'; };
+  paint();
+
+  btn.addEventListener('click', () => {
+    setLang(currentLang() === 'pt' ? 'en' : 'pt');
+  });
+
+  window.addEventListener('languagechange', () => {
+    paint();
+    /* Everything this app draws itself is redrawn. applyTranslations has already
+     * handled the static HTML; render() handles the DOM built in JS, which is
+     * most of it. A drawer that is open is rebuilt from the row it was opened
+     * with, so its headings follow too — except a live screen, which is
+     * deliberately left alone: re-rendering it would tear down a session and an
+     * encoder on a phone to change a heading. */
+    try { render(); } catch (_) { /* a redraw failure must not strand the switch */ }
+  });
 }

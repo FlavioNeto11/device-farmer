@@ -709,3 +709,26 @@ details summary:focus-visible { outline: 2px solid var(--accent); }
   touch-action: none;
   cursor: crosshair;
 }
+
+/* The language switch.
+ *
+ * Deliberately not styled as an accent or a call to action. It is a preference,
+ * used once and then forgotten, and a control that shouted would compete with
+ * the fleet grid for attention on every page load. Fixed width so the header
+ * does not reflow when the label flips between EN and PT. */
+.lang-btn { min-width: 3.1rem; font-variant-numeric: tabular-nums; letter-spacing: .04em; }
+
+/* NOTHING MAY MAKE THE DOCUMENT SCROLL SIDEWAYS.
+ *
+ * Measured on the Docs view before this rule existed: scrollWidth was 6888px
+ * against a 1920px viewport — one unconstrained table cell, three and a half
+ * screens of horizontal scroll on every view in the app, because the overflow is
+ * a property of the document and not of the page that caused it. Every view
+ * inherited a horizontal scrollbar and drifted sideways under the reader.
+ *
+ * A wide thing scrolls inside its OWN box. That is what the rules below say, and
+ * the min-width:0 is the load-bearing half: a grid or flex child refuses to
+ * shrink below its content by default, so overflow-x on the child does nothing
+ * until its parent is allowed to be narrower than what is inside it. */
+html, body { overflow-x: clip; }
+main, .view, .panel { min-width: 0; }

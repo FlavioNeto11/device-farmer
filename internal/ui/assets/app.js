@@ -2885,6 +2885,9 @@ function wire() {
   closeScreenOnDrawerClose();
 
   wireLanguage();
+  wireDensity();
+  wireRail();
+  wirePageHeads();
   wireConfirm();
   wireToken();
 
@@ -2989,4 +2992,235 @@ function wireLanguage() {
      * encoder on a phone to change a heading. */
     try { render(); } catch (_) { /* a redraw failure must not strand the switch */ }
   });
+}
+
+/* ------------------------------------------------------------------ *
+ * The shell: density, the navigation rail, and the seven page headers
+ * ------------------------------------------------------------------ */
+
+/* wireDensity drives the header's density switch.
+ *
+ * Like the language button beside it, it shows the state it would switch TO,
+ * because a two-state control that shows the state you are already in makes
+ * you press it once to find out what it does.
+ *
+ * Nothing is re-rendered. setDensity writes one attribute on <html> and every
+ * spacing token in tokens.css resolves differently, so the page restyles in
+ * place — keeping scroll position, focus, open dialogs and any command in
+ * flight. That is the whole reason density is a token swap. */
+function wireDensity() {
+  const btn = $('#density-btn');
+  if (!btn) return;
+
+  const paint = () => {
+    const next = currentDensity() === 'compact' ? 'comfortable' : 'compact';
+    const label = next === 'compact' ? t('header.densityCompact') : t('header.densityComfortable');
+    btn.textContent = label;
+    /* The visible word is the destination; the accessible name says what the
+     * word is about and contains it, so speech input can still say the word
+     * that is on screen. */
+    btn.setAttribute('aria-label', t('header.density') + ': ' + label);
+  };
+  paint();
+
+  btn.addEventListener('click', () => {
+    setDensity(currentDensity() === 'compact' ? 'comfortable' : 'compact');
+  });
+  window.addEventListener('densitychange', paint);
+  window.addEventListener('languagechange', paint);
+}
+
+/* NOTHING BELOW THE BOOT BLOCK MAY BE A const.
+ *
+ * This file calls boot() at the point where boot() is defined, which is above
+ * here, and app.js is deferred — so by the time the parser reaches this line
+ * the whole application has already started. A `const` down here is in its
+ * temporal dead zone for the entire run of wire(), and reading it throws
+ * "Cannot access X before initialization" from a file that parses cleanly and
+ * has nothing wrong with it that you can see. Function declarations hoist and
+ * are fine, which is why wireLanguage above works and why the two tables below
+ * are functions rather than the objects they want to be.
+ *
+ * The rail's collapsed state is a reading preference like the language and the
+ * density, so it is stored the same way: localStorage, per browser, never on
+ * the server. */
+function railKey() { return 'device-farmer.rail'; }
+
+function initialRail() {
+  try {
+    const saved = localStorage.getItem(railKey());
+    if (saved === 'collapsed' || saved === 'open') return saved;
+  } catch (_) { /* private mode: fall through to the window's own width */ }
+  /* Nothing stored yet. On a narrow window 240px of menu is a quarter of the
+   * page spent saying where you are rather than showing what you came for, so
+   * the first visit there starts with the icons. A choice, once made, outranks
+   * this forever — including on the same narrow window. */
+  return window.matchMedia('(max-width: 1100px)').matches ? 'collapsed' : 'open';
+}
+
+function wireRail() {
+  const btn = $('#rail-toggle');
+  if (!btn) return;
+
+  /* The state, kept here rather than read back out of the attribute it was
+   * written to. index.html ships aria-expanded="true" and the expanded label
+   * because the markup cannot know what this browser chose; both are corrected
+   * by the first apply() below, which runs before the page is interactive. */
+  let state_ = 'open';
+
+  const apply = (next) => {
+    state_ = next;
+    document.documentElement.setAttribute('data-rail', next);
+    const collapsed = next === 'collapsed';
+    btn.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+    /* The label names what pressing it DOES, and it is the button's only name:
+     * the icon inside is aria-hidden. */
+    const label = collapsed ? t('nav.expand') : t('nav.collapse');
+    btn.setAttribute('aria-label', label);
+    btn.title = label;
+
+    /* A collapsed tab still HAS its name — the label is clipped to the screen
+     * reader, not removed — but a mouse cannot read a clipped label, so the
+     * name is also hung on the tab as a tooltip for exactly as long as it is
+     * invisible. Expanded, the tooltip would only repeat the word next to the
+     * pointer, so it is taken off again. */
+    for (const tab of $$('.rail-nav .tab')) {
+      const label2 = $('.tab-label', tab);
+      if (collapsed && label2) tab.title = label2.textContent;
+      else tab.removeAttribute('title');
+    }
+  };
+  /* At phone width the rail starts collapsed whatever is stored: 240px of menu
+   * on a 390px screen is two thirds of the page spent on navigation. This
+   * decides the state at load and again whenever the window crosses the
+   * boundary — an operator who then presses the toggle still gets what they
+   * pressed, on any width, and the stored choice is never overwritten by the
+   * window. */
+  const tooNarrow = window.matchMedia('(max-width: 640px)');
+  const settle = () => apply(tooNarrow.matches ? 'collapsed' : initialRail());
+  settle();
+  tooNarrow.addEventListener('change', settle);
+
+  btn.addEventListener('click', () => {
+    const next = state_ === 'collapsed' ? 'open' : 'collapsed';
+    try { localStorage.setItem(railKey(), next); } catch (_) { /* not fatal */ }
+    apply(next);
+  });
+
+  /* The labels are language, so they are repainted in the new one. */
+  window.addEventListener('languagechange', () => apply(state_));
+}
+
+/* THE PAGE HEADERS.
+ *
+ * Each view now says what it is for before it shows anything. The product
+ * already did this in two places — the Leases axiom and the hint paragraphs —
+ * and everywhere else assumed the reader already knew what a lease, a rung or
+ * a bulk run was. A lede here is a true sentence that teaches; it is not a
+ * label that repeats the tab you just pressed.
+ *
+ * The copy is in i18n.js under page.<view>.*, read through literal t() calls so
+ * that TestEveryKeyTheAppAsksForExists can see every one of them. A computed
+ * key would be invisible to that test and would render as its own name on
+ * screen the day somebody renamed it. */
+function pageCopy() {
+  return {
+    fleet:    { title: t('page.fleet.title'),    lede: t('page.fleet.lede'),    action: t('page.fleet.action') },
+    leases:   { title: t('page.leases.title'),   lede: t('page.leases.lede'),   action: t('page.leases.action') },
+    jobs:     { title: t('page.jobs.title'),     lede: t('page.jobs.lede'),     action: t('page.jobs.action') },
+    recovery: { title: t('page.recovery.title'), lede: t('page.recovery.lede'), action: t('page.recovery.action') },
+    bulk:     { title: t('page.bulk.title'),     lede: t('page.bulk.lede'),     action: t('page.bulk.action') },
+    events:   { title: t('page.events.title'),   lede: t('page.events.lede'),   action: t('page.events.action') },
+    docs:     { title: t('page.docs.title'),     lede: t('page.docs.lede'),     action: t('page.docs.action') }
+  };
+}
+
+/* One action per view, and each one is the thing that view exists to start.
+ *
+ * `needs` is a selector the action depends on: the two jump actions point at
+ * forms that belong to the Jobs and Bulk views, not to this shell. Those views
+ * are being redrawn by other hands, and if a form is renamed or replaced the
+ * header renders no button at all rather than one that silently does nothing —
+ * a dead control is worse than a missing one, because it teaches an operator
+ * that pressing things here does not work. The five recheck actions need
+ * nothing outside this file and carry no guard. */
+function pageActions() {
+  return {
+    fleet:    { style: 'ghost',   run: () => recheck('fleet') },
+    leases:   { style: 'ghost',   run: () => recheck('leases') },
+    jobs:     { style: 'primary', needs: '#job-form',  run: () => jumpToForm('#job-form', '#job-pool') },
+    recovery: { style: 'ghost',   run: () => recheck('recovery') },
+    bulk:     { style: 'primary', needs: '#bulk-form', run: () => jumpToForm('#bulk-form', '#bulk-command') },
+    events:   { style: 'ghost',   run: () => recheck('events') },
+    docs:     { style: 'ghost',   run: () => recheck('docs') }
+  };
+}
+
+/* recheck refetches one view and SAYS SO.
+ *
+ * loadFor on its own is silent, and a page whose data has not changed since
+ * the last fetch looks identical afterwards — so the button reads as broken to
+ * the one operator most likely to press it, the one who is not sure the screen
+ * in front of them is current. The header's Refresh has said this in a banner
+ * since it was written; this is the same sentence for one view. The key
+ * replaces the previous copy rather than stacking, because pressing it three
+ * times is one piece of news. */
+function recheck(view) {
+  loadFor(view);
+  banner('info', t('page.rechecking'), { key: 'page-recheck' });
+}
+
+/* jumpToForm brings a side form into view and puts the cursor in it. The form
+ * is beside the main column on a wide window and below it on a narrow one,
+ * which is exactly the case where somebody does not find it at all.
+ *
+ * The offset is the point of this function. scrollIntoView puts the form's top
+ * edge at y=0, which is UNDER the sticky top bar — the form's own heading and
+ * its first label disappear behind it, and focus({preventScroll: true}) then
+ * suppresses the browser's own correction. style.css fixes the same thing for
+ * the docs page with scroll-margin-top; here the bar's height is measured
+ * instead, because it changes with the density and with how far the top bar
+ * has wrapped. */
+function jumpToForm(formSel, fieldSel) {
+  const form = $(formSel);
+  if (!form) return;
+
+  const bar = $('.top');
+  const clear = (bar ? bar.getBoundingClientRect().height : 0) + 12;
+  const y = form.getBoundingClientRect().top + window.scrollY - clear;
+  const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  window.scrollTo({ top: Math.max(0, y), behavior: reduce ? 'auto' : 'smooth' });
+
+  const field = $(fieldSel);
+  if (field) field.focus({ preventScroll: true });
+}
+
+function mountPageHeads() {
+  const copy = pageCopy();
+  const actions = pageActions();
+  for (const view of VIEWS) {
+    const sec = $('#view-' + view);
+    const words = copy[view];
+    if (!sec || !words) continue;
+
+    const old = $('.page-head', sec);
+    if (old) old.remove();
+
+    const act = actions[view];
+    const actionable = act && (!act.needs || $(act.needs));
+
+    sec.prepend(el('div', { class: 'page-head' },
+      el('div', { class: 'page-head-text' },
+        el('h1', { class: 'page-title' }, words.title),
+        el('p', { class: 'page-lede' }, words.lede)),
+      actionable
+        ? el('div', { class: 'page-actions' },
+          el('button', { type: 'button', class: act.style, onclick: act.run }, words.action))
+        : null));
+  }
+}
+
+function wirePageHeads() {
+  mountPageHeads();
+  window.addEventListener('languagechange', mountPageHeads);
 }

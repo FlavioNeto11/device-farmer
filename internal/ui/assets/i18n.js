@@ -177,7 +177,13 @@ const STRINGS = {
     'exec.cat.topOnce.label': 'Top processes, once',
     'exec.cat.topOnce.why': 'A single non-interactive top, so it returns instead of streaming forever.',
     /* Header and navigation */
-    'app.name': 'device-farmer',
+    /* The masthead. "device-farmer" is the repository, the binary and the
+     * database owner; it is not what a business calls the thing its fleet runs
+     * on. The product name is capitalised like a product and the line under it
+     * says what the page is for. Neither is a customer's name: this file has
+     * no way to know one. */
+    'app.name': 'Device Farmer',
+    'app.role': 'Operations console',
     'app.skip': 'Skip to content',
     'nav.views': 'Views',
     'nav.fleet': 'Fleet',
@@ -195,6 +201,53 @@ const STRINGS = {
     'header.tokenTitle': 'Set the bearer token this browser sends to the API',
     'header.language': 'Language',
     'header.languageTitle': 'Read this dashboard in English or Portuguese',
+    'header.density': 'Density',
+    'header.densityTitle': 'Fit more on the screen, or give it more room to read',
+    'header.densityComfortable': 'Comfortable',
+    'header.densityCompact': 'Compact',
+
+    /* The navigation rail. The groups are named for what an operator is doing,
+     * not for which endpoint each view calls. */
+    'nav.group.operations': 'Operations',
+    'nav.group.maintenance': 'Maintenance',
+    'nav.group.help': 'Help',
+    'nav.collapse': 'Collapse the menu',
+    'nav.expand': 'Expand the menu',
+
+    /* The per-view page headers.
+     *
+     * A lede is a true sentence that teaches, not a label that repeats the tab
+     * it is under. The model is the Leases axiom in index.html and the "this
+     * device is free" paragraph in device.js: say what the view is for, and say
+     * the one thing a newcomer would otherwise get wrong.
+     *
+     * The titles are their own keys and not the nav labels, even where the two
+     * read the same today. A rail label has to survive a 240px column and a
+     * page title does not — "Bulk" against "Bulk runs" is already the
+     * difference — and tying them together would mean the shorter constraint
+     * decided both. */
+    'page.fleet.title': 'Fleet',
+    'page.fleet.lede': 'Every device this farm can see, grouped by the host and the hub it is plugged into. Health is what the watchdog last measured — a healthy device can be busy, and an offline one can still be held.',
+    'page.fleet.action': 'Recheck the fleet',
+    'page.leases.title': 'Leases',
+    'page.leases.lede': 'Who is holding which device, and until when. A lease is a claim on a device rather than a statement about its health, and this is the page to read before you take anything back from anyone.',
+    'page.leases.action': 'Recheck the leases',
+    'page.jobs.title': 'Jobs',
+    'page.jobs.lede': 'Work waiting for a device, work running on one, and what each step printed. Submitting a job asks the control plane for a device that matches what you described; you never pick the handset yourself.',
+    'page.jobs.action': 'Submit a job',
+    'page.recovery.title': 'Recovery',
+    'page.recovery.lede': 'Where a device that stopped answering gets its chances, and where you can see whether they worked. Nothing on this page ends a lease: recovery acts on behalf of whoever is holding the device, never instead of them.',
+    'page.recovery.action': 'Recheck recovery',
+    'page.bulk.title': 'Bulk runs',
+    'page.bulk.lede': 'One command, many devices, and one record of what each of them answered. It is the page for a question you would otherwise have to ask one device at a time.',
+    'page.bulk.action': 'Start a run',
+    'page.events.title': 'Events',
+    'page.events.lede': 'What the control plane and the operators did, newest first. It is the record to reach for when somebody asks why a device changed hands, and the server writes it — not this page.',
+    'page.events.action': 'Load the newest entries',
+    'page.docs.title': 'Documentation',
+    'page.docs.lede': 'Help for whoever is on shift. It explains the words the other six pages use — a lease, a rung, a fence — and it describes this deployment rather than the product in general.',
+    'page.docs.action': 'Recheck what this farm can do',
+    'page.rechecking': 'Asking the API for this page again.',
 
     /* Connection state. These are about THIS page's connection to the API and
      * say nothing about any lease — see conn.downNote. */
@@ -483,7 +536,10 @@ const STRINGS = {
     'exec.cat.topOnce.label': 'Processos mais pesados, uma vez',
     'exec.cat.topOnce.why': 'Um top único e não interativo, para que ele termine em vez de transmitir para sempre.',
     /* Cabeçalho e navegação */
-    'app.name': 'device-farmer',
+    /* O cabeçalho da marca. Veja a nota no dicionário em inglês: o nome do
+     * produto não é o nome do repositório. */
+    'app.name': 'Device Farmer',
+    'app.role': 'Console de operações',
     'app.skip': 'Ir para o conteúdo',
     'nav.views': 'Visões',
     'nav.fleet': 'Frota',
@@ -501,6 +557,47 @@ const STRINGS = {
     'header.tokenTitle': 'Definir o bearer token que este navegador envia à API',
     'header.language': 'Idioma',
     'header.languageTitle': 'Ler este painel em inglês ou português',
+    'header.density': 'Densidade',
+    'header.densityTitle': 'Caber mais na tela, ou dar mais espaço para ler',
+    'header.densityComfortable': 'Confortável',
+    'header.densityCompact': 'Compacto',
+
+    /* A barra de navegação. Os grupos têm o nome do que o operador está
+     * fazendo, não do endpoint que cada visão chama. */
+    'nav.group.operations': 'Operação',
+    'nav.group.maintenance': 'Manutenção',
+    'nav.group.help': 'Ajuda',
+    'nav.collapse': 'Recolher o menu',
+    'nav.expand': 'Expandir o menu',
+
+    /* Os cabeçalhos de cada visão.
+     *
+     * Um lide é uma frase verdadeira que ensina, não um rótulo que repete a
+     * aba acima dele. O modelo é o axioma das leases no index.html e o
+     * parágrafo “este dispositivo está livre” do device.js: dizer para que
+     * serve a visão, e dizer a única coisa que um recém-chegado erraria. */
+    'page.fleet.title': 'Frota',
+    'page.fleet.lede': 'Todo dispositivo que esta fazenda enxerga, agrupado pelo host e pelo hub em que está conectado. Saúde é o que o watchdog mediu por último — um dispositivo saudável pode estar ocupado, e um offline ainda pode estar preso a uma lease.',
+    'page.fleet.action': 'Reconferir a frota',
+    'page.leases.title': 'Leases',
+    'page.leases.lede': 'Quem está segurando qual dispositivo, e até quando. Uma lease é uma reivindicação sobre o dispositivo, não uma afirmação sobre a saúde dele, e esta é a página para ler antes de tomar qualquer coisa de volta de alguém.',
+    'page.leases.action': 'Reconferir as leases',
+    'page.jobs.title': 'Jobs',
+    'page.jobs.lede': 'Trabalho esperando por um dispositivo, trabalho rodando em um, e o que cada passo imprimiu. Enviar um job pede ao control plane um dispositivo que combine com o que você descreveu; você nunca escolhe o aparelho na mão.',
+    'page.jobs.action': 'Enviar um job',
+    'page.recovery.title': 'Recuperação',
+    'page.recovery.lede': 'Onde um dispositivo que parou de responder ganha suas chances, e onde dá para ver se elas funcionaram. Nada nesta página encerra uma lease: a recuperação age em nome de quem segura o dispositivo, nunca no lugar dele.',
+    'page.recovery.action': 'Reconferir a recuperação',
+    'page.bulk.title': 'Execuções em massa',
+    'page.bulk.lede': 'Um comando, muitos dispositivos, e um registro do que cada um respondeu. É a página para uma pergunta que você teria de fazer a um dispositivo de cada vez.',
+    'page.bulk.action': 'Iniciar uma execução',
+    'page.events.title': 'Eventos',
+    'page.events.lede': 'O que o control plane e os operadores fizeram, do mais recente para o mais antigo. É o registro a consultar quando alguém pergunta por que um dispositivo trocou de mãos, e quem escreve é o servidor — não esta página.',
+    'page.events.action': 'Carregar as entradas mais recentes',
+    'page.docs.title': 'Documentação',
+    'page.docs.lede': 'Ajuda para quem está de plantão. Explica as palavras que as outras seis páginas usam — lease, degrau, fence — e descreve este deployment, não o produto em geral.',
+    'page.docs.action': 'Reconferir o que esta fazenda faz',
+    'page.rechecking': 'Pedindo esta página à API de novo.',
 
     /* Estado da conexão. É sobre a conexão DESTA página com a API e não diz
      * nada sobre nenhuma lease — veja conn.downNote. */

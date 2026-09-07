@@ -36,49 +36,149 @@
 <body>
 <a class="skip" href="#main" data-i18n="app.skip">Skip to content</a>
 
-<header class="top">
-  <div class="brand">
-    <span class="brand-mark" aria-hidden="true">▚</span>
-    <span class="brand-name">device-farmer</span>
-  </div>
+<!-- THE SHELL: a navigation rail beside one content column.
+     ==========================================================================
+     Everything below the rail — the top bar, the banner strip and <main> — is
+     one column, so that the width the reading content is allowed to take is
+     decided in ONE place (shell.css, var(--page-max)) rather than by whatever
+     monitor the operator happens to own. A table stretched to 2560px is not
+     more information; it is the same information further apart.
 
-  <nav class="tabs" role="tablist" aria-label="Views" data-i18n-attr="aria-label:nav.views">
-    <button class="tab" role="tab" id="tab-fleet"    data-view="fleet"    aria-controls="view-fleet"    aria-selected="true"><span class="key" aria-hidden="true">1</span><span data-i18n="nav.fleet">Fleet</span></button>
-    <button class="tab" role="tab" id="tab-leases"   data-view="leases"   aria-controls="view-leases"   aria-selected="false"><span class="key" aria-hidden="true">2</span><span data-i18n="nav.leases">Leases</span></button>
-    <button class="tab" role="tab" id="tab-jobs"     data-view="jobs"     aria-controls="view-jobs"     aria-selected="false"><span class="key" aria-hidden="true">3</span><span data-i18n="nav.jobs">Jobs</span></button>
-    <button class="tab" role="tab" id="tab-recovery" data-view="recovery" aria-controls="view-recovery" aria-selected="false"><span class="key" aria-hidden="true">4</span><span data-i18n="nav.recovery">Recovery</span></button>
-    <button class="tab" role="tab" id="tab-bulk"     data-view="bulk"     aria-controls="view-bulk"     aria-selected="false"><span class="key" aria-hidden="true">5</span><span data-i18n="nav.bulk">Bulk</span></button>
-    <button class="tab" role="tab" id="tab-events"   data-view="events"   aria-controls="view-events"   aria-selected="false"><span class="key" aria-hidden="true">6</span><span data-i18n="nav.events">Events</span></button>
-    <button class="tab" role="tab" id="tab-docs"     data-view="docs"     aria-controls="view-docs"     aria-selected="false"><span class="key" aria-hidden="true">7</span><span data-i18n="nav.docs">Docs</span></button>
-  </nav>
+     The seven views are still shown and hidden with the `hidden` attribute and
+     the tab contract below is unchanged: role, aria-controls, aria-selected,
+     data-view and the 1-7 shortcuts all still mean what app.js thinks they
+     mean. Only where they sit on screen changed.
 
-  <div class="search">
-    <label class="sr-only" for="q" data-i18n="header.searchLabel">Search devices, hosts, jobs and holders</label>
-    <input id="q" type="search" placeholder="Search  ( / )" autocomplete="off" spellcheck="false"
-           data-i18n-attr="placeholder:header.searchPlaceholder">
-  </div>
+     The inline SVG is markup rather than a sprite, an icon font or a fetch:
+     the page is served under a CSP with no external origins, and an icon that
+     needs a network request is an icon that is sometimes not there. -->
+<div class="shell">
 
-  <button id="refresh" class="ghost" title="Refetch every view now"
-          data-i18n="header.refresh" data-i18n-attr="title:header.refreshTitle">Refresh</button>
-  <button id="token-btn" class="ghost" title="Set the bearer token this browser sends to the API"
-          data-i18n="header.token" data-i18n-attr="title:header.tokenTitle">Token</button>
+  <!-- The rail. Grouped by what an operator is DOING — running the farm, or
+       repairing it — rather than by which endpoint each view happens to call.
+       Docs is pinned to the bottom because help is not step seven of a task.
 
-  <!-- The language switch. A two-state control rather than a select, because
-       there are two languages and a select would cost a click to discover
-       that. It shows the language it would switch TO, which is the thing a
-       reader who cannot read the current one can still recognise. -->
-  <button id="lang-btn" class="ghost lang-btn"
-          data-i18n-attr="title:header.languageTitle aria-label:header.language">PT</button>
+       A plain div and not an aside: aside is the `complementary` landmark,
+       which announces the primary navigation of a page as content off to one
+       side of it. The tab strip's own semantics are on the tablist inside. -->
+  <div class="rail" id="rail">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor" focusable="false">
+          <rect x="2" y="6" width="5" height="14" rx="1.6"/>
+          <rect x="9.5" y="3" width="5" height="18" rx="1.6"/>
+          <rect x="17" y="8.5" width="5" height="9.5" rx="1.6"/>
+        </svg>
+      </span>
+      <span class="brand-text">
+        <span class="brand-name" data-i18n="app.name">Device Farmer</span>
+        <span class="brand-role" data-i18n="app.role">Operations console</span>
+      </span>
+    </div>
 
-  <div id="conn" class="conn conn-connecting" role="status" aria-live="polite">
-    <span class="dot" aria-hidden="true"></span>
-    <span id="conn-text">connecting</span>
-  </div>
-</header>
+    <nav class="rail-nav" role="tablist" aria-orientation="vertical" aria-label="Views" data-i18n-attr="aria-label:nav.views">
+      <!-- The group name is said twice, once for each kind of reader, and
+           neither copy is a heading. A tablist owns tabs; a heading inside one
+           is outside that contract, and three <h2>s in the rail would also come
+           before the <h1> of the page they lead to — a document whose first
+           heading is level two and whose second is level one. So: the wrapper
+           carries the name for assistive technology, and the visible label is
+           decoration that repeats it. -->
+      <div class="nav-group" role="group" aria-label="Operations" data-i18n-attr="aria-label:nav.group.operations">
+        <span class="nav-group-h" aria-hidden="true" data-i18n="nav.group.operations">Operations</span>
+        <button class="tab" role="tab" id="tab-fleet" data-view="fleet" aria-controls="view-fleet" aria-selected="true">
+          <svg class="tab-icon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>
+          <span class="tab-label" data-i18n="nav.fleet">Fleet</span>
+          <span class="key" aria-hidden="true">1</span>
+        </button>
+        <button class="tab" role="tab" id="tab-leases" data-view="leases" aria-controls="view-leases" aria-selected="false">
+          <svg class="tab-icon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><circle cx="8" cy="15.5" r="3.4"/><path d="M10.6 13.1 20 3.7M16.8 6.9l2.6 2.6M14.2 9.5l2.6 2.6"/></svg>
+          <span class="tab-label" data-i18n="nav.leases">Leases</span>
+          <span class="key" aria-hidden="true">2</span>
+        </button>
+        <button class="tab" role="tab" id="tab-jobs" data-view="jobs" aria-controls="view-jobs" aria-selected="false">
+          <svg class="tab-icon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M4 6h16M4 11.5h9M4 17h6"/><path d="M15.5 13.5 21 16.8l-5.5 3.2z"/></svg>
+          <span class="tab-label" data-i18n="nav.jobs">Jobs</span>
+          <span class="key" aria-hidden="true">3</span>
+        </button>
+      </div>
 
-<div id="banners" class="banners" role="status" aria-live="polite" aria-atomic="false"></div>
+      <div class="nav-group" role="group" aria-label="Maintenance" data-i18n-attr="aria-label:nav.group.maintenance">
+        <span class="nav-group-h" aria-hidden="true" data-i18n="nav.group.maintenance">Maintenance</span>
+        <button class="tab" role="tab" id="tab-recovery" data-view="recovery" aria-controls="view-recovery" aria-selected="false">
+          <svg class="tab-icon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M20.5 12a8.5 8.5 0 1 1-2.7-6.2"/><path d="M20.5 3.5v5h-5"/></svg>
+          <span class="tab-label" data-i18n="nav.recovery">Recovery</span>
+          <span class="key" aria-hidden="true">4</span>
+        </button>
+        <button class="tab" role="tab" id="tab-bulk" data-view="bulk" aria-controls="view-bulk" aria-selected="false">
+          <svg class="tab-icon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M12 3 3 7.6l9 4.6 9-4.6z"/><path d="M3 12.6 12 17.2l9-4.6"/><path d="M3 17.4 12 22l9-4.6"/></svg>
+          <span class="tab-label" data-i18n="nav.bulk">Bulk</span>
+          <span class="key" aria-hidden="true">5</span>
+        </button>
+        <button class="tab" role="tab" id="tab-events" data-view="events" aria-controls="view-events" aria-selected="false">
+          <svg class="tab-icon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><circle cx="12" cy="12" r="8.7"/><path d="M12 6.8V12l3.6 2.1"/></svg>
+          <span class="tab-label" data-i18n="nav.events">Events</span>
+          <span class="key" aria-hidden="true">6</span>
+        </button>
+      </div>
 
-<main id="main" tabindex="-1">
+      <div class="nav-group nav-group-help" role="group" aria-label="Help" data-i18n-attr="aria-label:nav.group.help">
+        <span class="nav-group-h" aria-hidden="true" data-i18n="nav.group.help">Help</span>
+        <button class="tab" role="tab" id="tab-docs" data-view="docs" aria-controls="view-docs" aria-selected="false">
+          <svg class="tab-icon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M4.5 5.5A2.5 2.5 0 0 1 7 3h13v15H7a2.5 2.5 0 0 0-2.5 2.5z"/><path d="M8 7.5h8M8 11h6"/></svg>
+          <span class="tab-label" data-i18n="nav.docs">Docs</span>
+          <span class="key" aria-hidden="true">7</span>
+        </button>
+      </div>
+    </nav>
+  </div><!-- .rail -->
+
+  <div class="col">
+
+    <header class="top">
+      <div class="top-inner">
+        <button id="rail-toggle" class="ghost icon-btn" aria-expanded="true" aria-controls="rail"
+                aria-label="Collapse the menu" data-i18n-attr="aria-label:nav.collapse title:nav.collapse">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><rect x="3" y="4.5" width="18" height="15" rx="2"/><path d="M9.5 4.5v15"/></svg>
+        </button>
+
+        <div class="search">
+          <label class="sr-only" for="q" data-i18n="header.searchLabel">Search devices, hosts, jobs and holders</label>
+          <input id="q" type="search" placeholder="Search  ( / )" autocomplete="off" spellcheck="false"
+                 data-i18n-attr="placeholder:header.searchPlaceholder">
+        </div>
+
+        <div class="top-actions">
+          <div id="conn" class="conn conn-connecting" role="status" aria-live="polite">
+            <span class="dot" aria-hidden="true"></span>
+            <span id="conn-text">connecting</span>
+          </div>
+
+          <!-- The density switch. Two states, like the language switch beside
+               it, and for the same reason: there are two, and a select would
+               cost a click to discover that. It shows the density it would
+               switch TO. What it actually does is written in tokens.css. -->
+          <button id="density-btn" class="ghost density-btn"
+                  data-i18n-attr="title:header.densityTitle">Compact</button>
+
+          <!-- The language switch. A two-state control rather than a select, because
+               there are two languages and a select would cost a click to discover
+               that. It shows the language it would switch TO, which is the thing a
+               reader who cannot read the current one can still recognise. -->
+          <button id="lang-btn" class="ghost lang-btn"
+                  data-i18n-attr="title:header.languageTitle aria-label:header.language">PT</button>
+
+          <button id="refresh" class="ghost" title="Refetch every view now"
+                  data-i18n="header.refresh" data-i18n-attr="title:header.refreshTitle">Refresh</button>
+          <button id="token-btn" class="ghost" title="Set the bearer token this browser sends to the API"
+                  data-i18n="header.token" data-i18n-attr="title:header.tokenTitle">Token</button>
+        </div>
+      </div>
+    </header>
+
+    <div id="banners" class="banners" role="status" aria-live="polite" aria-atomic="false"></div>
+
+    <main id="main" tabindex="-1">
 
   <!-- ================= FLEET ================= -->
   <section id="view-fleet" class="view" role="tabpanel" aria-labelledby="tab-fleet" tabindex="-1">
@@ -306,7 +406,9 @@
     <div id="events-body" class="panel-body" aria-busy="true"></div>
   </section>
 
-</main>
+    </main>
+  </div><!-- .col -->
+</div><!-- .shell -->
 
 <!-- Confirm-with-reason. Every destructive operator action goes through here:
      it names exactly what will be disturbed, asks for a reason for the audit

@@ -732,3 +732,29 @@ details summary:focus-visible { outline: 2px solid var(--accent); }
  * until its parent is allowed to be narrower than what is inside it. */
 html, body { overflow-x: clip; }
 main, .view, .panel { min-width: 0; }
+
+/* .tscroll is the box a wide table scrolls inside.
+ *
+ * docs.js has wrapped every table in this class since it was written, and the
+ * class had NO RULE ANYWHERE. That was survivable while the document itself
+ * scrolled sideways — ugly, and the table was at least reachable.
+ *
+ * It stopped being survivable the moment html/body got `overflow-x: clip`
+ * above: clipping the document without giving the wide thing its own scroller
+ * turns "you can reach this awkwardly" into "you cannot reach this at all",
+ * which is a worse page than the one that was being fixed. The two rules are
+ * one change and must never be separated.
+ *
+ * min-width: 0 is the load-bearing half. A grid or flex child refuses to shrink
+ * below its content, so overflow-x on the box does nothing until the box is
+ * allowed to be narrower than the table inside it. */
+.tscroll {
+  overflow-x: auto;
+  max-width: 100%;
+  min-width: 0;
+  /* A scrollbar that only appears on hover is a scrollbar a reader does not
+     know is there. This one is always visible when it is needed, because the
+     alternative is a table that silently hides its last four columns. */
+  scrollbar-gutter: stable;
+}
+.tscroll > table { min-width: max-content; }

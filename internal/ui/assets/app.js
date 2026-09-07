@@ -131,14 +131,27 @@ function fmtRel(v) {
   else if (s < 3600) out = Math.round(s / 60) + 'm';
   else if (s < 86400) out = Math.floor(s / 3600) + 'h' + (Math.round((s % 3600) / 60) || '') + (Math.round((s % 3600) / 60) ? 'm' : '');
   else out = Math.floor(s / 86400) + 'd' + (Math.floor((s % 86400) / 3600) || '') + (Math.floor((s % 86400) / 3600) ? 'h' : '');
-  return ago ? out + ' ago' : 'in ' + out;
+  // The unit letters are not translated — s, m, h, d are read as symbols and a
+  // translated one would not line up down a column. The direction is a word,
+  // and a word that says "ago" to a Portuguese reader is a word they have to
+  // stop and translate on a page that is otherwise theirs.
+  return ago ? t('time.ago', { v: out }) : t('time.in', { v: out });
+}
+
+/* tookSub is the "and how long did it take" second line, derived rather than
+ * read: three tables get it from a start and a finish instant and none of them
+ * gets a duration from the API. It answers null when either end is missing, so
+ * csub drops the line rather than printing a dash next to a word. */
+function tookSub(startedAt, finishedAt) {
+  const s = parseTime(startedAt), f = parseTime(finishedAt);
+  return csub(t('sub.took'), s && f ? fmtSecs((f - s) / 1000) : null);
 }
 
 /* timeCell shows the relative distance, which is what an operator reads, with
  * the exact server instant on hover and in the accessible name. */
 function timeCell(v, cls) {
   const d = parseTime(v);
-  if (!d) return el('span', { class: 'chip chip-plain', title: 'not reported by the API' }, '—');
+  if (!d) return el('span', { class: 'chip chip-plain', title: t('word.notReported') }, '—');
   return el('time', { class: cls || null, datetime: d.toISOString(), title: fmtAbs(v) + '  (' + d.toLocaleString() + ')' }, fmtRel(v));
 }
 
@@ -1225,6 +1238,38 @@ function emptyAction(label, onclick) {
   return el('button', { class: 'mini primary', type: 'button', onclick }, label);
 }
 
+/* cstack and csub are how four tables lost twenty-two columns between them
+ * without losing a single value.
+ *
+ * The Jobs table was fifteen columns and wanted 1182px inside an 897px panel on
+ * an ordinary 1280px laptop: Created, Started, Finished, By and the Cancel
+ * button were reachable only by scrolling a table sideways inside a page that
+ * does not scroll, which is a fine way to hide five columns from anybody who
+ * does not already know they are there.
+ *
+ * The observation that fixes it is that half of those columns were never
+ * scanned down. Nobody reads the "created by" column of a job table; they read
+ * it about ONE job, the one they have already found. A value like that does not
+ * need a column of its own — it needs to be next to the thing that identifies
+ * the row. So the identifier goes on the first line and its qualifiers go
+ * underneath, each with its own name so the second line is never a bare value
+ * whose meaning has to be guessed from its shape.
+ *
+ * The rule for which is which: if you would sort or filter by it, it is a
+ * column. If you would only read it after you had found the row, it is a sub. */
+function cstack(primary, ...subs) {
+  return el('div', { class: 'cstack' }, primary, subs);
+}
+
+function csub(label, value, title) {
+  if (value === null || value === undefined || value === '') return null;
+  // The value is wrapped so it — and never the label — is the part that
+  // ellipsises when the column is tight, and so that a cut value still says
+  // what it was on hover.
+  return el('span', { class: 'csub', title: title || (typeof value === 'string' ? value : null) },
+    el('span', { class: 'clab' }, label), el('span', { class: 'cval' }, value));
+}
+
 /* panelState renders the honest not-yet / failed / nothing-there states so no
  * view is ever silently blank. */
 function panelState(key, rows, empty) {
@@ -1284,9 +1329,8 @@ function truncChip(key, narrow) {
   if (!state.truncated[key]) return null;
   return el('span', {
     class: 'chip chip-degraded',
-    title: 'the server capped this response. ' + narrow +
-      ' Everything counted here counts only the rows that came back, not the farm.'
-  }, el('span', { 'aria-hidden': 'true' }, '▲'), 'truncated by the server');
+    title: t('trunc.title') + ' ' + narrow + ' ' + t('trunc.tail')
+  }, el('span', { 'aria-hidden': 'true' }, '▲'), t('trunc.chip'));
 }
 
 function deviceLabel(deviceID, fallbackRack) {
@@ -1329,11 +1373,11 @@ function renderLeases() {
       // A protected suspect lease is the one the reaper will never take: it
       // waits for a human. That number is worth its own badge.
       state.data.protectedSuspect
-        ? el('span', { class: 'chip chip-protected', title: 'protected and suspect: the reaper will not reclaim these; a human is expected to look' },
-          el('span', { 'aria-hidden': 'true' }, '★'), 'protected suspect ' + state.data.protectedSuspect)
+        ? el('span', { class: 'chip chip-protected', title: t('leases.protectedSuspectTitle') },
+          el('span', { 'aria-hidden': 'true' }, '★'), t('leases.protectedSuspect') + ' ' + state.data.protectedSuspect)
         : null,
       el('span', { class: 'count' }, t('fleet.showing') + ' ', el('b', null, String(rows.length))),
-      truncChip('leases', 'Pick a single lease state to see the rest.')
+      truncChip('leases', t('leases.narrow'))
     ]);
   }
 
@@ -1357,31 +1401,56 @@ function renderLeases() {
   if (problem) { body.replaceChildren(problem); return; }
 
   body.setAttribute('aria-busy', 'false');
+  /* NINE COLUMNS, DOWN FROM TWELVE.
+   *
+   * Five of the twelve were instants — acquired, heartbeat, expires,
+   * reclaimable, witness — laid out as five columns of "3m ago" that an
+   * operator reads in pairs: when did this start and is the holder still
+   * talking; when does it turn suspect and when may the reaper act. So they
+   * are two cells of a pair each, plus witness, which is the odd one because
+   * most leases have none. Tenant joins the holder it belongs to and the queue
+   * joins the job. Nothing left the page. */
   body.replaceChildren(table([
     {
-      label: 'State', cell: (l) => {
+      label: t('col.state'), cell: (l) => {
         const chips = [el('span', { class: 'chip chip-' + (l.state === 'suspect' ? 'suspect' : l.state === 'held' ? 'held' : 'plain') },
           el('span', { 'aria-hidden': 'true' }, l.state === 'suspect' ? '◐' : l.state === 'held' ? '●' : '○'), l.state)];
         if (l.protected) chips.push(el('span', { class: 'chip chip-protected' }, el('span', { 'aria-hidden': 'true' }, '★'), 'protected'));
         if (l.state === 'suspect') {
-          chips.push(el('span', { class: 'chip chip-plain', title: 'suspect is an alerting state only' }, 'holder not visible'));
+          chips.push(el('span', { class: 'chip chip-plain', title: t('leases.suspectAlertOnly') }, t('leases.holderNotVisible')));
         }
         return el('span', { class: 'chips' }, chips);
       }
     },
-    { label: termLabel('fence', 'Fence'), cls: 'num', cell: (l) => (l.fence === undefined ? '—' : String(l.fence)) },
-    { label: 'Device', cell: (l) => deviceLabel(l.deviceID, l.rackSlot) },
-    { label: 'Job', cls: 'mono', cell: (l) => el('span', { title: String(l.jobID || '') }, shortId(l.jobID) || '—') },
-    { label: 'Tenant', cell: (l) => l.tenant || '—' },
-    { label: 'Holder', cls: 'mono', cell: (l) => el('span', { class: 'trunc', title: (l.holder || '') + ' — audit only; the holder name confers no ownership' }, l.holder || '—') },
-    { label: 'Acquired', cell: (l) => timeCell(l.acquiredAt) },
-    { label: 'Heartbeat', cell: (l) => timeCell(l.heartbeatAt) },
-    { label: 'Expires', cell: (l) => timeCell(l.expiresAt) },
-    { label: 'Reclaimable', cell: (l) => timeCell(l.reclaimableAt) },
-    { label: termLabel('witness', 'Witness'), cell: (l) => (l.witnessAt ? timeCell(l.witnessAt) : el('span', { class: 'chip chip-plain' }, 'none')) },
+    /* `fence` keeps its gloss. It is the least guessable word on this page and
+     * the header is the one place it can be explained once rather than once
+     * per row. termLabel is a no-op when terms.js is absent. */
+    { label: termLabel('fence', t('col.fence')), cls: 'num', cell: (l) => (l.fence === undefined ? '—' : String(l.fence)) },
+    { label: t('col.device'), cell: (l) => deviceLabel(l.deviceID, l.rackSlot) },
     {
-      label: '', cls: 'acts', cell: (l) => (l.state === 'held' || l.state === 'suspect')
-        ? el('button', { class: 'mini danger', onclick: () => revokeLease(l) }, 'Revoke')
+      label: t('col.job'), cell: (l) => cstack(
+        el('span', { class: 'mono', title: String(l.jobID || '') }, shortId(l.jobID) || '—'),
+        csub(t('sub.queue'), l.queue || null))
+    },
+    {
+      label: t('col.holder'), cell: (l) => cstack(
+        el('span', { class: 'mono trunc', title: (l.holder || '') + ' — ' + t('leases.holderTitle') }, l.holder || '—'),
+        csub(t('sub.tenant'), l.tenant || null))
+    },
+    {
+      label: t('col.acquired'), cell: (l) => cstack(
+        timeCell(l.acquiredAt),
+        csub(t('sub.heartbeat'), timeCell(l.heartbeatAt)))
+    },
+    {
+      label: t('col.expires'), cell: (l) => cstack(
+        timeCell(l.expiresAt),
+        csub(t('sub.reclaimable'), timeCell(l.reclaimableAt), t('leases.reclaimableTitle')))
+    },
+    { label: termLabel('witness', t('col.witness')), cell: (l) => (l.witnessAt ? timeCell(l.witnessAt) : el('span', { class: 'chip chip-plain' }, t('word.none'))) },
+    {
+      label: t('col.actions'), cls: 'acts', cell: (l) => (l.state === 'held' || l.state === 'suspect')
+        ? el('button', { class: 'mini danger', onclick: () => revokeLease(l) }, t('act.revoke'))
         : (l.releaseReason ? el('span', { class: 'chip chip-plain' }, l.releaseReason) : '')
     }
   ], rows, {
@@ -1409,7 +1478,7 @@ function renderJobs() {
     const by = {};
     for (const j of rows0) by[j.state] = (by[j.state] || 0) + 1;
     append(counts, [countChips(by), el('span', { class: 'count' }, t('fleet.showing') + ' ', el('b', null, String(rows.length))),
-      truncChip('jobs', 'Pick a single job state to see the rest.')]);
+      truncChip('jobs', t('jobs.narrow'))]);
   }
 
   const problem = panelState('jobs', rows0, state.filters.jobState
@@ -1419,38 +1488,87 @@ function renderJobs() {
         syncControls(); syncHash(); loaders.jobs(); render();
       }))
     : emptyState(t('empty.jobs.none'), t('empty.jobs.noneDetail'),
-      emptyAction(t('empty.jobs.submit'), () => { const f = $('#job-pool'); if (f) f.focus(); })));
+      // jumpToForm rather than a bare focus(): the form is a disclosure now and
+      // is closed on arrival, so focusing a field inside a `hidden` <form> puts
+      // the cursor nowhere and the button reads as broken.
+      emptyAction(t('empty.jobs.submit'), () => jumpToForm('#job-form', '#job-pool'))));
   if (problem) { body.replaceChildren(problem); renderJobSteps(); return; }
 
   body.setAttribute('aria-busy', 'false');
+  /* EIGHT COLUMNS, DOWN FROM FIFTEEN — and this is the table the whole
+   * min-width argument in style.css was written about. At 1280px it wanted
+   * 1182px inside an 897px panel and hid its last five columns behind a
+   * sideways scrollbar.
+   *
+   * What went: `queue` under the pool it belongs to, `created_by` under the job
+   * id it belongs to, `expected_duration` under the max runtime it is compared
+   * against, `started_at` and `finished_at` under the `created_at` they follow,
+   * the two guard chips under the state they guard, and the two action buttons
+   * into one cell. Fifteen values, still fifteen values, eight headings. */
   body.replaceChildren(table([
     {
-      label: '', cls: 'acts', cell: (j) => el('button', {
-        class: 'mini' + (String(j.id) === String(state.jobStepsID) ? ' primary' : ''),
-        onclick: () => selectJobSteps(j.id)
-      }, String(j.id) === String(state.jobStepsID) ? 'Selected' : 'Steps')
+      /* The disruption policy is a labelled sub rather than a fifth chip.
+       * `allow_port_power_cycle` in a chip is 130px that will not shrink —
+       * a chip is `white-space: nowrap` by design — and one such value on
+       * every row set the whole table's minimum width single-handed. As a
+       * sub it keeps the value verbatim, gains the word POLICY in front of
+       * it, and yields to an ellipsis with its full text on hover when the
+       * column is tight. `protected` stays a chip: it is short, it is rare,
+       * and it is the one thing on the row worth a colour. */
+      label: t('col.state'), cell: (j) => cstack(
+        el('span', { class: 'chips' },
+          el('span', { class: 'chip ' + (JOB_CLASS[j.state] || 'chip-plain') }, j.state),
+          j.protected ? el('span', { class: 'chip chip-protected', title: t('jobs.protectedTitle') }, el('span', { 'aria-hidden': 'true' }, '★'), 'protected') : null),
+        csub(t('sub.policy'), j.policy || null, 'disruption_policy'))
     },
-    { label: 'State', cell: (j) => el('span', { class: 'chip ' + (JOB_CLASS[j.state] || 'chip-plain') }, j.state) },
-    { label: 'Step', cell: (j) => liveStepCell(j) },
-    { label: 'Job', cls: 'mono', cell: (j) => el('span', { title: String(j.id || '') }, shortId(j.id)) },
-    { label: 'Pool', cell: (j) => j.pool || '—' },
-    { label: 'Queue', cell: (j) => j.queue || '—' },
-    { label: 'Tenant', cell: (j) => j.tenant || '—' },
+    { label: t('col.step'), cell: (j) => liveStepCell(j) },
     {
-      label: termLabel('disruption_policy', 'Guards'), cell: (j) => el('span', { class: 'chips' },
-        j.protected ? el('span', { class: 'chip chip-protected' }, el('span', { 'aria-hidden': 'true' }, '★'), 'protected') : null,
-        j.policy ? el('span', { class: 'chip chip-plain', title: 'disruption_policy' }, j.policy) : null)
+      /* This was the `Guards` column, and it carried the gloss on
+       * `disruption_policy`. The column is gone — its two values are the chip
+       * and the sub in the State cell above — so the gloss moved rather than
+       * being dropped: glossJobForm() attaches it to the form's own
+       * "Disruption policy" label, and ladderLegend() to the ladder that
+       * refuses a rung for exceeding it. Both are places a reader meets the
+       * word once, rather than a term button repeated down fifty rows. */
+      label: t('col.job'), cell: (j) => cstack(
+        el('span', { class: 'mono', title: String(j.id || '') }, shortId(j.id)),
+        csub(t('sub.by'), j.createdBy || null))
     },
-    { label: 'Max runtime', cell: (j) => el('span', { title: 'the only user-supplied clock that may end a lease automatically' }, fmtInterval(j.maxRuntime)) },
-    { label: 'Expected', cell: (j) => fmtInterval(j.expected) },
-    { label: 'Created', cell: (j) => timeCell(j.createdAt) },
-    { label: 'Started', cell: (j) => (j.startedAt ? timeCell(j.startedAt) : '—') },
-    { label: 'Finished', cell: (j) => (j.finishedAt ? timeCell(j.finishedAt) : '—') },
-    { label: 'By', cell: (j) => j.createdBy || '—' },
     {
-      label: '', cls: 'acts', cell: (j) => (['queued', 'allocating', 'running'].includes(j.state)
-        ? el('button', { class: 'mini danger', onclick: () => cancelJob(j) }, 'Cancel')
-        : '')
+      label: t('col.pool'), cell: (j) => cstack(
+        j.pool || '—',
+        csub(t('sub.queue'), j.queue || null))
+    },
+    { label: t('col.tenant'), cell: (j) => j.tenant || '—' },
+    {
+      label: t('col.limits'), cell: (j) => cstack(
+        el('span', { title: t('jobs.maxRuntimeTitle') }, fmtInterval(j.maxRuntime)),
+        csub(t('sub.expected'), nz(j.expected) === null ? null : fmtInterval(j.expected), t('jobs.expectedTitle')))
+    },
+    {
+      /* All three instants, not the newest one.
+       *
+       * This cell first showed `finished` when there was one and `started`
+       * otherwise, which loses `started_at` entirely for every job that has
+       * ended — and `started_at` is the only thing that says how long a job sat
+       * in the queue before it was placed, and the only way to derive how long
+       * it actually ran. It is rendered nowhere else in this app. A row grows
+       * to three lines when a job has finished, which is the cost of the claim
+       * this redesign makes: nothing the API returns stopped being on screen. */
+      label: t('col.created'), cell: (j) => cstack(
+        timeCell(j.createdAt),
+        j.startedAt ? csub(t('sub.started'), timeCell(j.startedAt)) : null,
+        j.finishedAt ? csub(t('sub.finished'), timeCell(j.finishedAt)) : null)
+    },
+    {
+      label: t('col.actions'), cls: 'acts', cell: (j) => el('span', null,
+        el('button', {
+          class: 'mini' + (String(j.id) === String(state.jobStepsID) ? ' primary' : ''),
+          onclick: () => selectJobSteps(j.id)
+        }, String(j.id) === String(state.jobStepsID) ? t('act.selected') : t('act.steps')),
+        ['queued', 'allocating', 'running'].includes(j.state)
+          ? el('button', { class: 'mini danger', onclick: () => cancelJob(j) }, t('act.cancel'))
+          : null)
     }
   ], rows, { rowClass: (j) => (String(j.id) === String(state.jobStepsID) ? 'row-held' : null) }));
 
@@ -1487,10 +1605,7 @@ function liveStepCell(j) {
     // no steps.
     return el('span', {
       class: 'chip chip-plain',
-      title: state.conn.mode === 'live'
-        ? 'no step frame has arrived for this job on the event stream'
-        : 'this column is fed by the event stream, which is not connected — the page is polling. ' +
-          'Press Steps to read the step log over the API instead.'
+      title: state.conn.mode === 'live' ? t('step.noFrame') : t('step.notLive')
     }, '—');
   }
   if (s.index === null || s.index === undefined || s.index < 0) {
@@ -1498,16 +1613,13 @@ function liveStepCell(j) {
     const done = ['succeeded', 'failed', 'cancelled'].includes(j.state);
     return el('span', {
       class: 'chip chip-plain',
-      title: done
-        ? 'this job reached a terminal state without a single step row: it never got as far as running one'
-        : 'the control plane reports no step of this attempt has started yet'
-    }, done ? 'no steps ran' : 'not started');
+      title: done ? t('step.noneRanTitle') : t('step.notStartedTitle')
+    }, done ? t('step.noneRan') : t('step.notStarted'));
   }
   return el('span', { class: 'chips' },
     el('span', {
       class: 'chip ' + (STEP_CLASS[s.state] || 'chip-plain'),
-      title: 'step ' + s.index + ' "' + s.id + '" (' + (s.kind || 'step') + ') is ' + s.state +
-        ' on attempt ' + s.attempt + ', as of the last event-stream frame'
+      title: t('step.frameTitle', { index: s.index, id: s.id, kind: s.kind || 'step', state: s.state, attempt: s.attempt })
     }, String(s.index), ' ', s.state),
     el('span', { class: 'mono trunc', title: s.id || '' }, s.id || ''));
 }
@@ -1522,14 +1634,14 @@ function readJobForm() {
   const json = (id, label) => {
     const v = $(id).value.trim();
     if (v === '') return {};
-    try { return JSON.parse(v); } catch (e) { throw new Error(label + ' is not valid JSON: ' + e.message); }
+    try { return JSON.parse(v); } catch (e) { throw new Error(t('form.badJSON', { field: label }) + ' ' + e.message); }
   };
   const body = {
     pool: $('#job-pool').value.trim(),
     queue: $('#job-queue').value.trim(),
     tenant: $('#job-tenant').value.trim(),
-    spec: json('#job-spec', 'Spec'),
-    selector: json('#job-selector', 'Selector'),
+    spec: json('#job-spec', 'spec'),
+    selector: json('#job-selector', 'selector'),
     protected: $('#job-protected').checked,
     disruption_policy: $('#job-policy').value
   };
@@ -1572,8 +1684,8 @@ function stepTook(s) {
 function charNote(truncated, chars, rendered) {
   const n = Number(chars) || 0;
   if (!n) return '';
-  if (!truncated) return n.toLocaleString() + ' chars';
-  return Array.from(rendered).length.toLocaleString() + ' of ' + n.toLocaleString() + ' chars — cut by the server';
+  if (!truncated) return t('log.chars', { n: n.toLocaleString() });
+  return t('log.charsCut', { shown: Array.from(rendered).length.toLocaleString(), n: n.toLocaleString() });
 }
 
 /* openLogs is which log blocks the operator has expanded, keyed by
@@ -1606,7 +1718,7 @@ function logBlock(key, label, text, chars, truncated, bad) {
   const body = String(text);
   const firstLine = body.split('\n')[0].slice(0, 100);
   const summary = firstLine.trim() === ''
-    ? '(whitespace only, ' + (Number(chars) || 0).toLocaleString() + ' characters stored)'
+    ? t('log.whitespaceOnly', { n: (Number(chars) || 0).toLocaleString() })
     : firstLine;
   return logDetails(key, label, bad, summary, charNote(truncated, chars, body), body);
 }
@@ -1617,11 +1729,9 @@ function omittedChip(label, chars, attempt) {
   const stored = Number(chars) || 0;
   return el('span', {
     class: 'chip chip-degraded',
-    title: 'the response had already spent its size budget, so this ' + label + ' was dropped whole ' +
-      'rather than cut to a fragment that would look complete. Show attempt ' + attempt +
-      ' on its own to get it back.'
+    title: t('log.omittedTitle', { field: label, attempt })
   }, el('span', { 'aria-hidden': 'true' }, '▲'),
-    label + ' omitted' + (stored ? ' (' + stored.toLocaleString() + ' chars stored)' : ''));
+    t('log.omitted', { field: label }) + (stored ? ' ' + t('log.storedChars', { n: stored.toLocaleString() }) : ''));
 }
 
 function stepLogCell(s) {
@@ -1647,10 +1757,8 @@ function stepLogCell(s) {
   if (!parts.length) {
     return el('span', {
       class: 'chip chip-plain',
-      title: s.state === 'pending'
-        ? 'this step has not run'
-        : 'the runner stored no output, no error and no detail for this step'
-    }, s.state === 'pending' ? 'not started' : 'nothing stored');
+      title: s.state === 'pending' ? t('log.notRunTitle') : t('log.nothingStoredTitle')
+    }, s.state === 'pending' ? t('step.notStarted') : t('log.nothingStored'));
   }
   return el('div', { class: 'steplogs' }, parts);
 }
@@ -1677,7 +1785,7 @@ function renderJobSteps() {
   }
 
   const scope = el('select', {
-    'aria-label': 'Which attempt of this job to show',
+    'aria-label': t('steps.whichAttempt'),
     onchange: (e) => {
       state.filters.stepAttempt = e.target.value;
       state.data.jobSteps = null;
@@ -1692,9 +1800,9 @@ function renderJobSteps() {
   const pinned = state.filters.stepAttempt || '';
   const known = (data.attemptsWithSteps || []).map((n) => String(n));
   append(scope, [
-    el('option', { value: '' }, 'newest attempt that ran'),
-    el('option', { value: 'all' }, 'every attempt'),
-    known.map((n) => el('option', { value: n }, 'attempt ' + n)),
+    el('option', { value: '' }, t('steps.newest')),
+    el('option', { value: 'all' }, t('steps.every')),
+    known.map((n) => el('option', { value: n }, t('steps.attemptN', { n }))),
     // A pinned attempt with no rows — ?attempt=7 pasted from a link, or a
     // number typed into the URL — still needs an option, or assigning it below
     // silently snaps the control back to "newest" while the panel goes on
@@ -1702,7 +1810,7 @@ function renderJobSteps() {
     // operator could not click their way out: the control already reads
     // "newest", so choosing it fires no change event.
     pinned && pinned !== 'all' && !known.includes(pinned)
-      ? el('option', { value: pinned }, 'attempt ' + pinned + ' (no steps)')
+      ? el('option', { value: pinned }, t('steps.attemptNoSteps', { n: pinned }))
       : null
   ]);
   scope.value = pinned;
@@ -1713,23 +1821,22 @@ function renderJobSteps() {
     el('span', { class: 'chip ' + (JOB_CLASS[data.jobState] || 'chip-plain') }, data.jobState || 'unknown'),
     el('span', {
       class: 'count',
-      title: 'farm.jobs.attempt against max_attempts: how many placements this job has had, and how many it may have'
-    }, 'attempt ', el('b', null, String(data.attempt === undefined ? '?' : data.attempt)),
-      ' of ', String(data.maxAttempts === undefined ? '?' : data.maxAttempts)),
-    el('label', null, 'Showing ', scope),
+      title: t('steps.attemptCountTitle')
+    }, t('steps.attempt') + ' ', el('b', null, String(data.attempt === undefined ? '?' : data.attempt)),
+      ' ' + t('steps.of') + ' ', String(data.maxAttempts === undefined ? '?' : data.maxAttempts)),
+    el('label', null, t('steps.showing') + ' ', scope),
     el('span', { class: 'grow' }),
     el('span', { class: 'counts' },
       countChips(data.states),
-      failed ? el('span', { class: 'chip chip-offline', title: 'steps in failed or aborted' },
-        el('span', { 'aria-hidden': 'true' }, '✕'), failed + ' failed') : null,
+      failed ? el('span', { class: 'chip chip-offline', title: t('steps.failedTitle') },
+        el('span', { 'aria-hidden': 'true' }, '✕'), t('steps.nFailed', { n: failed })) : null,
       data.logsOmitted
         ? el('span', {
           class: 'chip chip-degraded',
-          title: 'the server dropped ' + data.logsOmitted + ' log field(s) for its response size budget. ' +
-            'Every step is here; some of their text is not. Pin a single attempt above to get it back.'
-        }, el('span', { 'aria-hidden': 'true' }, '▲'), data.logsOmitted + ' logs omitted')
+          title: t('steps.logsOmittedTitle', { n: data.logsOmitted })
+        }, el('span', { 'aria-hidden': 'true' }, '▲'), t('steps.logsOmitted', { n: data.logsOmitted }))
         : null,
-      truncChip('jobSteps', 'Pin a single attempt with the selector above.')));
+      truncChip('jobSteps', t('steps.narrow'))));
 
   /* Two readings of the same blank panel: this job HAS steps, filed under an
    * attempt you are not looking at — one button away — or it has none at all,
@@ -1761,26 +1868,39 @@ function renderJobSteps() {
   const problem = panelState('jobSteps', data.steps, empty);
   if (problem) { host.replaceChildren(header, problem); return; }
 
+  /* Six columns, down from nine. `kind` sits under the step id it describes,
+   * and the exit code under the state it explains — a NULL exit code on a
+   * finished step is not a zero, so it still says so in words. */
   host.replaceChildren(header, table([
     {
-      label: 'Attempt', cls: 'num', cell: (s) => el('span', {
-        title: 'the placement this step belongs to; a retry writes a fresh set of rows'
+      label: t('col.attempt'), cls: 'num', cell: (s) => el('span', {
+        title: t('steps.attemptColTitle')
       }, String(s.attempt === undefined ? '—' : s.attempt))
     },
-    { label: '#', cls: 'num', cell: (s) => String(s.index === undefined ? '—' : s.index) },
-    { label: 'Step', cls: 'mono', cell: (s) => el('span', { title: String(s.id || '') }, s.id || '—') },
-    { label: 'Kind', cell: (s) => el('span', { class: 'chip chip-plain' }, s.kind || 'unknown') },
-    { label: 'State', cell: (s) => el('span', { class: 'chip ' + (STEP_CLASS[s.state] || 'chip-plain') }, s.state) },
+    { label: t('col.index'), cls: 'num', cell: (s) => String(s.index === undefined ? '—' : s.index) },
     {
-      // A NULL exit code on a finished step is not a zero: the step never got
-      // one, which is a different fact and usually the more interesting one.
-      label: 'Exit', cls: 'num', cell: (s) => (s.exitCode === undefined || s.exitCode === null
-        ? el('span', { class: 'dim', title: 'the runner recorded no exit code for this step' }, '—')
-        : String(s.exitCode))
+      label: t('col.step'), cell: (s) => cstack(
+        el('span', { class: 'mono', title: String(s.id || '') }, s.id || '—'),
+        csub(t('sub.kind'), s.kind || 'unknown'))
     },
-    { label: 'Started', cell: (s) => (s.startedAt ? timeCell(s.startedAt) : '—') },
-    { label: 'Took', cls: 'num', cell: (s) => stepTook(s) },
-    { label: 'Log', cell: (s) => stepLogCell(s) }
+    {
+      label: t('col.state'), cell: (s) => cstack(
+        el('span', { class: 'chip ' + (STEP_CLASS[s.state] || 'chip-plain') }, s.state),
+        // A NULL exit code on a finished step is not a zero: the step never got
+        // one, which is a different fact and usually the more interesting one.
+        csub(t('sub.exit'),
+          nz(s.exitCode) === null ? t('steps.noExit') : String(s.exitCode),
+          nz(s.exitCode) === null ? t('steps.noExitTitle') : null))
+    },
+    {
+      // stepTook returns an em dash rather than null for a step with no
+      // duration, and csub only suppresses null — so passing it straight
+      // through printed "TOOK —" under every pending step.
+      label: t('col.started'), cell: (s) => cstack(
+        s.startedAt ? timeCell(s.startedAt) : '—',
+        csub(t('sub.took'), nz(s.durationS) === null ? null : stepTook(s)))
+    },
+    { label: t('col.log'), cell: (s) => stepLogCell(s) }
   ], data.steps, {
     rowClass: (s) => (stepFailed(s) ? 'row-refused' : s.state === 'running' ? 'row-held' : null)
   }));
@@ -1796,21 +1916,47 @@ function renderRecovery() {
   renderQuarantines();
 }
 
-/* ladderLegend glosses the ladder's two load-bearing words once, above the
- * rungs, rather than nine times inside them.
+/* ladderLegend glosses the ladder's load-bearing words once, above the rungs,
+ * rather than nine times inside them.
  *
- * `tier` and `blast radius` are the whole grammar of this panel and neither is
- * guessable: a rung is refused when its blast radius exceeds what the live
- * lease's disruption policy allows, and a reader who does not know either word
- * cannot read that sentence. Absent terms.js this line would be the two words
- * again with nothing attached, which is noise, so it is not drawn at all — the
- * panel then looks exactly as it does today. */
+ * `tier`, `blast radius` and `disruption policy` are the whole grammar of this
+ * panel and none of them is guessable: a rung is refused when its blast radius
+ * exceeds what the live lease's disruption policy allows, and a reader who does
+ * not know those words cannot read that sentence. Absent terms.js this line
+ * would be the words again with nothing attached, which is noise, so it is not
+ * drawn at all — the panel then looks exactly as it does without the glossary.
+ *
+ * `disruption_policy` is here because the Jobs table's `Guards` column, which
+ * used to carry it, folded into the State cell when that table lost seven
+ * columns. The word did not stop needing an explanation; it stopped having a
+ * heading of its own to hang one on. */
 function ladderLegend() {
   if (typeof term !== 'function') return null;
+  const dot = () => el('span', { 'aria-hidden': 'true' }, ' · ');
   return el('p', { class: 'ladder-legend' },
-    term('tier', 'Tier'), el('span', { 'aria-hidden': 'true' }, ' · '), term('blast_radius', 'blast radius'));
+    term('rung', t('col.tier')), dot(),
+    term('blastRadius', t('recovery.blastWord')), dot(),
+    term('disruptionPolicy', t('recovery.policyWord')));
 }
 
+/* THE LADDER READS AS ONE THING NOW.
+ *
+ * It was a seven-column grid: tier number, name, description, then four chips
+ * in four unlabelled tracks. The four were `power_domain`, `allow_soft_reset`,
+ * `cd 5m` and `6/h` — the same four on every row, in the same order, with
+ * nothing on screen saying which was the cooldown and which the hourly budget.
+ * A reader learned that by hovering, one badge at a time, or not at all.
+ *
+ * Recovery CLIMBS: rung 0 is tried before rung 1, and the whole point of the
+ * page is that an operator can see how far up the escalation the watchdog is
+ * allowed to go and what each step would cost. Nine unrelated cards do not say
+ * that. One rail with numbered rungs on it, a sentence per rung, and the four
+ * numbers labelled underneath, does.
+ *
+ * The `.rung.blast-*` class names keep the snake_case values from
+ * farm.recovery_tiers.blast_radius. They are how the CSS finds the rung and
+ * how a reader matches a row against the column; renaming them would be churn
+ * that helps nobody. */
 function renderTiers() {
   const host = $('#tiers-body');
   const tiers = state.data.tiers;
@@ -1820,16 +1966,26 @@ function renderTiers() {
   if (problem) { host.replaceChildren(problem); return; }
   host.setAttribute('aria-busy', 'false');
   const legend = ladderLegend();
-  host.replaceChildren(...(legend ? [legend] : []), ...tiers.map((t) => el('div', { class: 'rung blast-' + t.blast + (t.enabled ? '' : ' disabled') },
-    el('span', { class: 'tier' }, String(t.tier)),
-    el('span', { class: 'rname' }, t.name || '—'),
-    el('span', { class: 'rdesc' }, t.description || ''),
-    el('span', { class: 'chip ' + (t.blast === 'device' ? 'chip-plain' : t.blast === 'power_domain' ? 'chip-degraded' : 'chip-offline'), title: 'blast radius' },
-      el('span', { 'aria-hidden': 'true' }, t.blast === 'device' ? '·' : '▲'), t.blast),
-    el('span', { class: 'chip chip-plain', title: 'a live lease must carry at least this disruption policy or the rung is refused' }, t.requires || '—'),
-    el('span', { class: 'chip chip-plain', title: 'cooldown' }, 'cd ' + fmtInterval(t.cooldown)),
-    el('span', { class: 'chip chip-plain', title: 'max attempts per hour' }, (t.maxPerHour !== undefined ? t.maxPerHour : '—') + '/h'),
-    t.enabled ? null : el('span', { class: 'chip chip-offline' }, 'disabled'))));
+  host.replaceChildren(...(legend ? [legend] : []), ...tiers.map((tr) => el('div', { class: 'rung blast-' + tr.blast + (tr.enabled ? '' : ' disabled') },
+    el('div', { class: 'rung-step' }, el('span', { class: 'tier' }, String(tr.tier))),
+    el('div', { class: 'rung-main' },
+      el('div', { class: 'rung-head' },
+        el('span', { class: 'rname' }, tr.name || '—'),
+        el('span', {
+          class: 'chip ' + (tr.blast === 'device' ? 'chip-plain' : tr.blast === 'power_domain' ? 'chip-degraded' : 'chip-offline'),
+          title: t('recovery.blastTitle')
+        }, el('span', { 'aria-hidden': 'true' }, tr.blast === 'device' ? '·' : '▲'), tr.blast),
+        tr.enabled ? null : el('span', { class: 'chip chip-offline', title: t('recovery.disabledTitle') },
+          el('span', { 'aria-hidden': 'true' }, '⊘'), t('recovery.disabled'))),
+      tr.description ? el('p', { class: 'rdesc' }, tr.description) : null,
+      el('dl', { class: 'rung-meta' },
+        el('div', { title: t('recovery.requiresTitle') },
+          el('dt', null, t('recovery.requires')), el('dd', null, tr.requires || '—')),
+        el('div', { title: t('recovery.cooldownTitle') },
+          el('dt', null, t('recovery.cooldown')), el('dd', null, fmtInterval(tr.cooldown))),
+        el('div', { title: t('recovery.budgetTitle') },
+          el('dt', null, t('recovery.budget')),
+          el('dd', null, t('recovery.perHour', { n: tr.maxPerHour !== undefined ? tr.maxPerHour : '—' }))))))));
 }
 
 function renderAttempts() {
@@ -1845,30 +2001,34 @@ function renderAttempts() {
   if (problem) { host.replaceChildren(problem); return; }
   host.setAttribute('aria-busy', 'false');
   host.replaceChildren(table([
-    { label: 'Started', cell: (a) => timeCell(a.startedAt) },
-    { label: termLabel('tier', 'Tier'), cls: 'mono', cell: (a) => (a.tier !== undefined ? a.tier + ' ' + (a.tierName || tierName(a.tier)) : '—') },
-    { label: 'Device', cell: (a) => deviceLabel(a.deviceID, a.rackSlot) },
-    { label: 'Host', cell: (a) => a.host || '—' },
+    { label: t('col.started'), cell: (a) => cstack(timeCell(a.startedAt), tookSub(a.startedAt, a.finishedAt)) },
     {
-      label: 'Outcome', cell: (a) => (a.outcome
-        ? el('span', { class: 'chip ' + (OUTCOME_CLASS[a.outcome] || 'chip-plain') },
-          el('span', { 'aria-hidden': 'true' }, a.outcome === 'recovered' ? '✓' : a.outcome === 'refused' ? '⊘' : a.outcome === 'failed' ? '✕' : '·'), a.outcome)
-        : el('span', { class: 'chip chip-booting' }, el('span', { 'aria-hidden': 'true' }, '↻'), 'in flight'))
+      label: termLabel('rung', t('col.tier')), cell: (a) => cstack(
+        el('span', { class: 'mono' }, a.tier !== undefined ? String(a.tier) : '—'),
+        // `sub.name`, not `sub.rung`: the heading already says Rung, and a
+        // label that repeats its heading tells the reader nothing about the
+        // value under it — which is the one thing csub exists to prevent.
+        csub(t('sub.name'), a.tierName || tierName(a.tier) || null))
     },
     {
-      label: 'Refusal / detail', cell: (a) => {
+      label: t('col.device'), cell: (a) => cstack(
+        deviceLabel(a.deviceID, a.rackSlot),
+        csub(t('sub.host'), a.host || null))
+    },
+    {
+      label: t('col.outcome'), cell: (a) => (a.outcome
+        ? el('span', { class: 'chip ' + (OUTCOME_CLASS[a.outcome] || 'chip-plain') },
+          el('span', { 'aria-hidden': 'true' }, a.outcome === 'recovered' ? '✓' : a.outcome === 'refused' ? '⊘' : a.outcome === 'failed' ? '✕' : '·'), a.outcome)
+        : el('span', { class: 'chip chip-booting' }, el('span', { 'aria-hidden': 'true' }, '↻'), t('recovery.inFlight')))
+    },
+    {
+      label: t('col.refusal'), cell: (a) => {
         if (a.refusal) return el('span', { class: 'mono', title: a.refusal }, a.refusal);
         if (a.detail && typeof a.detail === 'object' && Object.keys(a.detail).length) {
           const s = JSON.stringify(a.detail);
           return el('span', { class: 'mono trunc', title: s }, s);
         }
         return '—';
-      }
-    },
-    {
-      label: 'Took', cls: 'num', cell: (a) => {
-        const s = parseTime(a.startedAt), f = parseTime(a.finishedAt);
-        return s && f ? fmtSecs((f - s) / 1000) : '—';
       }
     }
   ], rows, { rowClass: (a) => (a.outcome === 'refused' ? 'row-refused' : null) }));
@@ -1908,17 +2068,20 @@ function quarantineSubject(q) {
       if (q.slotID !== undefined && q.slotID !== null) parts.push('slot ' + q.slotID);
       if (q.host) parts.push('on ' + q.host);
       return parts.length
-        ? el('span', { class: 'mono', title: 'a whole power domain, located by ' + parts.join(', ') }, 'power domain · ' + parts.join(' · '))
-        : unnamedSubject('power domain');
+        ? el('span', { class: 'mono', title: t('quarantine.domainTitle', { by: parts.join(', ') }) }, 'power_domain · ' + parts.join(' · '))
+        : unnamedSubject('power_domain');
     }
     default:
-      return unnamedSubject(q.scope || 'unknown scope');
+      // `unknown scope` and not `unknown`: the sentence this feeds reads
+      // "{what}, id not reported", and "unknown, id not reported" tells a
+      // reader that something is unknown without saying what.
+      return unnamedSubject(q.scope || t('quarantine.unknownScope'));
   }
 }
 
 function unnamedSubject(what) {
-  return el('span', { class: 'chip chip-plain', title: 'the API reported no identifier for this ' + what },
-    what + ', id not reported');
+  return el('span', { class: 'chip chip-plain', title: t('quarantine.unnamedTitle', { what }) },
+    t('quarantine.unnamed', { what }));
 }
 
 function renderQuarantines() {
@@ -1930,12 +2093,15 @@ function renderQuarantines() {
   if (problem) { host.replaceChildren(problem); return; }
   host.setAttribute('aria-busy', 'false');
   host.replaceChildren(table([
-    { label: 'Scope', cell: (q) => el('span', { class: 'chip chip-quarantined' }, el('span', { 'aria-hidden': 'true' }, '■'), q.scope) },
-    { label: 'Subject', cell: (q) => quarantineSubject(q) },
-    { label: 'Reason', cell: (q) => el('span', { title: q.reason || '' }, q.reason || '—') },
-    { label: 'Opened', cell: (q) => timeCell(q.openedAt) },
-    { label: 'Source', cell: (q) => el('span', { class: 'chip chip-plain' }, q.auto ? 'automatic' : 'operator') },
-    { label: '', cls: 'acts', cell: (q) => el('button', { class: 'mini', onclick: () => closeQuarantine(q) }, 'Close') }
+    { label: t('col.scope'), cell: (q) => el('span', { class: 'chip chip-quarantined' }, el('span', { 'aria-hidden': 'true' }, '■'), q.scope) },
+    { label: t('col.subject'), cell: (q) => quarantineSubject(q) },
+    { label: t('col.reason'), cell: (q) => el('span', { title: q.reason || '' }, q.reason || '—') },
+    {
+      label: t('col.opened'), cell: (q) => cstack(
+        timeCell(q.openedAt),
+        csub(t('sub.source'), q.auto ? t('quarantine.automatic') : t('quarantine.operator')))
+    },
+    { label: t('col.actions'), cls: 'acts', cell: (q) => el('button', { class: 'mini', onclick: () => closeQuarantine(q) }, t('act.close')) }
   ], rows0));
 }
 
@@ -1956,7 +2122,7 @@ function runStateChip(s) {
 function runProgress(r) {
   if (r.targetCount === undefined || r.targetCount === null) return '—';
   const done = (Number(r.ok) || 0) + (Number(r.errors) || 0) + (Number(r.skipped) || 0);
-  return el('span', { class: 'chips', title: 'ok / error / skipped, out of the targets the selector matched' },
+  return el('span', { class: 'chips', title: t('bulk.progressTitle') },
     el('span', { class: 'count' }, String(done), ' / ', el('b', null, String(r.targetCount))),
     Number(r.errors) ? el('span', { class: 'chip chip-offline' }, 'error ' + r.errors) : null,
     Number(r.skipped) ? el('span', { class: 'chip chip-unknown' }, 'skipped ' + r.skipped) : null);
@@ -1995,26 +2161,46 @@ function renderBulk() {
   const rows0 = state.data.bulk;
   const problem = panelState('bulk', rows0, emptyState(t('empty.bulk.none'),
     t('empty.bulk.noneDetail'),
-    emptyAction(t('empty.bulk.start'), () => { const f = $('#bulk-command'); if (f) f.focus(); })));
+    // The command field is inside a disclosure that is closed on arrival, and
+    // it is a mounted widget rather than an <input>, so jumpToForm opens the
+    // panel and hands the focus to whatever the builder made focusable.
+    emptyAction(t('empty.bulk.start'), () => jumpToForm('#bulk-form', '#bulk-command'))));
   if (problem) { runsHost.replaceChildren(problem); }
   else {
     runsHost.setAttribute('aria-busy', 'false');
+    /* Seven columns, down from ten: the selector under the command it runs, the
+     * timeout under the concurrency limit it pairs with, and the finish under
+     * the start. */
     runsHost.replaceChildren(table([
+      { label: t('col.state'), cell: (r) => runStateChip(r.state) },
+      { label: t('col.progress'), cell: (r) => runProgress(r) },
       {
-        label: '', cls: 'acts', cell: (r) => el('button', {
+        label: t('col.command'), cell: (r) => cstack(
+          el('span', { class: 'mono trunc', title: r.command || '' }, r.command || '—'),
+          csub(t('sub.selector'), r.selector
+            ? el('span', { class: 'mono trunc', title: JSON.stringify(r.selector) }, JSON.stringify(r.selector))
+            : null))
+      },
+      {
+        label: t('col.limits'), cell: (r) => cstack(
+          t('bulk.perHub', { n: r.maxPerHub !== undefined ? r.maxPerHub : '—' }),
+          // nz first: fmtInterval answers '—' for an absent value, and csub only
+          // suppresses null/undefined/'' — so a run whose response omits
+          // timeout_s would grow a second line reading "timeout —".
+          csub(t('sub.timeout'), nz(r.timeout) === null ? null : fmtInterval(r.timeout)))
+      },
+      {
+        label: t('col.started'), cell: (r) => cstack(
+          timeCell(r.createdAt),
+          r.finishedAt ? csub(t('sub.finished'), timeCell(r.finishedAt)) : null)
+      },
+      { label: t('col.by'), cell: (r) => r.createdBy || '—' },
+      {
+        label: t('col.actions'), cls: 'acts', cell: (r) => el('button', {
           class: 'mini' + (String(r.id) === String(state.bulkRunID) ? ' primary' : ''),
           onclick: () => { state.bulkRunID = r.id; state.data.bulkRun = null; loaders.bulkRun(); render(); }
-        }, String(r.id) === String(state.bulkRunID) ? 'Selected' : 'Open')
-      },
-      { label: 'State', cell: (r) => runStateChip(r.state) },
-      { label: 'Progress', cell: (r) => runProgress(r) },
-      { label: 'Command', cls: 'mono', cell: (r) => el('span', { class: 'trunc', title: r.command || '' }, r.command || '—') },
-      { label: 'Selector', cls: 'mono', cell: (r) => el('span', { class: 'trunc', title: r.selector ? JSON.stringify(r.selector) : '' }, r.selector ? JSON.stringify(r.selector) : '—') },
-      { label: 'Per hub', cls: 'num', cell: (r) => (r.maxPerHub !== undefined ? String(r.maxPerHub) : '—') },
-      { label: 'Timeout', cls: 'num', cell: (r) => fmtInterval(r.timeout) },
-      { label: 'By', cell: (r) => r.createdBy || '—' },
-      { label: 'Started', cell: (r) => timeCell(r.createdAt) },
-      { label: 'Finished', cell: (r) => (r.finishedAt ? timeCell(r.finishedAt) : '—') }
+        }, String(r.id) === String(state.bulkRunID) ? t('act.selected') : t('act.open'))
+      }
     ], rows0));
   }
 
@@ -2033,31 +2219,36 @@ function renderBulk() {
 
   const targets = run.targets || [];
   const by = {};
-  for (const t of targets) by[t.state] = (by[t.state] || 0) + 1;
+  for (const tg of targets) by[tg.state] = (by[tg.state] || 0) + 1;
 
   const header = el('div', { class: 'toolbar' },
     el('span', { class: 'mono' }, run.command || ''),
     runStateChip(run.state),
     el('span', { class: 'grow' }),
     el('span', { class: 'counts' }, countChips(by),
-      el('span', { class: 'count' }, 'targets ', el('b', null, String(targets.length)))));
+      el('span', { class: 'count' }, t('bulk.targets') + ' ', el('b', null, String(targets.length)))));
 
   const body = targets.length ? table([
-    { label: 'Device', cell: (t) => deviceLabel(t.deviceID, t.rackSlot) },
-    { label: 'State', cell: (t) => el('span', { class: 'chip ' + (TARGET_CLASS[t.state] || 'chip-plain') }, t.state) },
-    { label: 'Exit', cls: 'num', cell: (t) => (t.exitCode === undefined || t.exitCode === null ? '—' : String(t.exitCode)) },
-    { label: 'Started', cell: (t) => (t.startedAt ? timeCell(t.startedAt) : '—') },
-    { label: 'Took', cls: 'num', cell: (t) => { const s = parseTime(t.startedAt), f = parseTime(t.finishedAt); return s && f ? fmtSecs((f - s) / 1000) : '—'; } },
+    { label: t('col.device'), cell: (tg) => deviceLabel(tg.deviceID, tg.rackSlot) },
     {
-      label: 'Output', cell: (t) => {
-        const text = t.error ? t.error : t.output;
-        if (!text) return el('span', { class: 'chip chip-plain' }, t.state === 'pending' ? 'not started' : 'no output');
-        const d = el('details', null, el('summary', { class: 'mono trunc' }, String(text).split('\n')[0].slice(0, 80)),
+      label: t('col.state'), cell: (tg) => cstack(
+        el('span', { class: 'chip ' + (TARGET_CLASS[tg.state] || 'chip-plain') }, tg.state),
+        csub(t('sub.exit'), nz(tg.exitCode) === null ? null : String(tg.exitCode)))
+    },
+    {
+      label: t('col.started'), cell: (tg) => cstack(
+        tg.startedAt ? timeCell(tg.startedAt) : '—',
+        tookSub(tg.startedAt, tg.finishedAt))
+    },
+    {
+      label: t('col.output'), cell: (tg) => {
+        const text = tg.error ? tg.error : tg.output;
+        if (!text) return el('span', { class: 'chip chip-plain' }, tg.state === 'pending' ? t('step.notStarted') : t('bulk.noOutput'));
+        return el('details', null, el('summary', { class: 'mono trunc' }, String(text).split('\n')[0].slice(0, 80)),
           el('pre', { class: 'out' }, String(text)));
-        return d;
       }
     }
-  ], targets, { rowClass: (t) => (t.state === 'error' ? 'row-refused' : null) })
+  ], targets, { rowClass: (tg) => (tg.state === 'error' ? 'row-refused' : null) })
     : emptyState(t('empty.bulk.noTargets'), t('empty.bulk.noTargetsDetail'));
 
   detail.replaceChildren(header, body);
@@ -2084,7 +2275,7 @@ function renderEvents() {
   if (rows0) {
     append(counts, [
       el('span', { class: 'count' }, t('fleet.showing') + ' ', el('b', null, String(rows.length)), ' / ' + rows0.length),
-      truncChip('events', 'This is the newest page only; raise Show to reach further back.')
+      truncChip('events', t('events.narrow'))
     ]);
   }
 
@@ -2094,15 +2285,18 @@ function renderEvents() {
   if (problem) { host.replaceChildren(problem); return; }
   host.setAttribute('aria-busy', 'false');
   host.replaceChildren(table([
-    { label: 'When', cell: (e) => timeCell(e.at) },
-    { label: 'Source', cell: (e) => el('span', { class: 'chip ' + (e.source === 'audit' ? 'chip-protected' : 'chip-plain') }, e.source) },
-    { label: 'Kind', cls: 'mono', cell: (e) => e.kind || '—' },
-    { label: 'Actor', cell: (e) => e.actor || '—' },
-    { label: 'Subject', cell: (e) => (e.subject ? el('span', { class: 'mono trunc', title: e.subject }, e.subject) : deviceLabel(e.deviceID)) },
-    { label: 'Reason', cell: (e) => (e.reason ? el('span', { title: e.reason }, e.reason) : '—') },
-    { label: 'Job', cls: 'mono', cell: (e) => (e.jobID ? el('span', { title: String(e.jobID) }, shortId(e.jobID)) : '—') },
+    { label: t('col.when'), cell: (e) => timeCell(e.at) },
+    { label: t('col.source'), cell: (e) => el('span', { class: 'chip ' + (e.source === 'audit' ? 'chip-protected' : 'chip-plain') }, e.source) },
+    { label: t('col.kind'), cls: 'mono', cell: (e) => e.kind || '—' },
+    { label: t('col.actor'), cell: (e) => e.actor || '—' },
     {
-      label: 'Detail', cell: (e) => {
+      label: t('col.subject'), cell: (e) => cstack(
+        e.subject ? el('span', { class: 'mono trunc', title: e.subject }, e.subject) : deviceLabel(e.deviceID),
+        csub(t('sub.job'), e.jobID ? el('span', { class: 'mono', title: String(e.jobID) }, shortId(e.jobID)) : null))
+    },
+    { label: t('col.reason'), cell: (e) => (e.reason ? el('span', { title: e.reason }, e.reason) : '—') },
+    {
+      label: t('col.detail'), cell: (e) => {
         if (!e.detail || (typeof e.detail === 'object' && !Object.keys(e.detail).length)) return '—';
         const s = typeof e.detail === 'string' ? e.detail : JSON.stringify(e.detail);
         return el('details', null, el('summary', { class: 'mono trunc' }, s.slice(0, 70)), el('pre', { class: 'out' }, s));
@@ -2446,7 +2640,13 @@ function closeQuarantine(q) {
     route: 'quarantines/{id}/close',
     suggest: ['confirm.suggest.cableReplaced', 'confirm.suggest.healthyAgain'],
     impact: impactList(q.scope + ' ' + (q.rackSlot || q.deviceID || q.host || q.hubID || q.slotID || ''), [
-      'The quarantine opened ' + fmtRel(q.openedAt) + ' is marked closed with your name on it.',
+      // fmtAbs and not fmtRel. fmtRel now answers in the reader's language —
+      // "há 3m" — and these four sentences are still English, so the relative
+      // form put one Portuguese fragment in the middle of an English
+      // confirmation. The absolute instant is language-neutral, and on a
+      // destructive action written to farm.audit_log it is the better of the
+      // two anyway.
+      'The quarantine opened ' + fmtAbs(q.openedAt) + ' is marked closed with your name on it.',
       'Scheduling resumes to this ' + q.scope + ' as soon as its health allows.',
       'Reason it was opened: ' + (q.reason || 'not recorded') + '.',
       'Close it because the fault is fixed, not to clear the screen — the watchdog will simply open it again.'
@@ -3026,7 +3226,7 @@ function wire() {
     err.hidden = true; err.replaceChildren();
     let body;
     try { body = readJobForm(); } catch (e) {
-      err.replaceChildren(el('strong', null, 'Cannot submit: '), String(e.message));
+      err.replaceChildren(el('strong', null, t('jobs.cannotSubmit') + ' '), String(e.message));
       err.hidden = false;
       return;
     }
@@ -3035,10 +3235,10 @@ function wire() {
     try {
       const resp = await api.post('jobs', body);
       const id = pick(resp, 'job_id', 'id') || (pick(resp, 'job') ? pick(pick(resp, 'job'), 'id') : null);
-      banner('ok', 'Job submitted' + (id ? ' — ' + shortId(id) : '') + '.');
+      banner('ok', t('jobs.submitted') + (id ? ' — ' + shortId(id) : '') + '.');
       loaders.jobs();
     } catch (e) {
-      err.replaceChildren(el('strong', null, 'The server rejected this job: '), errText(e),
+      err.replaceChildren(el('strong', null, t('jobs.rejected') + ' '), errText(e),
         e instanceof ApiError && e.detail !== undefined
           ? el('span', { class: 'fe-detail' }, typeof e.detail === 'string' ? e.detail : JSON.stringify(e.detail, null, 2))
           : null);
@@ -3054,7 +3254,7 @@ function wire() {
     err.hidden = true; err.replaceChildren();
     let selector;
     try { selector = JSON.parse($('#bulk-selector').value.trim() || '{}'); } catch (e) {
-      err.replaceChildren(el('strong', null, 'Selector is not valid JSON: '), String(e.message));
+      err.replaceChildren(el('strong', null, t('bulk.badSelector') + ' '), String(e.message));
       err.hidden = false;
       return;
     }
@@ -3081,10 +3281,10 @@ function wire() {
       const resp = await api.post('bulk', body);
       const id = pick(resp, 'run_id', 'id') || (pick(resp, 'run') ? pick(pick(resp, 'run'), 'id') : null);
       if (id) { state.bulkRunID = id; state.data.bulkRun = null; syncHash(); }
-      banner('ok', 'Bulk run started' + (id ? ' — ' + shortId(id) : '') + '. Results appear below as each device answers.');
+      banner('ok', t('bulk.started') + (id ? ' — ' + shortId(id) : '') + '. ' + t('bulk.startedDetail'));
       loaders.bulk();
     } catch (e) {
-      err.replaceChildren(el('strong', null, 'The server rejected this run: '), errText(e),
+      err.replaceChildren(el('strong', null, t('bulk.rejected') + ' '), errText(e),
         e instanceof ApiError && e.detail !== undefined
           ? el('span', { class: 'fe-detail' }, typeof e.detail === 'string' ? e.detail : JSON.stringify(e.detail, null, 2))
           : null);
@@ -3099,6 +3299,7 @@ function wire() {
   // for nobody. See closeScreenOnDrawerClose.
   closeScreenOnDrawerClose();
 
+  wireFormPanels();
   wireLanguage();
   wireDensity();
   wireRail();
@@ -3191,7 +3392,15 @@ function glossJobForm() {
   for (const [sel, id, label] of [
     ['#job-pool-label', 'pool', 'Pool'],
     ['#job-queue-label', 'queue', 'Queue'],
-    ['#job-tenant-label', 'tenant', 'Tenant']
+    ['#job-tenant-label', 'tenant', 'Tenant'],
+    /* disruption_policy arrived here when the Jobs table lost its `Guards`
+     * column, which was where its gloss used to hang. The form is a better
+     * home for it than a column heading was: it is where an operator has to
+     * CHOOSE one of the three values, and the label is the last thing they
+     * read before they do. The word is a phrase, not the identifier, so it
+     * takes the dictionary's version; the dialog prints `disruption_policy`
+     * itself, unchanged in both languages. */
+    ['#job-policy-label', 'disruptionPolicy', t('jobs.form.policy')]
   ]) {
     const node = $(sel);
     if (node) node.replaceChildren(term(id, label));
@@ -3242,6 +3451,78 @@ if (document.readyState === 'loading') {
   boot();
 }
 
+/* wireFormPanels drives the two disclosure forms — Submit a job, Run a
+ * command — that used to be permanent sidebars beside their tables.
+ *
+ * THE `[hidden]` TRAP LIVES HERE. `.formpanel-body` sets `display: grid`, and
+ * an author `display` beats the user agent's `[hidden] { display: none }` at
+ * any specificity. Without the global `[hidden] { display: none !important }`
+ * at the top of style.css this form would be on screen from the first paint
+ * with `aria-expanded="false"` beside it — a control that says closed over a
+ * form that is open. That is the third time this stylesheet has met that trap
+ * and the first time it was closed for the whole page rather than patched
+ * for one component.
+ *
+ * The button carries `aria-expanded` and `aria-controls`, so a screen reader
+ * is told the same thing the glyph says. The glyph is + and −, which survive
+ * a greyscale screenshot; nothing here is signalled by colour alone. */
+function wireFormPanels() {
+  for (const btn of $$('.formpanel-toggle')) {
+    const form = $('#' + btn.dataset.formpanel);
+    if (!form) continue;
+    const glyph = $('.fp-glyph', btn);
+    const paint = () => {
+      const open = btn.getAttribute('aria-expanded') === 'true';
+      form.hidden = !open;
+      if (glyph) glyph.textContent = open ? '−' : '+';
+    };
+    paint();
+    // openFormPanel repaints through this rather than synthesising a click, so
+    // that opening the panel from a page action does not also scroll.
+    btn.addEventListener('formpanel:paint', paint);
+    btn.addEventListener('click', () => {
+      const open = btn.getAttribute('aria-expanded') === 'true';
+      btn.setAttribute('aria-expanded', open ? 'false' : 'true');
+      paint();
+      // Opening puts the caret in the first field. Somebody who clicked
+      // "Submit a job" is about to type a pool name, not to read a legend.
+      if (!open) focusFirstField(form);
+    });
+  }
+}
+
+/* openFormPanel opens a disclosure form from somewhere other than its own
+ * button — a page action in the top bar, or the action on an empty panel.
+ *
+ * It drives the BUTTON and not the form, because `aria-expanded` on the button
+ * is the thing a screen reader is told and a form that is visible under a
+ * control still saying "collapsed" is worse than one that is shut. If the form
+ * is not inside a disclosure at all — nothing else in this app is, but the
+ * helper should not care — this is a no-op and the caller's scroll and focus
+ * still work. */
+function openFormPanel(form) {
+  if (!form || !form.id) return;
+  const btn = $('.formpanel-toggle[data-formpanel="' + form.id + '"]');
+  if (!btn || btn.getAttribute('aria-expanded') === 'true') return;
+  // Not btn.click(): the click handler focuses the first field, which scrolls,
+  // and jumpToForm is about to do its own scroll from a position that jump
+  // just invalidated. Set the state and repaint; the caller places the caret.
+  btn.setAttribute('aria-expanded', 'true');
+  btn.dispatchEvent(new CustomEvent('formpanel:paint'));
+}
+
+/* The bulk form's first field is built by exec.js at render time, so it is
+ * neither an <input> in the HTML nor reliably first in the DOM. Anything the
+ * widget mounted that can take a caret will do. */
+function focusFirstField(form, opts) {
+  const first = form.querySelector('input:not([type="hidden"]), textarea, select');
+  // preventScroll is forwarded rather than assumed: when the toggle is pressed
+  // directly the browser's own scroll is right, and when jumpToForm opened the
+  // panel it owns the scroll and an instant jump here would be seen as a
+  // stutter before the smooth one.
+  if (first) first.focus(opts);
+}
+
 /* wireLanguage drives the header's language switch.
  *
  * The button shows the language it would switch TO, not the one in use. That is
@@ -3272,6 +3553,12 @@ function wireLanguage() {
      * deliberately left alone: re-rendering it would tear down a session and an
      * encoder on a phone to change a heading. */
     try { render(); } catch (_) { /* a redraw failure must not strand the switch */ }
+    /* The job form's four glossed labels are static HTML, so applyTranslations
+     * has just set their textContent — which is exactly the term button
+     * glossJobForm put there. Re-attaching is not a refresh, it is the repair:
+     * without it the dotted underline survives one language switch and is gone
+     * for the rest of the session. */
+    glossJobForm();
   });
 }
 
@@ -3466,14 +3753,34 @@ function jumpToForm(formSel, fieldSel) {
   const form = $(formSel);
   if (!form) return;
 
+  /* Both forms are disclosures now and both are closed on arrival, so this has
+   * to open the panel before it can scroll to it or focus into it. Scrolling to
+   * a `hidden` form lands on a zero-height box and `focus()` on a field inside
+   * one does nothing at all — the button would read as broken to precisely the
+   * reader who pressed it because they could not find the form. */
+  openFormPanel(form);
+
+  /* The scroll anchor is the disclosure, not the form. The heading that says
+   * "Submit a job" is the `.formpanel-h` button ABOVE the form now, so
+   * anchoring on the form puts exactly the label this function exists to keep
+   * visible behind the sticky bar. */
+  const anchor = form.closest('.formpanel') || form;
   const bar = $('.top');
   const clear = (bar ? bar.getBoundingClientRect().height : 0) + 12;
-  const y = form.getBoundingClientRect().top + window.scrollY - clear;
+  const y = anchor.getBoundingClientRect().top + window.scrollY - clear;
   const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
   window.scrollTo({ top: Math.max(0, y), behavior: reduce ? 'auto' : 'smooth' });
 
+  /* `#bulk-command` is a mount point, not a control: exec.js builds the real
+   * field inside it. focus() on a plain <div> silently does nothing, so fall
+   * through to whatever the widget put there rather than leaving the caret
+   * wherever the click came from. */
   const field = $(fieldSel);
-  if (field) field.focus({ preventScroll: true });
+  const target = field && typeof field.focus === 'function' && field.tabIndex >= 0
+    ? field
+    : (field ? field.querySelector('input:not([type="hidden"]), textarea, select') : null);
+  if (target) target.focus({ preventScroll: true });
+  else focusFirstField(form, { preventScroll: true });
 }
 
 function mountPageHeads() {

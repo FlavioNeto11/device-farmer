@@ -42,6 +42,34 @@
 
 * { box-sizing: border-box; }
 
+/* THE `[hidden]` TRAP, CLOSED ONCE FOR THE WHOLE PAGE.
+ *
+ * The user agent hides `[hidden]` with `display: none` at the lowest cascade
+ * origin there is, so ANY author rule that sets `display` on the same element
+ * beats it — regardless of specificity, regardless of order. This stylesheet
+ * documents that trap three times and two of the three shipped as real bugs:
+ * a back-to-top button that offered to return a reader who had not gone
+ * anywhere, and a closed screen that left a live-looking frame and a row of key
+ * buttons that sent nothing.
+ *
+ * The three scoped patches below (`.doc-totop[hidden]`, `.screen-panel
+ * [hidden]`, `.cmd-panel [hidden]`) each fixed one occurrence after the fact.
+ * This rule fixes the class. An author `!important` outranks the user agent's
+ * declaration, so one line at the top of the first component sheet makes the
+ * trap unspringable for every component in every sheet — including the six
+ * this redesign added, each written by a different hand in a different
+ * worktree, and each of which shows and hides something: a nav rail, a
+ * cards/table toggle, six tabs in the device sheet, a segmented control, a
+ * dismissible first-visit card, a suggestion row.
+ *
+ * The scoped rules stay. They are redundant now and they carry the story of
+ * why this line exists; deleting them would leave this rule looking arbitrary.
+ *
+ * The one thing this forecloses is `hidden="until-found"`, whose whole point is
+ * that find-in-page can reveal it. Nothing in this app uses it. If something
+ * ever does, exempt it here by name rather than by weakening this rule. */
+[hidden] { display: none !important; }
+
 html, body { height: 100%; }
 
 body {
@@ -180,45 +208,134 @@ button.mini    { padding: var(--s-1) var(--s-2); font-size: var(--fs-xs); }
 main { padding: 8px 12px 40px; }
 .view:focus { outline: none; }
 
+/* The filter bar over a table. Its padding is a density token because a
+   toolbar is one of the four things the density control retunes; before this
+   it carried a hardcoded 6px and the toggle did nothing to it. */
 .toolbar {
-  display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
-  padding: var(--pad-toolbar); margin-bottom: 8px;
-  background: var(--panel); border: 1px solid var(--line); border-radius: var(--r);
+  display: flex; flex-wrap: wrap; align-items: center; gap: var(--s-2) var(--s-3);
+  padding: var(--pad-toolbar); margin-bottom: var(--gap-grid);
+  background: var(--srf-raised); border: 1px solid var(--brd-subtle); border-radius: var(--r);
 }
-.toolbar label { display: flex; align-items: center; gap: 5px; color: var(--dim); font-size: var(--fs-sm); }
+/* Sentence case, not the small-caps this branch originally wrote. Unit 1's
+   rule is that uppercase survives on `thead th` and nowhere else in this file,
+   and a filter label is exactly the micro-label that rule is about: the toolbar
+   sits directly over a header row, and two runs of shouted type stacked on each
+   other is the "too tech" texture this redesign is removing. */
+.toolbar label {
+  display: flex; align-items: center; gap: var(--s-2);
+  color: var(--txt-2); font-size: var(--fs-sm); font-weight: var(--fw-medium);
+}
 .toolbar select, .toolbar input {
-  font: inherit; padding: var(--s-1) var(--s-2); color: var(--text);
-  background: var(--bg); border: 1px solid var(--line); border-radius: 4px;
+  font: var(--fs-body)/var(--lh) var(--sans); padding: var(--s-1) var(--s-2);
+  color: var(--txt-1); font-weight: var(--fw-normal);
+  background: var(--srf-raised); border: 1px solid var(--brd-strong); border-radius: var(--r-sm);
 }
 .grow { flex: 1; }
 
-.counts { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; }
-/* A count is digits and a word. tabular-nums keeps the digits from jittering as
-   the number changes under the event stream, which is the only thing monospace
-   was buying here. */
+.counts { display: flex; flex-wrap: wrap; gap: var(--s-1); align-items: center; }
+/* A count is a number with a name on it. Tabular figures rather than a
+   monospace face, for the reason td.num gives: it keeps the digits from
+   jittering as the number changes under the event stream. */
 .count {
-  font-size: var(--fs-xs); line-height: var(--lh);
-  font-variant-numeric: tabular-nums;
-  border: 1px solid var(--line); border-radius: 999px; padding: 0 var(--s-2);
-  background: var(--panel-2); color: var(--dim);
+  font: var(--fs-xs)/var(--lh) var(--sans); font-variant-numeric: tabular-nums;
+  border: 1px solid var(--brd-subtle); border-radius: var(--r-pill); padding: 0 var(--s-2);
+  background: var(--srf-sunken); color: var(--txt-2); white-space: nowrap;
 }
-.count b { color: var(--text); font-weight: var(--fw-semi); }
+.count b { color: var(--txt-1); font-weight: var(--fw-semi); }
 
+/* A section heading inside a view. It names a region, so it is sized like a
+   heading rather than set as a dim caption above a panel — the five views this
+   file owns are mostly a stack of these and the reader needs to be able to tell
+   where one panel's argument ends and the next begins. */
 .section-h {
-  font-size: var(--fs-sm); font-weight: var(--fw-semi); color: var(--txt-2);
-  margin: var(--gap-section) 0 var(--s-2);
+  font-size: var(--fs-lg); font-weight: var(--fw-semi); letter-spacing: -.01em;
+  color: var(--txt-1); margin: var(--gap-section) 0 var(--s-2);
+}
+.section-h:first-child { margin-top: 0; }
+
+/* THE FORM THAT USED TO BE A COLUMN.
+
+   Jobs and Bulk were a `.split`: the table in one track and the form pinned
+   beside it in a 330px sidebar, on every visit, whether or not anybody was
+   submitting anything. Measured at 1280px, that left the Jobs table 840px for
+   fifteen columns that wanted 1182 — the sidebar was the single largest reason
+   the table needed a horizontal scrollbar, and the Jobs table is what the page
+   is FOR.
+
+   It is now a labelled disclosure above the table. Closed, the table gets the
+   whole page and fits at 1280 with room over. Open, the FORM gets the whole
+   page: its five groups sit side by side instead of stacking eleven boxes down
+   a 330px gutter, which is a better form than the one it replaces and not a
+   hidden one — the control is a real button with a real label, not an icon,
+   and it reads "Submit a job".
+
+   `.split` is gone with it. No view uses it now. */
+.formpanel { margin-bottom: var(--gap-grid); }
+.formpanel-h { margin: 0; font: inherit; }
+.formpanel-toggle {
+  display: inline-flex; align-items: center; gap: var(--s-2);
+  padding: var(--pad-toolbar) var(--s-4);
+  font-size: var(--fs-md); font-weight: var(--fw-semi);
+}
+.formpanel-toggle .fp-glyph {
+  display: inline-block; width: 1em; text-align: center;
+  font-size: var(--fs-lg); line-height: 1; color: var(--brand-600);
 }
 
-.split { display: grid; grid-template-columns: minmax(0, 1fr) 330px; gap: 12px; align-items: start; }
-@media (max-width: 1100px) { .split { grid-template-columns: minmax(0, 1fr); } }
+.formpanel-body {
+  margin-top: var(--gap-grid);
+  background: var(--srf-raised); border: 1px solid var(--brd-subtle);
+  border-radius: var(--r); padding: var(--pad-page);
+  display: grid; gap: var(--gap-section) var(--s-6);
+  /* 250px is a measure, not a space: it is the narrowest a field group can be
+     and still fit "Expected duration" beside "Max runtime" in a .row2. Track
+     floors of this kind are stated at their call site throughout this file —
+     see .doc-table's 34rem and .cmd-pf's 11rem. */
+  grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+  /* A form is read across, and five groups spread over a 2560px monitor is a
+     line of fields nobody can follow. The page's own maximum is the right
+     ceiling: it is the width the rest of the product is designed against. */
+  max-width: var(--page-max);
+  align-items: start;
+}
+/* Across a grid the gutter already separates the groups, so the rule between
+   them is noise — but ONLY across a grid. auto-fit collapses to one column on
+   its own when the panel is narrow, and a single column of fieldsets with no
+   rule and no margin between them is the undifferentiated run of eleven boxes
+   these fieldsets exist to break up. So the reset is conditional and the
+   stacked case keeps its separators.
 
+   900px is arithmetic, not a round number. Two 250px tracks plus the --s-6
+   gutter need 532px of panel; the panel is the viewport less the 240px rail,
+   less --pad-page either side of the content column, less --pad-page either
+   side of the panel — about 336px of chrome. 532 + 336 = 868, rounded up to
+   the next hundred so the boundary is not sitting on the arithmetic. */
+@media (min-width: 900px) {
+  .formpanel-body fieldset + fieldset { margin-top: 0; padding-top: 0; border-top: 0; }
+}
+/* A group whose control is a mounted widget rather than a field: it is as tall
+   as four ordinary groups and it takes the whole row rather than making one
+   narrow column of code beside a screen of nothing. `1 / -1` and not
+   `span 2`, which would invent an implicit second column on a narrow window. */
+.formpanel-body > .fp-wide,
+.formpanel-body > .form-error,
+.formpanel-body > button[type="submit"] { grid-column: 1 / -1; }
+.formpanel-body > button[type="submit"] { justify-self: start; margin-top: 0; }
+
+/* A panel with a heading. Its only two call sites were the Jobs and Bulk
+   sidebar forms, which are now `.formpanel-body`, so nothing in this worktree
+   uses it. It stays because it is a generic primitive that already composes
+   the tokens correctly, and deleting a shared primitive in the middle of a
+   parallel redesign breaks somebody else's branch for no gain. */
 .card {
-  background: var(--panel); border: 1px solid var(--line);
-  border-radius: var(--r); padding: var(--pad-tile);
+  background: var(--srf-raised); border: 1px solid var(--brd-subtle);
+  border-radius: var(--r); padding: var(--pad-page);
 }
 .card h2 {
-  margin: 0 0 var(--s-2);
-  font-size: var(--fs-sm); font-weight: var(--fw-semi); color: var(--txt-2);
+  margin: 0 0 var(--s-3); padding-bottom: var(--s-3);
+  border-bottom: 1px solid var(--brd-subtle);
+  font-size: var(--fs-lg); font-weight: var(--fw-semi); letter-spacing: -.01em;
+  color: var(--txt-1);
 }
 
 /* ---------------- fleet ---------------- */
@@ -328,10 +445,48 @@ main { padding: 8px 12px 40px; }
 
 /* ---------------- tables ---------------- */
 
-.panel-body { background: var(--panel); border: 1px solid var(--line); border-radius: var(--r); overflow: auto; }
-/* Dense operational tables scroll sideways inside their own panel rather than
-   folding every cell into three lines on a narrow window. */
-table { width: 100%; min-width: 900px; border-collapse: collapse; }
+.panel-body {
+  background: var(--srf-raised); border: 1px solid var(--brd-subtle);
+  border-radius: var(--r); overflow: auto;
+  max-width: 100%; min-width: 0;
+  /* If a table is still wider than its panel on some window nobody measured,
+     it scrolls HERE. Never the document — see the four rules under NOTHING MAY
+     MAKE THE DOCUMENT SCROLL SIDEWAYS. A gutter that is always reserved is a
+     scrollbar the reader can see coming rather than one that appears under
+     their cursor and shifts the column they were reading. */
+  scrollbar-gutter: stable;
+}
+
+/* THE 900px MINIMUM IS GONE. This is the argument, because the comment it
+   replaces made the opposite one and was not wrong when it was written.
+
+   It read: "Dense operational tables scroll sideways inside their own panel
+   rather than folding every cell into three lines on a narrow window." That
+   trade is real. What made it the wrong side of the trade is that it was a
+   FLOOR, not a ceiling: `min-width: 900px` cannot fold a cell, but it also
+   cannot notice that the Jobs table wanted 1182px inside an 897px panel on an
+   ordinary 1280px laptop. Measured before this change: 285px of columns —
+   Created, Started, Finished, By and the Cancel button — reachable only by
+   scrolling a table sideways inside a page that does not scroll. An operator
+   who does not know they are there does not go looking.
+
+   A horizontal scrollbar under a business table on a 1280px screen is the
+   whole "too tech" complaint in miniature: it is the interface telling the
+   reader that fitting the data on the screen was their problem.
+
+   So the fix is upstream of the CSS. The five views that own this file lost
+   their widest tables' column counts instead — Jobs 15 → 8, Leases 12 → 9,
+   Bulk runs 10 → 7, job steps 9 → 6 — by stacking a qualifier under the value
+   it qualifies (see `.cstack`) rather than by dropping a single field. Nothing
+   the API returns stopped being on screen; it stopped needing its own column.
+
+   `.panel-body` above keeps its own scroll box regardless, so the day a table
+   grows past its panel again the failure is a scrollbar in one panel and not a
+   document that drifts sideways under the reader. The two other min-widths in
+   this file — `.doc-table table` and `.tscroll > table` — are unaffected: they
+   are scoped to boxes that ARE their own scrollers. */
+table { width: 100%; border-collapse: collapse; }
+
 /* The one surviving uppercase in this file. A column head is not read, it is
    located, and the case change is what separates the header row from the data
    under it without needing a heavier rule or a louder colour. */
@@ -340,31 +495,116 @@ thead th {
   text-align: left;
   font-size: var(--fs-xs); font-weight: var(--fw-semi);
   text-transform: uppercase; letter-spacing: .04em;
-  color: var(--dim); background: var(--panel-2);
-  padding: var(--pad-cell); border-bottom: 1px solid var(--line); white-space: nowrap;
+  color: var(--txt-2); background: var(--srf-sunken);
+  padding: var(--pad-cell);
+  border-bottom: 1px solid var(--brd-strong);
+  white-space: nowrap;
 }
-tbody td { padding: var(--pad-cell); border-bottom: 1px solid var(--line); vertical-align: top; }
-tbody tr:hover td { background: var(--panel-2); }
-/* Aligned digits without a typewriter face: tabular-nums is what a numeric
-   column actually wanted from monospace. */
-td.num { text-align: right; font-variant-numeric: tabular-nums; }
+/* A glossed column heading is still a column heading.
+ *
+ * Found by walking the merged tree, and it is a seam between two units rather
+ * than a mistake in either. terms.js renders a glossed word as a <button>, and
+ * a <button> does not inherit the case and tracking of the cell it sits in the
+ * way a <span> does — so `Fence`, `Witness` and `Rung` came out sentence-cased
+ * and untracked in the middle of a header row that is uppercase and tracked.
+ * Three of nine columns visibly out of step with the other six, on three
+ * tables. fleet.css already resets exactly this on its own `.th-sort` button;
+ * this is the same reset for the other button that lands in a `th`. */
+thead th .term { text-transform: inherit; letter-spacing: inherit; }
+
+tbody td {
+  padding: var(--pad-cell);
+  border-bottom: 1px solid var(--brd-subtle);
+  vertical-align: top;
+  font-size: var(--fs-body);
+}
+/* The panel already draws the bottom edge; a second line under the last row is
+   a doubled rule at every table's foot. */
+tbody tr:last-child td { border-bottom: none; }
+tbody tr:hover td { background: var(--srf-hover); }
+
+/* A number is read DOWN the column, not across the row, and what makes a
+   column of numbers readable is that the digits line up. A monospace face did
+   that — and it also did the other thing, which is why every figure in this
+   product looked like console output. Tabular figures are the same alignment
+   out of the page's own typeface: 1,024 and 96 keep the same decimal position
+   and neither shouts. */
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 td.mono, .mono { font-family: var(--mono); }
 
-/* A value deliberately shown AS an identifier: a uuid, a devpath, a column
+/* A value deliberately shown as an identifier: a uuid, a devpath, a column
    name, a metric label — something an operator copies into a query rather than
    reads as a name. Mono is the signal that it is machine text, and the smaller
-   dimmer type is the signal that it is not why you are looking at the row. */
-/* A value deliberately shown as an identifier: a uuid, a devpath, a column
-   name. overflow-wrap because a 32-character hex string has nowhere to break
-   and will otherwise push a panel sideways rather than wrap inside it. */
+   type is the signal that it is not why you are looking at the row.
+   overflow-wrap because a 32-character hex string has nowhere to break and will
+   otherwise push a panel sideways rather than wrap inside it.
+
+   --txt-2, NOT --txt-3, and the audit that closes this redesign is why. --txt-3
+   is the token whose stated role — "a value that is present but not the reason
+   you are looking at the row" — describes this class exactly, and it does not
+   reach 4.5:1 anywhere in the light scheme: 3.86 on --srf-raised, 3.60 on
+   --srf-canvas, 3.40 on --srf-sunken, 3.22 on a hovered row. An identifier is
+   the one string on the page a reader copies CHARACTER BY CHARACTER into a psql
+   session, so it is the last thing that may be hard to read. The dimness was
+   never carrying the signal on its own; the face and the size are.
+   .csub above records the same trade for the same reason. */
 .ident {
   font-family: var(--mono);
   font-size: var(--fs-xs);
-  color: var(--txt-3);
+  color: var(--txt-2);
   overflow-wrap: anywhere;
 }
-td.acts { white-space: nowrap; text-align: right; }
+td.acts, th.acts { white-space: nowrap; text-align: right; }
+td.acts .mini + .mini { margin-left: var(--s-1); }
+
 .trunc { display: inline-block; max-width: 22ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom; }
+
+/* A cell with a second line.
+
+   This is what let four tables lose twenty-two columns between them without
+   losing one value. The line on top is what identifies the row — a job id, a
+   pool, an instant. The line under it is the qualifier you only read once you
+   have found the row: who created it, which queue it went to, when it
+   finished. A qualifier does not need a column heading of its own; it needs to
+   be next to the thing it qualifies, which a separate column four cells to the
+   right is not. */
+.cstack { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+/* A chip is a badge and must stay the width of its word. Left to stretch — the
+   default for a column flex child — an `ok` chip filled the whole State column
+   and read as a progress bar. The sub line below it still stretches, which is
+   what lets it ellipsise. */
+.cstack > .chip, .cstack > .chips { align-self: flex-start; }
+/* The second line stays ONE line. It wrapped at first, and a three-line cell
+   reading "BY / demo- / feeder" is worse than the column it replaced: the
+   whole saving was vertical, and a qualifier that folds three ways spends it
+   again. The label never yields; the value ellipsises and keeps its title. */
+/* --txt-2 and NOT --txt-3, which is the token whose stated role — "a value
+   that is present but not the reason you are looking at the row" — describes
+   this line exactly. Measured in dark on a hovered row, --txt-3 (#7f8b98) over
+   --srf-hover (#232b35) is 4.12:1, under the 4.5 a 12px string needs. It
+   passes at 4.73 on an unhovered row, which is the worst kind of failure: it
+   is legible until you put the mouse on the row you are trying to read. Role
+   purity loses to a contrast ratio. --txt-2 measures 6.49 in dark and 5.26 in
+   light against the same hover. */
+.cstack > .csub {
+  color: var(--txt-2); font-size: var(--fs-xs); line-height: var(--lh-tight);
+  display: flex; flex-wrap: nowrap; align-items: baseline; gap: 0 var(--s-1);
+  min-width: 0; white-space: nowrap;
+}
+/* The qualifier's own name, so the second line is never a bare value whose
+   meaning the reader has to guess from its shape. It is told apart from the
+   value by WEIGHT, not by being dimmer — dimmer is how the contrast above was
+   lost in the first place — and not by case either.
+
+   This branch first set it in small caps. On a merged page that was the wrong
+   call twice over: unit 1's rule is that uppercase survives on `thead th` and
+   nowhere else, and this label appears twice per row on a table of fifty rows,
+   directly under a header row that is already shouting. One run of caps
+   separates a header from its data; two runs stacked is the terminal texture
+   this redesign exists to remove. The dictionary already writes these labels
+   lowercase — `queue`, `by`, `heartbeat` — so the weight does the work. */
+.csub > .clab { flex: none; font-size: var(--fs-xs); font-weight: var(--fw-semi); }
+.csub > .cval { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 
 tr.row-suspect td { background: var(--warn-bg); }
 tr.row-suspect:hover td { background: var(--warn-bg); filter: brightness(1.03); }
@@ -373,8 +613,15 @@ tr.row-held td:first-child { border-left: 4px solid var(--info); }
 tr.row-protected td:first-child { border-left: 4px solid var(--violet); }
 tr.row-refused td { background: var(--bad-bg); }
 
-.empty { padding: 18px 14px; color: var(--dim); }
-.empty strong { display: block; color: var(--text); margin-bottom: 3px; }
+/* An empty state is a sentence, not a shrug. It gets a reading measure and a
+   line height, because the detail line under the heading is the part that says
+   whether anything is wrong — and the action under that is the part that gets
+   the reader out of the blank screen. */
+.empty { padding: var(--pad-page) var(--s-4); color: var(--txt-2); max-width: var(--measure-prose); line-height: var(--lh); }
+.empty strong {
+  display: block; color: var(--txt-1); margin-bottom: var(--s-1);
+  font-size: var(--fs-lg); font-weight: var(--fw-semi);
+}
 .empty-detail { max-width: var(--measure-prose); line-height: var(--lh); }
 .empty-act { margin-top: var(--s-3); }
 
@@ -385,18 +632,29 @@ tr.row-refused td { background: var(--bad-bg); }
 .empty-src summary { color: var(--dim); font-size: var(--fs-xs); }
 .empty-src-body { margin: var(--s-1) 0 0; max-width: var(--measure-prose); font-size: var(--fs-xs); color: var(--dim); }
 
-.ladder-legend { margin: 0 0 var(--s-2); color: var(--dim); font-size: var(--fs-xs); }
+/* The three words the ladder's grammar rests on, glossed once above the rungs.
+   A row of term buttons, so it is set as a quiet caption and not as prose. */
+.ladder-legend {
+  display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--s-1);
+  margin: 0 0 var(--s-2); color: var(--txt-2); font-size: var(--fs-sm);
+}
 
 /* The callout: a bordered aside that states something the reader is assumed not
    to know. .axiom carries the standing sentence at the top of a view;
    .firstrun is the same object said once to somebody who arrived today, so it
-   borrows the look rather than restating it five declarations at a time. */
+   borrows the look rather than restating it five declarations at a time.
+
+   Both are prose, so both are set at a prose line height and given a measure.
+   The Leases axiom is the best sentence in the product and it was being
+   rendered at the density of a log line. */
 .axiom, .firstrun {
-  margin: 0 0 8px; padding: 8px 10px;
-  border: 1px solid var(--line); border-left: 4px solid var(--accent);
-  border-radius: var(--r); background: var(--panel); color: var(--dim);
+  margin: 0 0 var(--gap-grid); padding: var(--pad-row) var(--pad-toolbar);
+  border: 1px solid var(--brd-subtle); border-left: 4px solid var(--brand-600);
+  border-radius: var(--r); background: var(--srf-raised); color: var(--txt-2);
+  line-height: var(--lh-prose);
 }
-.axiom strong { color: var(--text); }
+.axiom { max-width: 100ch; }
+.axiom strong { color: var(--txt-1); }
 
 /* The first-visit card on the Fleet view. Dismissed to localStorage; see
    firstRunSeen() in app.js.
@@ -418,36 +676,109 @@ tr.row-refused td { background: var(--bad-bg); }
 .firstrun p { margin: 0; line-height: var(--lh); }
 .firstrun-acts { display: flex; gap: var(--s-2); flex-wrap: wrap; margin-top: var(--s-1); }
 
-.hint { color: var(--dim); font-size: var(--fs-sm); margin: 4px 0 8px; }
-.alerts { display: flex; flex-direction: column; gap: 6px; }
-.alerts:not(:empty) { margin-bottom: 8px; }
+.hint { color: var(--txt-2); font-size: var(--fs-sm); line-height: var(--lh); margin: 0 0 var(--gap-grid); max-width: 92ch; }
+.alerts { display: flex; flex-direction: column; gap: var(--s-2); }
+.alerts:not(:empty) { margin-bottom: var(--gap-grid); }
 
 /* ---------------- recovery ladder ---------------- */
 
-.ladder { display: flex; flex-direction: column; gap: 3px; }
+/* ---------------- recovery ladder ----------------
+
+   THE LADDER IS A LIST OF ESCALATING ACTIONS AND IT SHOULD READ AS ONE.
+
+   It did not. It was a seven-column grid — tier number, name, description, then
+   four chips in four `auto` tracks — which is a table without a table's
+   headings: four unlabelled badges per row, the same four on every row, and a
+   reader with no way to learn which was the cooldown and which the hourly
+   budget except by hovering each one. Nine such rows in a stack of nine
+   separate cards read as nine unrelated cards, which is the one thing this
+   thing is not. Recovery CLIMBS. Rung 0 is tried before rung 1.
+
+   So: one continuous rail down the left with the tier number on it, the name
+   and the sentence that explains the rung beside it, and the four numbers as a
+   labelled definition list underneath. Same data, same classes, same
+   `blast-*` names — farm.recovery_tiers.blast_radius is device | power_domain |
+   hub | host and those snake_case values stay in the class names, because
+   renaming them changes nothing for the reader and breaks the match against the
+   column for everybody else. */
+
+.ladder { display: flex; flex-direction: column; }
+
 .rung {
-  display: grid; grid-template-columns: 42px minmax(120px, 170px) minmax(0, 1fr) repeat(4, auto);
-  gap: 10px; align-items: center;
-  background: var(--panel); border: 1px solid var(--line); border-radius: var(--r);
-  padding: var(--pad-row);
+  display: grid; grid-template-columns: 40px minmax(0, 1fr);
+  gap: var(--s-3);
+  align-items: start;
+  padding: var(--pad-row) var(--pad-toolbar);
+  background: var(--srf-raised);
+  border: 1px solid var(--brd-subtle);
+  border-left: 4px solid var(--brd-strong);
 }
-.rung .tier { font-size: var(--fs-lg); font-weight: var(--fw-semi); line-height: var(--lh-tight); font-variant-numeric: tabular-nums; }
-.rung .rname { font-size: var(--fs-sm); font-weight: var(--fw-semi); line-height: var(--lh-tight); }
-.rung .rdesc { color: var(--dim); font-size: var(--fs-sm); }
-.rung.disabled { opacity: .55; }
+/* No gap and no doubled border between rungs: one ladder, not nine cards. */
+.rung + .rung { border-top: 0; }
+.rung:first-child { border-radius: var(--r) var(--r) 0 0; }
+.rung:last-child { border-radius: 0 0 var(--r) var(--r); }
+
+/* The rail. The number sits ON it, so the eye follows one line from the
+   cheapest rung to the most expensive instead of reading nine boxes. */
+.rung-step { position: relative; display: flex; justify-content: center; align-self: stretch; }
+.rung-step::before {
+  content: ""; position: absolute; left: 50%; width: 2px; margin-left: -1px;
+  top: calc(0px - var(--pad-row)); bottom: calc(0px - var(--pad-row));
+  background: var(--brd-subtle);
+}
+.rung:first-child .rung-step::before { top: 14px; }
+.rung:last-child .rung-step::before { bottom: calc(100% - 14px); }
+.rung .tier {
+  position: relative; z-index: 1;
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 28px; height: 28px; border-radius: var(--r-pill);
+  background: var(--srf-sunken); border: 1px solid var(--brd-strong); color: var(--txt-1);
+  font-size: var(--fs-sm); font-weight: var(--fw-semi); font-variant-numeric: tabular-nums;
+}
+
+.rung-main { display: flex; flex-direction: column; gap: var(--s-2); min-width: 0; }
+.rung-head { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s-2); min-width: 0; }
+/* The rung's name is the value of farm.recovery_tiers.name, so it keeps the
+   monospace face every identifier in this product wears. */
+.rung .rname { font: var(--fw-semi) var(--fs-md)/var(--lh-tight) var(--mono); color: var(--txt-1); }
+.rung .rdesc { color: var(--txt-2); font-size: var(--fs-sm); line-height: var(--lh); margin: 0; max-width: 88ch; }
+
+/* The four numbers, each with its name on it. They were four bare chips.
+
+   Sentence case on the term, not the small caps this branch first wrote:
+   "Requires policy" is a phrase a reader parses, "REQUIRES POLICY" is a phrase
+   a reader is shouted at with, and unit 1's rule keeps the shouting on
+   `thead th` where it separates a header row from its data. --txt-2 rather
+   than --txt-3: at --txt-3 this line measures 4.12:1 over --srf-hover in dark,
+   which is legible until you put the mouse on the rung you are reading. */
+.rung-meta {
+  display: flex; flex-wrap: wrap; gap: var(--s-1) var(--s-5);
+  margin: 0; font-size: var(--fs-xs);
+}
+.rung-meta > div { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.rung-meta dt { color: var(--txt-2); font-weight: var(--fw-medium); }
+.rung-meta dd { margin: 0; color: var(--txt-1); font-family: var(--mono); font-variant-numeric: tabular-nums; }
+
+/* A disabled rung is dimmed AND carries the word, because dimming alone is a
+   colour signal and this file does not ship those. */
+.rung.disabled { opacity: .7; }
+.rung.disabled .rname { text-decoration: line-through; text-decoration-thickness: 1px; }
+
 /* farm.recovery_tiers.blast_radius is device | power_domain | hub | host.
    Every value that reaches past one phone gets the loud border; leaving one of
    them out made the widest rung on the ladder look like the safest. */
 .rung.blast-host,
 .rung.blast-hub,
-.rung.blast-power_domain { border-left: 4px solid var(--bad); }
-.rung.blast-device { border-left: 4px solid var(--line-2); }
-/* Below the ladder's natural width the columns stop helping: a two-column
-   grid would drop the description into the 42px tier column. Flow instead. */
-@media (max-width: 1000px) {
-  .rung { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; }
-  .rung .rdesc { flex: 1 1 100%; order: 1; }
-  .rung .chip { order: 2; }
+.rung.blast-power_domain { border-left-color: var(--cri-fg); }
+.rung.blast-device { border-left-color: var(--brd-strong); }
+
+/* The rail costs 40px and buys nothing on a phone, where the number can simply
+   lead the line. The `blast-*` left border stays: it is the loudest thing on
+   the row and the reason the row is worth reading twice. */
+@media (max-width: 700px) {
+  .rung { grid-template-columns: minmax(0, 1fr); gap: var(--s-2); }
+  .rung-step { justify-content: flex-start; align-self: auto; }
+  .rung-step::before { display: none; }
 }
 
 /* ---------------- dialogs ---------------- */
@@ -459,29 +790,38 @@ dialog {
   max-width: min(900px, 94vw);
 }
 dialog::backdrop { background: rgba(3, 7, 12, .55); }
-dialog h2 { margin: 0 0 8px; font-size: var(--fs-lg); }
-#dlg-confirm form, #token-form { padding: 14px 16px 12px; width: min(560px, 92vw); }
-#token-form menu { display: flex; justify-content: flex-end; gap: 8px; margin: 14px 0 0; padding: 0; }
+dialog h2 { margin: 0 0 var(--s-2); font-size: var(--fs-lg); }
+/* THE DIALOGS RETUNE TOO.
+   Found by moving the density control with the confirm dialog open: every
+   surface on the seven views changed and this one did not. A dialog is a
+   surface an operator reads at the moment they are deciding something
+   irreversible, and "dense on demand" that stops at the dialog is a control
+   that does most of the page. Six hardcoded values, wired to the component
+   tokens the rest of the file already reads. */
+#dlg-confirm form, #token-form { padding: var(--pad-page); width: min(560px, 92vw); }
+#token-form menu { display: flex; justify-content: flex-end; gap: var(--pad-row); margin: var(--gap-section) 0 0; padding: 0; }
 #token-form button[type="submit"] { width: auto; margin: 0; }
-#dlg-confirm label { display: block; margin: 10px 0 4px; color: var(--dim); font-size: var(--fs-sm); }
+#dlg-confirm label { display: block; margin: var(--pad-row) 0 var(--s-1); color: var(--dim); font-size: var(--fs-sm); }
 #dlg-confirm input {
   width: 100%; font: inherit; padding: var(--pad-cell); color: var(--text);
   background: var(--bg); border: 1px solid var(--line-2); border-radius: 4px;
 }
-#dlg-confirm menu { display: flex; justify-content: flex-end; gap: 8px; margin: 14px 0 0; padding: 0; }
+#dlg-confirm menu { display: flex; justify-content: flex-end; gap: var(--pad-row); margin: var(--gap-section) 0 0; padding: 0; }
 .impact {
   border: 1px solid var(--line); border-left: 4px solid var(--warn);
-  background: var(--panel-2); border-radius: var(--r); padding: 8px 10px;
+  background: var(--panel-2); border-radius: var(--r);
+  padding: var(--pad-row) var(--pad-toolbar);
 }
-.impact ul { margin: 6px 0 0; padding-left: 18px; }
+.impact ul { margin: var(--s-2) 0 0; padding-left: var(--s-5); }
 .impact li { margin: 2px 0; }
 /* The weight stays: the subject of a destructive confirmation is the one word
    in the dialog that must not be skimmed. The typewriter face does not. */
 .impact .subject { font-weight: 700; }
 
 .dlg-head {
-  display: flex; align-items: center; gap: 10px;
-  padding: 10px 14px; border-bottom: 1px solid var(--line); background: var(--panel-2);
+  display: flex; align-items: center; gap: var(--pad-row);
+  padding: var(--pad-row) var(--pad-toolbar);
+  border-bottom: 1px solid var(--line); background: var(--panel-2);
 }
 /* The title of the sheet is the name of the device you clicked. */
 .dlg-head h2 { flex: 1; }
@@ -525,18 +865,103 @@ dialog h2 { margin: 0 0 8px; font-size: var(--fs-lg); }
 }
 .reason-chip:hover { background: var(--srf-hover); color: var(--txt-1); border-color: var(--brd-strong); }
 
-form label { display: block; margin: 8px 0 3px; color: var(--dim); font-size: var(--fs-sm); }
-form input, form select, form textarea {
-  width: 100%; font: inherit; padding: var(--pad-cell); color: var(--text);
-  background: var(--bg); border: 1px solid var(--line); border-radius: 4px;
+/* ---------------- forms ----------------
+
+   THE PROBLEM THESE RULES WERE WRITTEN FOR.
+
+   The Jobs form is eleven fields and the Bulk form six, both in the sidebar
+   beside a table. They were eleven labels and eleven boxes in one undifferentiated
+   run: `Pool`, `Queue`, `Tenant`, `Spec (JSON)`, `Selector (JSON)`, `Expected
+   duration (s)`, `Max runtime (s)`, `TTL (s, min 600)`, `Grace (s, min 300)`,
+   `Disruption policy`, `Protected`, `Created by`. Nothing said that the first
+   three answer "where does this run", the next two "what does it run", the
+   next four "how long may it take" and the last two "what may disturb it" —
+   and a form that does not group its fields is a form you can only fill in if
+   you already knew the answer, which is the complaint this whole redesign is
+   about.
+
+   The labels themselves said `(s)` and `(JSON)` and `min 600`, which is a
+   schema constraint written where a sentence belongs. Those move into a help
+   line under the field, where there is room to say what the number is FOR.
+
+   What does NOT change is any value. `allow_port_power_cycle` is what the API
+   accepts and what `ctl` prints, so it is still what the option says — with a
+   human sentence beside it, never instead of it. */
+
+form fieldset { border: 0; margin: 0; padding: 0; min-width: 0; }
+form legend {
+  padding: 0; margin: 0 0 var(--s-1);
+  color: var(--txt-1); font-size: var(--fs-sm); font-weight: var(--fw-semi);
+  letter-spacing: .02em;
 }
-/* Mono: a textarea in this product holds a command, a selector or a JSON body,
-   and every one of those is text somebody will diff. */
+/* Each group after the first is separated by a rule, so the four questions the
+   form asks are four visible blocks rather than one column of boxes. */
+form fieldset + fieldset {
+  margin-top: var(--gap-section); padding-top: var(--pad-row);
+  border-top: 1px solid var(--brd-subtle);
+}
+form label {
+  display: block; margin: var(--pad-row) 0 var(--s-1);
+  color: var(--txt-1); font-size: var(--fs-sm); font-weight: var(--fw-medium);
+}
+form fieldset > label:first-of-type,
+form .row2 label { margin-top: 0; }
+
+form input, form select, form textarea {
+  width: 100%; font: var(--fs-body)/var(--lh) var(--sans); padding: var(--s-2) var(--s-3);
+  color: var(--txt-1);
+  background: var(--srf-raised); border: 1px solid var(--brd-strong); border-radius: var(--r-sm);
+}
+form input:hover, form select:hover, form textarea:hover { border-color: var(--brand-500); }
+/* The global :focus-visible ring is an outline, so a component that draws its
+   own border cannot defeat it — but a field whose border does not also move
+   reads as unfocused at a glance. Both. */
+form input:focus-visible, form select:focus-visible, form textarea:focus-visible { border-color: var(--brand-600); }
+/* --txt-2, for the reason .ident gives: --txt-3 does not reach 4.5:1 on any
+   surface in the light scheme. A placeholder in this form is an EXAMPLE VALUE —
+   `pixel-6`, `ci-main`, `{}` — and an example nobody can read is a field with
+   no help on it. */
+form input::placeholder, form textarea::placeholder { color: var(--txt-2); }
+
+/* A JSON body is code and stays in the code face. Everything else is prose or
+   a number and is not. */
 form textarea { font-family: var(--mono); font-size: var(--fs-sm); resize: vertical; }
-form .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-form .chk { display: flex; align-items: flex-start; gap: 6px; margin-top: 10px; }
-form .chk input { width: auto; margin-top: 2px; }
-form button[type="submit"] { margin-top: 12px; width: 100%; }
+form input[type="number"] { font-variant-numeric: tabular-nums; }
+
+/* The help line under a field: what the number means and what happens if you
+   leave it empty. This is where `(s, min 600)` went. */
+form .fhelp { margin: var(--s-1) 0 0; color: var(--txt-2); font-size: var(--fs-xs); line-height: var(--lh); }
+
+form .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: var(--s-3); margin-top: var(--pad-row); }
+form fieldset > .row2:first-child { margin-top: 0; }
+form .row2 > div { min-width: 0; }
+
+/* A checkbox whose consequence needs a sentence. The sentence goes under the
+   name, indented to the name, so the control and its explanation are one
+   block and the explanation is not competing with the next field's label. */
+form .chk {
+  display: grid; grid-template-columns: auto minmax(0, 1fr);
+  gap: 0 var(--s-2); align-items: start;
+  margin-top: var(--s-4); font-weight: var(--fw-medium);
+}
+form .chk input { width: auto; margin: 3px 0 0; }
+form .chk .chk-note {
+  grid-column: 2; margin-top: var(--s-1);
+  color: var(--txt-2); font-size: var(--fs-xs); font-weight: var(--fw-normal); line-height: var(--lh);
+}
+
+/* `form >` and not `form`, which is the bug this line was.
+ *
+ * The rule used to be `form button[type="submit"] { width: 100% }`, written for
+ * the two sidebar forms where a full-width submit was right. It also matched
+ * the submit button inside `#dlg-confirm menu` — a flex row of Cancel and
+ * Confirm — where 100% of the row makes the destructive button fill the dialog
+ * and squeezes Cancel to the width of its own text. `#token-form` carries an
+ * explicit `width: auto` override for exactly this reason and `#dlg-confirm`
+ * never got one, so "Revoke this lease" has been a full-width red bar next to a
+ * crushed Cancel. The child combinator fixes both dialogs at once: their submit
+ * buttons are inside a `<menu>`, not direct children of the form. */
+form > button[type="submit"] { margin-top: var(--gap-section); padding: var(--s-2) var(--s-4); }
 
 /* Mono, and not negotiable: this is what the handset said, verbatim. */
 pre.out {
@@ -604,9 +1029,13 @@ details summary:focus-visible { outline: 2px solid var(--accent); }
    AND THE 6888px DOCUMENT
 
    `document.documentElement.scrollWidth` used to be 6888 against a 1920
-   viewport, because one docs table — a `<td>` of vocabulary text, under
-   the global `table { min-width: 900px }` — overflowed a `.doc-table`
-   that had neither `overflow` nor a width constraint. Visible overflow
+   viewport, because one docs table — a `<td>` of vocabulary text, held
+   open by the global `table { min-width: 900px }` that this stylesheet
+   carried at the time — overflowed a `.doc-table` that had neither
+   `overflow` nor a width constraint. (That global floor is gone; the
+   argument for dropping it is in the tables section above. The scroll
+   box below is what still holds, and it is what holds regardless of
+   which table happens to be wide.) Visible overflow
    that nothing clips propagates all the way out to the viewport, so ONE
    table cell gave the whole document a horizontal scrollbar, which
    every other view then inherited. `.doc-table` is now its own scroll
@@ -922,9 +1351,14 @@ details summary:focus-visible { outline: 2px solid var(--accent); }
 }
 
 /* The scroll box the 6888px document was missing. A docs table is data rather
-   than prose, so it steps back to the grid's own size; and the global
-   `table { min-width: 900px }` is relaxed here, because 900px of forced width
-   puts a horizontal scrollbar under a four-column table that would have fit. */
+   than prose, so it steps back to the grid's own size.
+
+   The `min-width: 34rem` on the table below used to be a RELAXATION of the
+   global `table { min-width: 900px }`, written because 900px of forced width
+   put a horizontal scrollbar under a four-column table that would have fit.
+   That global floor no longer exists, so this is now simply this table's own
+   floor: below 34rem a four-column vocabulary table stops being a table. It
+   scrolls inside the box, which is the point of the box. */
 .doc-table {
   margin: .6rem 0 1rem;
   max-width: 100%; min-width: 0; overflow-x: auto;

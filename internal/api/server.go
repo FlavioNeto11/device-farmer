@@ -386,13 +386,19 @@ func New(cfg *config.Config, pool *pgxpool.Pool, opts ...Option) (*Server, error
 		streamInterval:  defaultStreamInterval,
 		newExecutor:     defaultExecutorFactory(cfg),
 		execMaxOutput:   defaultExecMaxOutput,
-		screens:         screen.NewManager(cfg.Screen.MaxSessions, slog.Default()),
 		newScreenDevice: defaultScreenDeviceFactory(cfg),
 		startedAt:       time.Now(),
 	}
 	for _, o := range opts {
 		o(s)
 	}
+
+	// AFTER the options, because WithLogger is one of them. Built here with
+	// slog.Default() it captured the process logger before the caller had a
+	// chance to hand one over, so every line a screen session wrote went
+	// somewhere other than the rest of the api's output — including the tests,
+	// which pass a discarding handler precisely so a failure is readable.
+	s.screens = screen.NewManager(cfg.Screen.MaxSessions, s.log)
 	if s.auth == nil {
 		return nil, fmt.Errorf("api: no authenticator: pass WithAuthenticator(NewStaticBearer(...)), "+
 			"or WithAuthenticator(NewAllowAll(...)) to disable authentication deliberately "+

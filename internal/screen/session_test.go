@@ -889,3 +889,58 @@ func TestTheVideoSocketOutlivesTheCallThatOpenedIt(t *testing.T) {
 		t.Fatalf("reading the spliced stream after Open returned: %v", err)
 	}
 }
+
+// TestAReservationIsNotASession pins the two places a half-started session was
+// mistaken for a real one.
+//
+// Open puts a nil under both map keys BEFORE it dials, so that two concurrent
+// Opens on one device cannot both push a jar and start a server. That
+// placeholder is a *Session that is nil, and both readers of the map treated it
+// as found:
+//
+//   - Lookup returned (nil, nil). A caller with no error has every reason to
+//     dereference what it was handed, and the api's input route did.
+//   - Close called (*Session).Close on it. That one panicked in the SHUTDOWN
+//     path — which runs on every deploy, while requests are still draining, and
+//     takes the process down hard instead of letting them finish.
+//
+// The window is small and entirely reachable: it is an input request or a
+// SIGTERM arriving while another request is starting a session, which is what a
+// client retrying a stream produces on a busy farm.
+//
+// Falsify: drop the `|| s == nil` in Lookup, or the `if s != nil` in Close. The
+// first returns a nil session with no error; the second panics.
+func TestAReservationIsNotASession(t *testing.T) {
+	m := NewManager(4, nil)
+
+	// Reach the state directly. Driving Open to its window would need a device
+	// that blocks mid-dial and a second goroutine racing it — a test about
+	// timing rather than about the property, and one that would pass by luck.
+	id, err := newSessionID()
+	if err != nil {
+		t.Fatalf("newSessionID: %v", err)
+	}
+	if err := m.reserve("dev-1", id); err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+
+	got, err := m.Lookup(id)
+	if !errors.Is(err, ErrNoSession) {
+		t.Errorf("Lookup of a reservation returned (%v, %v); want ErrNoSession. A caller with "+
+			"no error dereferences what it is handed.", got, err)
+	}
+	if got != nil {
+		t.Errorf("Lookup of a reservation returned a session: %v", got)
+	}
+
+	// The one that panicked. No assertion is needed beyond returning: a panic
+	// here fails the test, and a panic in Shutdown fails a deploy.
+	m.Close()
+
+	// And the manager is properly shut afterwards, so the fix did not turn the
+	// panic into a manager that skipped its own close.
+	if _, err := m.Open(context.Background(), newFakeDevice(nil),
+		Options{DeviceID: "dev-2", JarID: "0f1e2d3c4b5a", Version: "3.1", MaxSize: 1024}); !errors.Is(err, ErrClosed) {
+		t.Errorf("Open after Close returned %v, want ErrClosed", err)
+	}
+}

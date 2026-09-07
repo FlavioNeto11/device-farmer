@@ -204,8 +204,18 @@ func (m *Manager) Len() int {
 func (m *Manager) Lookup(id string) (*Session, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	// A nil value is a RESERVATION, not a session: Open puts one under both keys
+	// before it dials, so that two concurrent Opens on one device cannot both
+	// push a jar and start a server. It is present in the map and it has no
+	// Session behind it yet.
+	//
+	// Reporting that as found returned (nil, nil), and the caller — which has
+	// every reason to trust an error-free lookup — dereferenced it. The window
+	// is small and entirely reachable: an input request that arrives while
+	// another request is starting a session, which is exactly what a client
+	// retrying a stream does.
 	s, ok := m.byID[id]
-	if !ok {
+	if !ok || s == nil {
 		return nil, ErrNoSession
 	}
 	return s, nil
@@ -224,7 +234,18 @@ func (m *Manager) Close() {
 	m.closed = true
 	live := make([]*Session, 0, len(m.byID))
 	for _, s := range m.byID {
-		live = append(live, s)
+		// Skip reservations. Open holds a nil under both keys while it dials,
+		// and calling Close on one panicked — in the shutdown path, which is the
+		// single worst place in this process to panic: it runs on every deploy,
+		// it runs while requests are still draining, and a panic there takes the
+		// api down hard instead of letting it finish serving them.
+		//
+		// The reserving Open cleans its own entry up on the way out, and it will
+		// find the manager closed and fail; nothing is leaked by ignoring it
+		// here.
+		if s != nil {
+			live = append(live, s)
+		}
 	}
 	m.mu.Unlock()
 

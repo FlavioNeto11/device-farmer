@@ -558,6 +558,33 @@
      both tiers showing at once so IDENTITY and HEALTH each appeared twice. -->
 <dialog id="dlg-cmd" aria-labelledby="cmd-chooser-title"></dialog>
 
+<!-- The glossary. One shared dialog for all seventeen glossed words rather than
+     one panel per word: it is the same three fields every time, and a popover
+     or an anchored panel would need `popover` or CSS anchor positioning, both
+     of which this page cannot rely on and neither of which can be polyfilled
+     under the no-dependency rule.
+
+     Filled by terms.js. The heading is the word itself and is the dialog's
+     accessible name — a dialog announced as "Glossary" would tell a screen
+     reader user nothing about which word they just opened. -->
+<dialog id="dlg-term" tabindex="-1" aria-labelledby="term-title">
+  <div class="dlg-head">
+    <h2 id="term-title" class="term-word"></h2>
+    <button type="button" id="term-close" class="ghost" data-i18n="term.close">Close</button>
+  </div>
+  <div class="term-body">
+    <p id="term-short" class="term-short"></p>
+    <p class="term-ident-row">
+      <span class="term-ident-label" data-i18n="term.identLabel">In the database, in the API and in the logs</span>
+      <span id="term-ident" class="term-ident"></span>
+    </p>
+    <p class="term-ident-note" data-i18n="term.identNote">That name never changes with the language on this page. It is what psql, ctl and a log line say, and matching them by eye is the whole reason this word is not translated.</p>
+    <menu class="term-actions">
+      <button type="button" id="term-more" class="primary" data-i18n="term.readMore">Read the full definition</button>
+    </menu>
+  </div>
+</dialog>
+
 <!-- Device detail: identity, physical position, health, lease, and the
      ad-hoc exec box. -->
 <dialog id="dlg-device" aria-labelledby="device-title">

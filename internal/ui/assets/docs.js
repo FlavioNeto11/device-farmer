@@ -1149,5 +1149,112 @@
     return wrap;
   }
 
+  /* --------------------------------------------------------- the deep link */
+
+  /* The English section headings of one area, used only to turn a heading a
+     call site wrote into a section INDEX. Filled at most once per area, and
+     ONLY on success: a fetch that failed must not be remembered as "this area
+     has no sections", which would silently degrade every deep link into it for
+     the rest of the tab. `cache` above has retryArea for exactly this reason;
+     this map gets the same treatment by never storing a failure at all. */
+  const enHeadings = new Map();
+
+  async function englishHeadings(area) {
+    if (enHeadings.has(area)) return enHeadings.get(area);
+
+    const loaded = cache.get(ck(area, 'en'));
+    let sections = loaded && !loaded.error ? loaded.sections : null;
+    if (!sections) {
+      try {
+        sections = (await loadJSON(area + '.json')).sections;
+      } catch {
+        return null; /* not remembered; the next click asks again */
+      }
+    }
+    const list = (sections || []).map((s) => s.heading);
+    enHeadings.set(area, list);
+    return list;
+  }
+
+  /* areaReady resolves once the area is in the cache, loaded or failed.
+     ensureArea already keeps the in-flight promise; this only hands it back. */
+  function areaReady(area) {
+    const key = ck(area, lang());
+    if (cache.has(key)) return Promise.resolve();
+    ensureArea(area);
+    return pending.get(key) || Promise.resolve();
+  }
+
+  /* openDocs(area, heading) — take the reader from a word on any view to the
+   * section of this page that defines it.
+   *
+   * It is a FUNCTION CALL and not an <a href="#doc-s-4">, for exactly the
+   * reason the table of contents above is made of buttons: the app routes on
+   * location.hash, and an anchor would rewrite the route and land the reader on
+   * the Fleet grid instead of the section they asked for.
+   *
+   * The heading arrives in ENGLISH, always, because assets/docs/<area>.json is
+   * the source of truth on disk and a call site should name a section by what
+   * that file calls it. The translated documents carry the same sections in the
+   * same ORDER with translated headings, so the index is the thing that crosses
+   * the language boundary and the string is not: this resolves the English
+   * heading to an index, then reads the heading back out of whichever document
+   * is actually on screen. Without that step every deep link would hand a
+   * Portuguese reader an empty "no match for …".
+   *
+   * A heading that resolves to nothing opens the area with no search at all.
+   * The whole page is a worse answer than one section and a far better one than
+   * an empty result — and TestEveryTermPointsAtADocsSectionThatExists turns the
+   * doc rename that causes it into a build failure, rather than something a
+   * reader finds at 3am.
+   *
+   * The search needle is the mechanism, and it has one cost worth writing down:
+   * it stays in the box afterwards, so the area cards are scored against a
+   * whole heading and opening a DIFFERENT area next shows "no match" until the
+   * reader clears it. That is the ordinary behaviour of a search on this page —
+   * the box holds the text, at the top of the page, and emptying it restores
+   * everything — and it buys the thing an anchor cannot: the contents list
+   * shrinks to the section that answers the question, so the reader can see
+   * they were taken somewhere deliberate. */
+  async function openDocs(area, heading) {
+    openArea = area;
+    query = '';
+    pendingScroll = true;
+    if (typeof window.setView === 'function') window.setView('docs');
+    renderDocs();
+
+    const l = lang();
+    await areaReady(area);
+    /* The reader may have switched language or opened something else while the
+       area was in flight. Their last action wins, not this one. */
+    if (l !== lang() || openArea !== area) return;
+
+    const doc = cache.get(ck(area, l));
+    const sections = doc && !doc.error ? (doc.sections || []) : [];
+    let idx = sections.findIndex((s) => s.heading === heading);
+
+    if (idx < 0) {
+      /* A translated document. Cross by index — but only after checking that
+       * the two documents still line up.
+       *
+       * Every section of a translated file is the same section of the English
+       * one at the same position, and TestEveryTranslatedDocKeepsItsSections
+       * InTheSameOrder enforces that from the untranslated `source` each
+       * carries. This is the runtime half of the same check, because the
+       * failure it guards against is the worst one available here: an index
+       * into a document with a section inserted or dropped lands the reader on
+       * a DIFFERENT definition, stated with the same confidence as the right
+       * one. Opening the area unfiltered is the honest answer instead. */
+      const en = await englishHeadings(area);
+      if (en && en.length === sections.length) idx = en.indexOf(heading);
+    }
+    if (l !== lang() || openArea !== area) return;
+
+    query = idx >= 0 && sections[idx] ? sections[idx].heading : '';
+    pendingScroll = true;
+    renderDocs();
+  }
+
   window.renderDocs = renderDocs;
+  window.openDocs = openDocs;
 })();

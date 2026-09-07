@@ -78,6 +78,7 @@ const shellServicePrefix = "shell,v2,raw:"
 
 // Shell v2 packet ids, as the fake writes them.
 const (
+	shellPacketStdout = 1
 	shellPacketStderr = 2
 	shellPacketExit   = 3
 )

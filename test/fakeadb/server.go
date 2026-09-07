@@ -111,7 +111,7 @@ type Request struct {
 	Service string    // the service string exactly as framed by the client
 	Target  string    // the address the client used: serial, devpath or transport-id:N
 	Devpath string    // the device the request actually reached; empty if none did
-	Reply   string    // "OKAY", "FAIL: <msg>", "RESET" or "HANG"
+	Reply   string    // "OKAY", "FAIL: <msg>", "RESET", "HANG" or "ERROR: <msg>"
 	Fault   FaultKind // the injected fault applied, if any
 
 	// Preamble is the fence-proxy admission frame that arrived on the same
@@ -138,6 +138,7 @@ type Stats struct {
 	Faults    int // injected faults applied
 	Trackers  int // host:track-devices streams currently open
 	Snapshots int // device-list snapshots pushed to trackers
+	Streams   int // duplex device services currently held by a stream handler
 }
 
 // Server is a fake ADB host server.
@@ -154,6 +155,8 @@ type Server struct {
 	changed  chan struct{} // closed and replaced on every mutation
 	faults   []*faultRule
 	scripts  []script
+	streams  []streamScript
+	scrcpy   map[string]*scrcpyDevice
 	requests []*Request
 	conns    map[net.Conn]struct{}
 	stats    Stats
@@ -402,7 +405,9 @@ func (s *Server) bumpLocked() {
 // appended the moment the request arrives and filled in as it is answered, so
 // one that has not been answered yet carries an empty Reply. A streaming
 // request is a single entry whose Reply reflects its most recent write, which
-// is why snapshot counting belongs to Stats and not to this log.
+// is why snapshot counting belongs to Stats and not to this log. A duplex
+// stream keeps its OKAY until it ends badly: "RESET" once a handler severs
+// it, "ERROR: <msg>" when the handler itself failed.
 func (s *Server) Requests() []Request {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -918,6 +923,14 @@ func (s *Server) transport(c net.Conn, br *bufio.Reader, rec *Request, svc strin
 // After its OKAY the bytes are raw: no framing, no length, just the stream
 // until close — which is why a reset here is indistinguishable from a device
 // dying, and why adbwire must classify it as transport-only.
+//
+// Stream scripts are consulted FIRST, and a match still goes out through
+// finish for its OKAY rather than writing four bytes directly. That is what
+// keeps failure injection whole: a FaultFail on this service string refuses a
+// duplex service in the server's own words, a FaultReset severs it before the
+// handler ever sees the socket, and a FaultHang swallows it. None of that
+// would happen if a duplex match jumped the fault check on its way to the
+// handler, and the hole would only show up in the one test that needed it.
 func (s *Server) deviceStream(c net.Conn, br *bufio.Reader, d Device) {
 	svc, err := readFrame(br)
 	if err != nil {
@@ -925,8 +938,23 @@ func (s *Server) deviceStream(c net.Conn, br *bufio.Reader, d Device) {
 	}
 	rec := &Request{At: time.Now(), Service: svc, Target: d.Devpath, Devpath: d.Devpath}
 	s.record(rec)
-	body := append([]byte("OKAY"), s.scriptFor(d, svc)...)
-	s.finish(c, rec, body, s.takeFault(svc, d.Devpath))
+	f := s.takeFault(svc, d.Devpath)
+
+	if h, ok := s.matchStream(d, svc); ok {
+		// Two conditions, not one, because finish reports whether the
+		// CONNECTION survived and a FAIL is something a connection survives.
+		// Handing the handler a socket the server has just refused would
+		// write a screen stream on top of a refusal — which is not a shape
+		// any client is built to parse, and would have made every
+		// fault-injection test on a duplex service quietly meaningless. Only
+		// a fault that left the reply alone still leaves a service to run.
+		if !s.finish(c, rec, []byte("OKAY"), f) || (f != nil && f.Kind != FaultNone) {
+			return
+		}
+		s.runStream(c, br, rec, d.Devpath, svc, h)
+		return
+	}
+	s.finish(c, rec, append([]byte("OKAY"), s.scriptFor(d, svc)...), f)
 }
 
 func (s *Server) deviceQuery(c net.Conn, rec *Request, svc string, tgt target, cmd string) {

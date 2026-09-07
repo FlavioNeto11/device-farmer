@@ -1,0 +1,669 @@
+{
+  "area": "operate",
+  "title": "Rodando na prática: roles, configuração, deployment e o que não está construído",
+  "summary": "O farmd é um único binário estático com treze subcomandos; todo role é um subcomando, de modo que um reaper nunca pode rodar um commit diferente do scheduler com o qual ele disputa. Esta página é a referência autoritativa de configuração — 28 variáveis em internal/config mais 7 lidas em outros lugares, quatro delas validadas no boot e depois ignoradas — e o inventário honesto do que não está ligado. Quatro entradas que encabeçavam esse inventário estão fechadas: a autenticação é escolhida por configuração, o `farmd node` inicia, a recovery ladder tem um cliente para o host agent e um chart Helm é distribuído. O que resta é a lacuna de métricas, e ela está pior do que costumava dizer: /metrics não carrega nenhuma série própria de pacote nenhum, porque cmd/farmd/roles.go chama obs.RegisterAll sem nenhum grupo de collectors e o único ponto de chamada de Collectors() da árvore fica num ramo que o farmd nunca toma. A única coisa a levar daqui: SIGTERM drena o trabalho e não libera nada, deliberadamente.",
+  "sections": [
+    {
+      "heading": "Os doze subcomandos, e qual deles está sendo iniciado",
+      "body": "O `farmd` sem argumentos imprime o uso em **stderr** e sai com **2**. O `farmd --help` imprime um texto byte a byte idêntico em **stdout** e sai com **0**. Os dois respondem sem tocar no ambiente nem no banco, então continuam funcionando em um contêiner descartável e em um deployment quebrado: o desvio de `help`/`version` em cmd/farmd/main.go roda antes de `context.WithCancel` e antes de qualquer chamada a config.Load.\n\nNão existe role padrão. O Dockerfile define `ENTRYPOINT [\"/usr/local/bin/farmd\"]` sem CMD, então um manifesto com um erro de digitação falha em vez de iniciar algo plausível.\n\nOs códigos de saída são distintos de propósito: 0 sucesso, 1 falha, 2 o comando foi digitado errado, 3 role não implementado. **O código 3 é hoje inalcançável** — `notImplemented` está definido em cmd/farmd/main.go:236 e não tem chamadores.\n\nUma peculiaridade a conhecer antes de depurar um manifesto: `runRole` define as flags `-hosts` e `-devices` do demo no flag set de *todo* role, então `farmd scheduler -hosts 9` é parseado e ignorado. Uma flag digitada errado é um erro de uso cujo texto de ajuda então lista `-devices` e `-hosts` — ambas rotuladas como \"demo only:\", o que é a única coisa que o salva de ser ativamente enganoso.",
+      "bullets": [
+        "`api`, `scheduler`, `reaper`, `watchdog`, `recovery`, `jobrunner`, `node`, `all`, `demo` passam todos por `runRole`: preflight da configuração, depois dial + ping do pool, depois dispatch. Um manifesto ruim falha no rollout, não na primeira requisição.",
+        "`ctl` carrega a configuração com `WithoutDatabase()` e nunca abre o Postgres — ele precisa continuar funcionando quando o control plane é justamente aquilo que está sendo investigado.",
+        "`migrate` também carrega com `WithoutDatabase()` (cmd/farmd/migrate.go:162) porque `-dsn` tem permissão de ser a única fonte de um DSN.",
+        "`all` roda api + scheduler + reaper + recovery + jobrunner + um watchdog por host registrado em um único processo. Ele **não** inclui `node`.",
+        "`demo` é o `all` mais o `internal/demo`, que é dono do hardware falso. O scheduler, o lease store, o reaper, a recovery ladder e o job runner são os caminhos de código de produção."
+      ],
+      "examples": [
+        {
+          "label": "farmd sem argumentos",
+          "lang": "bash",
+          "code": "$ farmd; echo \"exit=$?\"",
+          "output": "farmd — device-farmer control plane\n\nUsage: farmd <role> [flags]\n\nRoles:\n  migrate     apply, roll back, or inspect the database schema\n  api         tenant-facing HTTP API; job submission and lease renewal\n  scheduler   matches queued jobs to free devices via farm.lease_acquire\n  reaper      suspect sweep and the single automatic release path\n  watchdog    device health only; it can never touch a lease\n  jobrunner   runs job specs on leased devices; re-attaches after an eviction\n  recovery    the recovery ladder; acts for a holder that keeps its device\n  all         every control-plane role in one process (laptop / single node)\n  demo        simulated hardware plus the real control plane; needs no phones\n  node        host agent: USB discovery, enrollment, and the hardware rungs\n  ctl         operator CLI against the API\n  version     build information\n\nEvery role reads its configuration from the environment; DATABASE_URL is\nrequired by all of them except ctl. Run \"farmd migrate -h\" for its flags.\n\nSIGTERM and SIGINT drain in-flight work. They do not release leases: a pod\neviction is not evidence that the job on the phone died, and the replacement\nre-attaches to the same lease at the same fence.\nexit=2",
+          "note": "O `farmd --help` escreve os mesmos 1218 bytes em stdout e sai com 0; o `diff` das duas capturas é vazio."
+        },
+        {
+          "label": "Metadados de build",
+          "lang": "bash",
+          "code": "$ farmd version",
+          "output": "farmd dev\ncommit:  d872818f4aa32a29943ef17084a43f469c1c072c\ngo:      go1.26.5 windows/amd64",
+          "note": "`version` é definido com -ldflags; sem ele, cai para o vcs.revision de debug.ReadBuildInfo, que é o que aparece aqui. Confira isso contra `git rev-parse HEAD` antes de confiar em um binário que não acabou de ser compilado — a raiz do repositório também carrega um farmd.exe mais antigo."
+        },
+        {
+          "label": "Um erro de flag cita flags que aquele role ignora",
+          "lang": "bash",
+          "code": "$ farmd scheduler -bogus; echo \"exit=$?\"",
+          "output": "flag provided but not defined: -bogus\nUsage of scheduler:\n  -devices int\n    \tdemo only: simulated devices across those hosts (default 56)\n  -hosts int\n    \tdemo only: simulated ADB hosts (default 2)\nexit=2"
+        }
+      ],
+      "source": "cmd/farmd/main.go, cmd/farmd/roles.go, Dockerfile",
+      "table": {
+        "columns": [
+          "Role",
+          "O que faz",
+          "Escala",
+          "Como a concorrência é arbitrada"
+        ],
+        "rows": [
+          [
+            "migrate",
+            "Aplica o schema embarcado (goose). up / down-to / status.",
+            "N (seguro)",
+            "Session advisory lock, chave 0x6466_6d69_6772_0001 (cmd/farmd/migrate.go:71). O `status` pula o lock deliberadamente (migrate.go:220-222), para que se possa olhar enquanto um migrador o segura."
+          ],
+          [
+            "api",
+            "API HTTP + dashboard embarcado + /metrics em um único listener.",
+            "N",
+            "Stateless. Sem eleição de líder. Escale atrás de um Service."
+          ],
+          [
+            "scheduler",
+            "Chama farm.lease_acquire; transforma jobs enfileirados em leases.",
+            "1 ativo",
+            "pg_try_advisory_lock, chave 0x6661726d5363686c (\"farmSchl\", scheduler.go:82). Os standbys ficam ociosos e mesmo assim batem heartbeat."
+          ],
+          [
+            "reaper",
+            "Varredura de suspects, expiração por max-runtime e farm.lease_reclaim — o único caminho automático de liberação.",
+            "1 ativo",
+            "pg_try_advisory_lock, chave 0x6661726d52656170 (\"farmReap\", reaper.go:85). O censo somente-leitura roda em toda réplica, líder ou não (reaper.go:222-229)."
+          ],
+          [
+            "jobrunner",
+            "Reivindica jobs já alocados, se reconecta ao lease deles pelo job_id, conduz o internal/runner.",
+            "N (escale à vontade)",
+            "Três proteções: session advisory lock por job, um predicado de poll sobre uma attempt aberta com heartbeat vivo, e SELECT ... FOR UPDATE OF j SKIP LOCKED (jobrunner.go:500)."
+          ],
+          [
+            "watchdog",
+            "Somente saúde do dispositivo. Nunca toca em um lease; não importa internal/lease, e o role de banco farm_watchdog tem todos os privilégios sobre farm.leases revogados.",
+            "1 por host",
+            "Sem lock. Com FARM_HOST_ID definido ele supervisiona um host; sem ele, uma goroutine por linha de farm.hosts onde admin_state <> 'disabled', e ele sai com erro se não houver nenhuma."
+          ],
+          [
+            "recovery",
+            "A recovery ladder, tiers 0–8 (nove degraus).",
+            "N",
+            "Nenhuma eleição de líder. pg_advisory_xact_lock(classe 26981, hashtext(device)) por tentativa (ladder.go:97, ladder.go:986)."
+          ],
+          [
+            "node",
+            "Host agent: descoberta USB, enrollment, USBDEVFS_RESET, energia VBUS.",
+            "1 por host físico",
+            "Exige FARM_HOST_ID. Hoje não consegue iniciar — veja as lacunas abaixo."
+          ],
+          [
+            "all",
+            "Todo role do control plane em um único processo.",
+            "1",
+            "Laptop / nó único. Formato errado para produção: os roles não conseguem escalar nem falhar de forma independente, e veja a lacuna do FARM_COMPONENT."
+          ],
+          [
+            "demo",
+            "Hardware simulado mais o control plane real.",
+            "1",
+            "Não precisa de telefones."
+          ],
+          [
+            "ctl",
+            "CLI do operador sobre HTTP. Nunca toca no Postgres.",
+            "N/A",
+            "—"
+          ],
+          [
+            "version / help",
+            "Informações de build / uso.",
+            "N/A",
+            "Responde sem ambiente e sem banco."
+          ]
+        ]
+      }
+    },
+    {
+      "heading": "Por que alguns roles elegem um líder e outros apenas disputam",
+      "body": "Dois mecanismos, escolhidos por dois motivos diferentes.\n\n**Eleição de líder por advisory lock (scheduler, reaper).** Os dois loops tomam decisões *globais* — qual dos devices livres da farm vai para qual job enfileirado; quais leases suspeitos se tornam recuperáveis. Dois deles rodando não é mais lento, é errado. Cada um segura um advisory lock de **sessão** do Postgres sobre uma conexão retirada do pool e mantida por todo o tempo que a liderança durar (scheduler.go:631-668, reaper.go:551).\n\nTrês detalhes são estruturais:\n\n- O lock nunca é tomado com o `pg_advisory_lock` bloqueante. Um standby que bloqueasse manteria uma conexão do pool aberta para sempre, esperando por um líder que talvez nunca ceda.\n- A checagem de liderança serve também de `Ping` naquela conexão, e perder a conexão é tratado como perder a liderança *imediatamente*. Uma conexão retirada do pool cujo backend morreu ainda parece saudável para o pool, e ela fica isenta da coleta por ociosidade e por tempo de vida do pool — que é exatamente a propriedade da qual se depende aqui.\n- Em um shutdown limpo o lock é destravado explicitamente, então um rolling deploy passa a liderança adiante em milissegundos, em vez de esperar o fim de um timeout de TCP.\n\nO reaper acrescenta uma regra: a cada **ganho** de liderança ele chama `farm.reaper_arm` *antes* da sua primeira varredura (reaper.go:243-258). Até o arm retornar, todo lease vivo ainda carrega o deadline que tinha antes da queda e o gate de quiesce não está definido. Se o arm falha, o reaper abre mão da liderança e se retira, em vez de varrer desarmado — um reaper que varre sem dar o refund cobra dos tenants o downtime do control plane, e os leases sob maior risco são justamente os que ficaram calados por mais tempo.\n\n**Claim por SKIP LOCKED (jobrunner).** Um job runner toma uma decisão *local* — pegar este job, rodá-lo aqui. N réplicas pegando jobs diferentes é justamente o objetivo. A correção vem de três proteções independentes descritas no doc do pacote em internal/jobrunner/jobrunner.go, e atrás das três está o banco: se duas réplicas alguma vez chegarem a se prender ao mesmo job, o segundo `Acquire` assume a renovação e o primeiro é fenced na sua renovação seguinte, o que vira uma attempt abandonada sem que outro byte seja escrito no device.",
+      "bullets": [
+        "As advisory keys de job carregam o prefixo \"device-farmer/jobrunner:\" antes do hash FNV porque o espaço advisory de bigint de um argumento é compartilhado com as chaves de liderança do scheduler e do reaper (`claimKey`, jobrunner.go).",
+        "No shutdown o jobrunner nomeia suas chaves em vez de chamar `pg_advisory_unlock_all()` — isso limparia também os locks de liderança e entregaria a liderança como efeito colateral de um jobrunner parando (`claimLocks.close`, jobrunner.go:1451-1462).",
+        "`farm.lease_mark_suspect`, `farm.lease_reclaim` e `farm.lease_expire_max_runtime` são todos limitados por LIMIT e usam `FOR NO KEY UPDATE … SKIP LOCKED` (00002_lease.sql:520, :589, :633), então um lote limitado que perde uma corrida pega a linha no ciclo seguinte."
+      ],
+      "examples": [
+        {
+          "label": "Quem detém os locks de liderança neste momento",
+          "lang": "sql",
+          "code": "psql \"$DATABASE_URL\" -P footer=off -c \"\nSELECT pid,\n       CASE classid::bigint * 4294967296 + objid::bigint\n         WHEN x'6661726d5363686c'::bigint THEN 'scheduler leader'\n         WHEN x'6661726d52656170'::bigint THEN 'reaper leader'\n         ELSE 'jobrunner claim (per job)' END AS what\n  FROM pg_locks WHERE locktype = 'advisory' ORDER BY 2;\"",
+          "output": "  pid  |       what       \n-------+------------------\n 14000 | reaper leader\n 27152 | scheduler leader",
+          "note": "Rodado contra o demo ao vivo. `pid` é o backend do Postgres, não o processo farmd — um único processo farmd mostra duas linhas porque cada loop é dono da sua própria conexão retirada do pool. Em produção a leitura útil é a contagem de linhas contra a contagem de réplicas: exatamente um de cada, sempre. Amostrado três vezes com alguns segundos de intervalo, sem nenhuma linha de claim do jobrunner; essas só existem enquanto um job está de fato rodando, e os jobs do demo são curtos."
+        }
+      ],
+      "source": "internal/scheduler/scheduler.go, internal/reaper/reaper.go, internal/jobrunner/jobrunner.go, migrations/00002_lease.sql"
+    },
+    {
+      "heading": "Referência de configuração: as 28 variáveis que internal/config lê",
+      "body": "Não há outro lugar de onde tirar isto. `internal/config/config.go` é o único lugar onde esses nomes existem, e a regra do pacote é que toda violação seja relatada de uma vez, para que um manifesto seja corrigido em uma edição em vez de cinco deploys.\n\nUm valor vazio ou só com espaços em branco é tratado como **não definido** (`loader.raw` faz trim e devolve `\"\", false`). Não dá para esvaziar uma variável para desativá-la; o que se obtém é o padrão. Esse único comportamento é o que torna o `farmd node` impossível de iniciar — veja as lacunas.\n\nDurações usam a sintaxe do Go: `90s`, `15m`, `2h`. Uma duração malformada é coletada como erro de parse e relatada ao lado de todos os outros erros de parse antes de qualquer validação semântica rodar, porque validar um valor que não se conseguiu parsear produz um ruído que soterra o problema real.\n\nRepare no que nenhum destes parâmetros consegue fazer: nenhum deles encurta ou encerra um lease em resposta a um evento de transporte. Os únicos relógios aqui capazes de encerrar um lease são `FARM_LEASE_TTL` + `FARM_LEASE_GRACE`, e eles medem o fio da *renovação* até o Postgres, nunca o fio ADB até o telefone.",
+      "bullets": [
+        "`DATABASE_URL` aceita tanto a forma de URL do libpq (`postgres://…`) quanto a forma chave/valor (`host=db user=farm sslmode=require`). Qualquer outra coisa é rejeitada no boot, e não dentro de um CrashLoopBackOff.",
+        "Senhas são redigidas em toda linha de log e em todo erro: `RedactedDatabaseURL()` apaga senhas do userinfo *e* os parâmetros de query `password`/`sslpassword`, porque `url.Redacted()` sozinho não pega a forma de query.",
+        "`FARM_COMPONENT` é respeitado **somente pelo role api**. Todo outro role fixa no código o nome do seu componente em cmd/farmd/roles.go. Leia a lacuna sobre isso antes de depender dele."
+      ],
+      "examples": [
+        {
+          "label": "config.Summary() com apenas DATABASE_URL definida",
+          "lang": "text",
+          "code": "# printed by cfg.Summary(); see the note below on where it is reachable",
+          "output": "component        = api\ndatabase         = postgres://farm@127.0.0.1:55432/device_farmer?sslmode=disable\napi addr         = :8080\nmetrics addr     = :9090\nnode addr        = :8082\nlease ttl/grace  = 15m0s / 30m0s\nrenew / witness  = 1m30s / 2m0s\nslot rearm       = 35s (node self-fence 20s + margin 5s)\nreaper           = every 10s, batch 100, gap floor 1m0s, renewal path only: an outage of\n                   any of these extends every live lease by its length: reaper,api,scheduler",
+          "note": "Obtido chamando config.Load(\"api\") + Summary() a partir de um teste descartável mapeado com `go test -overlay` (nenhum arquivo do repositório foi criado ou modificado). NOTA: nenhum role distribuído imprime isto. Seu único ponto de chamada é cmd/farmd/main.go:249, dentro de notImplemented(), que não tem chamadores. Não dá para perguntar a um farmd em execução com qual configuração ele subiu; a superfície viva mais próxima é o objeto `limits` em /api/v1/capabilities, e um dos seus seis campos é um parâmetro que nada consome. A linha da watch list foi regravada depois que internal/config passou a recusar aqui um componente do health plane: \"watching\" dizia menos do que a lista de fato faz, e esse eufemismo era a própria má configuração."
+        },
+        {
+          "label": "Um FARM_API_URL ruim derruba um role que nunca faz uma chamada HTTP",
+          "lang": "bash",
+          "code": "FARM_API_URL=localhost:9999 farmd scheduler; echo \"exit=$?\"",
+          "output": "Configuration preflight FAILED.\nfarmd scheduler: invalid configuration:\nFARM_API_URL (\"localhost:9999\") must be an absolute URL with a scheme and a host, e.g. http://127.0.0.1:8080\nexit=1",
+          "note": "A checagem é incondicional em `problems()`, então um valor que só o `ctl` lê pode barrar o rollout de um scheduler. Vale saber quando ele é definido uma única vez para um namespace inteiro."
+        }
+      ],
+      "source": "internal/config/config.go",
+      "table": {
+        "columns": [
+          "Variável",
+          "Padrão",
+          "O que muda"
+        ],
+        "rows": [
+          [
+            "DATABASE_URL",
+            "(nenhum — obrigatório)",
+            "DSN do Postgres. Exigido por todo role exceto `ctl` e `migrate -dsn`. Forma de URL ou chave/valor."
+          ],
+          [
+            "FARM_DB_MAX_CONNS",
+            "8",
+            "MaxConns do pgxpool. O caminho de renovação toma emprestado deste pool. Um holder que não consegue tomar uma conexão emprestada para de renovar; se isso durar TTL+grace o lease se torna recuperável. Isso é o relógio da *renovação* falhando, não uma falha de conectividade — o socket até o telefone não tem parte nenhuma nisso. Parseado como int32, então `4294967297` é rejeitado em vez de dar a volta e virar um pool de um."
+          ],
+          [
+            "FARM_DB_CONNECT_TIMEOUT",
+            "10s",
+            "Deadline para o dial + ping de inicialização, e para o ping do migrate."
+          ],
+          [
+            "FARM_COMPONENT",
+            "o nome do role",
+            "Chave escrita por `farm.component_beat` — **somente pelo role api**. Precisa aparecer em FARM_REAPER_COMPONENTS se o processo estiver no caminho de renovação."
+          ],
+          [
+            "FARM_LOG_LEVEL",
+            "info",
+            "`debug` / `info` / `warn` / `error` → nível do slog. Qualquer outra string significa info, silenciosamente (`newLogger`, roles.go:38-48)."
+          ],
+          [
+            "FARM_SHUTDOWN_GRACE",
+            "30s",
+            "Limita a drenagem das requisições HTTP em voo e do trabalho pesado em background — **somente no servidor api** (server.go:459). Roles que não servem HTTP nunca a leem. Nunca é um deadline de lease."
+          ],
+          [
+            "FARM_API_ADDR",
+            "`:8080`",
+            "Endereço de escuta da API, do dashboard e de /metrics — tudo em um único listener."
+          ],
+          [
+            "FARM_METRICS_ADDR",
+            "`:9090`",
+            "**Nada.** Carregada, impressa em Summary(), nunca vinculada a um socket. Veja a seção dos parâmetros mortos."
+          ],
+          [
+            "FARM_NODE_ADDR",
+            "`:8082`",
+            "Endereço de escuta da superfície `/node/v1/*` do node agent. Não pode ser esvaziada (vazio → padrão), que é o que torna o `farmd node` impossível de iniciar hoje."
+          ],
+          [
+            "FARM_API_URL",
+            "`http://127.0.0.1:8080`",
+            "URL base que o `ctl` chama. Validada como URL http/https absoluta no boot **para todo role**, então um valor ruim derruba o scheduler também."
+          ],
+          [
+            "FARM_LEASE_TTL",
+            "15m",
+            "`farm.jobs.ttl` padrão para jobs criados via POST /api/v1/jobs. Piso de 10m, espelhando o CHECK do schema."
+          ],
+          [
+            "FARM_LEASE_GRACE",
+            "30m",
+            "`farm.jobs.grace` padrão. Piso de 5m. TTL+grace é o único deadline automático de liberação que o usuário não escreveu."
+          ],
+          [
+            "FARM_LEASE_RENEW_INTERVAL",
+            "90s",
+            "**Validada, depois ignorada.** Veja a seção dos parâmetros mortos."
+          ],
+          [
+            "FARM_LEASE_WITNESS_INTERVAL",
+            "2m",
+            "**Validada, depois ignorada.** Não existe nenhum witness loop."
+          ],
+          [
+            "FARM_LEASE_WITNESS_MAX_EXTENSIONS",
+            "12",
+            "**Validada, depois ignorada.** Nunca chega a um Holder."
+          ],
+          [
+            "FARM_SLOT_REARM",
+            "35s",
+            "`p_rearm` de `farm.lease_release` e `farm.lease_reclaim`: por quanto tempo um slot fica estacionado antes de poder ser agendado de novo. Sujeita à asserção de inicialização abaixo."
+          ],
+          [
+            "FARM_REAPER_INTERVAL",
+            "10s",
+            "Período de varredura do reaper (com jitter)."
+          ],
+          [
+            "FARM_REAPER_BATCH",
+            "100",
+            "Linhas por varredura. Limitado por LIMIT com SKIP LOCKED, então um lote pequeno significa apenas mais ciclos."
+          ],
+          [
+            "FARM_REAPER_GAP_FLOOR",
+            "60s",
+            "`farm.reaper_arm` trata `now() - min(beat_at)` acima disto como uma queda do control plane e devolve esse tempo a todo lease vivo. Precisa ser positiva."
+          ],
+          [
+            "FARM_REAPER_COMPONENTS",
+            "`reaper,api,scheduler`",
+            "Os componentes cujo beat **mais antigo existente** define o gap. Um componente nomeado que não tem linha nenhuma é pulado, não tratado como obsoleto. Um componente que está no caminho de renovação e falta aqui é um ponto cego grande o bastante para provocar um reclaim em massa na farm (BLOCKER 8, migrations/00002_lease.sql:447)."
+          ],
+          [
+            "FARM_HEARTBEAT_INTERVAL",
+            "5s",
+            "Período do beat. Não pode passar da metade do piso do gap (a checagem falha quando `interval*2 > gapFloor`), senão o jitter comum de agendamento é registrado como uma queda e devolve tempo de lease que ninguém perdeu."
+          ],
+          [
+            "FARM_NODE_SELF_FENCE_TIMEOUT",
+            "20s",
+            "Por quanto tempo o node proxy pode ficar sem uma checagem de fence bem-sucedida antes de derrubar seus sockets ADB. Derrubar sockets não é encerrar um lease; o lease fica intocado por isso."
+          ],
+          [
+            "FARM_FENCE_SAFETY_MARGIN",
+            "5s",
+            "Folga exigida entre o timeout de self-fence e o rearm do slot."
+          ],
+          [
+            "FARM_ADB_ENDPOINT",
+            "`127.0.0.1:5037`",
+            "O servidor ADB com o qual o node agent deste host e o watchdog de host único conversam."
+          ],
+          [
+            "FARM_HOST_ID",
+            "(vazio)",
+            "Por qual host físico este processo fala. **Obrigatória** para `node`. Seleciona o modo de host único para o `watchdog`."
+          ],
+          [
+            "FARM_WATCHDOG_INTERVAL",
+            "5s",
+            "Período de reconciliação do watchdog."
+          ],
+          [
+            "FARM_MIGRATIONS_TABLE",
+            "`public.goose_db_version`",
+            "Tabela de versão do goose."
+          ],
+          [
+            "FARM_MIGRATIONS_DIR",
+            "(vazio)",
+            "Sobrepõe o SQL embarcado. Defini-la suprime o aviso \"migrations discovered on disk\", porque o operador que a definiu já sabe."
+          ]
+        ]
+      }
+    },
+    {
+      "heading": "Mais sete variáveis, e quatro parâmetros que não fazem nada",
+      "body": "Nem tudo que o farmd lê mora em `internal/config`. Estas sete são lidas diretamente pelo pacote dono do assunto — autenticação é assunto de `internal/api`, e `config.Config` é compartilhado por todo role do binário, a maioria dos quais não serve HTTP nenhum.\n\nQuatro parâmetros documentados são validados na inicialização e depois não chegam a lugar nenhum, ou chegam a exatamente um role. Isso importa mais do que parece: `config.Summary()` imprime `renew / witness = 1m30s / 2m0s`, `/api/v1/capabilities` informa `\"renew_interval\": \"1m30s\"`, e nenhum dos dois números chega a código algum. O operador que baixa o intervalo de renovação para sobreviver a um Postgres lento ganha uma verificação cruzada contra o TTL no boot, duas leituras tranquilizadoras e nenhuma mudança de comportamento, nenhuma mesmo. FARM_API_TOKENS e FARM_API_AUTH já estiveram nesta lista e não estão mais — elas estão ligadas, e a tabela acima diz o que fazem agora.",
+      "bullets": [
+        "**FARM_LEASE_RENEW_INTERVAL** — validada (≥3 tentativas de renovação precisam caber dentro do TTL), mas `cmd/farmd/roles.go:runJobRunner` nunca define `jobrunner.Config.HolderConfig` (o campo existe em jobrunner.go:194), então `lease.Holder` recai sobre `DefaultRenewInterval = 60s` (holder.go:24). Os mesmos 60s também fixam a janela de takeover, já que `DefaultTakeover = 3 * lease.DefaultRenewInterval` (jobrunner.go:140). Os 90s configurados não são os 60s que rodam.",
+        "**FARM_LEASE_WITNESS_INTERVAL / FARM_LEASE_WITNESS_MAX_EXTENSIONS** — `farm.lease_witness` existe no SQL (00002_lease.sql:385), `lease.Store.Witness` (store.go:284), `Holder.Witness` (holder.go:316), `Holder.StartWitness` e o `WitnessLoop` (witness.go:216) existem todos e são testados, e o marcador no device que produz a evidência existe em internal/runner/witness.go. **Nada em um caminho de placement constrói nenhum dos dois.** Nenhum witness loop é iniciado por internal/jobrunner ou internal/runner, e não existe rota `/witness`, então esses dois valores continuam não mudando nada.",
+        "**FARM_METRICS_ADDR** — aparece em config.go e na string do Summary e nunca é passada para `net.Listen`. /metrics é servido em FARM_API_ADDR. O `EXPOSE 9090` do Dockerfile documenta uma porta que nada vincula.",
+        "**FARM_SHUTDOWN_GRACE** — validada para todo role e consumida por exatamente um arquivo, `internal/api/server.go:459`, onde ela limita a drenagem das requisições em voo. Em um scheduler, reaper, jobrunner, janitor, recovery ou watchdog ela é checada no boot e depois ignorada, então o valor definido descreve apenas os roles que servem HTTP."
+      ],
+      "examples": [
+        {
+          "label": "Confirmando que o caminho de witness nunca rodou",
+          "lang": "sql",
+          "code": "psql \"$DATABASE_URL\" -P footer=off -c \\\n  \"SELECT count(*) AS leases_total, count(witness_at) AS with_witness,\n          sum(witness_extensions) AS total_extensions FROM farm.leases;\"",
+          "output": " leases_total | with_witness | total_extensions \n--------------+--------------+------------------\n         1064 |            0 |                0",
+          "note": "Amostra pontual contra o demo ao vivo de 56 devices; a contagem de leases sobe continuamente. Os zeros são a afirmação — depois de dezenas de milhares de lease-segundos, nenhum witness foi jamais registrado."
+        }
+      ],
+      "source": "cmd/farmd/roles.go:279, :482 and :600, internal/ctl/ctl.go:511 and :519, internal/api/auth_wiring.go:75, :188, :283 and :312, internal/api/server.go:459, internal/ui/ui.go:82",
+      "table": {
+        "columns": [
+          "Variável",
+          "Padrão",
+          "Lida por",
+          "O que muda"
+        ],
+        "rows": [
+          [
+            "FARM_ARTIFACT_DIR",
+            "`$TMPDIR/device-farmer-artifacts`",
+            "cmd/farmd/roles.go:482",
+            "Raiz do blob store endereçado por conteúdo. Se o diretório não puder ser criado, os endpoints de artifact são desabilitados com um WARN e jobs com passos de push/install falham no primeiro artifact."
+          ],
+          [
+            "FARM_API_TOKEN",
+            "(vazio)",
+            "internal/ctl/ctl.go:519",
+            "Bearer token que o `ctl` envia. `--token` a sobrepõe. No singular — não confundir com FARM_API_TOKENS."
+          ],
+          [
+            "FARM_API_TOKENS",
+            "(vazio)",
+            "internal/api/auth_wiring.go:188",
+            "Uma lista separada por vírgulas de `<token>:<role>[:<subject>[:<tenant>]]`. Defina-a e a API passa a ser autenticada: `AuthenticatorFor` constrói um `StaticBearer` e loga os roles e subjects que concedeu, nunca os tokens. Vazia em um listener que não seja loopback é uma recusa a iniciar, a menos que FARM_API_ALLOW_ANONYMOUS diga o contrário."
+          ],
+          [
+            "FARM_API_AUTH",
+            "(vazio)",
+            "internal/api/auth_wiring.go:283",
+            "`bearer` ou `allow-all`. `bearer` com FARM_API_TOKENS vazia é recusado — uma configuração escrita pela metade cuja metade que falta são as credenciais. `allow-all` junto de uma lista de tokens também é recusado, em vez de resolvido por precedência."
+          ],
+          [
+            "FARM_API_ALLOW_ANONYMOUS",
+            "(vazio)",
+            "internal/api/auth_wiring.go:312",
+            "O opt-in deliberado a servir sem autenticação nenhuma. Existe porque uma farm de avaliação e um manifesto cuja linha de FARM_API_TOKENS se perdeu em um merge são idênticos vistos de dentro do processo; ninguém escreve isto por acidente."
+          ],
+          [
+            "FARM_NODE_TOKEN",
+            "(vazio)",
+            "cmd/farmd/roles.go:279 e :600",
+            "A credencial na superfície HTTP do host agent, dos dois lados dela: `runNode` a entrega a `node.New`, e `runRecovery` a entrega a `node.NewClient`. `node.New` recusa um FARM_NODE_ADDR não vazio sem ela — um endpoint não autenticado que desliga e liga portas USB é pior do que nenhum endpoint."
+          ],
+          [
+            "FARM_UI_DEV_DIR",
+            "(vazio)",
+            "internal/ui/ui.go:82",
+            "Serve o dashboard a partir do disco em vez da cópia embarcada, relendo cada arquivo a cada requisição. Defina-a como `internal/ui/assets` enquanto estiver trabalhando na UI."
+          ]
+        ]
+      }
+    },
+    {
+      "heading": "As asserções de inicialização que recusam um manifesto",
+      "body": "A configuração é validada *antes* de o role iniciar e antes de o dial com o banco acontecer. Toda violação é relatada junto. Duas asserções vale saber de cor, porque são as que custam devices.\n\n**A asserção do rearm do slot.** `FARM_SLOT_REARM` precisa exceder `FARM_NODE_SELF_FENCE_TIMEOUT` em pelo menos `FARM_FENCE_SAFETY_MARGIN`. Quando um lease sofre reclaim, o device ganha um novo piso de fence e o slot fica estacionado pelo intervalo de rearm. O node proxy só descobre que seu fence está obsoleto depois que o seu timeout de self-fence se esgota; até lá ele ainda mantém sockets ADB abertos e ainda encaminha os comandos do job antigo. Se o slot voltar a ser agendável antes de aquele teardown terminar, dois tenants compartilham um mesmo telefone — comandos de shell se intercalam, instalações caem na sessão errada, e nenhum dos dois lados vê um erro. Nada rio abaixo consegue detectar isso, e é por isso que é recusado aqui.\n\n**A asserção do BLOCKER 8.** Se o role ou o nome do componente está no caminho de renovação (`api`, `scheduler`, `reaper`), ele precisa aparecer em `FARM_REAPER_COMPONENTS`. A checagem consulta o *role* além do nome justamente para que `FARM_COMPONENT=api-canary` não consiga desligar a proteção para um processo que continua, e muito, no caminho de renovação. Leia as lacunas: essa mesma asserção tem dois buracos que ela não cobre.\n\nO resto, em uma lista só: TTL ≥ 10m e grace ≥ 5m (espelhando os CHECKs do schema, para que um acquire nunca morra com SQLSTATE 23514 enquanto um tenant espera); pelo menos 3 tentativas de renovação dentro de um TTL; intervalo de witness ≤ metade da faixa de grace; intervalo de heartbeat ≤ metade do piso do gap; piso do gap, intervalo do reaper, grace de shutdown, intervalo do watchdog, timeout de self-fence e timeout de conexão do banco todos positivos; margem de fence não negativa; batch ≥ 1; max conns ≥ 1; ao menos um componente de reaper; nome do componente casando com `[a-z][a-z0-9_-]*` e com ≤ 63 caracteres; FARM_API_URL absoluta e com esquema http/https.",
+      "examples": [
+        {
+          "label": "Um rearm que entregaria um telefone a dois jobs",
+          "lang": "bash",
+          "code": "FARM_SLOT_REARM=10s farmd scheduler; echo \"exit=$?\"",
+          "output": "Configuration preflight FAILED.\nfarmd scheduler: invalid configuration:\nFARM_SLOT_REARM (10s) must exceed FARM_NODE_SELF_FENCE_TIMEOUT (20s) by at least FARM_FENCE_SAFETY_MARGIN (5s), and is not.\n\nWhen a lease is reclaimed the device gets a new fence floor and the slot is\nparked for the rearm interval. The node proxy only discovers that its fence is\nstale after its self-fence timeout elapses; until then it is still holding open\nADB sockets and still forwarding the old job's commands to the phone.\n\nIf the slot becomes schedulable again before that teardown finishes, the\nscheduler hands the same physical device to a new job while the previous job is\nstill driving it. Two tenants then share one phone: shell commands interleave,\ninstalls land in the wrong session, and neither side sees an error. Nothing\ndownstream can detect this, which is why it is refused here.\n\nFix by raising FARM_SLOT_REARM above FARM_NODE_SELF_FENCE_TIMEOUT + FARM_FENCE_SAFETY_MARGIN, or by lowering the proxy's self-fence timeout.\nexit=1"
+        },
+        {
+          "label": "Renomear um componente do caminho de renovação para fora da contabilidade de gap",
+          "lang": "bash",
+          "code": "FARM_COMPONENT=api-canary farmd api; echo \"exit=$?\"",
+          "output": "Configuration preflight FAILED.\nfarmd api: invalid configuration:\ncomponent \"api-canary\" is on the lease renewal path but is missing from FARM_REAPER_COMPONENTS (reaper,api,scheduler). If this component is down while the reaper is healthy, no gap is recorded and every unprotected lease is reclaimed once TTL+grace elapses\nexit=1"
+        }
+      ],
+      "source": "internal/config/config.go (problems()), migrations/00001_core.sql, migrations/00002_lease.sql:447"
+    },
+    {
+      "heading": "Três maneiras de colocar no ar",
+      "body": "As três terminam no mesmo lugar: Postgres, schema na versão 4, e um control plane em `http://127.0.0.1:8420`.\n\n**1. `scripts/dev-up.ps1` — Windows, sem Docker.** Cria um cluster PostgreSQL *descartável* sob `%LOCALAPPDATA%\\device-farmer\\pgdata` na porta 55432, escutando apenas em 127.0.0.1 com autenticação trust. Ele nunca toca em um serviço PostgreSQL já existente. Se algo já estiver escutando na porta, ele reaproveita em vez de brigar por ela. `-Reset` para o cluster com `pg_ctl -m immediate`, apaga o diretório de dados, roda o initdb de novo e então segue para a subida normal; `-NoDemo` para depois da migração, para que se possa iniciar um role manualmente. É isto que está rodando por trás do sistema ao vivo contra o qual esta página foi escrita.\n\n**2. `make demo` — Linux/macOS, ou Git Bash com GNU make.** `build` → `migrate` → `demo -hosts 2 -devices 56`, contra `DATABASE_URL` (padrão: o mesmo cluster na 55432), com FARM_API_ADDR assumindo 127.0.0.1:8420. O GNU make *não* existe em uma máquina Windows de fábrica — é por isso que o dev-up.ps1 existe. `make test` também exige que `gofmt -l` venha vazio, o que reprova uma árvore com arquivos não formatados mesmo que ela compile.\n\n**3. `docker compose up -d` — tudo em contêineres.** Postgres 17-alpine com um healthcheck `pg_isready`, um serviço `migrate` de execução única pelo qual todos os outros serviços esperam com `condition: service_completed_successfully`, e então o `demo`. Uma migração que falha interrompe o rollout em vez de subir um control plane contra um schema que ele não entende. O Postgres é publicado em `127.0.0.1:55433` para o psql e para `test/assertions.sql`; o comentário ao lado diz para remover essa linha em qualquer coisa que não seja um laptop.\n\n**Não use `docker compose --profile farm up -d` como está escrito.** O serviço `demo` não carrega nenhuma chave `profiles:`, então o Compose o sobe junto dos seis serviços da farm — hardware simulado escrevendo no mesmo banco do control plane real — e tanto `demo` quanto `api` publicam `${FARM_PORT:-8420}`, então o segundo a subir não consegue fazer o bind. O próprio cabeçalho do arquivo diz para \"drop the `demo` service\", mas a instrução `--profile farm` cinquenta linhas abaixo não repete isso.",
+      "bullets": [
+        "O profile `farm` não tem serviço `node`, e corretamente: `farmd node` precisa de `/dev/bus/usb` na máquina física e não pode morar no cluster.",
+        "`make assertions` roda `test/assertions.sql` — o protocolo de lease como especificação executável — contra um Postgres vivo. Precisa do `psql` no PATH.",
+        "O Dockerfile roda `go vet ./... && go test ./...` no estágio de build *depois* de produzir o binário, então um teste que falha reprova a imagem, mas não poupa o build."
+      ],
+      "examples": [
+        {
+          "label": "O profile farm do compose também sobe o demo, na mesma porta",
+          "lang": "bash",
+          "code": "docker compose --profile farm config --format json > cc.json && python -c \"\nimport json\nd=json.load(open('cc.json'))\nfor n,s in sorted(d['services'].items()):\n    print(n,'profiles=',s.get('profiles'),'ports=',[p.get('published') for p in s.get('ports',[])])\n\"",
+          "output": "api profiles= ['farm'] ports= ['8420']\ndemo profiles= None ports= ['8420']\njobrunner profiles= ['farm'] ports= []\nmigrate profiles= None ports= []\npostgres profiles= None ports= ['55433']\nreaper profiles= ['farm'] ports= []\nrecovery profiles= ['farm'] ports= []\nscheduler profiles= ['farm'] ports= []\nwatchdog profiles= ['farm'] ports= []",
+          "note": "`docker compose config` faz o parse localmente e não precisa de daemon, então essa checagem funciona antes de qualquer coisa ser implantada. A correção é uma linha: dar ao `demo` o seu próprio `profiles: [\"demo\"]`. Até lá, rode o profile farm com `--scale demo=0`."
+        },
+        {
+          "label": "O banner do demo, impresso em stderr ao iniciar",
+          "lang": "text",
+          "code": "farmd demo -hosts 2 -devices 56",
+          "output": "  device-farmer demo — SIMULATED HARDWARE\n  ---------------------------------------\n  2 hosts and 56 devices are in-process fake ADB servers. No phone is\n  attached and nothing here touches real hardware.\n\n  Everything above the wire is real: the scheduler allocates through\n  farm.lease_acquire, holders renew through farm.lease_renew, and the reaper\n  is the same one that runs in production.\n\n  Watch for the line \"device dropped offline mid-lease\". The lease must NOT\n  end. That is the whole point of the system, and it is the one thing STF\n  issue #663 gets wrong.\n\n  Dashboard: http://127.0.0.1:8420/",
+          "note": "Texto citado do Fprintf em cmd/farmd/roles.go:runDemo. Não reexecutado: o processo vivo é `bin/farmd.exe demo -hosts 2 -devices 56` (PID 26236, confirmado via Win32_Process), e reiniciá-lo para capturar um banner teria custado os leases em execução de que esta página trata."
+        }
+      ],
+      "source": "scripts/dev-up.ps1, Makefile, docker-compose.yml, Dockerfile, cmd/farmd/roles.go"
+    },
+    {
+      "heading": "O schema, e o farmd migrate",
+      "body": "As migrations são **embarcadas no binário**. Padrões de `//go:embed` não podem conter `..` nem sair do diretório do pacote, então `cmd/farmd` não consegue embarcar `../../migrations` por conta própria; `migrations/embed.go` embarca os seus próprios `*.sql` e `cmd/farmd/embed.go` os adota na variável `migrationsFS`. O efeito é que uma imagem que tivesse distribuído o binário sem o SQL migraria, de outro modo, para a versão 0, informaria sucesso e deixaria um control plane em execução apontado para um banco vazio. O pacote `migrations` também dá panic no init se o conjunto embarcado estiver vazio, tiver um número de versão duplicado ou estiver sem `00001_core.sql` — uma camada de imagem faltando precisa parecer um build quebrado, e não um deploy limpo.\n\nSe o embed algum dia se perder, `resolveMigrations` recai sobre uma busca no diretório de trabalho, nos seus pais e no diretório onde está o binário — e avisa em alto e bom som, mas somente quando o diretório foi *adivinhado*. Se `-dir` foi passado ou `FARM_MIGRATIONS_DIR` foi definida, quem opera já sabe, e um aviso sobre o qual não se pode agir treina a pessoa a ignorar aqueles sobre os quais se pode.\n\nUm advisory lock de escopo de sessão sobre uma `*sql.Conn` dedicada serializa migradores concorrentes (um handle vindo do pool destravaria em uma conexão que já não é sua), então é seguro rodar `farmd migrate up` como um Job com mais de uma réplica ou como um init container que faz retry. O `status` deliberadamente **não** toma o lock — que é exatamente a hora em que se quer olhar.\n\nO `down-to` se recusa a andar para trás sem `-yes`, porque as migrations de descida derrubam `farm.leases`: o registro de quais jobs são donos de quais devices. Os telefones continuam rodando; nada no control plane ficaria sabendo.",
+      "examples": [
+        {
+          "label": "Status do schema contra o sistema ao vivo",
+          "lang": "bash",
+          "code": "farmd migrate status; echo \"exit=$?\"",
+          "output": "    Applied At                  Migration\n    =======================================\n    Fri Sep  4 09:33:44 2026 -- 00001_core.sql\n    Fri Sep  4 09:33:44 2026 -- 00002_lease.sql\n    Fri Sep  4 09:33:44 2026 -- 00003_ops.sql\n    Fri Sep  4 09:33:44 2026 -- 00004_operate.sql\nschema version: 4 (was 4), source embedded\nexit=0",
+          "note": "\"source embedded\" é a linha que prova que o binário carrega o próprio schema. \"source <path>\" significa que ele não carregava, e o aviso acima dela nomeia o diretório que ele adivinhou."
+        },
+        {
+          "label": "A proteção de rollback",
+          "lang": "bash",
+          "code": "farmd migrate down-to 3; echo \"exit=$?\"",
+          "output": "farmd migrate: refusing to migrate down from version 4 to 3 without -yes.\nRolling this schema back destroys farm.leases, and with it the record of\nwhich jobs currently own which devices. Live jobs keep running on the\nphones; nothing in the control plane will know. Re-run with -yes if that\nis genuinely what you want.\nexit=1"
+        },
+        {
+          "label": "Flags",
+          "lang": "bash",
+          "code": "farmd migrate -h",
+          "output": "Usage: farmd migrate <up | down-to VERSION | status> [flags]\n\n  up               apply every migration that has not been applied\n  down-to VERSION  roll back to VERSION (requires -yes when it moves backwards)\n  status           list migrations and whether they are applied\n\nA session-scoped advisory lock serialises concurrent migrators of this\ndatabase, so it is safe to run this as a Kubernetes Job with more than one\nreplica or a retrying init container.\n\nWhen FARM_MIGRATIONS_TABLE names a schema, that schema is created if it is\nmissing: goose writes its version table before the first migration runs, and\non a fresh database nothing else has created it yet. On a database that is\nalready a farm, a ledger that does not exist is refused instead — starting one\nthere would replay the whole set into tables that already exist.\n\nFlags:\n  -dir string\n    \tdirectory holding the .sql migrations; overrides FARM_MIGRATIONS_DIR\n  -dsn string\n    \tPostgres DSN; overrides DATABASE_URL\n  -lock-timeout duration\n    \thow long to wait for the migration advisory lock (default 2m0s)\n  -table string\n    \tgoose version table; overrides FARM_MIGRATIONS_TABLE\n  -timeout duration\n    \toverall deadline for the migration run (default 10m0s)\n  -yes\n    \tconfirm a destructive down-to"
+        }
+      ],
+      "source": "cmd/farmd/migrate.go, cmd/farmd/embed.go, migrations/embed.go"
+    },
+    {
+      "heading": "Implantando uma farm de verdade, e o hardware embaixo dela",
+      "body": "A camada USB não pode se mudar para dentro do cluster. Isso é física, não uma limitação de projeto. Todo o resto pode.\n\n**No cluster:** `api` (escale à vontade), `scheduler` (N réplicas, um líder), `jobrunner` (escale à vontade), `reaper` (N réplicas, um líder), `watchdog` (um por host, nomeado por FARM_HOST_ID), `recovery`. Mais o Postgres, que guarda todo o estado.\n\n**Em cada host USB, fora do cluster:** um servidor ADB em um contêiner privilegiado, e o `farmd node` (que não consegue iniciar neste build — veja as lacunas).\n\n```\ndocker run -d --name adbd --privileged --restart unless-stopped \\\n  -p 5037:5037 -v /dev/bus/usb:/dev/bus/usb devicefarmer/adb:latest/n```\n\nO watchdog e a recovery ladder do cluster alcançam o servidor ADB de cada host por TCP na 5037, então `farm.hosts.adb_endpoint` precisa ser um endereço que a rede do cluster consiga rotear.\n\n**O formato do hardware.** 28 devices por host — quatro hubs alimentados de 7 portas em uma placa PCIe USB 3.0 dedicada — é o próprio build de referência do STF (README.md), e é o formato que `internal/demo/seed.go` semeia (`DefaultHubsPerHost = 4`, `DefaultSlotsPerHub = 7`). Planeje dois hosts para 50–60 aparelhos, três se quiser drenar um para manutenção sem parar.\n\n**Ganged vs. switchable decide se o tier 4 de recovery existe para um device.** `internal/topo/sysfs.go` exige *evidência positiva* de chaveamento por porta: `Switchable()` só retorna true para `PerPortPower`, e `UnknownPower` — o kernel não expôs nada legível — é reportado como não switchable. A ausência de evidência nunca é lida como capacidade, porque um hub marcado erradamente como por porta deixaria a ladder cortar a energia de sete devices, seis deles no meio de uma execução e segurando leases vivos, acreditando ter tocado em um só. A descoberta então chama `farm.register_slot`, que mapeia não switchable para um único domínio **ganged** com `control='none'` para o hub inteiro (migrations/00004_operate.sql:419).\n\nUma ressalva ao ler a topologia do demo abaixo: o demo **não** passa por `register_slot`. `internal/demo/seed.go` insere direto em `farm.power_domains` e o seu `planPower` atribui um quarto tipo, `'none'`, que a descoberta real nunca produz. Trate as linhas `none` como um caso semeado para exercitar o caminho de recusa, não como algo que se verá em um host descoberto.\n\nE o tier 4 precisa de **Linux 6.0 ou mais novo**. Abaixo disso o USB core volta a energizar uma porta que foi desligada pelas costas dele (internal/node/uhubctl.go:31-41): o uhubctl informa sucesso, a porta nunca ficou sem energia, e a ladder aprenderia que o tier 4 \"foi tentado e não ajudou\", para então escalar até colocar em quarantine um device cujo único problema real é que o único degrau que o teria consertado nunca foi executado. `checkKernelFloor` (uhubctl.go:210-226) recusa o degrau inteiro em um kernel desses, com uma mensagem que nomeia a correção.",
+      "bullets": [
+        "`farmd watchdog` com FARM_HOST_ID definido supervisiona um host — o formato de produção, um pod por host. Sem ele, supervisiona toda linha não desabilitada de `farm.hosts` em um único processo, e sai com erro se não houver nenhuma.",
+        "Drenar um host interrompe novos placements e não libera nada. `ctl hosts` imprime LIVE LEASES precisamente porque é isso que uma drenagem tem de esperar acabar.",
+        "O heartbeat do node agent **não** pode estar em FARM_REAPER_COMPONENTS: `farm.reaper_arm` soma o downtime de cada componente nomeado ao deadline de todo lease vivo, e deixar a queda de um host agent mexer nos relógios de lease fundiria o plano de hardware com a vivacidade dos leases. internal/node/agent.go:1174 diz isso no texto de ajuda da métrica."
+      ],
+      "examples": [
+        {
+          "label": "A topologia real de energia da farm em execução",
+          "lang": "sql",
+          "code": "psql \"$DATABASE_URL\" -P footer=off -c \"\nSELECT h.host_id, h.usb_path AS hub, h.model, h.port_count, h.vbus_switchable,\n       count(s.id) AS slots, min(pd.kind) AS domain_kind\n  FROM farm.hubs h\n  LEFT JOIN farm.slots s ON s.hub_id = h.id\n  LEFT JOIN farm.power_domains pd ON pd.id = s.power_domain_id\n GROUP BY 1,2,3,4,5 ORDER BY 1,2;\"",
+          "output": " host_id | hub |            model             | port_count | vbus_switchable | slots | domain_kind \n---------+-----+------------------------------+------------+-----------------+-------+-------------\n h01     | 3-1 | StarTech ST7300USBM 7-port   |          7 | t               |     7 | per_port\n h01     | 3-2 | Plugable USB3-HUB7BC         |          7 | t               |     7 | per_port\n h01     | 4-1 | Anker A7515 7-port           |          7 | t               |     7 | ganged\n h01     | 4-2 | AmazonBasics HU3770V1 7-port |          7 | f               |     7 | none\n h02     | 3-1 | StarTech ST7300USBM 7-port   |          7 | t               |     7 | per_port\n h02     | 3-2 | Plugable USB3-HUB7BC         |          7 | t               |     7 | per_port\n h02     | 4-1 | Anker A7515 7-port           |          7 | t               |     7 | ganged\n h02     | 4-2 | AmazonBasics HU3770V1 7-port |          7 | f               |     7 | none",
+          "note": "4 hubs x 7 portas = 28 devices por host. A mistura é deliberada: o demo semeia um hub de cada tipo para que os caminhos de recusa sejam exercitados. Repare na linha do Anker — hardware switchable deliberadamente semeado com um domínio ganged, que `register_slot` também não consegue produzir. Em um host descoberto só se verá `per_port` e `ganged`."
+        },
+        {
+          "label": "O que essa topologia faz com a recovery ladder",
+          "lang": "bash",
+          "code": "FARM_API_URL=http://127.0.0.1:8420 farmd ctl recovery",
+          "output": "the ladder — a tier runs only when the live lease's disruption policy permits it:\nTIER  NAME             BLAST RADIUS  REQUIRES POLICY         COOLDOWN  MAX/HOUR  ENABLED  DESCRIPTION\n----  ---------------  ------------  ----------------------  --------  --------  -------  ---------------------------------------------\n0     observe          device        no_disruption           30s       60        yes      Do nothing for one debounce window. Most blips self-heal.\n1     adb_reconnect    device        no_disruption           1m00s     20        yes      host-usb:<devpath>:reconnect — re-handshake one transport.\n2     transport_reset  device        allow_soft_reset        2m00s     10        yes      host-usb:<devpath>:detach then :attach.\n3     usb_reset        device        allow_soft_reset        5m00s     6         yes      USBDEVFS_RESET on the device node. Re-enumerates one port.\n4     port_power       power_domain  allow_port_power_cycle  10m00s    4         yes      uhubctl power cycle. Disturbs the whole power domain if gan…\n5     device_reboot    device        allow_port_power_cycle  15m00s    3         yes      adb reboot. Costs boot time and any unsaved on-device state.\n6     quarantine       device        no_disruption           1h00m     2         yes      Stop scheduling to this slot and page a human.\n7     adb_restart      host          allow_port_power_cycle  1h00m     1         yes      Restart the host adb server. SEVERS EVERY DEVICE ON THE HOS…\n8     host_drain       host          no_disruption           6h00m     1         yes      Drain the host: no new leases, wait out the live ones, then…\n\nrecent attempts:\nRACK SLOT     UID                                  HOST  TIER  NAME        BLAST RADIUS  STARTED              OUTCOME    REFUSAL\n------------  -----------------------------------  ----  ----  ----------  ------------  -------------------  ---------  --------------------------------------------\nR1-U04-H4-P2  df-4e77c678246b2a400f5294150419817d  h01   4     port_power  power_domain  2026-09-04 10:43:55  refused    the live lease on this device carries disruption_policy=\"no…\nR1-U04-H4-P2  df-4e77c678246b2a400f5294150419817d  h01   0     observe     device        2026-09-04 10:43:55  —          —\nR1-U04-H2-P3  df-b0d48d5b7fedc0ced48264f3928b40a7  h01   0     observe     device        2026-09-04 10:42:20  recovered  —\nR1-U04-H4-P1  —                                    h01   4     port_power  power_domain  2026-09-04 10:42:04  refused    this slot has no controllable power domain, so its port pow…",
+          "note": "Cortado na margem direita; a tabela da ladder é impressa por inteiro antes das tentativas. Repare que o tier 3 (usb_reset) nunca foi tentado nesta farm, e os tiers 1, 2, 5, 7, 8 também não — um `SELECT tier, outcome, count(*) FROM farm.recovery_attempts GROUP BY 1,2` retorna apenas os tiers 0, 4 e 6. Toda recusa é registrada com o seu motivo, em vez de rebaixada silenciosamente para \"não ajudou\"."
+        },
+        {
+          "label": "Por que o farmd node não roda fora do Linux",
+          "lang": "bash",
+          "code": "FARM_HOST_ID=h01 farmd node; echo \"exit=$?\"",
+          "output": "farmd node: read the USB tree: topo: USB discovery reads /sys and needs Linux, not windows; run discovery on the farm host itself, or hand FromFS a fixture in a test (a node agent must run on the Linux host the devices are plugged into)\nexit=1",
+          "note": "Essa recusa é correta e deliberada — internal/topo/sysfs.go não carrega build tag e, em vez disso, recusa em tempo de execução. No Linux o mesmo comando falha algumas linhas adiante, por um motivo diferente e menos defensável. Veja as lacunas."
+        }
+      ],
+      "source": "README.md, internal/demo/seed.go, internal/topo/sysfs.go, internal/topo/discover.go, internal/node/uhubctl.go, migrations/00004_operate.sql, cmd/farmd/roles.go:runNode"
+    },
+    {
+      "heading": "Shutdown: SIGTERM drena o trabalho e não libera nada",
+      "body": "Esta é a seção para ler antes de um rolling deploy.\n\nSIGTERM e SIGINT cancelam o contexto raiz. Cancelamento significa *parar de aceitar trabalho novo e terminar o que está em voo*. **Não** significa *liberar os leases que este processo detém*, e nenhum código alcançável a partir de `cmd/farmd/main.go` pode fazer com que passe a significar isso.\n\nO motivo é a tese inteira. No Kubernetes um SIGTERM é o evento mais ordinário que existe: uma drenagem de nó, uma atualização em rolling, uma preempção de spot, um restart por OOM, uma redução de escala do HPA. Nenhum deles é evidência de que o job no telefone morreu. Um pod que \"limpa a bagunça atrás de si\" liberando os seus leases converte a rotatividade rotineira do cluster em trabalho destruído — a issue #663 do DeviceFarmer/STF, com um gatilho do Kubernetes em vez de um gatilho de socket.\n\nEntão o pod substituto chama `farm.lease_acquire` com o mesmo `job_id` e a Fase 1 (migrations/00002_lease.sql:236-259) devolve o mesmo lease, o mesmo device e o **mesmo fence**, com `reattached = true`. Ela avança `holder`, `holder_instance`, `holder_epoch` e o heartbeat, e estende os deadlines com `GREATEST(existing, now() + ttl)`, de modo que um re-attach nunca pode encurtar um lease. O fence deliberadamente não é avançado, porque o próprio trabalho do job pode ainda estar rodando destacado no device, e avançá-lo excluiria por fence o seu próprio processo. O runner então retoma a partir de `farm.jobs.checkpoint`.\n\nSe o substituto nunca chega, o lease termina do jeito que termina todo lease sem holder: os heartbeats param, a varredura de suspects o marca (marcar não libera nada, e um heartbeat em qualquer ponto da faixa de grace o cura de volta para `held` no mesmo fence, com zero trabalho perdido), a faixa de grace se esgota, e `farm.lease_reclaim` o toma de volta. Esse caminho tem, na frente dele, um refund de gap do control plane e um gate de quiesce. Um `os.Exit` local não tem nenhum dos dois, que é exatamente por que ele não chega a tomar a decisão.\n\n**Um segundo sinal restaura a disposição padrão.** Um operador impaciente que aperta Ctrl-C duas vezes recebe um kill imediato.",
+      "bullets": [
+        "O handler de sinal é um canal simples em vez de `signal.NotifyContext`, de modo que o banner de shutdown dispara em um sinal de verdade e não meramente no fim do contexto raiz — senão toda saída ordinária alegaria ter sido despejada.",
+        "O `http.Server.BaseContext` da API deliberadamente **não** é o contexto de execução (server.go:407-412). Se fosse, o cancelamento mataria toda requisição em voo no mesmo instante, incluindo uma renovação a um round trip de ter sucesso.",
+        "Os event streams são fechados *primeiro* no `Shutdown` (server.go:482-486); do contrário `http.Shutdown` queimaria todo o período de grace em conexões que são saudáveis e ociosas por projeto, e requisições reais em voo seriam cortadas quando ele expirasse.",
+        "Não há `WriteTimeout` no servidor da API: `GET /api/v1/stream` é de vida longa. A proteção contra slow loris é `ReadHeaderTimeout: 10s` mais `IdleTimeout: 120s`.",
+        "Se o período de grace expira com trabalho pesado de background ainda rodando, o servidor loga \"shutdown grace expired with background work still running; no lease was released\" e retorna assim mesmo.",
+        "`pool.Close()` em `runRole` encerra as conexões deste processo. Não encerra lease nenhum.",
+        "No jobrunner, um outcome com ReleaseReason **vazio** — uma attempt abandonada, um SIGTERM no meio da execução — precisa deixar o lease vivo: é a ele que o substituto se reconecta. Todo ponto de liberação pergunta antes por `lease.Holder.Fenced`, porque um re-attach entrega ao substituto o *mesmo* fence, então um processo fenced ainda apresenta um fence que casa, e o banco sozinho não consegue distinguir os dois."
+      ],
+      "examples": [
+        {
+          "label": "O que o farmd imprime em um SIGTERM",
+          "lang": "text",
+          "code": "# emitted by the signal goroutine in cmd/farmd/main.go",
+          "output": "farmd: terminated received; draining in-flight work. Live leases are intentionally NOT released — the replacement re-attaches at the same fence.",
+          "note": "Citado do Fprintf em cmd/farmd/main.go:106-109. Não executado: o único farmd rodando é o demo compartilhado, e matá-lo para produzir uma transcrição teria sido uma troca ruim."
+        },
+        {
+          "label": "O invariante, como o banco o impõe",
+          "lang": "sql",
+          "code": "psql \"$DATABASE_URL\" -P footer=off -c \\\n  \"SELECT release_reason, count(*) FROM farm.leases GROUP BY 1 ORDER BY 2 DESC;\"",
+          "output": "  release_reason  | count \n------------------+-------\n completed        |  1054\n max_runtime      |    30\n failed           |     8\n                  |     3\n operator_revoked |     1",
+          "note": "Não existe valor de conectividade nesta coluna e não pode existir: farm.leases.release_reason é restringida por CHECK a ('completed','failed','job_cancelled','max_runtime','operator_revoked','holder_expired','device_retired') em migrations/00001_core.sql:324. Um erro de socket, um timeout de sonda ou um device ficando offline não têm palavra para escrever aqui, então \"liberado porque o transporte caiu\" levanta check_violation em vez de destruir silenciosamente seis horas de trabalho. Ao longo de 1096 leases nesta farm, todo encerramento é um encerramento causado por um job, um deadline ou um humano."
+        }
+      ],
+      "source": "cmd/farmd/main.go (package doc + signal handler), internal/api/server.go:399-505, internal/jobrunner/jobrunner.go:27-52, migrations/00001_core.sql:318-327, migrations/00002_lease.sql:236-259"
+    },
+    {
+      "heading": "O que dá para ver enquanto ele roda",
+      "body": "Quatro rotas de infraestrutura sem autenticação, e todo o resto autenticado. Uma sonda de liveness que precisa de credencial é uma sonda de liveness que falha quando a credencial gira, e o operador que depura uma farm cuja autenticação é justamente a coisa quebrada ainda precisa enxergar o estado dela.\n\n`/api/v1/capabilities` (internal/api/capabilities.go) é a primeira a abrir às três da manhã: ela informa o build, a versão do schema, a postura de autenticação em palavras claras, quais componentes estão batendo heartbeat e quais funcionalidades estão, em consequência, indisponíveis — observado, e não declarado. No demo ao vivo ela informa corretamente `node: running false`, `enroll: running false`, `Dynamic enrollment: unavailable` e `Authentication: not_built`.\n\n`/metrics` é onde a honestidade acaba. `cmd/farmd/roles.go:newRegistry` constrói um `prometheus.NewRegistry()` pelado e chama **apenas** `obs.Register`. Nove pacotes definem uma função `Collectors()` — adbwire, enroll, jobrunner, node, reaper, recovery, scheduler, topo, watchdog — e nenhum deles é jamais registrado. Nem os collectors de runtime do Go, nem os de processo. Dezessete famílias de métricas são expostas; `farm_scheduler_leader` e `farm_reaper_leader`, os dois gauges cuja soma entre as réplicas precisa ser igual a 1, não estão entre elas.",
+      "bullets": [
+        "`/healthz` — liveness. Nome do componente e uptime. Nenhuma chamada ao banco.",
+        "`/readyz` — readiness, limitada por uma sonda de banco de 2s. Curta de propósito: uma sonda que trava é uma sonda que falha aberta.",
+        "`/metrics` — Prometheus, no próprio listener da API (FARM_METRICS_ADDR não vincula nada).",
+        "`/api/v1/capabilities` — build, schema, postura de autenticação, liveness por componente e disponibilidade por funcionalidade.",
+        "Todo o resto sob `/api/v1/` passa por `requireRole`, que hoje concede a todo chamador o role de operator."
+      ],
+      "examples": [
+        {
+          "label": "Health e readiness no sistema ao vivo",
+          "lang": "bash",
+          "code": "curl -s http://127.0.0.1:8420/healthz; echo\ncurl -s http://127.0.0.1:8420/readyz",
+          "output": "{\"component\":\"demo\",\"status\":\"ok\",\"uptime_s\":1093}\n{\"component\":\"demo\",\"database\":\"reachable\",\"pool\":{\"acquired\":3,\"constructing\":0,\"idle\":5,\"max\":8,\"total\":8},\"status\":\"ready\"}",
+          "note": "`component` é cfg.Component, que sob `farmd demo` é \"demo\" — veja a lacuna do FARM_COMPONENT. `max: 8` é FARM_DB_MAX_CONNS. Acompanhe `acquired` contra ele: um holder que não consegue tomar uma conexão emprestada para de renovar."
+        },
+        {
+          "label": "Tudo o que /metrics de fato expõe",
+          "lang": "bash",
+          "code": "curl -s http://127.0.0.1:8420/metrics | grep '^# HELP' | awk '{print $3}' | sort",
+          "output": "farm_adb_transport_blips_total\nfarm_api_bulk_targets_total\nfarm_api_device_execs_total\nfarm_api_operator_actions_total\nfarm_api_request_duration_seconds\nfarm_api_requests_in_flight\nfarm_api_requests_total\nfarm_api_stream_clients\nfarm_api_stream_clients_dropped_total\nfarm_api_stream_poll_errors_total\nfarm_device_health\nfarm_lease_held\nfarm_lease_reaped_total\nfarm_lease_renew_failures_total\nfarm_recovery_attempts_total\nfarm_slot_rearm_pending\npromhttp_metric_handler_errors_total",
+          "note": "Dezessete famílias. Nenhuma farm_scheduler_*, farm_reaper_*, farm_jobrunner_*, farm_watchdog_*, farm_node_*, farm_topo_*, farm_enroll_*. Nenhuma go_* nem process_*."
+        },
+        {
+          "label": "O estado da contabilidade de gap que dá para inspecionar diretamente",
+          "lang": "sql",
+          "code": "psql \"$DATABASE_URL\" -P footer=off \\\n  -c \"SELECT component, now()-beat_at AS age FROM farm.component_heartbeat ORDER BY 1;\" \\\n  -c \"SELECT quiesce_until, armed_at FROM farm.reaper_state;\" \\\n  -c \"SELECT count(*) FROM farm.control_plane_gap;\"",
+          "output": "  component   |       age       \n--------------+-----------------\n api          | 00:00:07.10033\n demo         | 00:00:02.197926\n jobrunner    | 00:00:11.786837\n reaper       | 00:00:04.238092\n recovery     | 00:00:02.206486\n scheduler    | 00:00:07.099491\n watchdog:h01 | 00:00:04.433972\n watchdog:h02 | 00:00:04.433953\n\n        quiesce_until         |           armed_at           \n------------------------------+------------------------------\n 2026-09-04 10:40:33.81898-03 | 2026-09-04 10:30:33.81898-03\n\n count \n-------\n     0",
+          "note": "Amostrado duas vezes com seis segundos de intervalo; toda linha avançou. quiesce_until é armed_at + `COALESCE(max(ttl), 15m)` sobre os leases vivos no momento do arm, de modo que um reaper restaurado não revogue em massa no instante da restauração; o intervalo de dez minutos aqui existe porque os jobs do próprio demo carregam ttl 10m / grace 5m, e não os padrões de 15m/30m. Zero linhas em control_plane_gap significa que este processo nunca observou uma queda do control plane. Um aviso sobre a linha `api` neste sistema em particular: sob `farmd demo` ela é escrita pela simulação (internal/demo/demo.go:1392-1394 bate em todo nome de lease.ReaperComponents), e não pelo servidor da API, que bate como \"demo\"."
+        },
+        {
+          "label": "O endpoint capabilities informa a postura de autenticação em palavras",
+          "lang": "bash",
+          "code": "curl -s http://127.0.0.1:8420/api/v1/capabilities \\\n  | python -c \"import sys,json; print(json.dumps(json.load(sys.stdin)['auth'], indent=2))\"",
+          "output": "{\n  \"mode\": \"allow-all\",\n  \"open\": true,\n  \"consequence\": \"every request is granted the operator role: anyone who can reach this port can revoke leases, drain hosts and power-cycle slots\",\n  \"fix\": \"set FARM_API_TOKENS to a token list, or supply an Authenticator\"\n}",
+          "note": "A string `fix` é aspiracional — definir FARM_API_TOKENS não muda nada neste build. Veja as lacunas. Troque `['auth']` por `['limits']` e obtêm-se os parâmetros de lease configurados, incluindo `\"renew_interval\": \"1m30s\"`, que também não é o que roda."
+        }
+      ],
+      "source": "internal/api/router.go:38-55, internal/api/server.go, internal/api/capabilities.go, cmd/farmd/roles.go:78-84, internal/obs/metrics.go:453"
+    },
+    {
+      "heading": "Roadmap, na ordem que o código defende",
+      "body": "Ordenado pelo que desbloqueia o quê, não pelo que soa bem em uma release note. Os itens 1–2 são a diferença entre um control plane e uma device farm; 3–6 são correções baratas para coisas que estão ativamente erradas nos padrões; 7–11 vêm depois.",
+      "bullets": [
+        "**1. Tornar o `farmd node` inicializável.** Adicionar um `FARM_NODE_TOKEN` a internal/config e passá-lo por `runNode`; fazer `node.Config.Component` assumir por padrão `\"node:\" + hostID`, como o pacote já pretende (agent.go:114-117, 250-251), em vez do `\"node\"` fixo no código. Toda afirmação deste repositório sobre hardware real — e toda a enrollment dinâmica — está rio abaixo de um node agent capaz de se construir.",
+        "**2. Dar ao role recovery um HostRunner.** Escrever o cliente HTTP para `POST /node/v1/usb-reset` e `/node/v1/port-power`, resolver o endpoint de node de cada host a partir de `farm.hosts`, e passá-lo para `recovery.NewADBActuator` em vez de `nil`. Enquanto isso não sair, os tiers 3 e 4 de uma ladder de nove degraus não podem executar em lugar nenhum. Em segundo lugar porque não tem sentido sem o 1.",
+        "**3. Ligar a autenticação.** Substituir `api.WithAuthenticator(api.NewAllowAll(log, \"anonymous\"))` em roles.go:148 por `api.AuthenticatorFromEnv(log)` — já escrito, já testado, e que se recusa a recair para aberto a menos que `FARM_API_AUTH=allow-all` diga isso deliberadamente. Uma linha mais a mudança no compose/manifesto. Antes do chart Helm, porque um chart que sai com autenticação aberta é pior do que nenhum chart.",
+        "**4. Respeitar FARM_COMPONENT em todo role, ou parar de validá-la em todo role.** Hoje a asserção do BLOCKER 8 verifica um nome que só o role `api` algum dia escreverá. Passar `cfg.Component` adiante em roles.go (mantendo o sufixo `watchdog:<host>`), ou fazer o preflight dizer com todas as letras que o parâmetro é exclusivo do api.",
+        "**5. Corrigir os padrões da contabilidade de gap.** Adicionar `jobrunner` a `DefaultReaperComponents`, e estender `onRenewalPath` para cobrir `jobrunner`, `all` e `demo`. Isto é um bug de perda de dados nos padrões: exatamente o formato do BLOCKER 8 que o pacote de configuração existe para impedir, alcançado por um componente que a asserção não cobre.",
+        "**6. Registrar os collectors.** Nove chamadas a `Collectors()` em `newRegistry`, mais `collectors.NewGoCollector()` e `NewProcessCollector()`. Hoje não é possível alertar sobre \"exatamente um líder de scheduler\", sobre falhas de arm do reaper, sobre falhas de beat do jobrunner ou sobre a cobertura de hosts do watchdog — e os itens 4 e 5 são difíceis de verificar sem eles.",
+        "**7. Ligar ou apagar os quatro parâmetros mortos.** Passar `FARM_LEASE_RENEW_INTERVAL` para `jobrunner.Config.HolderConfig`; ou construir o witness loop que o SQL e o Holder já esperam, ou remover as duas variáveis de witness, as suas verificações cruzadas e a linha `renew / witness` do summary; ou vincular `FARM_METRICS_ADDR` a um socket, ou apagá-la junto do `EXPOSE 9090` do Dockerfile. Um resumo de configuração que mente é pior do que um parâmetro que falta.",
+        "**8. Dar ao serviço `demo` do compose o seu próprio profile.** Uma linha. Impede que `--profile farm up` suba hardware simulado contra um banco real e colida na porta 8420.",
+        "**9. Chart Helm em `deploy/helm` (hoje um diretório vazio).** Depois de 3 e 6, para que o chart codifique a postura de autenticação e de métricas desde o início. Precisa de um Deployment por role, do Job de migrate, de PDBs que respeitem os singletons, de `terminationGracePeriodSeconds` acima de FARM_SHUTDOWN_GRACE, e de uma solução com formato de DaemonSet para o watchdog que não seja um DaemonSet, porque os hosts estão fora do cluster.",
+        "**10. Rodar `internal/node` e `internal/topo` contra hardware real.** Eles compilam em todo lugar e recusam com clareza onde não podem funcionar, mas nenhum dos dois encontrou um telefone. Não pode ser agendado antes de 1 e 2.",
+        "**11. O fence proxy mTLS.** A maior peça, e a única lacuna hoje compensada: o fence é imposto no banco e respeitado pelo cliente. Por último, porque deveria ser projetado contra uma farm em que 1, 2 e 10 já tenham saído."
+      ],
+      "source": "synthesised from cmd/farmd/roles.go, internal/config/config.go, internal/api/auth.go, internal/recovery/adbactuator.go, internal/node/agent.go, docker-compose.yml, deploy/helm"
+    },
+    {
+      "heading": "Lacunas fechadas desde que esta página foi escrita",
+      "body": "A lista de lacunas abaixo foi escrita contra uma árvore anterior, e parte dela já foi corrigida desde então. Essas entradas ficam registradas aqui em vez de apagadas: quem lê e se lembra de uma lacuna precisa conseguir distinguir **corrigida** de **nunca existiu**, e a mudança que fechou uma delas costuma ser a descrição verdadeira mais curta do que o comportamento é agora.\n\nA regra desta tabela é a regra da própria lista de lacunas. Uma entrada só se move para cá depois que o código foi lido e a afirmação conferida contra ele, nunca porque uma mensagem de commit disse que sim — que foi exatamente como a lista ficou desatualizada em primeiro lugar. Tudo que continua aberto está em **O que não está construído aqui**, logo abaixo.",
+      "table": {
+        "columns": [
+          "o que estava errado",
+          "o que fechou a lacuna"
+        ],
+        "rows": [
+          [
+            "`jobrunner` está em `DefaultReaperComponents` agora; `janitor` não está, e essa é a decisão certa, não um descuido — o janitor fecha linhas de step órfãs e não está no caminho de renovação, então devolver o downtime dele a um lease devolveria uma queda ocorrida em um plano que não consegue estender lease nenhum. O que resta é que nada declara essa distinção onde o operador que adiciona um componente à watch list fosse lê-la. Se toda réplica de jobrunner cai enquanto api/scheduler/reaper seguem saudáveis, `farm.reaper_arm` não registra gap nenhum de control plane e não devolve nada. Os holders que estavam renovando aqueles leases se foram junto com os jobrunners, então, nos padrões, todo lease afetado sofre reclaim 45 minutos depois (TTL 15m + grace 30m) e os jobs nos telefones são destruídos. Isto é precisamente o reclaim em massa do BLOCKER 8 que a asserção foi escrita para impedir, alcançado por um componente que a asserção não cobre. O janitor não está no caminho de renovação, então a ausência dele custa menos — mas é igualmente invisível.",
+            "`internal/config` recusa um `FARM_REAPER_COMPONENTS` que carregue um componente do health plane, e recusa a INICIAR em vez de avisar. A lista de recusa é derivada de `roleComponents` filtrada por `!onRenewalPath`, então um componente adicionado a um role é recusado no dia em que for adicionado — e uma segunda proteção pega o que uma lista de nomes não pega, um watchdog RENOMEADO para `wd` batendo como `wd:h01`, recusando no processo dono da renomeação. `Summary()` agora diz o que a watch list FAZ, em vez de dizer que ela observa: uma queda de qualquer um desses estende todo lease vivo pela duração dela."
+          ],
+          [
+            "`farm.reaper_arm` é cego a um componente observado que nunca escreveu uma linha de heartbeat. Ele calcula `SELECT min(h.beat_at) … WHERE h.component = ANY(p_components)` (migrations/00002_lease.sql:469-472); um nome sem linha nenhuma não contribui em nada para o mínimo, em vez de ser tratado como infinitamente obsoleto. Combinado com as duas lacunas anteriores, é assim que a contabilidade se degrada em silêncio. Sob `farmd all` contra um banco novo, `cfg.Component` é \"all\" e nada jamais escreve uma linha `api`, então a contabilidade de gap cobre silenciosamente 2 dos 3 nomes observados e nenhum erro é levantado em lugar nenhum. Não existe alerta para \"um componente que estou observando nunca bateu\" — confira `SELECT component FROM farm.component_heartbeat` contra FARM_REAPER_COMPONENTS na mão depois de qualquer mudança de deployment.",
+            "`migrations/00012_reaper_arm_unbeaten.sql` reescreve o arm para fazer `unnest` da watch list e LEFT JOIN com os heartbeats, de modo que um componente sem linha fica visível em vez de sumir do `min()`. Ele se recusa a armar, nomeia o componente em `unbeaten` e em `reaper_state.last_refusal`, e não faz reclaim de nada até que ele bata. Verificado ao vivo: `farm.reaper_arm(ARRAY['reaper','api','ghost_component'], '60s')` → `f | 00:00:00 | {ghost_component}`."
+          ],
+          [
+            "Dois dos três chegam ao seu destino: `FARM_LEASE_RENEW_INTERVAL` é passada por `jobrunner.Config.HolderConfig`, e `FARM_COMPONENT` chega a todo role. `FARM_LEASE_WITNESS_INTERVAL` ainda não dita o ritmo de nada, porque nenhum role inicia um witness loop — e `config.Summary()` diz exatamente isso na inicialização (`NOT STARTED`), em vez de imprimir o intervalo como se ele estivesse em vigor. Ajustar o intervalo de renovação para sobreviver a um Postgres lento não muda nada, enquanto `config.Summary()` e `/api/v1/capabilities` informam ambos o valor definido como se ele estivesse em vigor. O witness no device — o mecanismo que protegeria um lease quando o control plane está cego — não está rodando: `witness_at` é NULL em todo lease e `witness_extensions` nunca passou de 0. Os leases são protegidos apenas por TTL+grace e pelo refund de gap.",
+            "`FARM_LEASE_WITNESS_INTERVAL` dita o ritmo do witness loop do jobrunner, e a cadência do marcador e a janela de evidência derivam dela por uma regra que `New` se recusa a deixar ser definida na mão. `Summary()` imprime as três."
+          ],
+          [
+            "`docker compose --profile farm up -d` também sobe o demo. O serviço `demo` não tem chave `profiles:`, e tanto `demo` quanto `api` publicam `${FARM_PORT:-8420}`. O comando documentado para uma farm real sobe hardware simulado escrevendo no mesmo banco do control plane real, e o segundo dos dois serviços a subir não consegue fazer bind na 8420. Contorno de hoje: `docker compose --profile farm up -d --scale demo=0`. `docker compose --profile farm config` mostra isso antes de qualquer implantação, e sem daemon.",
+            "`demo` está atrás de `profiles: [\"demo\"]` e os roles atrás de `[\"farm\"]`, então `docker compose --profile farm up -d` sobe um control plane e nenhum hardware simulado. O `.env` versionado define `COMPOSE_PROFILES=demo`, de modo que um `up -d` pelado continua sendo o demo de laptop, e uma flag `--profile` SUBSTITUI esse valor em vez de somar a ele."
+          ],
+          [
+            "O projeto e um esqueleto testável existem — `docs/design/fence-proxy.md` e `internal/fenceproxy`, 24 testes — e NADA CONSTRÓI NENHUM DOS DOIS, então nenhum byte de ADB nesta farm passa hoje por um proxy. O pacote é deliberadamente inerte: não importa driver de banco, nem cliente HTTP, nem o pacote dono dos leases, e dois dos seus testes impõem isso (um afirma que `FenceSource` tem exatamente um método, porque um segundo é o que permitiria a uma recusa FAZER alguma coisa; o outro parseia cada arquivo e falha diante de um identificador que nomeie um ato que encerra um lease). A integração é o trabalho que resta. Um cliente com bug ou malicioso que ignore o próprio fence ainda consegue dirigir por ADB um device que já não lhe pertence, porque o próprio ADB não tem noção do fence. `FARM_NODE_SELF_FENCE_TIMEOUT` e `FARM_SLOT_REARM` existem para limitar essa janela, e é por isso que a asserção do rearm é uma falha de inicialização e não um aviso. Esta é a única lacuna que hoje está compensada, em vez de meramente ausente.",
+            "As duas metades estão construídas: o node agent serve o proxy em um listener mTLS quando `FARM_FENCE_TLS_*` estão definidas, e todo cliente adbwire em um processo do control plane apresenta `FARM_FENCE_CLIENT_*` e anuncia a sua classe e o seu fence. Desligado a menos que configurado, e `GET /api/v1/capabilities` informa o lado deste processo — nunca o da farm, que nenhum processo isolado consegue enxergar."
+          ],
+          [
+            "O chart tem um Deployment para `api`, `scheduler`, `reaper`, `recovery`, `jobrunner` e `watchdog`, e nenhum para `janitor` — que o binário tem desde que o modelo de steps chegou, e que é a única coisa que fecha uma linha de `farm.job_steps` cujo processo morreu. Um deployment de Kubernetes feito com este chart acumula linhas de step órfãs que envenenam o próprio predicado de claim do jobrunner. Ele agora também distribui um `PrometheusRule` ao lado do `ServiceMonitor`. Em uma instalação Kubernetes nada fecha uma linha órfã: um jobrunner despejado no meio de um step deixa a sua linha de `farm.job_steps` em `running` e o seu job em `running` para sempre, que é exatamente a condição que `internal/janitor` foi escrito para reparar, ausente do único artefato de deployment que o executaria. Adicione um Deployment para `farmd janitor` — ele é um singleton com lock de liderança, como o reaper. E o operador que segue o README não vai esperar que os seus tokens surtam efeito, e não vai entender por que um pod de api sem token se recusa a iniciar em vez de subir aberto, que é hoje o comportamento deliberado.",
+            "`deploy/helm/device-farmer/templates/janitor.yaml` e um serviço `janitor` no profile `farm` do compose. `chargepolicy` chegou com o seu próprio Deployment ao mesmo tempo, então o chart agora tem um por role e `DeviceFarmerComponentBeatFailing` ouve todo nome que observa."
+          ],
+          [
+            "A API era aberta e não podia ser fechada por configuração. `cmd/farmd/roles.go` acrescentava `api.WithAuthenticator(api.NewAllowAll(log, \"anonymous\"))` incondicionalmente, e `api.AuthenticatorFromEnv` — a função que lê `FARM_API_TOKENS` — não tinha chamador, então o remédio que `/api/v1/capabilities` imprimia não fazia nada.",
+            "`cmd/farmd/roles.go:187` agora chama `api.AuthenticatorFor(cfg, log)`. Ela lê `FARM_API_TOKENS` e `FARM_API_AUTH`, constrói um `StaticBearer`, e SE RECUSA a iniciar um listener exposto sem credenciais em vez de subir aberto — uma api que não inicia é registrada como um gap de control plane e devolvida a todo lease vivo, coisa que subir aberto não é. `internal/api/auth_wiring.go`, com `internal/api/auth_test.go` por trás."
+          ],
+          [
+            "`farmd node` não conseguia iniciar de jeito nenhum, em plataforma nenhuma. `runNode` passava `Addr: cfg.NodeAddr` e nunca passava `Token`, `node.New` recusa sempre que `Addr != \"\" && Token == \"\"`, e `FARM_NODE_ADDR` não podia ser esvaziada porque um valor vazio é lido como não definido e devolve o padrão `:8082` — de modo que ambiente nenhum satisfazia a proteção.",
+            "`cmd/farmd/roles.go:600` passa `FARM_NODE_TOKEN`. A proteção em si está certa e permanece: um endpoint não autenticado que desliga e liga portas USB é pior do que nenhum endpoint. Não servir nada continua sendo um deployment legítimo — um `Addr` vazio não precisa de token, e a descoberta e a enrollment rodam de qualquer jeito."
+          ],
+          [
+            "Os tiers 3 (`usb_reset`) e 4 (`port_power`) de recovery nunca podiam executar. `cmd/farmd/roles.go` construía `recovery.NewADBActuator(log, nil)` — um `HostRunner` nil — para todo role, nada na árvore falava `POST /node/v1/usb-reset` ou `/node/v1/port-power`, e `farm.hosts` não tinha coluna dizendo onde um agente escuta.",
+            "`internal/node/client.go` é esse cliente, `migrations/00006_node_endpoint.sql` acrescenta `farm.hosts.node_endpoint` e `node_version` para que a ladder consiga encontrar um agente, e `cmd/farmd/roles.go:278-299` liga um `HostRunner` de verdade quando há um configurado. Uma farm sem agentes ainda recusa os degraus com um motivo, em vez de reportá-los como ineficazes."
+          ],
+          [
+            "A enrollment dinâmica não conseguia rodar em nenhum formato implantável: `enroll.New` tinha exatamente um ponto de construção, dentro de `runNode`, e `runNode` não conseguia iniciar. Um aparelho plugado em um host nunca entraria na frota, em deployment nenhum.",
+            "`runNode` inicia agora, então o único ponto de construção é alcançável. A enrollment continua confinada àquele role, e aquele role continua exclusivo do Linux — veja as lacunas abaixo para saber o que isso custa."
+          ],
+          [
+            "Nenhum chart Helm e nenhum manifesto de Kubernetes. `deploy/helm` era um diretório vazio e `docker-compose.yml` era o único artefato de deployment do repositório, enquanto o diagrama de arquitetura do README mostrava o control plane no Kubernetes.",
+            "`deploy/helm/device-farmer` distribui um chart para os seis roles do control plane mais o Job de migrate que precisa ter sucesso antes de qualquer um deles iniciar, com um `ServiceMonitor`, templates de secret e de configmap, e um README que explica por que `farmd node` não pode ser uma workload dentro dele. `values.yaml` documenta cada parâmetro no próprio arquivo."
+          ],
+          [
+            "`FARM_COMPONENT` é respeitada somente pelo role `api`. `cmd/farmd/roles.go` fixa no código o `Component:` para scheduler (214), reaper (230), janitor (255), recovery (300), watchdog (328, `\"watchdog:\"+hostID`), jobrunner (519), enroll (566) e node (582). Só `runAPI` passa `cfg` adiante para algo que bata com `cfg.Component`. O caso do node é o pior deles: `Component: \"node\"` descarta o padrão `\"node:\" + hostID` do próprio `internal/node`.",
+            "Todo role resolve o seu nome por `cfg.ComponentFor`, e `roleComponents` registra quais linhas de heartbeat cada role de fato escreve — que é o que permite à asserção do BLOCKER 8 cobrir um processo rodando seis componentes, e é o que um nome adicionado a `FARM_REAPER_COMPONENTS` agora compra. `config.TestRoleComponentsCoversEveryRole` falha se um novo role for adicionado sem dizer com que nome ele bate."
+          ],
+          [
+            "`FARM_METRICS_ADDR` não vincula nada, nenhum role imprime `config.Summary()`, e `FARM_SHUTDOWN_GRACE` é lida por um único arquivo. `MetricsAddr` aparece apenas em config.go e na string do summary; `/metrics` é servido em `FARM_API_ADDR`. O único ponto de chamada de `Summary()` está dentro de `notImplemented()` (`cmd/farmd/main.go:251`), que não tem chamadores. `cfg.ShutdownGrace` tem exatamente um consumidor, `internal/api/server.go:459`.",
+            "Todo role vincula um listener de `/metrics` ANTES de começar o seu trabalho, então uma porta ocupada é uma falha de inicialização que nomeia a variável, em vez de um role que sobe saudável e não exporta nada — observado exatamente uma vez durante a verificação, quando um segundo processo encontrou a :9090 ocupada. `cmd/farmd/main.go` também imprime `cfg.Summary()` na inicialização, para todo role."
+          ],
+          [
+            "As métricas de role são definidas e nunca registradas. `cmd/farmd/roles.go:86` chama `obs.RegisterAll(reg, log)` sem nenhum grupo variádico, e a assinatura é `RegisterAll(r, log, groups ...[]prometheus.Collector)` — então o registry recebe os nove collectors do próprio internal/obs e nada mais. Dez pacotes definem `Collectors()` (adbwire, enroll, janitor, jobrunner, node, reaper, recovery, scheduler, topo, watchdog) e a árvore inteira guarda exatamente UM ponto de chamada: `internal/api/server.go:369`, para o adbwire — e essa linha fica dentro de `if ownRegistry`, um ramo que o `farmd` nunca toma, porque `runAPI` fornece ele mesmo o registry em `roles.go:138`. Então, no binário distribuído, os collectors de pacote nenhum chegam a `/metrics`, os do adbwire inclusive. Os collectors de processo e de runtime do Go ESTÃO registrados — `newRegistry` os adiciona em `cmd/farmd/roles.go:94-95`, deliberadamente no binário e não na biblioteca, para que dois roles em um mesmo processo não colidam por eles.",
+            "`newRegistry` passa todos os dez grupos para `obs.RegisterAll`, guardado por um teste que reprova o build quando o grupo de um pacote novo é deixado de fora."
+          ],
+          [
+            "O código de saída 3 (`not implemented`) é documentado e inalcançável. `notImplemented()` em `cmd/farmd/main.go:238` não tem chamadores, porque todo role commitado já está ligado.",
+            "Removido, com o motivo escrito onde estão os códigos: todo role despacha, então nada poderia retorná-lo, e o número não está livre — `farmd ctl` sai com 3 quando o remoto RECUSOU uma ação, o que é um 409 e portanto uma resposta, não uma falha. Dois significados para um número em um binário é como um script de rollout acaba lendo uma recusa como uma funcionalidade faltando."
+          ]
+        ]
+      },
+      "source": "cmd/farmd/roles.go, internal/api/auth_wiring.go, internal/node/client.go, migrations/00006_node_endpoint.sql, deploy/helm/device-farmer"
+    }
+  ],
+  "gaps": [
+    {
+      "what": "`all` e `demo` nomeiam o heartbeat da sua API a partir do role. `config.Load(\"all\")` produz o componente `all`; `Load(\"demo\")` produz `demo`. Nenhum dos dois está em `onRenewalPath`, então ambos passam no preflight, e nenhum dos dois está na watch list padrão.",
+      "consequence": "Sob `farmd all` — o formato de nó único que está documentado — o heartbeat da API é escrito como `all` e fica invisível para a contabilidade de gap, enquanto scheduler e reaper batem sob nomes observados. Uma API que trava enquanto o resto do processo roda produz beats novos, nenhum gap registrado e nenhum refund para holders externos cujas renovações passam por HTTP. Defina `FARM_COMPONENT=api` e adicione `all` a `FARM_REAPER_COMPONENTS`, ou rode os roles separadamente. No `farmd demo` o efeito fica mascarado: a própria simulação do demo bate api/reaper/scheduler, então a tabela parece completa quando não está.",
+      "status": "partial"
+    },
+    {
+      "what": "`internal/node` e `internal/topo` nunca rodaram contra hardware real. `internal/node/hostops.go` e `internal/node/uhubctl.go` carregam `//go:build linux`; `internal/topo/sysfs.go` não tem build tag e, em vez disso, recusa em tempo de execução. Todos eles compilam em qualquer lugar, e `internal/node/client_test.go` agora exercita o protocolo de fio contra um servidor falso — o que prova o cliente, não o hardware.",
+      "consequence": "Tudo o que a documentação diz sobre descoberta de caminho USB, USBDEVFS_RESET, comportamento do uhubctl e o piso de kernel Linux 6.0 é derivado do código e do comportamento documentado do kernel, não de um telefone. Reserve um período de bring-up no primeiro host físico. O binário consegue iniciar o agente agora, então esse bring-up é possível — ele apenas não aconteceu.",
+      "status": "unverified"
+    }
+  ],
+  "verified": "Lidos por inteiro: cmd/farmd/{main,roles,migrate,embed}.go, internal/config/config.go, migrations/embed.go, Dockerfile, docker-compose.yml, Makefile, scripts/dev-up.ps1; trechos específicos de internal/{scheduler,reaper,jobrunner,lease/holder,lease/store,api/server,api/router,api/auth,api/capabilities,node/agent,node/uhubctl,topo/sysfs,topo/discover,recovery/adbactuator,recovery/ladder,watchdog,ui,obs,demo/seed,demo/demo,ctl}.go, README.md, e migrations/00001_core.sql (CHECK de release_reason), 00002_lease.sql (fase 1 de lease_acquire, reaper_arm, lease_mark_suspect, gate de quiesce do reclaim), 00004_operate.sql (register_slot).\n\nRodado contra o sistema ao vivo (`bin/farmd.exe demo -hosts 2 -devices 56`, PID 26236 confirmado via Win32_Process; API em 127.0.0.1:8420, Postgres em 127.0.0.1:55432). Todos os exemplos de CLI usaram bin/farmd.exe, que reporta o commit d872818 coincidindo com `git rev-parse HEAD`; o farmd.exe desatualizado na raiz do repositório (197e6f9) não foi usado.\n\n- CLI: `farmd` sem argumentos -> uso em stderr, exit 2; `farmd --help` -> 1218 bytes byte a byte idênticos em stdout, exit 0 (diff vazio); `farmd version` -> commit d872818f4aa32a29943ef17084a43f469c1c072c, go1.26.5 windows/amd64; `farmd scheduler -bogus` -> exit 2 listando as flags exclusivas do demo.\n- migrate: `status` (4 aplicadas, \"source embedded\", exit 0), `-h` (lista completa de flags), `down-to 3` (recusado sem -yes, exit 1).\n- Preflight: `FARM_SLOT_REARM=10s farmd scheduler` e `FARM_COMPONENT=api-canary farmd api` ambos reproduzidos literalmente, exit 1; `FARM_API_URL=localhost:9999 farmd scheduler` -> recusa de URL absoluta, exit 1; `FARM_HOST_ID=h01 farmd node` -> recusa do topo sysfs nomeando windows, exit 1.\n- config: `config.Load` + `Summary()` executados via `go test -overlay` com um arquivo de teste de scratchpad mapeado para dentro de internal/config. Nenhum arquivo do repositório foi criado ou modificado — `git status --porcelain` antes e depois mostra os mesmos quatro arquivos modificados e um arquivo não rastreado de outra sessão. Confirmado que o Load tem sucesso para os roles api, all, demo, jobrunner, recovery, watchdog, node, scheduler, reaper, que os componentes são os nomes dos roles, e que a watch list permanece [reaper api scheduler] em todos os casos.\n- HTTP: /healthz, /readyz, /metrics (17 famílias `# HELP`, contadas e listadas), /api/v1/capabilities (corpo completo, depois auth e limits extraídos); GET /api/v1/fleet retornou 200 sem header Authorization e 200 com um bearer token lixo.\n- ctl (FARM_API_URL=http://127.0.0.1:8420): usage, hosts, recovery, leases, jobs.\n- psql (`-P footer=off`; caso contrário o locale do cluster imprime os rodapés de contagem de linhas em português): advisory de pg_locks decodificado contra as duas constantes de chave de liderança, amostrado três vezes; component_heartbeat amostrado duas vezes com seis segundos de intervalo (8 componentes, todos avançando); reaper_state; control_plane_gap (0 linhas); leases agrupados por state e por release_reason; censo de witness de farm.leases; farm.jobs agrupado por ttl/grace; contagem de farm.recovery_tiers (9, tiers 0-8); farm.recovery_attempts agrupado por tier/outcome e as suas strings distintas de recusa; \\d farm.recovery_attempts; farm.audit_log agrupado por actor/action; farm.hubs unido a farm.slots e farm.power_domains para a topologia por host.\n- docker: daemon não necessário — `docker compose config --services` (postgres, migrate, demo) e `docker compose --profile farm config --format json` ambos parseados localmente, provando que o serviço `demo` não carrega profile nenhum e publica a 8420 ao lado do `api`. O GNU make não está instalado neste host, então nenhum alvo do make foi executado; as afirmações sobre o Makefile são lidas do arquivo.\n\nNão executado: SIGTERM contra um farmd em execução (o único processo vivo é o demo compartilhado, e matá-lo teria destruído os leases que esta página documenta) — a seção de shutdown vem de cmd/farmd/main.go e internal/api/server.go, com o texto do banner citado do código, e não de uma transcrição. O banner de início do demo é igualmente citado de cmd/farmd/roles.go:runDemo. A string de recusa \"no host agent is configured for this farm\" do recovery é citada de internal/recovery/adbactuator.go:185-192 e não disparou nesta farm.\n\nChecagem de invariante: nada nesta página afirma ou dá a entender que uma falha de conectividade possa encerrar um lease, e duas formulações herdadas do rascunho foram apertadas para que não possam ser lidas assim — a linha de FARM_DB_MAX_CONNS agora diz explicitamente que um pool esfomeado faz falhar o relógio da *renovação* e que o socket até o telefone não tem parte nisso, e a linha de FARM_NODE_SELF_FENCE_TIMEOUT agora diz que derrubar sockets ADB não toca no lease. Uma consulta ao vivo em farm.leases.release_reason foi acrescentada como evidência positiva do domínio do CHECK.\n\nPASSE DE REVERIFICAÇÃO DAS LACUNAS. A lista de lacunas desta página foi reconferida contra a árvore, linha por linha, depois das migrations 00005, 00006 e 00007 e das mudanças em Go que vieram com elas. Toda entrada movida para \"Lacunas fechadas desde que esta página foi escrita\" foi confirmada pela leitura do código que a fechou, não por confiar em uma mensagem de commit. Três afirmações se revelaram desatualizadas na direção oposta e foram reabertas: reaper.Collectors(), jobrunner.Collectors() e os collectors de recovery/node continuam todos não registrados, porque cmd/farmd/roles.go:86 chama obs.RegisterAll(reg, log) sem grupos variádicos e o único ponto de chamada de Collectors() na árvore fica em um ramo que o farmd nunca toma. Uma afirmação estava simplesmente errada quando foi escrita — farm.slots.power_domain_id existe desde migrations/00001_core.sql:91 — e foi corrigida no lugar. Duas afirmações sobre cobertura de testes foram estreitadas em vez de fechadas: internal/lease e internal/api estão cobertos agora; internal/reaper, internal/scheduler, internal/runner e internal/jobrunner continuam com zero arquivos de teste. Somente os seis arquivos JSON de área foram editados por este passe; nenhum código Go, SQL ou de UI foi tocado. Este passe também ACRESCENTOU uma lacuna que o inventário nunca teve: o chart Helm não distribui nenhum Deployment de janitor, então nada fecha uma linha órfã em uma instalação Kubernetes, e deploy/helm/README.md ainda documenta a autenticação como não ligada."
+}

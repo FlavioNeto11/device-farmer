@@ -1173,8 +1173,56 @@ function headerCell(c, o) {
       ' — ' + (dir === 'asc' ? t('table.sortedAsc') : dir === 'desc' ? t('table.sortedDesc') : t('table.sortable')))));
 }
 
-function emptyState(title, detail) {
-  return el('div', { class: 'empty' }, el('strong', null, title), detail);
+/* emptyState draws the "there is nothing here" panel.
+ *
+ * THE THIRD ARGUMENT IS THE POINT. A panel that says only what is absent leaves
+ * the reader to work out what would make it present, and the conclusion an
+ * operator reaches at 3 a.m. is usually "the dashboard is broken". Almost every
+ * one of these panels named a SQL object at somebody who had arrived that
+ * morning — true, useful in year two, and the only thing on screen. So a state
+ * that has an action now carries it as a button, beside the sentence rather
+ * than buried in it; a state that genuinely has none carries no button, because
+ * a button that does nothing helpful is worse than the absence of one.
+ *
+ * `detail` takes a string, a node, or an array of either — which is how
+ * provenance() lands underneath the human sentence instead of in front of it.
+ */
+function emptyState(title, detail, action) {
+  return el('div', { class: 'empty' },
+    el('strong', null, title),
+    detail === null || detail === undefined || detail === '' ? null : el('div', { class: 'empty-detail' }, detail),
+    action ? el('div', { class: 'empty-act' }, action) : null);
+}
+
+/* provenance keeps the sentence that names the SQL object, and demotes it.
+ *
+ * farm.v_fleet, farm.recovery_tiers, farm.events, farm.audit_log: these
+ * sentences are true, and they are exactly what an operator wants on the day
+ * they start writing their own queries. They are not what a person wants on the
+ * day they first open the page and find an empty grid. Collapsed, both readers
+ * get what they came for — one reads a sentence and presses a button, the other
+ * opens one <details>. Deleting them would have served only the first reader.
+ */
+const openProvenance = new Set();
+
+function provenance(text) {
+  /* Keyed by its own sentence, which is stable per panel and unique across
+   * them. Every one of these panels is rebuilt from scratch on each render —
+   * a loader finishing, a stream event, the 30-second safety net — so without
+   * this the disclosure an operator just opened re-collapses under them within
+   * seconds, exactly as openLogs() exists to prevent for the step logs. */
+  return el('details', {
+    class: 'empty-src',
+    open: openProvenance.has(text) || null,
+    ontoggle: (e) => { if (e.target.open) openProvenance.add(text); else openProvenance.delete(text); }
+  },
+  el('summary', null, t('empty.where')),
+  el('p', { class: 'empty-src-body' }, text));
+}
+
+/* emptyAction is the button an empty state ends with. */
+function emptyAction(label, onclick) {
+  return el('button', { class: 'mini primary', type: 'button', onclick }, label);
 }
 
 /* panelState renders the honest not-yet / failed / nothing-there states so no
@@ -1183,13 +1231,27 @@ function panelState(key, rows, empty) {
   const e = state.errors[key];
   const have = Array.isArray(rows) && rows.length > 0;
   if (e && !have) {
-    return emptyState('Could not load this from the API.',
-      el('span', null, errText(e), e.detail ? el('span', { class: 'mono' }, ' ' + JSON.stringify(e.detail)) : null));
+    return emptyState(t('empty.failed'),
+      el('span', null, errText(e), e.detail ? el('span', { class: 'mono' }, ' ' + JSON.stringify(e.detail)) : null),
+      emptyAction(t('empty.retry'), () => refreshAll()));
   }
   if (e) return null;   // stale rows beat a blank screen; the banner says so
-  if (rows === null || rows === undefined) return emptyState('Loading from the API…', 'Nothing is drawn until the server answers.');
+  if (rows === null || rows === undefined) return emptyState(t('empty.loading'), t('empty.loadingDetail'));
   if (!rows.length) return empty;
   return null;
+}
+
+/* termLabel glosses one word, IF the glossary is loaded.
+ *
+ * terms.js owns term(); this file only decides which words are worth the
+ * dotted underline. The guard is not defensive habit — it is the contract:
+ * absent terms.js the header renders the same plain word it has always
+ * rendered, so nothing here depends on a file that may not be present. There
+ * is no second glossary in this file and there must never be one, because two
+ * definitions of `fence` that disagree is worse than none.
+ */
+function termLabel(id, label) {
+  return typeof term === 'function' ? term(id, label) : label;
 }
 
 function countChips(obj) {
@@ -1275,8 +1337,23 @@ function renderLeases() {
     ]);
   }
 
-  const problem = panelState('leases', rows0, emptyState('No leases in this state.',
-    'Every live lease appears here with its fence, holder, job, and the two server-computed instants that matter: expires_at (when it becomes suspect) and reclaimable_at (the earliest the reaper may act).'));
+  /* Two different situations, and they read identically until you separate
+   * them: a filter that hides every lease, and a farm that is holding none.
+   * The first is undone by a button; the second is not a fault at all. */
+  const problem = panelState('leases', rows0, state.filters.leaseState
+    ? emptyState(t('empty.leases.filtered'),
+      [t('empty.leases.filteredDetail'), provenance(t('empty.leases.where'))],
+      emptyAction(t('empty.leases.showAll'), () => {
+        state.filters.leaseState = '';
+        // render() as well as the fetch: syncControls() moves the select the
+        // instant it is pressed, and without a repaint the panel below goes on
+        // saying "no leases in this state" — disagreeing with the control that
+        // has already changed — for the whole round trip.
+        syncControls(); syncHash(); loaders.leases(); render();
+      }))
+    : emptyState(t('empty.leases.none'),
+      [t('empty.leases.noneDetail'), provenance(t('empty.leases.where'))],
+      emptyAction(t('empty.leases.openJobs'), () => setView('jobs'))));
   if (problem) { body.replaceChildren(problem); return; }
 
   body.setAttribute('aria-busy', 'false');
@@ -1292,7 +1369,7 @@ function renderLeases() {
         return el('span', { class: 'chips' }, chips);
       }
     },
-    { label: 'Fence', cls: 'num', cell: (l) => (l.fence === undefined ? '—' : String(l.fence)) },
+    { label: termLabel('fence', 'Fence'), cls: 'num', cell: (l) => (l.fence === undefined ? '—' : String(l.fence)) },
     { label: 'Device', cell: (l) => deviceLabel(l.deviceID, l.rackSlot) },
     { label: 'Job', cls: 'mono', cell: (l) => el('span', { title: String(l.jobID || '') }, shortId(l.jobID) || '—') },
     { label: 'Tenant', cell: (l) => l.tenant || '—' },
@@ -1301,7 +1378,7 @@ function renderLeases() {
     { label: 'Heartbeat', cell: (l) => timeCell(l.heartbeatAt) },
     { label: 'Expires', cell: (l) => timeCell(l.expiresAt) },
     { label: 'Reclaimable', cell: (l) => timeCell(l.reclaimableAt) },
-    { label: 'Witness', cell: (l) => (l.witnessAt ? timeCell(l.witnessAt) : el('span', { class: 'chip chip-plain' }, 'none')) },
+    { label: termLabel('witness', 'Witness'), cell: (l) => (l.witnessAt ? timeCell(l.witnessAt) : el('span', { class: 'chip chip-plain' }, 'none')) },
     {
       label: '', cls: 'acts', cell: (l) => (l.state === 'held' || l.state === 'suspect')
         ? el('button', { class: 'mini danger', onclick: () => revokeLease(l) }, 'Revoke')
@@ -1335,8 +1412,14 @@ function renderJobs() {
       truncChip('jobs', 'Pick a single job state to see the rest.')]);
   }
 
-  const problem = panelState('jobs', rows0, emptyState('No jobs.',
-    'Queued and running jobs appear here as soon as one is submitted. Use the form on the right.'));
+  const problem = panelState('jobs', rows0, state.filters.jobState
+    ? emptyState(t('empty.jobs.filtered'), t('empty.jobs.filteredDetail'),
+      emptyAction(t('empty.jobs.showAll'), () => {
+        state.filters.jobState = '';
+        syncControls(); syncHash(); loaders.jobs(); render();
+      }))
+    : emptyState(t('empty.jobs.none'), t('empty.jobs.noneDetail'),
+      emptyAction(t('empty.jobs.submit'), () => { const f = $('#job-pool'); if (f) f.focus(); })));
   if (problem) { body.replaceChildren(problem); renderJobSteps(); return; }
 
   body.setAttribute('aria-busy', 'false');
@@ -1354,7 +1437,7 @@ function renderJobs() {
     { label: 'Queue', cell: (j) => j.queue || '—' },
     { label: 'Tenant', cell: (j) => j.tenant || '—' },
     {
-      label: 'Guards', cell: (j) => el('span', { class: 'chips' },
+      label: termLabel('disruption_policy', 'Guards'), cell: (j) => el('span', { class: 'chips' },
         j.protected ? el('span', { class: 'chip chip-protected' }, el('span', { 'aria-hidden': 'true' }, '★'), 'protected') : null,
         j.policy ? el('span', { class: 'chip chip-plain', title: 'disruption_policy' }, j.policy) : null)
     },
@@ -1578,17 +1661,17 @@ function renderJobSteps() {
   if (!host) return;
 
   if (!state.jobStepsID) {
-    host.replaceChildren(emptyState('No job selected.',
-      'Press Steps on a job above to see which step it is on, what it printed, and why it stopped.'));
+    host.replaceChildren(emptyState(t('empty.steps.noJob'), t('empty.steps.noJobDetail')));
     return;
   }
   if (state.errors.jobSteps && !state.data.jobSteps) {
-    host.replaceChildren(emptyState('Could not read that job\'s steps.', errText(state.errors.jobSteps)));
+    host.replaceChildren(emptyState(t('empty.steps.failed'), errText(state.errors.jobSteps),
+      emptyAction(t('empty.retry'), () => loaders.jobSteps())));
     return;
   }
   const data = state.data.jobSteps;
   if (!data) {
-    host.replaceChildren(emptyState('Loading the step log…',
+    host.replaceChildren(emptyState(t('empty.steps.loading'),
       'GET /api/v1/jobs/' + shortId(state.jobStepsID) + '/steps'));
     return;
   }
@@ -1648,11 +1731,33 @@ function renderJobSteps() {
         : null,
       truncChip('jobSteps', 'Pin a single attempt with the selector above.')));
 
-  const empty = emptyState('No steps for this attempt.',
-    (data.attemptsWithSteps || []).length
-      ? 'farm.job_steps has rows for attempt ' + (data.attemptsWithSteps || []).join(', ') +
-        ' of this job, and none for the one selected.'
-      : 'The runner writes a row per step as it executes one. A job that has not been placed on a device yet has none.');
+  /* Two readings of the same blank panel: this job HAS steps, filed under an
+   * attempt you are not looking at — one button away — or it has none at all,
+   * because nothing has run yet, which no button of ours can bring forward.
+   *
+   * `pinned === 'all'` is excluded from the first reading and it is not a
+   * detail: with every attempt already selected there is no wider selection to
+   * offer, so the button would re-issue the identical request for the identical
+   * empty answer while the sentence above it claimed the steps were somewhere
+   * the reader had not looked. */
+  // `pinned` is the attempt selector's value, read above for the <select>.
+  const elsewhere = pinned !== 'all' && (data.attemptsWithSteps || []).length
+    ? (data.attemptsWithSteps || []).join(', ')
+    : '';
+  const empty = elsewhere
+    ? emptyState(t('empty.steps.none'),
+      [t('empty.steps.otherAttempts', { attempts: elsewhere }), provenance(t('empty.steps.where'))],
+      emptyAction(t('empty.steps.showAll'), () => {
+        state.filters.stepAttempt = 'all';
+        state.data.jobSteps = null;
+        syncHash(); loaders.jobSteps(); render();
+      }))
+    /* Not "Try again": nothing has failed. A queued job legitimately has no
+     * steps, and the rows appear on their own once the scheduler places it —
+     * this refetches rather than retries, and says so. */
+    : emptyState(t('empty.steps.none'),
+      [t('empty.steps.noneDetail'), provenance(t('empty.steps.where'))],
+      emptyAction(t('empty.steps.recheck'), () => loaders.jobSteps()));
   const problem = panelState('jobSteps', data.steps, empty);
   if (problem) { host.replaceChildren(header, problem); return; }
 
@@ -1691,14 +1796,31 @@ function renderRecovery() {
   renderQuarantines();
 }
 
+/* ladderLegend glosses the ladder's two load-bearing words once, above the
+ * rungs, rather than nine times inside them.
+ *
+ * `tier` and `blast radius` are the whole grammar of this panel and neither is
+ * guessable: a rung is refused when its blast radius exceeds what the live
+ * lease's disruption policy allows, and a reader who does not know either word
+ * cannot read that sentence. Absent terms.js this line would be the two words
+ * again with nothing attached, which is noise, so it is not drawn at all — the
+ * panel then looks exactly as it does today. */
+function ladderLegend() {
+  if (typeof term !== 'function') return null;
+  return el('p', { class: 'ladder-legend' },
+    term('tier', 'Tier'), el('span', { 'aria-hidden': 'true' }, ' · '), term('blast_radius', 'blast radius'));
+}
+
 function renderTiers() {
   const host = $('#tiers-body');
   const tiers = state.data.tiers;
-  const problem = panelState('recovery', tiers, emptyState('The ladder is empty.',
-    'farm.recovery_tiers rows 0 through 8 appear here — name, blast radius, the lease disruption policy each rung requires, its cooldown and its hourly budget.'));
+  const problem = panelState('recovery', tiers, emptyState(t('empty.tiers.none'),
+    [t('empty.tiers.noneDetail'), provenance(t('empty.tiers.where'))],
+    emptyAction(t('empty.openDocs'), () => setView('docs'))));
   if (problem) { host.replaceChildren(problem); return; }
   host.setAttribute('aria-busy', 'false');
-  host.replaceChildren(...tiers.map((t) => el('div', { class: 'rung blast-' + t.blast + (t.enabled ? '' : ' disabled') },
+  const legend = ladderLegend();
+  host.replaceChildren(...(legend ? [legend] : []), ...tiers.map((t) => el('div', { class: 'rung blast-' + t.blast + (t.enabled ? '' : ' disabled') },
     el('span', { class: 'tier' }, String(t.tier)),
     el('span', { class: 'rname' }, t.name || '—'),
     el('span', { class: 'rdesc' }, t.description || ''),
@@ -1717,13 +1839,14 @@ function renderAttempts() {
   const rows = (rows0 || []).filter((a) => !q || [a.host, a.tierName, a.outcome, a.refusal, a.rackSlot, a.deviceID,
     a.detail ? JSON.stringify(a.detail) : ''].join(' ').toLowerCase().includes(q));
 
-  const problem = panelState('recovery', rows0, emptyState('No recovery attempts recorded.',
-    'Each rung the watchdog climbs is logged here with its outcome, and a refused rung is shown with the reason it was refused.'));
+  const problem = panelState('recovery', rows0, emptyState(t('empty.attempts.none'),
+    t('empty.attempts.noneDetail'),
+    emptyAction(t('empty.openDocs'), () => setView('docs'))));
   if (problem) { host.replaceChildren(problem); return; }
   host.setAttribute('aria-busy', 'false');
   host.replaceChildren(table([
     { label: 'Started', cell: (a) => timeCell(a.startedAt) },
-    { label: 'Tier', cls: 'mono', cell: (a) => (a.tier !== undefined ? a.tier + ' ' + (a.tierName || tierName(a.tier)) : '—') },
+    { label: termLabel('tier', 'Tier'), cls: 'mono', cell: (a) => (a.tier !== undefined ? a.tier + ' ' + (a.tierName || tierName(a.tier)) : '—') },
     { label: 'Device', cell: (a) => deviceLabel(a.deviceID, a.rackSlot) },
     { label: 'Host', cell: (a) => a.host || '—' },
     {
@@ -1801,8 +1924,9 @@ function unnamedSubject(what) {
 function renderQuarantines() {
   const host = $('#quarantines-body');
   const rows0 = state.data.quarantines;
-  const problem = panelState('recovery', rows0, emptyState('No open quarantines.',
-    'A quarantine appears here when the ladder stops scheduling to a device, slot, hub or host and asks for a human. Closing one is an audited action.'));
+  const problem = panelState('recovery', rows0, emptyState(t('empty.quarantines.none'),
+    t('empty.quarantines.noneDetail'),
+    emptyAction(t('empty.openDocs'), () => setView('docs'))));
   if (problem) { host.replaceChildren(problem); return; }
   host.setAttribute('aria-busy', 'false');
   host.replaceChildren(table([
@@ -1869,8 +1993,9 @@ function renderBulk() {
   bulkCommandBuilder();
   const runsHost = $('#bulk-runs');
   const rows0 = state.data.bulk;
-  const problem = panelState('bulk', rows0, emptyState('No bulk runs yet.',
-    'A run submitted on the right appears here, and its per-device results stream into the panel below as each target finishes.'));
+  const problem = panelState('bulk', rows0, emptyState(t('empty.bulk.none'),
+    t('empty.bulk.noneDetail'),
+    emptyAction(t('empty.bulk.start'), () => { const f = $('#bulk-command'); if (f) f.focus(); })));
   if (problem) { runsHost.replaceChildren(problem); }
   else {
     runsHost.setAttribute('aria-busy', 'false');
@@ -1896,14 +2021,15 @@ function renderBulk() {
   const detail = $('#bulk-detail');
   const run = state.data.bulkRun;
   if (state.errors.bulkRun) {
-    detail.replaceChildren(emptyState('Could not load that run.', errText(state.errors.bulkRun)));
+    detail.replaceChildren(emptyState(t('empty.bulk.failedRun'), errText(state.errors.bulkRun),
+      emptyAction(t('empty.retry'), () => loaders.bulkRun())));
     return;
   }
   if (!state.bulkRunID) {
-    detail.replaceChildren(emptyState('No run selected.', 'Pick a run above to watch its per-device results.'));
+    detail.replaceChildren(emptyState(t('empty.bulk.noRun'), t('empty.bulk.noRunDetail')));
     return;
   }
-  if (!run) { detail.replaceChildren(emptyState('Loading that run…', 'Per-device results appear as the API reports them.')); return; }
+  if (!run) { detail.replaceChildren(emptyState(t('empty.bulk.loadingRun'), t('empty.bulk.loadingRunDetail'))); return; }
 
   const targets = run.targets || [];
   const by = {};
@@ -1932,7 +2058,7 @@ function renderBulk() {
       }
     }
   ], targets, { rowClass: (t) => (t.state === 'error' ? 'row-refused' : null) })
-    : emptyState('This run has no targets yet.', 'The selector matched nothing, or the run has not expanded its target set.');
+    : emptyState(t('empty.bulk.noTargets'), t('empty.bulk.noTargetsDetail'));
 
   detail.replaceChildren(header, body);
 }
@@ -1962,8 +2088,9 @@ function renderEvents() {
     ]);
   }
 
-  const problem = panelState('events', rows0, emptyState('No events.',
-    'farm.events and farm.audit_log are merged here newest first: every lease transition, every recovery attempt and every operator action with the human who typed the reason.'));
+  const problem = panelState('events', rows0, emptyState(t('empty.events.none'),
+    [t('empty.events.noneDetail'), provenance(t('empty.events.where'))],
+    emptyAction(t('empty.openDocs'), () => setView('docs'))));
   if (problem) { host.replaceChildren(problem); return; }
   host.setAttribute('aria-busy', 'false');
   host.replaceChildren(table([
@@ -2881,13 +3008,11 @@ function wire() {
   $('#f-health').addEventListener('change', (e) => setFilter('health', e.target.value));
   $('#f-pool').addEventListener('change', (e) => setFilter('pool', e.target.value));
   $('#f-lease').addEventListener('change', (e) => { state.filters.lease = e.target.value; syncHash(); render(); });
-  $('#f-clear').addEventListener('click', () => {
-    Object.assign(state.filters, { host: '', hub: '', health: '', pool: '', lease: '' });
-    state.q = '';
-    syncControls();
-    $('#f-host').value = ''; $('#f-hub').value = ''; $('#f-pool').value = '';
-    syncHash(); loaders.fleet(); render();
-  });
+  /* One implementation, two buttons. The empty grid offers a Clear too, and a
+   * second hand-written copy of "which fields does Clear reset" is a list that
+   * drifts the first time a sixth fleet filter is added. clearFleetFilters()
+   * in fleet.js is that list. */
+  $('#f-clear').addEventListener('click', () => clearFleetFilters());
 
   $('#l-state').addEventListener('change', (e) => { state.filters.leaseState = e.target.value; syncHash(); loaders.leases(); });
   $('#j-state').addEventListener('change', (e) => { state.filters.jobState = e.target.value; syncHash(); loaders.jobs(); });
@@ -2979,6 +3104,8 @@ function wire() {
   wirePageHeads();
   wireConfirm();
   wireToken();
+  wireFirstRun();
+  glossJobForm();
 
   document.addEventListener('keydown', (ev) => {
     const t = ev.target;
@@ -3014,6 +3141,63 @@ function wire() {
 }
 
 /* ------------------------------------------------------------------ *
+ * Arriving today
+ * ------------------------------------------------------------------ */
+
+const FIRST_RUN_KEY = 'device-farmer.firstRunSeen';
+
+/* firstRunSeen reads the one flag behind the first-visit card.
+ *
+ * It lives where the language and the density live: localStorage, per browser,
+ * never on the server. Dismissing a card is a reading preference and not a
+ * property of the farm — two operators sharing one control plane must be able
+ * to dismiss it independently, and neither should be able to dismiss it for the
+ * other.
+ *
+ * Every read and write is wrapped, because localStorage THROWS when site data
+ * is blocked rather than returning null, and an uncaught throw in boot() would
+ * cost the operator the entire dashboard for the sake of a welcome card. A
+ * browser that cannot remember the dismissal is told the card was already seen:
+ * a card that cannot be dismissed permanently would come back on every single
+ * reload, which is worse than never showing it. */
+function firstRunSeen() {
+  try { return localStorage.getItem(FIRST_RUN_KEY) === '1'; } catch (_) { return true; }
+}
+
+function wireFirstRun() {
+  const card = $('#first-run');
+  if (!card) return;
+  const docs = $('#first-run-docs');
+  const dismiss = $('#first-run-dismiss');
+  if (docs) docs.addEventListener('click', () => setView('docs'));
+  if (dismiss) {
+    dismiss.addEventListener('click', () => {
+      card.hidden = true;
+      try { localStorage.setItem(FIRST_RUN_KEY, '1'); } catch (_) { /* it comes back next reload; not fatal */ }
+    });
+  }
+  card.hidden = firstRunSeen();
+}
+
+/* glossJobForm attaches a definition to the three words the job form requires.
+ *
+ * Pool, Queue and Tenant are column names in farm.jobs, so they are not renamed
+ * and not translated — the explanation is attached to the word, which is the
+ * rule terms.js states. Absent terms.js the labels are left exactly as the HTML
+ * wrote them. */
+function glossJobForm() {
+  if (typeof term !== 'function') return;
+  for (const [sel, id, label] of [
+    ['#job-pool-label', 'pool', 'Pool'],
+    ['#job-queue-label', 'queue', 'Queue'],
+    ['#job-tenant-label', 'tenant', 'Tenant']
+  ]) {
+    const node = $(sel);
+    if (node) node.replaceChildren(term(id, label));
+  }
+}
+
+/* ------------------------------------------------------------------ *
  * Boot
  * ------------------------------------------------------------------ */
 
@@ -3042,7 +3226,11 @@ function boot() {
   // an operator who just opened a stack trace should not lose it to a clock.
   setInterval(() => {
     if ($('#dlg-cmd').open || $('#dlg-confirm').open || $('#dlg-device').open || $('#dlg-token').open) return;
-    if ($('#main details[open]')) return;
+    // An open "Where this comes from" is exempt: provenance() keys its own
+    // open state, so a repaint cannot collapse it, and letting it hold the
+    // clock would freeze every relative time on the page for as long as one
+    // background sentence is expanded.
+    if ($('#main details[open]:not(.empty-src)')) return;
     render();
   }, 15000);
 }

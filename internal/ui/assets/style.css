@@ -1061,7 +1061,7 @@ main, .view, .panel { min-width: 0; }
 
 /* The command builder.
  *
- * Two things here are load-bearing rather than decorative.
+ * Three things here are load-bearing rather than decorative.
  *
  * The wire line is monospace and set apart, because it is the one place in the
  * product where "the command goes to the handset verbatim" can be SHOWN instead
@@ -1072,10 +1072,32 @@ main, .view, .panel { min-width: 0; }
  * The two catalogue tiers are visually separated on purpose. "This project sends
  * this command to real handsets every minute" and "this command generally exists
  * on Android" are different kinds of claim, and a list that ran them together
- * would make them look like one kind. */
+ * would make them look like one kind.
+ *
+ * And the SIZE ORDER is the reading order. The field is the widest thing in
+ * step 1, Run is the widest thing in the panel, and the catalogue and the
+ * pre-flight — two and a half screens of reference material between the
+ * operator and the button, in the version this replaces — are one button and
+ * one summary line respectively. Nothing was deleted; the reference material is
+ * now where reference material belongs, which is after the thing it explains. */
 .cmd-panel { margin-top: 6px; }
-.cmd-choose-row { margin-bottom: 8px; }
+.cmd-step { margin-top: var(--s-3); }
+.cmd-step:first-child { margin-top: 0; }
+.cmd-step-head {
+  display: flex; align-items: center; gap: var(--s-2); margin-bottom: var(--s-1);
+  color: var(--dim); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: .05em;
+}
+.cmd-step-n {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 1.15rem; height: 1.15rem; flex: none;
+  border: 1px solid var(--line-2); border-radius: var(--r-pill);
+  background: var(--panel-2); color: var(--text);
+  font-size: var(--fs-xs); font-weight: var(--fw-semi); letter-spacing: 0;
+}
+/* The entire visible catalogue affordance, beside the field rather than above
+   it: one button where twenty-four used to be. */
 .cmd-open-chooser {
+  flex: none; white-space: nowrap;
   font: var(--fs-xs)/var(--lh-tight) var(--sans); padding: var(--s-1) var(--s-3); cursor: pointer;
   color: var(--text); background: var(--panel-2);
   border: 1px solid var(--line-2); border-radius: var(--r);
@@ -1145,7 +1167,8 @@ main, .view, .panel { min-width: 0; }
 
 .cmd-row { display: flex; gap: 6px; margin-top: 4px; }
 .cmd-input {
-  flex: 1; font: var(--fs-md)/var(--lh) var(--mono); padding: var(--pad-cell); color: var(--text);
+  flex: 1; min-width: 0;
+  font: var(--fs-md)/var(--lh) var(--mono); padding: var(--pad-cell); color: var(--text);
   background: var(--bg); border: 1px solid var(--line); border-radius: 4px;
 }
 .cmd-chosen { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px; margin-top: 5px; font-size: var(--fs-sm); }
@@ -1154,10 +1177,6 @@ main, .view, .panel { min-width: 0; }
 .cmd-unverified { color: var(--warn); font-size: var(--fs-sm); }
 .cmd-note { margin: 4px 0 0; color: var(--dim); font-size: var(--fs-sm); line-height: var(--lh); max-width: 78ch; }
 
-.cmd-wire { margin-top: 10px; }
-.cmd-wire-head {
-  color: var(--txt-2); font-size: var(--fs-sm); font-weight: var(--fw-semi);
-}
 /* Mono, and the whole point of the panel: this is the string the handset
    receives, character for character. */
 .cmd-wire-line {
@@ -1167,8 +1186,16 @@ main, .view, .panel { min-width: 0; }
   white-space: pre-wrap; overflow-wrap: anywhere;
 }
 
-.cmd-preflight-wrap { margin-top: 10px; }
-.cmd-preflight { list-style: none; margin: 3px 0 0; padding: 0; }
+/* The pre-flight, below the Run row, behind a summary that is the verdict
+   itself. Glyph AND word, never colour alone: a greyscale screenshot pasted
+   into a ticket has to say the same thing this screen does. */
+.cmd-preflight { margin-top: var(--s-3); }
+.cmd-pf-summary { cursor: pointer; font-size: var(--fs-xs); color: var(--dim); }
+.cmd-pf-summary-blocked { color: var(--bad); font-weight: var(--fw-semi); }
+.cmd-pf-sum-glyph { color: var(--ok); }
+.cmd-pf-summary-blocked .cmd-pf-sum-glyph { color: var(--bad); }
+.cmd-pf-sum-rest { color: var(--txt-3); }
+.cmd-pf-list { list-style: none; margin: 6px 0 0; padding: 0; }
 .cmd-pf {
   display: grid; grid-template-columns: 1.2rem minmax(0, 11rem) minmax(0, 1fr);
   gap: 6px; align-items: baseline; padding: var(--s-1) 0; font-size: var(--fs-sm);
@@ -1189,7 +1216,23 @@ main, .view, .panel { min-width: 0; }
   .cmd-pf-evidence { grid-column: 2; }
 }
 
-.cmd-timeout-wrap { display: flex; align-items: baseline; gap: 6px; margin-top: 10px; font-size: var(--fs-sm); color: var(--dim); }
+/* Step 3. Run is the widest and the largest control in the panel because it is
+   what the panel is for; the wait beside it is a qualifier on it, offered in
+   seconds and minutes rather than in the milliseconds the JSON field carries.
+
+   The two :empty rules are how a host that fills neither slot — the bulk form,
+   which submits through its own button — gets a builder with no submit and no
+   gap where one would have been. */
+.cmd-run-row { display: flex; align-items: stretch; gap: var(--s-2); }
+.cmd-run-slot { flex: 1; display: flex; min-width: 0; }
+.cmd-run-slot:empty, .cmd-consent:empty { display: none; }
+.cmd-run { flex: 1; padding: var(--s-3) var(--s-4); font-size: var(--fs-md); }
+.cmd-timeout-wrap { display: flex; align-items: center; gap: 6px; font-size: var(--fs-xs); color: var(--dim); }
+.cmd-timeout-pick {
+  font: var(--fw-normal) var(--fs-xs)/var(--lh-tight) var(--sans); padding: var(--s-1) var(--s-2);
+  color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: 4px;
+}
+.cmd-timeout-custom { display: flex; align-items: center; gap: 6px; margin-top: var(--s-2); font-size: var(--fs-xs); color: var(--dim); }
 .cmd-timeout { width: 8rem; font: var(--fs-sm)/var(--lh-tight) var(--mono); padding: var(--s-1) var(--s-2);
   color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: 4px; }
 
@@ -1206,7 +1249,14 @@ main, .view, .panel { min-width: 0; }
 .cmd-reason { font: var(--fs-md)/var(--lh) var(--sans); padding: var(--s-2) var(--s-3); color: var(--text);
   background: var(--bg); border: 1px solid var(--line); border-radius: 4px; }
 
-.cmd-actions { margin-top: 10px; }
+/* The result area before there is a result. It keeps the panel one shape, so
+   that the first run does not resize everything under the hand that started
+   it. */
+.cmd-idle {
+  margin: var(--s-3) 0 0; padding: var(--s-2) var(--s-3);
+  border: 1px dashed var(--line); border-radius: var(--r);
+  color: var(--txt-3); font-size: var(--fs-xs); line-height: var(--lh);
+}
 .cmd-verdict { margin-top: 8px; display: flex; flex-direction: column; gap: 3px; }
 .cmd-v { font-size: var(--fs-sm); line-height: var(--lh); max-width: 82ch; }
 .cmd-v-ok { color: var(--ok); }
@@ -1225,8 +1275,17 @@ main, .view, .panel { min-width: 0; }
  * the difference is about association and not about looks. */
 .lbl { display: block; margin: var(--s-2) 0 3px; color: var(--dim); font-size: var(--fs-sm); }
 .cmd-mount { margin-bottom: 4px; }
-.cmd-compact .cmd-choose-row { margin-bottom: 6px; }
-.cmd-compact .cmd-wire, .cmd-compact .cmd-preflight-wrap { margin-top: 8px; }
+.cmd-compact .cmd-step { margin-top: var(--s-2); }
+.cmd-compact .cmd-preflight { margin-top: var(--s-2); }
+/* The bulk form is a 330px side column, and the chooser button beside the
+   field — which is right in a 600px drawer — leaves about eighteen monospace
+   characters for the command there, so `getprop ro.build.fingerprint` reads as
+   `getprop ro.build.f`. Wrapping puts the button under the field, where it
+   costs a row rather than the command. Same reason the wait's label goes above
+   its select here and beside it in the drawer. */
+.cmd-compact .cmd-row { flex-wrap: wrap; }
+.cmd-compact .cmd-input { flex-basis: 100%; }
+.cmd-compact .cmd-timeout-wrap { flex-wrap: wrap; }
 /* The bulk form is a side column, not a drawer, so the pre-flight's three
  * columns do not fit however wide the window is — an 11rem label column beside
  * a sentence in 180px is a word per line. The narrow layout is a property of
@@ -1242,5 +1301,16 @@ main, .view, .panel { min-width: 0; }
  * .cmd-chooser is in the list because the tier segmented control hides one of
  * two .cmd-tier panes, and .cmd-tier's descendants carry grid and flex. This
  * has shipped as a real bug in this tree twice; a tier that will not hide is
- * the duplicated group names coming straight back. */
+ * the duplicated group names coming straight back.
+ *
+ * The three roots above already cover every descendant of the panel, of the
+ * builder and of the chooser, which is where all of this lives. The three named
+ * below are redundant on purpose: .cmd-step, .cmd-run-row and .cmd-preflight
+ * each set a display on themselves or on their children, and each contains
+ * something that is hidden — the custom-milliseconds field, the host's Run
+ * slot, the pre-flight's own rows. A component that sets display and can be
+ * hidden ships this rule with it, so that moving one out from under
+ * .cmd-builder later cannot resurrect a bug this file has now recorded three
+ * times. */
 .cmd-panel [hidden], .cmd-builder [hidden], .cmd-chooser [hidden] { display: none !important; }
+.cmd-step [hidden], .cmd-run-row [hidden], .cmd-preflight [hidden] { display: none !important; }

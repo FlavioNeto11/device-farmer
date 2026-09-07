@@ -19,6 +19,24 @@
  * and it is the honest cost of the split — the alternative was duplicating
  * errText's error-code translation and impactList's markup.
  *
+ * # The order on screen, which is a decision and not an accident
+ *
+ * The panel reads: the command, what goes on the wire, Run — and everything
+ * else after Run. The first version of this widget put the catalogue first, all
+ * twenty-four buttons under ten headings, and the operator met two and a half
+ * screens of reference material before reaching the field they came to type in
+ * and the button they came to press. Reference material is what you read when
+ * the thing you did failed; it is not what you read on the way in.
+ *
+ * So the catalogue is behind ONE button — openChooser below fills a dialog, and
+ * a segmented control shows one tier at a time so the group names stop
+ * repeating — and the pre-flight sits BELOW the Run row, behind a summary that
+ * is itself the verdict: collapsed when nothing blocks, opened by itself when
+ * something does, including when the fence answer lands a second late.
+ *
+ * Nothing was deleted to achieve that. Both of the things that moved are the
+ * fix for a real bug, and paragraph 1 and paragraph 2 below are why.
+ *
  * # The three facts this whole widget exists to make visible
  *
  * 1. THE COMMAND GOES TO THE DEVICE VERBATIM. adbwire.ShellService builds
@@ -208,6 +226,32 @@
   const TIMEOUT_MIN = 1000;
   const TIMEOUT_MAX = 300000;
   const TIMEOUT_DEF = 30000;
+
+  /* The waits worth offering, in the unit an operator thinks in.
+   *
+   * The control this replaces was a number box holding 30000, which is the unit
+   * internal/api's JSON field is written in and nobody else's: it asks a reader
+   * to divide by a thousand before they can agree with it. The list starts at
+   * ten seconds and not at TIMEOUT_MIN because the floor exists to stop a
+   * one-millisecond request coming back as a 502 that reads like a broken
+   * handset — it is a guard, not an offer. It ends at TIMEOUT_MAX itself,
+   * because the server clamps anything above maxExecTimeout SILENTLY, so a
+   * longer entry would be a wait this page promises and the server never
+   * honours. Custom keeps the raw milliseconds for the operator who wants 7500,
+   * clamped by exactly the same expression.
+   *
+   * A function rather than a table, because the labels have to be rebuilt on a
+   * language switch, and every one of them is a LITERAL t() key —
+   * TestEveryKeyTheAppAsksForExists can only see literals, and a computed key
+   * here would be four strings no build checks. */
+  function waitChoices() {
+    return [
+      ['10000', t('exec.timeout.s10')],
+      [String(TIMEOUT_DEF), t('exec.timeout.s30')],
+      ['60000', t('exec.timeout.m1')],
+      [String(TIMEOUT_MAX), t('exec.timeout.m5')],
+    ];
+  }
 
   const WIRE_PREFIX = 'shell,v2,raw:';
 
@@ -421,7 +465,17 @@
 
   /* ------------------------------------------------------------- the widget */
 
-  /* commandBuilder(opts) returns { node, command(), timeoutMS(), … }.
+  /* commandBuilder(opts) returns { node, runSlot, consentSlot, command(),
+   * timeoutMS(), input, refreshFence(), latchFence(), retranslate() }.
+   *
+   * node is the three steps in the order they are done — the command, what goes
+   * on the wire, send it — with two holes in it: consentSlot, between the wire
+   * line and the Run row, for a thing that has to be agreed to first; and
+   * runSlot, inside the Run row, for the host's own Run control. A host that
+   * fills neither gets a builder with no submit, which is exactly what the bulk
+   * form wants. The builder owns the ORDER, because the order is what was
+   * wrong; the host owns the Run control, because only the host knows what has
+   * to be consented to above it.
    *
    * opts:
    *   device   the normalised fleet row, or null for a fleet-wide form (bulk)
@@ -433,9 +487,12 @@
    *            below the force-and-reason consent, and only the host knows that
    *            order.
    *   compact  true for the bulk form, which has its own submit and its own
-   *            fields. The widget then drops the panel chrome and renders the
-   *            chooser, the command field, the wire line, a FLEET-WIDE
-   *            pre-flight and the timeout — and nothing else.
+   *            fields. The widget then drops the step numbers and the Send
+   *            heading — it is one field between a selector and a per-hub cap
+   *            there, not a panel, and numbering three of that form's seven
+   *            controls 1..3 would be a claim about the form. What it keeps is
+   *            everything that carries a fact: the chooser, the field, the wire
+   *            line, a FLEET-WIDE pre-flight and the timeout.
    *   timeout  the timeout field's starting value in ms, clamped to the field's
    *            own bounds. Bulk passes 60000 because the input this widget
    *            replaced shipped that default, and halving a fleet-wide timeout
@@ -456,7 +513,7 @@
     let selected = entry(DEFAULT_ID);
     let values = defaults(selected);
 
-    /* ---- the composer: one text field, one truth ---- */
+    /* ---- step 1: the composer — one text field, one truth ---- */
     const input = el('input', {
       type: 'text', class: 'cmd-input', spellcheck: 'false', autocomplete: 'off',
       placeholder: 'getprop ro.build.fingerprint',
@@ -475,7 +532,7 @@
     const params = el('div', { class: 'cmd-params' });
     const wire = el('code', { class: 'cmd-wire-line' });
     const chosen = el('div', { class: 'cmd-chosen' });
-    const preflight = el('ul', { class: 'cmd-preflight' });
+    const pfList = el('ul', { class: 'cmd-pf-list' });
 
     const paint = () => {
       wire.textContent = WIRE_PREFIX + input.value;
@@ -500,6 +557,10 @@
       input.value = renderTemplate(c, values);
       renderParams();
       paint();
+      /* Back to the field. The dialog closed itself on the pick, which returns
+       * focus to the button that opened it — and the thing to read and possibly
+       * edit now is the command, not the way back into the catalogue. */
+      input.focus();
     }
 
     /* ---- parameters: choice and int, and nothing else ----
@@ -589,117 +650,293 @@
      * handset's shell. Four boxes of which three are guesses is exactly what
      * app.js's header forbids: a dashboard that guesses is worse than no
      * dashboard, because an operator acts on it. */
-    function row(state, label, evidence) {
+    /* key names the row, because the summary below has to be able to tell one
+     * of them apart from the rest. */
+    function row(state, key, label, evidence) {
       const glyph = state === 'blocked' ? '✕' : state === 'unknown' ? '?' : '✓';
-      return el('li', { class: 'cmd-pf cmd-pf-' + state },
+      return el('li', { class: 'cmd-pf cmd-pf-' + state, dataset: { state: state, pf: key } },
         el('span', { class: 'cmd-pf-glyph', 'aria-hidden': 'true' }, glyph),
         el('span', { class: 'cmd-pf-label' }, label),
         el('span', { class: 'cmd-pf-evidence' }, evidence));
     }
 
     let fence = 'unknown';
-    function renderPreflight() {
-      preflight.replaceChildren();
+    let pfWasBlocking = false;
 
-      preflight.append(input.value.trim()
-        ? row('ok', t('exec.pf.command'), t('exec.pf.commandOk'))
-        : row('blocked', t('exec.pf.command'), t('exec.pf.commandEmpty')));
+    /* What the SERVER said about the lease, which outranks the fleet row the
+     * same way the force step does — and for the same reason, written three
+     * times in this file already: that row can be five seconds old and a lease
+     * acquired three seconds ago is invisible to it. Without this the summary
+     * goes on reading "5 checks pass" directly above a consent box that has
+     * just named the holder, which is a verdict the server already overturned.
+     *
+     * null until a 409 arrives, then { holder, job } out of its detail. */
+    let leaseLatch = null;
+
+    function preflightRows() {
+      const rows = [];
+
+      rows.push(input.value.trim()
+        ? row('ok', 'command', t('exec.pf.command'), t('exec.pf.commandOk'))
+        : row('blocked', 'command', t('exec.pf.command'), t('exec.pf.commandEmpty')));
 
       /* A fenced farm reads differently fleet-wide, and the difference matters
        * because it decides what the operator will SEE. refuseExecBehindTheFence
        * guards the single-device route only: a bulk run is never refused up
        * front, it starts, and every target answers with a transport failure of
        * its own. Fifty-six red rows and one 501 are the same fence. */
-      preflight.append(
-        fence === 'on' ? row('blocked', t('exec.pf.fence'),
+      rows.push(
+        fence === 'on' ? row('blocked', 'fence', t('exec.pf.fence'),
           compact ? t('exec.bulk.fenceOn') : t('exec.pf.fenceOn'))
-          : fence === 'off' ? row('ok', t('exec.pf.fence'), t('exec.pf.fenceOff'))
-            : row('unknown', t('exec.pf.fence'), t('exec.pf.fenceUnknown')));
+          : fence === 'off' ? row('ok', 'fence', t('exec.pf.fence'), t('exec.pf.fenceOff'))
+            : row('unknown', 'fence', t('exec.pf.fence'), t('exec.pf.fenceUnknown')));
 
       /* Device rows only when there is a device. The bulk form addresses a
        * selector, and claiming anything about "the device" there would be the
        * guessing failure again. */
       if (!device) {
-        preflight.append(row('unknown', t('exec.pf.targets'),
+        rows.push(row('unknown', 'targets', t('exec.pf.targets'),
           compact ? t('exec.bulk.targets') : t('exec.pf.targetsBulk')));
-        preflight.append(row('unknown', t('exec.pf.answer'),
+        rows.push(row('unknown', 'answer', t('exec.pf.answer'),
           compact ? t('exec.bulk.answer') : t('exec.pf.answerUnknown')));
-        return;
+        return rows;
       }
 
-      preflight.append(device.devPath
-        ? row('ok', t('exec.pf.slot'), device.devPath)
-        : row('blocked', t('exec.pf.slot'), t('exec.pf.slotNone')));
+      rows.push(device.devPath
+        ? row('ok', 'slot', t('exec.pf.slot'), device.devPath)
+        : row('blocked', 'slot', t('exec.pf.slot'), t('exec.pf.slotNone')));
 
-      preflight.append(device.adbEndpoint
-        ? row('ok', t('exec.pf.endpoint'), device.adbEndpoint)
-        : row('blocked', t('exec.pf.endpoint'), t('exec.pf.endpointNone')));
+      rows.push(device.adbEndpoint
+        ? row('ok', 'endpoint', t('exec.pf.endpoint'), device.adbEndpoint)
+        : row('blocked', 'endpoint', t('exec.pf.endpoint'), t('exec.pf.endpointNone')));
 
-      const held = device.leaseState && device.leaseState !== 'released';
-      preflight.append(held
-        ? row('blocked', t('exec.pf.lease'),
-          t('exec.pf.leaseHeld', { holder: device.holder || '—', job: shortId(device.jobID) }))
-        : row('ok', t('exec.pf.lease'), t('exec.pf.leaseFree')));
+      const held = leaseLatch
+        || (device.leaseState && device.leaseState !== 'released'
+          ? { holder: device.holder, job: device.jobID } : null);
+      rows.push(held
+        ? row('blocked', 'lease', t('exec.pf.lease'),
+          t('exec.pf.leaseHeld', { holder: held.holder || '—', job: shortId(held.job) }))
+        : row('ok', 'lease', t('exec.pf.lease'), t('exec.pf.leaseFree')));
 
-      preflight.append(row('unknown', t('exec.pf.answer'), t('exec.pf.answerUnknown')));
+      rows.push(row('unknown', 'answer', t('exec.pf.answer'), t('exec.pf.answerUnknown')));
+      return rows;
+    }
+
+    /* The list is behind a summary now, so the summary has to carry the one
+     * fact the list was there to deliver: does anything stop this.
+     *
+     * It counts three states and not two. "Passes" and "blocks" are verdicts;
+     * "cannot be known from here" is the third answer this pre-flight is built
+     * to be able to give — capabilities answers 503 by design when a probe
+     * fails, and the device's own answer is unknowable until it is asked. A
+     * summary that folded the unknowns into the passes would be the guess
+     * app.js's header forbids, made smaller and therefore easier to believe.
+     *
+     * Glyph AND word, never colour alone: a greyscale screenshot pasted into a
+     * ticket has to say what this screen says. */
+    function renderPreflight() {
+      const rows = preflightRows();
+      pfList.replaceChildren(...rows);
+
+      let blocked = 0;
+      let unknown = 0;
+      for (const r of rows) {
+        if (r.dataset.state === 'blocked') blocked++;
+        else if (r.dataset.state === 'unknown') unknown++;
+      }
+      const pass = rows.length - blocked - unknown;
+
+      pfGlyph.textContent = blocked ? '✕' : '✓';
+      pfSummary.className = 'cmd-pf-summary' + (blocked ? ' cmd-pf-summary-blocked' : '');
+      pfWord.textContent = blocked
+        ? (blocked === 1 ? t('exec.pf.summaryBlockedOne')
+          : t('exec.pf.summaryBlocked', { n: String(blocked) }))
+        : (pass === 1 ? t('exec.pf.summaryOkOne')
+          : t('exec.pf.summaryOk', { n: String(pass) }));
+      pfRest.textContent = unknown ? t('exec.pf.summaryUnknown', { n: String(unknown) }) : '';
+
+      /* Opened by itself when something starts blocking, and never closed by
+       * itself.
+       *
+       * The list is the answer to "why did that not run", so it must not be
+       * behind a click at the moment it becomes true — and it becomes true LATE
+       * in the two cases that matter: the capability probe resolves a second
+       * after the panel drew, and a 409 latches the fence only once the server
+       * has actually refused.
+       *
+       * Two things it deliberately does NOT do. It does not close again when
+       * the block clears, which would fight an operator who opened it on
+       * purpose. And it does not open for a row whose condition is ALREADY on
+       * screen in a larger form:
+       *
+       *   command — blocks on every keystroke that empties the field, which is
+       *     an ordinary way to start retyping. Expanding six rows to say "you
+       *     have not typed one" tells the operator what the empty field two
+       *     inches above already says.
+       *   lease  — a lease exists only when there is a device, and the one host
+       *     that passes a device answers a lease by revealing the force step in
+       *     consentSlot: a bordered box naming the holder, the job and the
+       *     tenant, directly above Run. That is the same news, larger. Opening
+       *     the list under it would put six rows of reference material back
+       *     between the operator and the button on the commonest non-trivial
+       *     device in the fleet, which is the wall this unit removed.
+       *
+       * Every other row reports a condition they cannot see from here at all,
+       * which is the whole reason the list exists. */
+      const quiet = ['command', 'lease'];
+      const unseen = rows.filter((r) => r.dataset.state === 'blocked' && !quiet.includes(r.dataset.pf));
+      if (unseen.length && !pfWasBlocking) preflightBox.open = true;
+      pfWasBlocking = unseen.length > 0;
     }
 
     /* ---- the way into the catalogue ----
      *
-     * One button. The catalogue itself is in the dialog above, which is the
-     * whole point of this unit: what used to sit here was every entry at once,
+     * One button, beside the field. The catalogue itself is in the dialog
+     * above, which is the point: what used to sit here was every entry at once,
      * in front of the field. */
-    const pickBtn = el('button', { class: 'cmd-open-chooser', type: 'button' },
-      t('exec.chooser.open'));
+    const pickBtn = el('button', { class: 'cmd-open-chooser', type: 'button' });
     pickBtn.addEventListener('click', () => openChooser(CATALOGUE, GROUPS, choose));
+
+    /* ---- step 3: the wait, in seconds and minutes ---- */
+
+    /* The starting wait. Bulk passes 60000 — the default the <input> it
+     * replaced shipped — and adopting the builder's own 30000 silently would
+     * halve the ceiling on every fleet-wide command. */
+    const startMS = clampTimeout(Number(o.timeout) || TIMEOUT_DEF);
 
     const timeout = el('input', {
       class: 'cmd-timeout', type: 'number',
       min: String(TIMEOUT_MIN), max: String(TIMEOUT_MAX), step: '1000',
     });
-    timeout.value = String(clampTimeout(Number(o.timeout) || TIMEOUT_DEF));
+    timeout.value = String(startMS);
 
-    /* Declared rather than assigned, so the Enter handler above — which is
+    const timeoutPick = el('select', { class: 'cmd-timeout-pick' });
+    const timeoutHead = el('span');
+    const customHead = el('span');
+    const customWrap = el('label', { class: 'cmd-timeout-custom', hidden: true },
+      customHead, timeout);
+
+    /* A start that is not one of the named waits is a custom one and has to SAY
+     * so, or the select reads "30 seconds" while the request carries something
+     * else. */
+    let wait = waitChoices().some(([v]) => v === String(startMS)) ? String(startMS) : 'custom';
+
+    function renderTimeoutChoices() {
+      const opts2 = waitChoices().map(([v, label]) => el('option', { value: v }, label));
+      opts2.push(el('option', { value: 'custom' }, t('exec.timeout.custom')));
+      timeoutPick.replaceChildren(...opts2);
+      timeoutPick.value = wait;
+      customWrap.hidden = wait !== 'custom';
+    }
+
+    timeoutPick.addEventListener('change', () => {
+      const previous = wait;
+      wait = timeoutPick.value;
+      customWrap.hidden = wait !== 'custom';
+      if (wait !== 'custom') return;
+      /* The box opens on the wait that was selected, not on the one the panel
+       * was built with. "Something else" is asked by an operator refining the
+       * number they just chose, and resetting five minutes to thirty seconds
+       * under that gesture is the panel throwing away their last decision. */
+      if (previous !== 'custom') timeout.value = String(previous);
+      timeout.focus();
+    });
+
+    /* The clamp is unchanged, expression for expression, and it has to be:
+     * TIMEOUT_MIN is a floor internal/api does not have and TIMEOUT_MAX is the
+     * server's own maxExecTimeout, which it applies silently. Only the reading
+     * of the control moved.
+     *
+     * Declared rather than assigned, so the Enter handler above — which is
      * wired before this line runs — can close over it. */
-    function timeoutMS() { return clampTimeout(Number(timeout.value) || TIMEOUT_DEF); }
+    function timeoutMS() {
+      const raw = timeoutPick.value === 'custom' ? Number(timeout.value) : Number(timeoutPick.value);
+      return clampTimeout(raw || TIMEOUT_DEF);
+    }
 
-    /* The static chrome is held by reference rather than built inline, because
-     * retranslate() has to reach every one of these. The bulk form is built
-     * once at first paint and never rebuilt — unlike the drawer, which a
-     * language switch reopens from the fleet row — so a heading this function
-     * cannot reach is a heading that stays in the old language for the life of
-     * the tab. */
-    const wireHead = el('div', { class: 'cmd-wire-head' }, t('exec.wire'));
-    const wireNote = el('p', { class: 'cmd-note' }, t('exec.wireNote'));
-    const pfHead = el('div', { class: 'cmd-wire-head' },
-      compact ? t('exec.bulk.preflight') : t('exec.preflight'));
+    /* On the way out of the field, show what will actually be sent. The clamp
+     * is unchanged either way — this only stops the box reading 999999 while
+     * the request carries 300000, which is the panel making a promise the wire
+     * does not keep, in miniature. */
+    timeout.addEventListener('change', () => { timeout.value = String(timeoutMS()); });
+
+    /* ---- the chrome, in one place, because the language can change under it ----
+     *
+     * Every label the widget writes itself is set here and set again from
+     * retranslate(). The bulk form is built once at first paint and never
+     * rebuilt — unlike the drawer, which a language switch reopens from the
+     * fleet row — so a heading this function cannot reach is a heading that
+     * stays in the old language for the life of the tab. What is NOT
+     * re-rendered is the command, its parameters and any bytes a device sent:
+     * translating those is the one thing this whole file exists to prevent. */
+    const headCommand = el('span');
+    const headWire = el('span');
+    const headSend = el('span');
+    const wireNote = el('p', { class: 'cmd-note' });
+    const pfNote = el('p', { class: 'cmd-note' });
     /* The one sentence that says what compact mode is FOR: in the drawer a
      * wrong command reaches one handset; here it reaches every device the
-     * selector matched. */
-    const bulkNote = compact ? el('p', { class: 'cmd-note' }, t('exec.bulk.note')) : null;
-    const timeoutLabel = el('span', null, t('exec.timeout', { max: TIMEOUT_MAX / 1000 }));
+     * selector matched. It sits under the wire line rather than inside the
+     * pre-flight, because a blast radius is not reference material and must not
+     * be behind a click. */
+    const bulkNote = compact ? el('p', { class: 'cmd-note' }) : null;
+    const pfGlyph = el('span', { class: 'cmd-pf-sum-glyph', 'aria-hidden': 'true' }, '✓');
+    const pfWord = el('span', { class: 'cmd-pf-sum-word' });
+    const pfRest = el('span', { class: 'cmd-pf-sum-rest' });
+
+    function renderChrome() {
+      headCommand.textContent = t('exec.step.command');
+      headWire.textContent = t('exec.wire');
+      headSend.textContent = t('exec.step.send');
+      wireNote.textContent = t('exec.wireNote');
+      pfNote.textContent = compact ? t('exec.bulk.preflight') : t('exec.preflight');
+      if (bulkNote) bulkNote.textContent = t('exec.bulk.note');
+      pickBtn.textContent = t('exec.chooser.open');
+      pickBtn.title = t('exec.pickWhy');
+      input.setAttribute('aria-label', t('exec.commandLabel'));
+      timeoutHead.textContent = t('exec.timeout.head');
+      customHead.textContent = t('exec.timeout', { max: TIMEOUT_MAX / 1000 });
+      timeoutPick.title = t('exec.timeout.why');
+      renderTimeoutChoices();
+    }
+
+    /* ---- the three steps, in the order they are done ---- */
+
+    const runSlot = el('div', { class: 'cmd-run-slot' });
+    const consentSlot = el('div', { class: 'cmd-consent' });
+    const runRow = el('div', { class: 'cmd-run-row' },
+      runSlot,
+      el('label', { class: 'cmd-timeout-wrap' }, timeoutHead, timeoutPick));
+
+    const pfSummary = el('summary', { class: 'cmd-pf-summary' },
+      pfGlyph, ' ', pfWord, ' ', pfRest);
+    const preflightBox = el('details', { class: 'cmd-preflight' },
+      pfSummary, pfNote, pfList);
+
+    /* The numbers are the panel's own. Compact is one field inside a form that
+     * has its own submit, so it gets the headings that carry a fact and none of
+     * the ones that would number somebody else's controls. */
+    const head1 = compact ? null : el('div', { class: 'cmd-step-head' },
+      el('span', { class: 'cmd-step-n' }, '1'), headCommand);
+    const head2 = el('div', { class: 'cmd-step-head' },
+      compact ? null : el('span', { class: 'cmd-step-n' }, '2'), headWire);
+    const head3 = compact ? null : el('div', { class: 'cmd-step-head' },
+      el('span', { class: 'cmd-step-n' }, '3'), headSend);
 
     const node = el('div', { class: 'cmd-builder' + (compact ? ' cmd-compact' : '') },
-      el('div', { class: 'cmd-choose-row' }, pickBtn),
-      params,
-      el('div', { class: 'cmd-row' }, input),
-      chosen,
-      el('div', { class: 'cmd-wire' }, wireHead, wire, wireNote),
-      el('div', { class: 'cmd-preflight-wrap' }, pfHead, preflight, bulkNote),
-      el('label', { class: 'cmd-timeout-wrap' }, timeoutLabel, timeout));
+      el('div', { class: 'cmd-step' }, head1, el('div', { class: 'cmd-row' }, input, pickBtn), params, chosen),
+      el('div', { class: 'cmd-step' }, head2, wire, wireNote, bulkNote),
+      consentSlot,
+      el('div', { class: 'cmd-step' }, head3, runRow, customWrap),
+      preflightBox);
 
     function retranslate() {
-      pickBtn.textContent = t('exec.chooser.open');
-      input.setAttribute('aria-label', t('exec.commandLabel'));
-      wireHead.textContent = t('exec.wire');
-      wireNote.textContent = t('exec.wireNote');
-      pfHead.textContent = compact ? t('exec.bulk.preflight') : t('exec.preflight');
-      if (bulkNote) bulkNote.textContent = t('exec.bulk.note');
-      timeoutLabel.textContent = t('exec.timeout', { max: TIMEOUT_MAX / 1000 });
+      renderChrome();
       renderParams();
       paint();
     }
 
+    renderChrome();
     renderParams();
     paint();
 
@@ -721,11 +958,19 @@
 
     return {
       node,
+      runSlot,      /* the host's Run control goes here — see execPanel */
+      consentSlot,  /* and anything that must be agreed to before pressing it */
       command: () => input.value.trim(),
       timeoutMS,
       input,
       refreshFence: () => fenceState().then((s) => { fence = s; renderPreflight(); }),
       latchFence: () => { latchFence(); fence = 'on'; renderPreflight(); },
+      /* Told by the host when the server has refused with a 409, so the
+       * summary stops reporting a lease the fleet row had not heard about. */
+      latchLease: (detail) => {
+        leaseLatch = { holder: detail && detail.holder, job: detail && detail.job_id };
+        renderPreflight();
+      },
       retranslate,
     };
   }
@@ -740,6 +985,14 @@
      * below, so the closure is valid here. */
     const builder = commandBuilder({ device: d, onRun: () => run() });
 
+    /* The result area exists before there is a result.
+     *
+     * Not politeness: a panel whose bottom half appears only after the first
+     * run changes shape under the operator at the exact moment they are reading
+     * what came back, and until then it hides the fact that there IS a place
+     * output lands. One line, always present, replaced by the first thing the
+     * handset says. */
+    const idle = el('p', { class: 'cmd-idle' }, t('exec.idle'));
     const out = el('pre', { class: 'out', hidden: true });
     const verdict = el('div', { class: 'cmd-verdict', hidden: true });
     const err = el('div', { class: 'form-error', hidden: true });
@@ -780,6 +1033,10 @@
     function revealForce(detail) {
       forcing = true;
       forceWrap.hidden = false;
+      /* The pre-flight hears it too. This box and that summary are two
+       * readings of one fact, and a 409 that moved only this one leaves
+       * "5 checks pass" standing directly above a warning naming the holder. */
+      builder.latchLease(detail);
       const lines = [];
       if (detail) {
         if (detail.holder) lines.push(t('exec.force.holder', { holder: detail.holder }));
@@ -801,6 +1058,7 @@
      * d.Lease != nil, so it is required BECAUSE this device is leased and not
      * because every command needs one. */
     function forceReasonMissing() {
+      idle.hidden = true;
       verdict.hidden = true;
       out.hidden = true;
       // Announced, not just shown. The caret lands in the reason field a moment
@@ -895,7 +1153,10 @@
           : null);
     }
 
-    const runBtn = el('button', { class: 'primary', type: 'button' }, t('exec.run'));
+    /* The largest control in the panel, and full width, because it is the point
+     * of the panel. It used to be the smallest thing on screen, below two and a
+     * half screens of reference material. */
+    const runBtn = el('button', { class: 'primary cmd-run', type: 'button' }, t('exec.run'));
 
     async function run() {
       const cmd = builder.command();
@@ -903,6 +1164,7 @@
       if (forcing && !reason.value.trim()) { forceReasonMissing(); reason.focus(); return; }
 
       runBtn.disabled = true;
+      idle.hidden = true;
       verdict.hidden = true;
       err.hidden = true;
       out.hidden = false;
@@ -958,13 +1220,19 @@
         builder.retranslate();
         runBtn.textContent = t('exec.run');
         reason.placeholder = t('exec.reasonPlaceholder');
+        idle.textContent = t('exec.idle');
       } catch (_) { /* a stale panel must not strand the switch */ }
     });
 
+    /* The panel is the builder's three steps with this host's two pieces
+     * dropped into their slots, and the result underneath. The consent step
+     * goes ABOVE the Run row on purpose: a reason field revealed below the
+     * button that needs it is a field an operator finds by being refused. */
+    builder.consentSlot.append(forceWrap);
+    builder.runSlot.append(runBtn);
+
     return el('div', { class: 'cmd-panel' },
-      builder.node, forceWrap,
-      el('div', { class: 'cmd-actions' }, runBtn),
-      err, verdict, out);
+      builder.node, idle, err, verdict, out);
   }
 
   window.execPanel = execPanel;

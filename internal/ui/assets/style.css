@@ -667,3 +667,38 @@ details summary:focus-visible { outline: 2px solid var(--accent); }
 @media (max-width: 700px) {
   .doc-roles, .doc-feats, .doc-areas { grid-template-columns: 1fr; }
 }
+
+/* The live screen.
+ *
+ * The canvas is sized by the stream — a session header sets width and height
+ * attributes — and displayed at whatever fits the drawer. Those are two
+ * different sizes on purpose: app.js maps a click from the displayed size back
+ * into the stream's, which is the only space the device understands.
+ *
+ * max-height rather than a fixed height, because a phone in landscape and a
+ * phone in portrait are both this panel's job and a fixed box would letterbox
+ * one of them into uselessness. */
+.screen-panel { margin-top: 6px; }
+.screen-controls { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.screen-keys { display: flex; gap: 6px; margin-left: auto; }
+.screen-status { margin: 6px 0; font-size: 12px; }
+.screen-note.screen-ok { color: var(--ok); }
+.screen-note.screen-warn { color: var(--warn); }
+.screen-note.screen-error { color: var(--bad); }
+.screen-note.screen-info { color: var(--dim); }
+.screen-remedy { margin-top: 4px; color: var(--dim); }
+.screen-canvas {
+  display: block;
+  max-width: 100%;
+  max-height: 60vh;
+  margin: 0 auto;
+  background: #000;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  /* The canvas is a touch surface for a phone, not a scroll region for this
+   * page: without this, a drag on the picture scrolls the drawer instead of
+   * dragging on the device, and the pointercancel that follows is a finger the
+   * page never lifts. */
+  touch-action: none;
+  cursor: crosshair;
+}

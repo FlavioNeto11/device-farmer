@@ -1,9 +1,22 @@
 # Interactive control: a live screen and a human's hands
 
-Status: **investigated, not built.** Nothing in this document exists in the
-tree. It is the case for a decision, written so the decision can be made once
-and cheaply, and so that a later reader can tell what was measured from what
-was assumed.
+Status: **built.** This was written as the case for a decision, before anything
+existed; the decision was taken and the arc is in the tree — `internal/screen`,
+the two operator routes, the dashboard panel, and `ctl device screen`. The
+register carries it as the `SCREEN` area.
+
+What this document still is, and why it is kept rather than rewritten into a
+reference: it is the record of what was MEASURED versus what was ASSUMED, and
+building it did not settle the second kind. **Nothing in the path has run against
+an Android handset.** The server command line here is built from the protocol and
+has never been accepted by a device.
+
+Two things it got wrong, corrected in place below where they occur: §7 step 2 is
+unnecessary, and the class it proposed was too wide — see the post-approval
+review. One thing it got right that a later reader tried to correct: the frame
+header carries a 61-bit PTS under THREE flags, not 62 under two. `test/fakeadb`
+held the wrong version for a while and nothing noticed, because nothing read the
+fake with the real parser.
 
 Method: six investigations (three of the outside world, three of this tree),
 three independent designs, a judge panel that scored them harshly, and an

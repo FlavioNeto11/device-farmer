@@ -1,12 +1,15 @@
 # Requirements register
 
-One hundred and one requirements this project has been given — functional and
+One hundred and nine requirements this project has been given — functional and
 non-functional — in one place, with where each came from, whether it holds
 today, and the evidence for that verdict. They were mined from nine commits, the
 88 gap entries across the six area pages under `internal/ui/assets/docs/`, the
 migrations that are the real contract, and three external findings that never
 touched the code. Five rows came from reviewing the code while writing this file
 and are in no other inventory: `API-02`, `API-09`, `SEC-08`, `OBS-09`, `OBS-10`.
+Eight more came from building interactive control and are dated by it: the
+`SCREEN` area below, whose newest row exists because two packages in this tree
+held different ideas of one wire format and nothing read either with the other.
 
 The same register renders in the product, under **Docs → Requirements**
 (`internal/ui/assets/docs/requirements.json`), beside the capability panel it
@@ -34,9 +37,9 @@ one-liner, the one-liner is in the row.
 
 ## Last re-verified
 
-Against `HEAD`, 2026-09-06, after forty-four branches. **Eighty-six rows are
-`met` outright**, eleven more are `met` in one dimension, three are `decided`,
-and **one is open**.
+Against `HEAD`, 2026-09-07, after the interactive-control branches. **Ninety-two
+rows are `met` outright**, twelve more are `met` in one dimension, four are
+`decided`, one is Linux-only, and **one is open**.
 
 ### The one open row
 
@@ -253,6 +256,25 @@ The founding requirement and everything that protects it.
 | API-07 | `ctl` validates against the server, which is the authority. | `gap:jobs.1` | `met` | `ctl submit` and `ctl validate` post to `/api/v1/specs/validate`, and `ctl kinds`/`ctl resets` fetch the other two; `cmdSpecValidate` prints which server checked it. The superseded local path — `cmdSubmit`, `cmdValidate` and the five helpers only they used — is deleted rather than left as a second authority for the next reader to find, and the package doc no longer claims `ctl validate` "never leaves the machine". |
 | API-08 | Exit code 3 (`not implemented`) means something. | `gap:operate.15` | `decided` | Answered by deleting it. `cmd/farmd/main.go` documents why there is no code 3: every role dispatches, so nothing could return "not implemented", and the number is not free — `farmd ctl` exits 3 when the remote REFUSED an action, which is a 409 and therefore an answer rather than a failure. Two meanings for one number in one binary is how a rollout script comes to read a refusal as a missing feature. `config.Summary()` no longer depends on it either (OBS-06). |
 | API-09 | The Docs reference recovers from a transient fetch failure. | `internal/ui/assets/docs.js` | `met` | A failed area fetch is cached with `retryable: true` and rendered with a **Try again** button that drops the entry and refetches (`internal/ui/assets/docs.js`). Only a FAILURE is dropped: discarding a loaded area would refetch a document that is already correct. Before this, a page opened while the api was restarting kept its error for the life of the tab, because the area was in the cache and `ensureArea` returned on its first line. |
+
+## SCREEN — interactive control
+
+An operator watching a phone and touching it. The newest area in this register,
+and the one with the largest distance between what is built and what is proved:
+the whole path has been driven end to end against `test/fakeadb` and none of it
+has run against an Android handset. The rows say so where it applies rather than
+leaving a reader to infer it.
+
+| ID | Requirement | Origin | Status | Evidence |
+|---|---|---|---|---|
+| SCREEN-01 | An operator can watch a device's screen live and touch it, without the device leaving its rack and without a second tool. | `docs/design/interactive-control.md` | `met` in code; `unverified` on hardware | The whole arc exists and was driven end to end: `internal/screen` owns the session, `GET /api/v1/devices/{id}/screen` splices it, the drawer decodes it with WebCodecs and sends pointer and key events back, and `ctl device screen --out` records the same stream without a browser. Verified against the compose demo: 174 KB streamed over HTTP, `ctl` recorded 71 packets and 6 key frames across a 5.667s PTS span, `ffprobe` reports 69 frames of Constrained Baseline 288x640, and the picture moved in Chrome while 16 input events reached the device. **Nothing in this path has run against an Android handset**: the command line is built from the protocol, not from a device that accepted it. |
+| SCREEN-02 | A screen session ends bytes and never a lease. A severed socket, a raised fence, a redeployed api, a closed tab and a stalled viewer all leave the device exactly as leased as it was. | LEASE-01, STF #663 | `met` | There is no code path from `internal/screen` or either screen route to `farm.leases`; neither package has a method that could. Pinned four ways: `TestAScreenOnALeasedDeviceNeedsForceAndAReason` reads state and `release_reason` before and after and requires both unchanged; `TestTheSummarySaysTheTTLEndsBytesAndNotALease` asserts the startup block says what `FARM_SCREEN_SESSION_TTL` bounds, because a `time.Duration` cannot say it itself; the `screen.close` audit row carries `lease_effect`; and the dashboard tells the operator, who is the person most likely to conclude otherwise, in the sentence that reports the stream ending. |
+| SCREEN-03 | A length chosen by a handset never sizes an allocation in the process that answers lease renewals. | `internal/scrcpy` package doc, `c:9d80251` | `met` | The api splices rather than decodes. `internal/screen` reads exactly sixteen fixed-width bytes — the codec id and the session header, which the input path needs for the frame's dimensions — and `spliceScreen` copies the rest through a 64 KiB buffer that is a constant in `internal/api/screen.go`. `TestOpenReadsTheFrameSizeAndNothingElse` fails if a second unit is ever read. The three clients that DO parse lengths each cap first: `internal/scrcpy` at `MaxPacket` before `make`, `app.js` at `SCREEN_MAX_PACKET` before the read, and `ctl` through `internal/scrcpy`. |
+| SCREEN-04 | A live screen is operator-only, because a framebuffer cannot be masked by tenant. | SEC-07, `TestBulkReadsAreOperatorOnly` | `met` | Every tenant-readable route narrows by `tenant_id` and the masking nils named fields; a framebuffer has no named fields, and the picture may be another tenant's login screen. `TestScreenRoutesAreOperatorOnly` reads `router.go` as text and fails for either route registered with `tenant(` — the mutation that matters is not malice but somebody letting tenants see \|their own\| devices. `TestATenantTokenCannotOpenAScreen` is the runtime half. |
+| SCREEN-05 | What a person did with a phone during a session is not answerable, and the audit trail says so rather than implying otherwise. | this feature | `decided` | `screen.open` and `screen.close` land in `farm.audit_log` with the frame size, the duration, whether the session was forced past a lease, an input COUNT, and an explicit `lease_effect` naming what the session did not do. A row per touch would be thousands a minute, so the honest ceiling is \|who held this device, from when to when, with input enabled, and how many messages they sent\|. The matching `farm.events` rows carry `lease_id` and `job_id` — which `device_exec` still does not, so the tenant whose job was touched cannot see that one in their own timeline. |
+| SCREEN-06 | The feature is off unless an operator turns it on, and a farm that has not turned it on is told what to set. | `internal/config` | `met` | `FARM_SCREEN_SERVER_SHA` and `FARM_SCREEN_SERVER_VERSION` are both required and neither has a default: the jar is operator-supplied, and resolving one by name rather than by digest would make replacing an artifact into running code on every handset. `screenUnavailable` reports EVERY misconfiguration at once rather than the first, following `internal/config`'s own rule, each with the variable that fixes it. A fenced farm with no control certificate is refused naming `FARM_FENCE_CONTROL_CERT`; an unfenced farm is not, because there is no proxy to present one to. |
+| SCREEN-07 | Coordinates are in the encoded video's space, not the device's pixels, and a caller that confuses them is refused rather than silently misplaced. | the design review of `docs/design/interactive-control.md` | `met` | A 1080x2400 panel streamed at `max_size` 1024 is 460x1024, so a caller sending device pixels misses by more than half the screen. `scrcpy.Position` is constructible only from a `Screen` derived from a live session header, the frame travels in `X-Screen-Frame`, and an out-of-frame coordinate is a 400 that names the space. A refused batch sends NONE of itself, including the events before the bad one: a partial down-move-up leaves a pointer down that nothing lifts. |
+| SCREEN-08 | The fixture and the parser are independent statements of the same wire format, and something reads one with the other. | found while building this feature | `met` | `test/fakeadb` and `internal/scrcpy` each held a self-consistent and DIFFERENT idea of the scrcpy video layout — config on bit 63 rather than 62, a 62-bit PTS mask rather than 61, and no separate codec id — for as long as nothing crossed between them. Settled against `app/src/demuxer.c` in Genymobile/scrcpy and collapsed to one layout; `internal/adbwire`'s duplex test, which asserted the wrong one by byte offset, was corrected with it. `TestTheFixturesVideoIsReadableByInternalScrcpy` is the crossing, and moving the flags back fails it. |
 
 ## SEC — authentication, authorisation and the fence at the resource
 

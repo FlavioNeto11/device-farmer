@@ -65,58 +65,62 @@ conectividade.
 
 ## O que mudou nesta rodada
 
-Duas levas. A primeira fechou o registro (catorze unidades); a segunda foram
-quatro pendências que a própria verificação encontrou.
+**Controle interativo: a tela de um aparelho, ao vivo, com um dedo humano nela.**
+Cinco unidades em paralelo mais o tronco, tudo mergeado em `main`.
 
-**O que o registro não sabia, e três agentes acharam procurando:**
+O arco inteiro existe e foi dirigido de ponta a ponta:
+`GET /api/v1/devices/{id}/screen` splica o stream do scrcpy,
+`POST /api/v1/devices/{id}/input` entrega toque, tecla e scroll,
+`internal/screen` é dono da sessão (três transportes ADB e um encoder no
+telefone), o drawer do dashboard decodifica com WebCodecs, e
+`ctl device screen --out` grava o mesmo stream sem navegador.
 
-- **`SEC-05` estava aberta por uma porta que ninguém tinha experimentado.** A
-  listagem de leases estava limpa, mas `00009` gravava `prior_instance` e
-  `new_instance` no `detail` de um evento `lease_reattached`, e
-  `GET /api/v1/events` projetava `detail` **verbatim** — republicando
-  `lease_id + fence + holder_instance` numa linha só, para um token de operador
-  que não tem escopo entre tenants, e direto na timeline do dashboard. O
-  comentário em `internal/api/leases.go` que pulava a checagem de tenant no
-  renew **se justificava** na afirmação que isso quebrava.
-- **`JOB-03` era mais estreita do que o registro dizia, e a receita documentada
-  não funcionava.** O status era lido na largada e no reattach; um soak que
-  morria na quarta hora ainda dava step verde. E a spec de referência da aba
-  Docs mandava conferir com `cat …result` e `expect_exit: [0]`, que julga o
-  `cat`.
-- **`JOB-10` estava em tensão direta com um requisito irmão**, e nada arbitrava.
-  A resolução foi **reter** o veredito em vez de rebaixá-lo: o job fica
-  `running`, que é a ausência de veredito, e as duas exigências passam a valer.
+**Verificado no Chrome, contra o demo em :8420**: a imagem se mexe, 16 eventos
+de input chegaram ao dispositivo, `ffprobe` lê 69 quadros de Constrained
+Baseline 288x640 no arquivo que o `ctl` gravou, e o `farm.audit_log` tem
+`screen.open`/`screen.close` com contagem de input, duração e a frase que diz
+o que a sessão **não** fez.
 
-**As quatro pendências da segunda leva:**
+**A regra que governa tudo isso**: uma sessão de tela termina BYTES e nunca uma
+lease. Não existe caminho de `internal/screen` nem das duas rotas até
+`farm.leases`. Um socket cortado, uma fence que sobe, um deploy que troca o pod,
+uma aba fechada — todos terminam a imagem e deixam o dispositivo exatamente tão
+alugado quanto estava. O painel diz isso ao operador na própria mensagem de fim
+de stream, porque ele é quem mais provavelmente concluiria o contrário.
 
-| | O que era | Onde ficou |
-|---|---|---|
-| F1 | O dashboard nunca recebia stream numa fazenda com token, porque `EventSource` não manda header | Tíquete de uso único, TTL de 30 s, gasto na primeira apresentação, abre **aquela** rota e nada mais |
-| F2 | `/specs/kinds` descrevia um `wait_for` que não existia mais | `00021`, mais um teste que fixa os identificadores dentro da prosa |
-| F3 | Uma renovação que falha no jobrunner virava só linha de log | `HolderHooks` ligado — o alerta já listava o jobrunner como publicador e estava cego para ele |
-| F4 | `FARM_MIGRATIONS_TABLE=farm.x` num banco novo falhava com `schema "farm" does not exist` | O migrador cria o schema e **anuncia**; num banco já migrado, **recusa** |
+**Quatro defeitos que só apareceram porque alguém olhou:**
 
-### Quatro defeitos que só apareceram rodando
+1. **`test/fakeadb` e `internal/scrcpy` discordavam do formato de fio** — flag
+   de config no bit 63 em vez de 62, máscara de PTS de 62 bits em vez de 61, e
+   nenhum codec id separado. Cada um era consistente consigo mesmo e nada lia um
+   com o outro, então o fake certificava um protocolo que nenhum telefone fala.
+   Resolvido contra `app/src/demuxer.c` do Genymobile/scrcpy; o teste duplex do
+   `internal/adbwire`, que afirmava o layout errado por offset de byte, foi
+   corrigido junto.
+2. **O socket de vídeo morria com a chamada que o abriu.** A resposta vinha 200,
+   com session header e frame size corretos, e nunca chegava um quadro: os
+   sockets eram abertos com o contexto do *spawn*, e o tempo de vida de um stream
+   do adbwire É o contexto com que ele foi aberto. Todos os testes unitários
+   passavam por cima disso, porque o `Device` falso ignorava o contexto.
+3. **`display: block` derrotava o atributo `hidden`** — fechar a tela deixava o
+   último quadro na página e uma fileira de botões que pareciam vivos e não
+   mandavam nada. Regra de autor ganha da do user agent, independente de
+   especificidade.
+4. **Um teste apostava no buffer de recepção do kernel** e perdia no Linux — a
+   plataforma onde isto roda — enquanto passava aqui.
 
-Nenhum deles era visível numa suíte verde, e é por isso que a corrida no Linux
-virou parte da receita:
+**As três unidades paralelas que não eram a tela**, cada uma um defeito real que
+o registro não conhecia:
 
-1. **Todo papel entrava em pânico no startup** por um registro duplicado de
-   collector, enquanto `go build`, `go vet`, `gofmt` e a suíte inteira ficavam
-   verdes — porque ninguém chamava `newRegistry`. Só existia no Linux: o
-   process collector do prometheus não descreve nada em outros sistemas.
-2. **`topo.Sysfs` nunca tinha executado.** Todo teste de topologia entrega ao
-   `FromFS` um `fstest.MapFS`; o binário chama `Sysfs`, que lê por `os.DirFS` e
-   tira a chaveabilidade de VBUS do **modo** do arquivo — que um MapFS só sabe
-   afirmar.
-3. **O dashboard não recebia stream** em nenhuma fazenda com token.
-4. **A schema só tinha sido checada contra um major do PostgreSQL.**
-
-E três testes estavam passando pelo motivo errado — um afirmava sobre
-`encoding/json` em vez do código, um casava a linha errada do arquivo que
-varria, um tinha um relógio que tornava a própria falsificação indetectável. Os
-três foram escritos nesta sessão, pelo mesmo processo que depois os pegou. É
-para isso que serve falsificar cada asserção.
+- **`internal/fenceproxy`**: com o proxy ligado, o `/exec` da api, a sonda de
+  bateria do watchdog e as escritas de brand do enroll estavam **todos recusados,
+  em silêncio**. Os literais agora viajam dos pacotes que os possuem; o `/exec`
+  recusa com uma mensagem em vez de um erro de dial, porque não existe alfabeto
+  seguro para o shell de um operador.
+- **watchdog**: um `farm.hosts` vazio é um poll que não achou nada, não um erro
+  de inicialização. O papel não conseguia subir numa instalação nova — e estava
+  em loop de restart nesta máquina havia 14 horas.
+- **`ctl device screen`**: o mesmo stream, gravado, sem navegador.
 
 ## Empacotamento — o que a auditoria e as corridas acharam
 
@@ -193,8 +197,12 @@ célula-a-célula na rodada passada e **tinham se desencontrado de novo em 35
 células**. Agora `TestDocsRegisterMatchesREQUIREMENTS` lê os dois e compara cada
 célula, então o próximo desencontro reprova o build em vez de chegar à tela.
 
-- **86 de 101** linhas em `met`, **11** em `met` numa dimensão e abertas em
-  outra, **3** `decided`.
+- **92 de 109** linhas em `met`, **12** em `met` numa dimensão e abertas em
+  outra, **4** `decided`, **1** só-Linux.
+- **Oito linhas novas**: a área `SCREEN`. A mais recente, `SCREEN-08`, existe
+  porque dois pacotes desta árvore tinham ideias diferentes de um formato de fio
+  e nada lia um com o outro — o registro agora carrega a exigência de que algo
+  cruze entre eles.
 - **Uma aberta**: `REC-03` — tiers 3 (`USBDEVFS_RESET`) e 4 (corte de VBUS)
   contra hardware real. `HW-05` é a mesma frase sobre uma coisa mais estreita.
   **Não há telefone nesta máquina**, e nenhuma mudança de código muda isso. Ler
@@ -204,14 +212,21 @@ célula, então o próximo desencontro reprova o build em vez de chegar à tela.
 
 ## O que fazer ao retomar, nesta ordem
 
-1. **Rodar contra um rack.** É o item 1 do registro e as duas últimas linhas
-   esperam por ele. Tudo que leva às duas chamadas está escrito, testado e
-   agora **rodado** no Linux; o que falta é o aparelho.
-2. **`-race`.** Nunca rodou nesta máquina (não há compilador C). É o buraco de
-   cobertura mais barato de fechar em qualquer máquina que tenha gcc.
-3. **`REC-02`, `SEC-04`, `OPS-04`, `DEV-04`, `DEV-05`** — as linhas `met` em
+1. **Rodar contra um rack.** É o item 1 do registro, e agora a tela ao vivo
+   depende dele também: a linha de comando do servidor scrcpy é construída a
+   partir do protocolo e **nunca foi aceita por um aparelho**. A primeira
+   execução contra hardware deve ser lida como uma primeira execução.
+2. **Um jar de scrcpy de verdade.** O demo empurra um marcador cujos bytes dizem
+   que não são um jar, e marca o artefato como já presente porque este fake ADB
+   não fala `sync:`. O push em si não é exercitado em lugar nenhum do demo — é
+   exercitado nos testes de sync do `internal/adbwire`, e `SCREEN-01` diz isso.
+3. **`-race`.** Nunca rodou nesta máquina (não há compilador C). É o buraco de
+   cobertura mais barato de fechar em qualquer máquina que tenha gcc — e agora
+   há concorrência nova para ele olhar: uma sessão de tela tem três goroutines
+   por dispositivo.
+4. **`REC-02`, `SEC-04`, `OPS-04`, `DEV-04`, `DEV-05`** — as linhas `met` em
    código e `unverified` em hardware. Todas viram `met` numa tarde com um rack.
-4. O resto está ordenado em `REQUIREMENTS.md` → *What the register argues for
+5. O resto está ordenado em `REQUIREMENTS.md` → *What the register argues for
    next*.
 
 ## Defeitos conhecidos e ainda abertos em `main`

@@ -407,6 +407,38 @@ const STRINGS = {
     'device.drainHost': 'Drain host {host}',
     'device.refused': 'refused: {err}',
 
+    /* The Fleet as a table: the mode switch, the column headings, and the words
+     * a screen reader hears where a sighted reader sees an arrow.
+     *
+     * A column HEADING is interface and is translated. Nothing a cell holds is:
+     * a rack slot, a model, a host, a hub path and a health value are all what
+     * the API said, and an operator matches them by eye against a psql session
+     * and a log line. */
+    'fleet.view': 'How to show the fleet',
+    'fleet.viewCards': 'Cards',
+    'fleet.viewTable': 'Table',
+    'fleet.viewCardsWhy': 'One card per device, grouped by host and then by hub — the order somebody walks the room in.',
+    'fleet.viewTableWhy': 'One row per device, sortable by any column. This is the mode that stays readable on a large farm.',
+    'fleet.col.slot': 'Rack slot',
+    'fleet.col.model': 'Model',
+    'fleet.col.where': 'Host / hub',
+    'fleet.col.condition': 'Condition',
+    'fleet.col.availability': 'Availability',
+    'fleet.col.battery': 'Battery',
+    'fleet.col.lastSeen': 'Last seen',
+    'fleet.openDevice': 'Open {device}',
+    'fleet.unslotted': 'no slot',
+    'fleet.unslottedWhy': 'This device has no rack_slot label, so nobody can be told where to walk to reach it.',
+    'fleet.unknownModel': 'model not reported',
+    'fleet.dupSerial': 'dup serial',
+    'fleet.dupSerialWhy': 'This ADB serial is not unique in this farm, so a command addressed by serial could reach either handset. Address this one by devpath.',
+    'fleet.openQuarantine': 'an open quarantine record, with no reason written on it',
+    'fleet.noHost': 'no host recorded',
+    'fleet.noHub': 'no hub recorded',
+    'table.sortable': 'not sorted by this column; activate to sort by it',
+    'table.sortedAsc': 'sorted by this column, ascending; activate to reverse it',
+    'table.sortedDesc': 'sorted by this column, descending; activate to reverse it',
+
     /* The live screen */
     'screen.open': 'Open screen',
     'screen.close': 'Close screen',
@@ -841,6 +873,38 @@ const STRINGS = {
     'device.powerCycle': 'Ciclar energia do slot',
     'device.drainHost': 'Drenar host {host}',
     'device.refused': 'recusado: {err}',
+
+    /* A frota como tabela: o seletor de modo, os títulos de coluna, e as palavras
+     * que um leitor de tela ouve onde um leitor que enxerga vê uma seta.
+     *
+     * O TÍTULO da coluna é interface e é traduzido. Nada do que a célula contém
+     * é: posição no rack, modelo, host, caminho do hub e valor de saúde são o
+     * que a API disse, e o operador confere isso a olho contra uma sessão psql
+     * e contra uma linha de log. */
+    'fleet.view': 'Como mostrar a frota',
+    'fleet.viewCards': 'Cartões',
+    'fleet.viewTable': 'Tabela',
+    'fleet.viewCardsWhy': 'Um cartão por dispositivo, agrupado por host e depois por hub — a ordem em que alguém caminha pela sala.',
+    'fleet.viewTableWhy': 'Uma linha por dispositivo, ordenável por qualquer coluna. É o modo que continua legível numa fazenda grande.',
+    'fleet.col.slot': 'Posição no rack',
+    'fleet.col.model': 'Modelo',
+    'fleet.col.where': 'Host / hub',
+    'fleet.col.condition': 'Condição',
+    'fleet.col.availability': 'Disponibilidade',
+    'fleet.col.battery': 'Bateria',
+    'fleet.col.lastSeen': 'Visto por último',
+    'fleet.openDevice': 'Abrir {device}',
+    'fleet.unslotted': 'sem posição',
+    'fleet.unslottedWhy': 'Este dispositivo não tem rótulo rack_slot, então ninguém pode ser informado até onde caminhar para alcançá-lo.',
+    'fleet.unknownModel': 'modelo não informado',
+    'fleet.dupSerial': 'serial repetido',
+    'fleet.dupSerialWhy': 'Este serial ADB não é único nesta fazenda, então um comando endereçado por serial pode chegar a qualquer um dos dois aparelhos. Enderece este por devpath.',
+    'fleet.openQuarantine': 'um registro de quarentena aberto, sem motivo anotado',
+    'fleet.noHost': 'nenhum host registrado',
+    'fleet.noHub': 'nenhum hub registrado',
+    'table.sortable': 'não ordenado por esta coluna; acione para ordenar por ela',
+    'table.sortedAsc': 'ordenado por esta coluna, crescente; acione para inverter',
+    'table.sortedDesc': 'ordenado por esta coluna, decrescente; acione para inverter',
 
     /* A tela ao vivo */
     'screen.open': 'Abrir tela',

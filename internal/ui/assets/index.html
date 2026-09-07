@@ -236,6 +236,23 @@
         </select>
       </label>
       <button id="f-clear" class="ghost" data-i18n="filter.clear">Clear</button>
+
+      <!-- Cards or table. Two buttons rather than a select, for the reason the
+           language switch is two buttons: there are two states, and a select
+           would cost a click to discover that. aria-pressed is what says which
+           one is on; fleet.js sets it on every render, and remembers the
+           choice in localStorage the way the language and the density are
+           remembered. The default is decided by the size of the farm — a card
+           grid is a map of a rack you can walk, and past forty devices it
+           stops being a map and becomes a wall. -->
+      <div id="fleet-mode" class="seg" role="group"
+           data-i18n-attr="aria-label:fleet.view">
+        <button type="button" class="seg-btn" data-mode="cards" aria-pressed="false"
+                data-i18n-attr="title:fleet.viewCardsWhy"><span class="seg-glyph" aria-hidden="true">▦</span><span data-i18n="fleet.viewCards">Cards</span></button>
+        <button type="button" class="seg-btn" data-mode="table" aria-pressed="false"
+                data-i18n-attr="title:fleet.viewTableWhy"><span class="seg-glyph" aria-hidden="true">☰</span><span data-i18n="fleet.viewTable">Table</span></button>
+      </div>
+
       <span class="grow"></span>
       <span id="fleet-counts" class="counts"></span>
     </div>

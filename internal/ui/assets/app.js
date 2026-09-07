@@ -1107,12 +1107,39 @@ function errText(e) {
  * Generic pieces
  * ------------------------------------------------------------------ */
 
+/* table builds every data table in this app.
+ *
+ * A column is `{label, cls, cell(row)}`. Two options are additions, and both
+ * are opt-in: a column that also carries `sort` becomes a sortable header when
+ * the caller supplies `onSort`, and `onRowClick` makes the whole row a mouse
+ * target. Every existing caller passes neither and is unchanged.
+ *
+ * The sort state is drawn TWICE on purpose — `aria-sort` on the <th> and an
+ * arrow inside it — because they are read by different people and neither
+ * substitutes for the other. A table that only draws the arrow has told a
+ * screen reader nothing at all about why the rows moved. */
 function table(cols, rows, opts) {
   const o = opts || {};
-  const head = el('tr', null, cols.map((c) => el('th', { scope: 'col', class: c.cls || null }, c.label)));
+  const head = el('tr', null, cols.map((c) => headerCell(c, o)));
   const body = el('tbody');
   for (const r of rows) {
     const tr = el('tr', { class: o.rowClass ? o.rowClass(r) : null });
+    if (o.onRowClick) {
+      /* A convenience for the mouse, and only that. The keyboard path is a
+       * real control INSIDE the row — see the fleet table's first cell —
+       * because a <tr> with a tabindex announces itself as nothing, and a
+       * keydown handler on it is a button no assistive technology can find. */
+      tr.addEventListener('click', (ev) => {
+        if (ev.target.closest('button, a, input, select, textarea, summary, label')) return;
+        /* A drag that selected text ends in a click on the row. Opening a
+         * drawer over the serial somebody was half way through copying is the
+         * kind of thing that makes a table feel like it is fighting back, so
+         * a click that finished a selection does nothing. */
+        const sel = window.getSelection();
+        if (sel && !sel.isCollapsed && tr.contains(sel.anchorNode)) return;
+        o.onRowClick(r, ev);
+      });
+    }
     for (const c of cols) {
       const td = el('td', { class: c.cls || null });
       append(td, [c.cell(r)]);
@@ -1121,6 +1148,29 @@ function table(cols, rows, opts) {
     body.append(tr);
   }
   return el('table', null, el('thead', null, head), body);
+}
+
+/* headerCell is one <th>. Sortable or not, it is a real th with scope="col",
+ * so a screen reader still names the column when it reads a cell. */
+function headerCell(c, o) {
+  if (!c.sort || !o.onSort) return el('th', { scope: 'col', class: c.cls || null }, c.label);
+  const active = o.sortKey === c.sort;
+  const dir = active ? (o.sortDir === 'desc' ? 'desc' : 'asc') : null;
+  return el('th', {
+    scope: 'col',
+    class: c.cls || null,
+    'aria-sort': dir === 'asc' ? 'ascending' : dir === 'desc' ? 'descending' : 'none'
+  }, el('button', {
+    type: 'button',
+    class: 'th-sort' + (active ? ' th-sorted' : ''),
+    onclick: () => o.onSort(c.sort)
+  },
+    el('span', null, c.label),
+    el('span', { class: 'th-arrow', 'aria-hidden': 'true' }, dir === 'asc' ? '▲' : dir === 'desc' ? '▼' : '↕'),
+    // Said, not only drawn: the arrow above is aria-hidden, and aria-sort
+    // names the state but not the action the button performs.
+    el('span', { class: 'sr-only' },
+      ' — ' + (dir === 'asc' ? t('table.sortedAsc') : dir === 'desc' ? t('table.sortedDesc') : t('table.sortable')))));
 }
 
 function emptyState(title, detail) {

@@ -202,3 +202,185 @@
   color: var(--cau-fg);
   cursor: help;
 }
+
+/* ------------------------------------------------------------------ *
+ * THE TWO MODES
+ *
+ * THE TRAP, WRITTEN DOWN BECAUSE IT HAS SHIPPED TWICE ALREADY.
+ *
+ * The Fleet draws one of two panes and hides the other with the hidden
+ * attribute. A [hidden] element is hidden by a USER-AGENT rule, and any author
+ * rule that sets `display` on the same element beats it — regardless of
+ * specificity, because the user-agent origin loses to the author origin before
+ * specificity is even consulted. So the moment anybody gives .fleet-pane a
+ * display of its own (a grid, a flex column, anything), both modes paint at
+ * once and the fleet appears twice.
+ *
+ * No rule below sets display on .fleet-pane. The line after this comment is
+ * the fuse for the next person who does, and it must stay in the same file as
+ * whatever tempts them. style.css carries the same pairing in three places —
+ * .doc-totop, .screen-panel and the command builder — and shell.css names it
+ * as the trap that file is most likely to spring.
+ * ------------------------------------------------------------------ */
+.fleet-pane[hidden] { display: none !important; }
+
+/* ------------------------------------------------------------------ *
+ * The mode switch in the toolbar
+ *
+ * Two buttons welded into one control, so the pair reads as one question with
+ * two answers rather than as two unrelated actions. The chosen half is filled
+ * AND bolder AND carries aria-pressed: a reader in greyscale sees the weight
+ * and the fill, and a reader who hears the page is told which is pressed.
+ * ------------------------------------------------------------------ */
+.seg {
+  display: inline-flex;
+  align-items: stretch;
+  border: 1px solid var(--brd-strong);
+  border-radius: var(--r);
+  background: var(--srf-raised);
+}
+/* Deliberately NOT `overflow: hidden` on the group, which is the obvious way
+   to round the ends. The global focus ring is drawn with a 2px outline-offset,
+   so clipping the group swallows the ring of whichever button has focus — and
+   this is a control a keyboard reaches. The ends are rounded per button
+   instead, and the ring survives. */
+.seg-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s-1);
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--txt-2);
+  padding: var(--s-1) var(--s-3);
+  font-size: var(--fs-sm);
+  cursor: pointer;
+}
+.seg-btn:first-child { border-radius: var(--r) 0 0 var(--r); }
+.seg-btn:last-child { border-radius: 0 var(--r) var(--r) 0; }
+.seg-btn + .seg-btn { border-left: 1px solid var(--brd-subtle); }
+.seg-btn:hover { background: var(--srf-hover); }
+.seg-btn[aria-pressed="true"] {
+  background: var(--brand-600);
+  color: var(--txt-on-brand);
+  font-weight: var(--fw-semi);
+}
+.seg-btn[aria-pressed="true"]:hover { background: var(--brand-700); }
+.seg-glyph { font-size: var(--fs-md); line-height: 1; }
+
+/* ------------------------------------------------------------------ *
+ * The fleet table
+ * ------------------------------------------------------------------ */
+
+/* .tscroll gives the table its own scroller, which is not optional: html and
+   body clip sideways overflow, so a wide table without one is a table nobody
+   can reach. See the 6888px note in style.css.
+ *
+ * The global rule floors every table at 900px and .tscroll > table then pins
+ * it to max-content, which together mean "never shrink, scroll instead". That
+ * is right for the eleven-column Leases table and wrong here. This one is
+ * seven columns wide on purpose and it FITS a 1280px laptop: a fleet table
+ * that starts life behind a horizontal scrollbar is the whole "too technical"
+ * complaint in miniature. So the floor is released and the columns are allowed
+ * to share the width they have. The scroller stays as the last resort for a
+ * genuinely narrow window — it costs nothing when it is not needed.
+ *
+ * fleet.css loads after style.css, so these win the tie at equal specificity;
+ * that ordering is stated in the head of index.html and is load-bearing. */
+.fleet-tbl > table {
+  min-width: 0;
+  width: 100%;
+  table-layout: auto;
+}
+
+/* Cells take the density token rather than a number, so one attribute on
+   <html> retunes this table with everything else. */
+.fleet-tbl tbody td { padding: var(--pad-cell); }
+.fleet-tbl thead th {
+  padding: 0;                     /* the button below carries it, so the whole
+                                     heading is the click target */
+  font-size: var(--fs-xs);
+  background: var(--srf-sunken);
+}
+
+/* A sortable heading is a real button inside a real <th scope="col">. The th
+   keeps aria-sort — that is what a screen reader reads — and the button is
+   what everybody else clicks. */
+.th-sort {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s-1);
+  width: 100%;
+  padding: var(--pad-cell);
+  font: inherit;
+  color: inherit;
+  letter-spacing: inherit;
+  text-transform: inherit;
+  text-align: left;
+  background: none;
+  border: 0;
+  border-radius: 0;
+  cursor: pointer;
+}
+.th-sort:hover { background: var(--srf-hover); color: var(--txt-1); }
+.th-sorted { color: var(--txt-1); font-weight: var(--fw-semi); }
+
+/* The arrow is decoration on top of aria-sort, never the only word for it: the
+   glyph itself changes shape (↕ ▲ ▼) so the state survives greyscale, and the
+   sr-only sentence beside it says the same thing in words. */
+.th-arrow { color: var(--txt-3); font-size: var(--fs-xs); }
+.th-sorted .th-arrow { color: var(--brand-600); }
+
+/* The whole row opens the device for a mouse. The keyboard reaches it through
+   the one control in the first cell — seven tab stops per row is a table
+   nobody tabs to the bottom of. */
+.fleet-tbl tbody tr { cursor: pointer; }
+.fleet-tbl .rowlink {
+  font: inherit;
+  padding: 0;
+  margin: 0;
+  border: 0;
+  background: none;
+  color: var(--brand-600);
+  text-align: left;
+  cursor: pointer;
+}
+.fleet-tbl .rowlink:hover { text-decoration: underline; }
+.fleet-tbl .rowlink .unslotted { color: var(--cau-fg); font-weight: var(--fw-semi); }
+
+/* Column shapes. The four short columns never wrap; the two wide ones are
+   clamped by a measure so one long model name cannot push Battery off the
+   edge and take the scrollbar with it. */
+.fleet-tbl .f-slot,
+.fleet-tbl .f-cond,
+.fleet-tbl .f-avail,
+.fleet-tbl .f-batt,
+.fleet-tbl .f-seen { white-space: nowrap; }
+.fleet-tbl .f-model .trunc { max-width: 26ch; }
+.fleet-tbl .f-where .trunc { max-width: 18ch; }
+.fleet-tbl .f-where-in { display: inline-flex; align-items: baseline; gap: var(--s-1); }
+.fleet-tbl .f-seen { color: var(--txt-2); }
+
+/* .chips is defined in style.css only as a child of .tile, so outside a card
+   it is a plain inline box and two chips render welded together. A cell that
+   carries two of them needs the gap of its own. */
+.fleet-tbl .chips {
+  display: inline-flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: var(--s-1);
+}
+
+/* WHY THE COLUMN HEADER DOES NOT STICK, since the global rule says it should.
+ *
+ * style.css sets `thead th { position: sticky; top: 0 }`, and sticky resolves
+ * against the nearest scrollport. .tscroll is one — `overflow-x: auto` makes
+ * `overflow-y` compute to auto as well — and it has no height, so it never
+ * scrolls vertically and the header never sticks. Giving it a height would fix
+ * that and cost more than it bought: the pane is rebuilt on every repaint, and
+ * an inner scroller would throw the reader back to row one every two seconds.
+ * Page scroll survives a rebuild; an inner scroll position does not.
+ *
+ * So the header scrolls away with the page, exactly as it does on every other
+ * table in this app today. It is worth revisiting once the fleet stops
+ * rebuilding itself wholesale. */

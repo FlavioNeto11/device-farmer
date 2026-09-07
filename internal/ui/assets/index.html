@@ -585,14 +585,35 @@
   </div>
 </dialog>
 
-<!-- Device detail: identity, physical position, health, lease, and the
-     ad-hoc exec box. -->
+<!-- The device sheet.
+
+     A right-side sheet rather than a centred dialog, with six panels behind an
+     internal tab strip: Overview, Health, Lease, Screen, Command, Raw. The
+     tab strip and the panels are built by device.js, because their labels are
+     translated and their contents depend on the device; what lives here is the
+     frame, which never changes.
+
+     STILL A <dialog>, AND THAT IS LOAD-BEARING. showModal() gives the focus
+     trap, the inert background and the Escape handling for free, and the
+     `close` event is what closeScreenOnDrawerClose listens to. A screen left
+     running behind a closed sheet is a handset still encoding for nobody. -->
 <dialog id="dlg-device" aria-labelledby="device-title">
   <div class="dlg-head">
-    <h2 id="device-title">Device</h2>
-    <button type="button" id="device-close" class="ghost" aria-label="Close">Close</button>
+    <div class="dev-head-text">
+      <h2 id="device-title">Device</h2>
+      <p id="device-subtitle" class="dev-sub"></p>
+    </div>
+    <button type="button" id="device-close" class="ghost"
+            data-i18n="device.close" data-i18n-attr="aria-label:device.close">Close</button>
   </div>
+  <div id="device-tabs" class="sheet-tabs" role="tablist"
+       data-i18n-attr="aria-label:device.tabsLabel" aria-label="Device sections"></div>
   <div id="device-body" class="dlg-body"></div>
+  <!-- The operator actions. A footer rather than a row buried mid-scroll: the
+       decision to power-cycle a slot is made after reading the panels, and
+       scrolling back past them to act on it is a tax on the one interaction
+       that matters. -->
+  <div id="device-foot" class="sheet-foot" hidden></div>
 </dialog>
 
 </body>

@@ -1788,7 +1788,35 @@ function runProgress(r) {
     Number(r.skipped) ? el('span', { class: 'chip chip-unknown' }, 'skipped ' + r.skipped) : null);
 }
 
+/* The Bulk form's command field is the drawer's command builder, in compact
+ * mode — the same catalogue, the same wire line, the same timeout floor.
+ *
+ * That it was not, until now, is the defect this fixes: commandBuilder's own
+ * header documented a `compact` option for exactly this form, nothing read it,
+ * and the form that reaches every device the selector matches shipped a bare
+ * <input> with no catalogue, no `shell,v2,raw:` line and no floor under the
+ * timeout. One wrong command in the drawer reaches one handset. Here it reaches
+ * all of them.
+ *
+ * Built on first paint of the view rather than at boot, because constructing it
+ * reads GET /capabilities — three database probes — and a tab that never opens
+ * Bulk should not pay for them. */
+let bulkBuilder = null;
+function bulkCommandBuilder() {
+  if (!bulkBuilder) {
+    // 60000 is the default the <input id="bulk-timeout"> this replaced shipped.
+    // The builder's own default is 30000, and adopting it silently would halve
+    // the ceiling on every fleet-wide command — a run that used to finish would
+    // start reporting a timeout on all fifty-six targets, from a change whose
+    // stated purpose was to ADD a floor.
+    bulkBuilder = commandBuilder({ compact: true, timeout: 60000 });
+    $('#bulk-command').replaceChildren(bulkBuilder.node);
+  }
+  return bulkBuilder;
+}
+
 function renderBulk() {
+  bulkCommandBuilder();
   const runsHost = $('#bulk-runs');
   const rows0 = state.data.bulk;
   const problem = panelState('bulk', rows0, emptyState('No bulk runs yet.',
@@ -2854,11 +2882,22 @@ function wire() {
       err.hidden = false;
       return;
     }
+    // The command comes from the builder, not from a field. The <input> that
+    // used to be here carried `required`, which is the check that goes with it,
+    // so it is made here instead.
+    const builder = bulkCommandBuilder();
+    const command = builder.command();
+    if (!command) {
+      err.replaceChildren(el('strong', null, t('exec.bulk.empty')));
+      err.hidden = false;
+      builder.input.focus();
+      return;
+    }
     const body = {
       selector,
-      command: $('#bulk-command').value.trim(),
+      command,
       max_per_hub: Number($('#bulk-max').value) || 4,
-      timeout_ms: Number($('#bulk-timeout').value) || 60000
+      timeout_ms: builder.timeoutMS()
     };
     const btn = $('#bulk-form button[type="submit"]');
     btn.disabled = true;
@@ -2900,7 +2939,10 @@ function wire() {
       // consumed the key). An operator pressing Escape on a confirm dialog and
       // having nothing happen is not acceptable, so close it here. Topmost
       // first: confirm and token are opened over the device dialog.
-      const stack = ['#dlg-confirm', '#dlg-token', '#dlg-device'];
+      // The command chooser is opened OVER the device drawer, so it is first:
+      // without it here, Escape in the chooser would close the drawer
+      // underneath and leave the chooser standing.
+      const stack = ['#dlg-cmd', '#dlg-confirm', '#dlg-token', '#dlg-device'];
       for (const sel of stack) {
         const dlg = $(sel);
         if (dlg && dlg.open) { ev.preventDefault(); dlg.close(); return; }
@@ -2909,7 +2951,7 @@ function wire() {
       return;
     }
     if (typing || ev.metaKey || ev.ctrlKey || ev.altKey) return;
-    if ($('#dlg-confirm').open || $('#dlg-device').open || $('#dlg-token').open) return;
+    if ($('#dlg-cmd').open || $('#dlg-confirm').open || $('#dlg-device').open || $('#dlg-token').open) return;
     if (ev.key === '/') { ev.preventDefault(); $('#q').focus(); $('#q').select(); return; }
     const n = Number(ev.key);
     if (n >= 1 && n <= VIEWS.length) { ev.preventDefault(); setView(VIEWS[n - 1]); }
@@ -2949,7 +2991,7 @@ function boot() {
   // while someone is reading: a repaint collapses an expanded output row and
   // an operator who just opened a stack trace should not lose it to a clock.
   setInterval(() => {
-    if ($('#dlg-confirm').open || $('#dlg-device').open || $('#dlg-token').open) return;
+    if ($('#dlg-cmd').open || $('#dlg-confirm').open || $('#dlg-device').open || $('#dlg-token').open) return;
     if ($('#main details[open]')) return;
     render();
   }, 15000);

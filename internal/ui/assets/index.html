@@ -360,22 +360,31 @@
         <h2 class="section-h">Selected run</h2>
         <div id="bulk-detail" class="panel-body"></div>
       </div>
-      <form class="col-side card" id="bulk-form" autocomplete="off">
+      <!-- novalidate because the command widget mounted below owns its own
+           bounds. Its number fields carry min/max/step as affordances, and it
+           CLAMPS rather than refusing — timeoutMS() and the parameter handlers
+           both do. Native validation on top of that produces the worst
+           outcome available: a form that silently will not submit while the
+           wire line above it shows a command that is perfectly valid. What is
+           actually required — a non-empty command — is checked in app.js and
+           reported in #bulk-form-error, where an operator can read it. -->
+      <form class="col-side card" id="bulk-form" autocomplete="off" novalidate>
         <h2>Run a command</h2>
         <label for="bulk-selector">Selector (JSON)</label>
         <textarea id="bulk-selector" name="selector" rows="3" spellcheck="false">{"pool":""}</textarea>
-        <label for="bulk-command">Command</label>
-        <input id="bulk-command" name="command" required placeholder="getprop ro.build.fingerprint">
-        <div class="row2">
-          <div>
-            <label for="bulk-max">Max per hub</label>
-            <input id="bulk-max" name="max_per_hub" type="number" min="1" step="1" value="4">
-          </div>
-          <div>
-            <label for="bulk-timeout">Timeout (ms)</label>
-            <input id="bulk-timeout" name="timeout_ms" type="number" min="1000" step="500" value="60000">
-          </div>
-        </div>
+        <!-- The command builder mounts HERE, and the bare <input> that used to
+             sit in its place is why: the drawer had a catalogue, a wire line and
+             a timeout floor, and the form that reaches fifty-six handsets at
+             once had none of them.
+
+             A <span> rather than a <label>, because a label that labels nothing
+             is worse than no label: it looks associated to a reader and is not,
+             and clicking it focuses nothing. The field the widget builds names
+             itself, through the aria-label exec.commandLabel. -->
+        <span class="lbl">Command</span>
+        <div id="bulk-command" class="cmd-mount"></div>
+        <label for="bulk-max">Max per hub</label>
+        <input id="bulk-max" name="max_per_hub" type="number" min="1" step="1" value="4">
         <p class="hint">Max per hub keeps a fleet-wide command from browning out one power domain.</p>
         <div id="bulk-form-error" class="form-error" hidden></div>
         <button type="submit" class="primary">Start run</button>
@@ -469,6 +478,13 @@
     </menu>
   </form>
 </dialog>
+
+<!-- The command catalogue. Empty here and filled by assets/exec.js, which owns
+     the entries and their provenance; this is only the frame it opens in.
+     It used to be rendered inline in the device drawer — twenty-four buttons
+     under ten headings, above the field an operator was trying to type in, with
+     both tiers showing at once so IDENTITY and HEALTH each appeared twice. -->
+<dialog id="dlg-cmd" aria-labelledby="cmd-chooser-title"></dialog>
 
 <!-- Device detail: identity, physical position, health, lease, and the
      ad-hoc exec box. -->

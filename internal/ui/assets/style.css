@@ -1031,25 +1031,66 @@ main, .view, .panel { min-width: 0; }
  * on Android" are different kinds of claim, and a list that ran them together
  * would make them look like one kind. */
 .cmd-panel { margin-top: 6px; }
-.cmd-cat { margin-bottom: 10px; }
-.cmd-cat > summary { font-weight: var(--fw-semi); }
-.cmd-tier { margin: 10px 0 4px; }
-.cmd-tier-head { font-size: var(--fs-md); font-weight: var(--fw-semi); color: var(--text); }
-.cmd-tier-note { margin: 2px 0 6px; color: var(--dim); font-size: var(--fs-sm); max-width: 78ch; line-height: var(--lh); }
-.cmd-group { margin-bottom: 8px; }
+.cmd-choose-row { margin-bottom: 8px; }
+.cmd-open-chooser {
+  font: var(--fs-xs)/var(--lh-tight) var(--sans); padding: var(--s-1) var(--s-3); cursor: pointer;
+  color: var(--text); background: var(--panel-2);
+  border: 1px solid var(--line-2); border-radius: var(--r);
+}
+.cmd-open-chooser:hover { border-color: var(--accent); }
+
+/* The chooser dialog. Everything from .cmd-filter down was rendered INLINE in
+ * the panel until this landed: two and a half screens of catalogue above the
+ * one field the panel exists for, with both tiers open at once so IDENTITY and
+ * HEALTH each appeared twice. The segmented control shows one tier, and that
+ * is what stops the group names repeating — no rename, just never both. */
+.cmd-chooser { padding: var(--s-3) var(--s-4); width: min(720px, 94vw); max-height: 72vh; overflow: auto; }
+.cmd-filter {
+  width: 100%; font: var(--fs-sm)/var(--lh) var(--sans); padding: var(--s-2); color: var(--text);
+  background: var(--bg); border: 1px solid var(--line-2); border-radius: 4px;
+}
+.cmd-segs { display: flex; gap: 6px; margin: 10px 0 4px; }
+.cmd-seg {
+  flex: 1; font: var(--fs-xs)/var(--lh-tight) var(--sans); padding: var(--s-2) var(--s-3); cursor: pointer; text-align: left;
+  color: var(--dim); background: var(--panel-2);
+  border: 1px solid var(--line); border-radius: var(--r);
+}
+.cmd-seg:hover { border-color: var(--accent); }
+/* Pressed is carried by the border, the weight and the colour together, and
+ * aria-pressed carries it to anything that does not see any of them. */
+.cmd-seg[aria-pressed="true"] {
+  color: var(--text); font-weight: var(--fw-semi);
+  border-color: var(--accent); background: var(--panel);
+}
+.cmd-seg-n { color: var(--dim); font-variant-numeric: tabular-nums; font-size: var(--fs-xs); }
+.cmd-chooser-empty { margin: 10px 0 0; color: var(--dim); font-size: var(--fs-xs); }
+
+/* No tier heading: the segmented control above IS the heading, glyph and all,
+ * and repeating it here is how the group names came to look duplicated in the
+ * first place. The note stays — it is the claim, and it is the part a reader
+ * has to have. */
+.cmd-tier { margin: 6px 0 4px; }
+.cmd-tier-note { margin: 2px 0 8px; color: var(--dim); font-size: var(--fs-xs); max-width: 78ch; line-height: var(--lh); }
+.cmd-group { margin-bottom: 10px; }
 .cmd-group-name {
   color: var(--txt-2); font-size: var(--fs-sm); font-weight: var(--fw-semi);
   margin-bottom: 3px;
 }
-.cmd-group-items { display: flex; flex-wrap: wrap; gap: 4px; }
-/* The catalogue buttons are prose — "Read the battery", not `dumpsys battery`.
-   The command itself is one line further down, in mono, where it belongs. */
+.cmd-group-items { display: grid; gap: 4px; }
 .cmd-pick {
-  font: var(--fs-sm)/var(--lh-tight) var(--sans); padding: var(--s-1) var(--s-3); cursor: pointer;
+  display: grid; grid-template-columns: minmax(0, 1fr) auto;
+  gap: 2px 10px; align-items: baseline; text-align: left;
+  font: var(--fs-xs)/var(--lh) var(--sans); padding: var(--s-2); cursor: pointer;
   color: var(--text); background: var(--panel-2);
-  border: 1px solid var(--line); border-radius: 999px;
+  border: 1px solid var(--line); border-radius: var(--r);
 }
 .cmd-pick:hover { border-color: var(--accent); }
+.cmd-pick-label { font-size: var(--fs-sm); font-weight: var(--fw-semi); }
+.cmd-pick-cmd {
+  grid-column: 1 / -1; font: var(--fs-xs)/var(--lh) var(--mono);
+  color: var(--accent); overflow-wrap: anywhere;
+}
+.cmd-pick-why { grid-column: 1 / -1; color: var(--dim); }
 
 .cmd-params { display: flex; flex-wrap: wrap; gap: 8px; margin: 6px 0; }
 .cmd-param-wrap { display: flex; flex-direction: column; gap: 2px; }
@@ -1096,7 +1137,14 @@ main, .view, .panel { min-width: 0; }
 .cmd-pf-blocked .cmd-pf-glyph { color: var(--bad); }
 .cmd-pf-blocked .cmd-pf-evidence { color: var(--bad); }
 .cmd-pf-unknown .cmd-pf-glyph { color: var(--dim); }
-@media (max-width: 700px) { .cmd-pf { grid-template-columns: 1.2rem minmax(0, 1fr); } }
+/* Two columns on a narrow window, and the evidence has to be told to stay in
+ * the second one: dropped to auto-placement it lands in column 1 of the next
+ * row, under the glyph rather than under the label it explains. Same pairing as
+ * the .cmd-compact rules further down, and the same reason. */
+@media (max-width: 700px) {
+  .cmd-pf { grid-template-columns: 1.2rem minmax(0, 1fr); }
+  .cmd-pf-evidence { grid-column: 2; }
+}
 
 .cmd-timeout-wrap { display: flex; align-items: baseline; gap: 6px; margin-top: 10px; font-size: var(--fs-sm); color: var(--dim); }
 .cmd-timeout { width: 8rem; font: var(--fs-sm)/var(--lh-tight) var(--mono); padding: var(--s-1) var(--s-2);
@@ -1125,7 +1173,31 @@ main, .view, .panel { min-width: 0; }
 .cmd-v-note { color: var(--dim); }
 .cmd-stderr-head { color: var(--bad); margin-top: 8px; }
 
+/* The compact builder: the bulk form has its own submit, its own selector and
+ * its own per-hub cap, so the widget inside it is spaced to sit among them
+ * rather than to own a section. */
+/* .lbl is the caption for a mount point rather than for a control — see the
+ * comment on it in index.html. It matches `form label` exactly so that a
+ * reader cannot tell which of the captions in that column is which, because
+ * the difference is about association and not about looks. */
+.lbl { display: block; margin: var(--s-2) 0 3px; color: var(--dim); font-size: var(--fs-sm); }
+.cmd-mount { margin-bottom: 4px; }
+.cmd-compact .cmd-choose-row { margin-bottom: 6px; }
+.cmd-compact .cmd-wire, .cmd-compact .cmd-preflight-wrap { margin-top: 8px; }
+/* The bulk form is a side column, not a drawer, so the pre-flight's three
+ * columns do not fit however wide the window is — an 11rem label column beside
+ * a sentence in 180px is a word per line. The narrow layout is a property of
+ * this container, which is why it cannot be left to the viewport media query
+ * the wide one uses. */
+.cmd-compact .cmd-pf { grid-template-columns: 1.2rem minmax(0, 1fr); }
+.cmd-compact .cmd-pf-evidence { grid-column: 2; }
+
 /* An author `display` beats the user agent's [hidden] rule no matter how
  * specific either is — the same trap this stylesheet already documents twice.
- * Every container above that sets a display must opt back in. */
-.cmd-panel [hidden], .cmd-builder [hidden] { display: none !important; }
+ * Every container above that sets a display must opt back in.
+ *
+ * .cmd-chooser is in the list because the tier segmented control hides one of
+ * two .cmd-tier panes, and .cmd-tier's descendants carry grid and flex. This
+ * has shipped as a real bug in this tree twice; a tier that will not hide is
+ * the duplicated group names coming straight back. */
+.cmd-panel [hidden], .cmd-builder [hidden], .cmd-chooser [hidden] { display: none !important; }

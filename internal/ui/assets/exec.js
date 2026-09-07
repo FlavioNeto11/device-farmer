@@ -233,6 +233,8 @@
     return v;
   }
 
+  function clampTimeout(ms) { return Math.min(Math.max(ms, TIMEOUT_MIN), TIMEOUT_MAX); }
+
   /* ------------------------------------------------------- fence capability */
 
   /* fenceState answers one question — will this farm refuse every exec — and it
@@ -273,20 +275,183 @@
    * predicted, and it is the honest fallback when capabilities is unavailable. */
   function latchFence() { fenceLatched = true; fenceCache = 'on'; }
 
+  /* ------------------------------------------------------------ the chooser */
+
+  /* The catalogue was twenty-four buttons under ten headings, inline, above the
+   * one field the panel exists for: two and a half screens of wall before the
+   * command line. And because both tiers carry the same groups, IDENTITY and
+   * HEALTH each appeared twice — so the wall read as one duplicated list rather
+   * than as two claims of different standing.
+   *
+   * It is a dialog now, and the tier is a two-option segmented control that
+   * renders ONE tier at a time. That is what fixes the repeated headings: not a
+   * rename, just never showing both at once. Twenty-four buttons behind a
+   * filter is a chooser; twenty-four buttons in front of the field is a wall.
+   *
+   * The dialog element itself lives in index.html, empty, and is filled here —
+   * the same division docs.js uses. */
+  const CHOOSER_DIALOG_ID = 'dlg-cmd';
+
+  /* openChooser(cat, groups, onPick) is deliberately self-contained: it takes
+   * the catalogue and a callback and knows nothing about the panel around it,
+   * so it drops into any host that has a command field to fill.
+   *
+   * It rebuilds its contents on every open rather than once. Twenty-four rows
+   * cost nothing to build, and the alternative is a retranslate() that has to
+   * remember the filter text and the selected tier — a language switch would
+   * otherwise leave a dialog reading in the language it was first opened in. */
+  function openChooser(cat, groups, onPick) {
+    const dlg = document.getElementById(CHOOSER_DIALOG_ID);
+    if (!dlg) return false;
+
+    let verifiedTier = true;
+
+    const filter = el('input', {
+      type: 'text', class: 'cmd-filter', spellcheck: 'false', autocomplete: 'off',
+      placeholder: t('exec.chooser.filter'), 'aria-label': t('exec.chooser.filter'),
+    });
+
+    const countV = el('span', { class: 'cmd-seg-n' });
+    const countU = el('span', { class: 'cmd-seg-n' });
+    const segV = el('button', { class: 'cmd-seg', type: 'button', 'aria-pressed': 'true' },
+      el('span', { 'aria-hidden': 'true' }, '✓'), ' ', t('exec.tier.verified'), ' ', countV);
+    const segU = el('button', { class: 'cmd-seg', type: 'button', 'aria-pressed': 'false' },
+      el('span', { 'aria-hidden': 'true' }, '?'), ' ', t('exec.tier.unverified'), ' ', countU);
+
+    const paneV = el('div', { class: 'cmd-tier' });
+    const paneU = el('div', { class: 'cmd-tier' });
+    const empty = el('p', { class: 'cmd-chooser-empty', hidden: true });
+
+    /* Matches command text, label, explanation, group and provenance path, on
+     * every word typed. The command text is in there because it is what an
+     * operator who already knows Android searches for: somebody looking for
+     * `logcat` does not know this catalogue calls it "Last N log lines". */
+    function matches(c, words) {
+      if (!words.length) return true;
+      const hay = [
+        c.template, c.source,
+        t('exec.cat.' + c.id + '.label'), t('exec.cat.' + c.id + '.why'),
+        t('exec.group.' + c.group),
+      ].join(' ').toLowerCase();
+      return words.every((w) => hay.includes(w));
+    }
+
+    function pickRow(c) {
+      return el('button', {
+        class: 'cmd-pick', type: 'button',
+        onclick: () => { dlg.close(); onPick(c); },
+      },
+        el('span', { class: 'cmd-pick-label' }, t('exec.cat.' + c.id + '.label')),
+        c.source
+          ? el('span', { class: 'cmd-source', title: t('exec.verifiedWhy') },
+            el('span', { 'aria-hidden': 'true' }, '✓'), ' ', c.source)
+          : null,
+        /* The command, verbatim and in monospace. Never through t(): a
+         * translated command does not run, and this is the one string in the
+         * row an operator may be reading to decide. */
+        el('code', { class: 'cmd-pick-cmd' }, c.template),
+        el('span', { class: 'cmd-pick-why' }, t('exec.cat.' + c.id + '.why')));
+    }
+
+    /* fill returns how many entries this tier has under the current filter,
+     * which is what the segmented control counts and what decides the empty
+     * note — including its most useful case, "it is in the other tier". */
+    function fill(pane, verified, words) {
+      pane.replaceChildren(el('p', { class: 'cmd-tier-note' },
+        t(verified ? 'exec.tier.verifiedNote' : 'exec.tier.unverifiedNote')));
+      let n = 0;
+      for (const g of groups) {
+        const items = cat.filter((c) => c.group === g && !!c.source === verified && matches(c, words));
+        if (!items.length) continue;
+        n += items.length;
+        const list = el('div', { class: 'cmd-group-items' });
+        for (const c of items) list.append(pickRow(c));
+        pane.append(el('div', { class: 'cmd-group' },
+          el('div', { class: 'cmd-group-name' }, t('exec.group.' + g)), list));
+      }
+      return n;
+    }
+
+    function repaint() {
+      const words = filter.value.trim().toLowerCase().split(/\s+/).filter(Boolean);
+      const nv = fill(paneV, true, words);
+      const nu = fill(paneU, false, words);
+      countV.textContent = String(nv);
+      countU.textContent = String(nu);
+      segV.setAttribute('aria-pressed', verifiedTier ? 'true' : 'false');
+      segU.setAttribute('aria-pressed', verifiedTier ? 'false' : 'true');
+      /* One tier at a time. .cmd-tier is given a display below, so the
+       * stylesheet has to opt back into [hidden] for it — an author display
+       * beats the user agent's [hidden] rule at any specificity, which this
+       * tree has shipped as a real bug twice. */
+      paneV.hidden = !verifiedTier;
+      paneU.hidden = verifiedTier;
+      const here = verifiedTier ? nv : nu;
+      const there = verifiedTier ? nu : nv;
+      empty.hidden = here > 0;
+      empty.replaceChildren(t('exec.chooser.none'),
+        there ? ' ' + t('exec.chooser.otherTier', { n: String(there) }) : '');
+    }
+
+    segV.addEventListener('click', () => { verifiedTier = true; repaint(); });
+    segU.addEventListener('click', () => { verifiedTier = false; repaint(); });
+    filter.addEventListener('input', repaint);
+
+    const close = el('button', { class: 'ghost', type: 'button', onclick: () => dlg.close() },
+      t('exec.chooser.close'));
+
+    dlg.replaceChildren(
+      el('div', { class: 'dlg-head' },
+        el('h2', { id: 'cmd-chooser-title' }, t('exec.catalogue')), close),
+      el('div', { class: 'cmd-chooser' },
+        filter,
+        el('div', { class: 'cmd-segs', role: 'group', 'aria-label': t('exec.chooser.tiers') },
+          segV, segU),
+        paneV, paneU, empty));
+
+    repaint();
+    /* showModal() on an already-open dialog throws, and the panel's own button
+     * cannot be reached while it is open — but window.openCommandChooser can be
+     * called by anything, and a thrown InvalidStateError there would take the
+     * caller's click handler down with it. */
+    if (!dlg.open) dlg.showModal();
+    filter.focus();
+    return true;
+  }
+
   /* ------------------------------------------------------------- the widget */
 
-  /* commandBuilder(opts) returns { node, command(), setBusy(b), onCommand }.
+  /* commandBuilder(opts) returns { node, command(), timeoutMS(), … }.
    *
    * opts:
    *   device   the normalised fleet row, or null for a fleet-wide form (bulk)
-   *   onRun    async (command, timeoutMS, extra) => void; when absent the widget
-   *            renders no Run button and the host owns submission (bulk)
+   *   onRun    async (command, timeoutMS) => void, called when Enter is pressed
+   *            in the command field. Absent for the bulk form, where Enter
+   *            belongs to the host <form> whose submit button owns the run, and
+   *            where a widget that ran the command itself would run it twice.
+   *            The Run BUTTON is never the widget's: in the drawer it must sit
+   *            below the force-and-reason consent, and only the host knows that
+   *            order.
    *   compact  true for the bulk form, which has its own submit and its own
-   *            fields and only wants the chooser, the wire line and the timeout
+   *            fields. The widget then drops the panel chrome and renders the
+   *            chooser, the command field, the wire line, a FLEET-WIDE
+   *            pre-flight and the timeout — and nothing else.
+   *   timeout  the timeout field's starting value in ms, clamped to the field's
+   *            own bounds. Bulk passes 60000 because the input this widget
+   *            replaced shipped that default, and halving a fleet-wide timeout
+   *            in passing is how a run that used to finish starts reporting a
+   *            timeout on every one of fifty-six targets.
+   *
+   * Every option above is read below, and that sentence is here because it was
+   * not true: `compact` and `onRun` were documented and never implemented, so
+   * this comment described an API the file did not have while the bulk form
+   * went on shipping a bare <input> with none of it.
+   * TestTheCommandBuilderOptionsAreRead is what keeps it true.
    */
   function commandBuilder(opts) {
     const o = opts || {};
     const device = o.device || null;
+    const compact = !!o.compact;
 
     let selected = entry(DEFAULT_ID);
     let values = defaults(selected);
@@ -295,8 +460,17 @@
     const input = el('input', {
       type: 'text', class: 'cmd-input', spellcheck: 'false', autocomplete: 'off',
       placeholder: 'getprop ro.build.fingerprint',
+      'aria-label': t('exec.commandLabel'),
     });
     input.value = renderTemplate(selected, values);
+
+    /* Enter is the widget's only submission gesture, because the field is the
+     * widget's. The button is not: see onRun above. */
+    input.addEventListener('keydown', (ev) => {
+      if (ev.key !== 'Enter' || typeof o.onRun !== 'function') return;
+      ev.preventDefault();
+      o.onRun(input.value.trim(), timeoutMS());
+    });
 
     const params = el('div', { class: 'cmd-params' });
     const wire = el('code', { class: 'cmd-wire-line' });
@@ -365,6 +539,12 @@
             input.value = renderTemplate(selected, values);
             paint();
           });
+          /* And the field is corrected to what was actually used, on the way
+           * out. Clamping on every keystroke would fight the typist — 1 is on
+           * the way to 10 — but leaving 2000 in a box whose command reads
+           * `-t 1000` shows the operator two different numbers and calls both
+           * of them the request. */
+          field.addEventListener('change', () => { field.value = String(values[p.name]); });
         }
         params.append(el('label', { class: 'cmd-param-wrap' },
           el('span', null, p.name), field));
@@ -425,8 +605,14 @@
         ? row('ok', t('exec.pf.command'), t('exec.pf.commandOk'))
         : row('blocked', t('exec.pf.command'), t('exec.pf.commandEmpty')));
 
+      /* A fenced farm reads differently fleet-wide, and the difference matters
+       * because it decides what the operator will SEE. refuseExecBehindTheFence
+       * guards the single-device route only: a bulk run is never refused up
+       * front, it starts, and every target answers with a transport failure of
+       * its own. Fifty-six red rows and one 501 are the same fence. */
       preflight.append(
-        fence === 'on' ? row('blocked', t('exec.pf.fence'), t('exec.pf.fenceOn'))
+        fence === 'on' ? row('blocked', t('exec.pf.fence'),
+          compact ? t('exec.bulk.fenceOn') : t('exec.pf.fenceOn'))
           : fence === 'off' ? row('ok', t('exec.pf.fence'), t('exec.pf.fenceOff'))
             : row('unknown', t('exec.pf.fence'), t('exec.pf.fenceUnknown')));
 
@@ -434,8 +620,10 @@
        * selector, and claiming anything about "the device" there would be the
        * guessing failure again. */
       if (!device) {
-        preflight.append(row('unknown', t('exec.pf.targets'), t('exec.pf.targetsBulk')));
-        preflight.append(row('unknown', t('exec.pf.answer'), t('exec.pf.answerUnknown')));
+        preflight.append(row('unknown', t('exec.pf.targets'),
+          compact ? t('exec.bulk.targets') : t('exec.pf.targetsBulk')));
+        preflight.append(row('unknown', t('exec.pf.answer'),
+          compact ? t('exec.bulk.answer') : t('exec.pf.answerUnknown')));
         return;
       }
 
@@ -456,60 +644,74 @@
       preflight.append(row('unknown', t('exec.pf.answer'), t('exec.pf.answerUnknown')));
     }
 
-    /* ---- the chooser ---- */
-    function chooserFor(verified) {
-      const wrap = el('div', { class: 'cmd-groups' });
-      for (const g of GROUPS) {
-        const items = CATALOGUE.filter((c) => c.group === g && (!!c.source === verified));
-        if (!items.length) continue;
-        const list = el('div', { class: 'cmd-group-items' });
-        for (const c of items) {
-          list.append(el('button', {
-            class: 'cmd-pick', type: 'button',
-            title: t('exec.cat.' + c.id + '.why'),
-            onclick: () => choose(c),
-          }, t('exec.cat.' + c.id + '.label')));
-        }
-        wrap.append(el('div', { class: 'cmd-group' },
-          el('div', { class: 'cmd-group-name' }, t('exec.group.' + g)), list));
-      }
-      return wrap;
-    }
+    /* ---- the way into the catalogue ----
+     *
+     * One button. The catalogue itself is in the dialog above, which is the
+     * whole point of this unit: what used to sit here was every entry at once,
+     * in front of the field. */
+    const pickBtn = el('button', { class: 'cmd-open-chooser', type: 'button' },
+      t('exec.chooser.open'));
+    pickBtn.addEventListener('click', () => openChooser(CATALOGUE, GROUPS, choose));
 
     const timeout = el('input', {
       class: 'cmd-timeout', type: 'number',
       min: String(TIMEOUT_MIN), max: String(TIMEOUT_MAX), step: '1000',
     });
-    timeout.value = String(TIMEOUT_DEF);
+    timeout.value = String(clampTimeout(Number(o.timeout) || TIMEOUT_DEF));
 
-    const node = el('div', { class: 'cmd-builder' },
-      el('details', { class: 'cmd-cat', open: true },
-        el('summary', null, t('exec.catalogue')),
-        el('div', { class: 'cmd-tier' },
-          el('div', { class: 'cmd-tier-head' },
-            el('span', { 'aria-hidden': 'true' }, '✓'), ' ', t('exec.tier.verified')),
-          el('p', { class: 'cmd-tier-note' }, t('exec.tier.verifiedNote')),
-          chooserFor(true)),
-        el('div', { class: 'cmd-tier' },
-          el('div', { class: 'cmd-tier-head' },
-            el('span', { 'aria-hidden': 'true' }, '?'), ' ', t('exec.tier.unverified')),
-          el('p', { class: 'cmd-tier-note' }, t('exec.tier.unverifiedNote')),
-          chooserFor(false))),
+    /* Declared rather than assigned, so the Enter handler above — which is
+     * wired before this line runs — can close over it. */
+    function timeoutMS() { return clampTimeout(Number(timeout.value) || TIMEOUT_DEF); }
+
+    /* The static chrome is held by reference rather than built inline, because
+     * retranslate() has to reach every one of these. The bulk form is built
+     * once at first paint and never rebuilt — unlike the drawer, which a
+     * language switch reopens from the fleet row — so a heading this function
+     * cannot reach is a heading that stays in the old language for the life of
+     * the tab. */
+    const wireHead = el('div', { class: 'cmd-wire-head' }, t('exec.wire'));
+    const wireNote = el('p', { class: 'cmd-note' }, t('exec.wireNote'));
+    const pfHead = el('div', { class: 'cmd-wire-head' },
+      compact ? t('exec.bulk.preflight') : t('exec.preflight'));
+    /* The one sentence that says what compact mode is FOR: in the drawer a
+     * wrong command reaches one handset; here it reaches every device the
+     * selector matched. */
+    const bulkNote = compact ? el('p', { class: 'cmd-note' }, t('exec.bulk.note')) : null;
+    const timeoutLabel = el('span', null, t('exec.timeout', { max: TIMEOUT_MAX / 1000 }));
+
+    const node = el('div', { class: 'cmd-builder' + (compact ? ' cmd-compact' : '') },
+      el('div', { class: 'cmd-choose-row' }, pickBtn),
       params,
       el('div', { class: 'cmd-row' }, input),
       chosen,
-      el('div', { class: 'cmd-wire' },
-        el('div', { class: 'cmd-wire-head' }, t('exec.wire')),
-        wire,
-        el('p', { class: 'cmd-note' }, t('exec.wireNote'))),
-      el('div', { class: 'cmd-preflight-wrap' },
-        el('div', { class: 'cmd-wire-head' }, t('exec.preflight')),
-        preflight),
-      el('label', { class: 'cmd-timeout-wrap' },
-        el('span', null, t('exec.timeout', { max: TIMEOUT_MAX / 1000 })), timeout));
+      el('div', { class: 'cmd-wire' }, wireHead, wire, wireNote),
+      el('div', { class: 'cmd-preflight-wrap' }, pfHead, preflight, bulkNote),
+      el('label', { class: 'cmd-timeout-wrap' }, timeoutLabel, timeout));
+
+    function retranslate() {
+      pickBtn.textContent = t('exec.chooser.open');
+      input.setAttribute('aria-label', t('exec.commandLabel'));
+      wireHead.textContent = t('exec.wire');
+      wireNote.textContent = t('exec.wireNote');
+      pfHead.textContent = compact ? t('exec.bulk.preflight') : t('exec.preflight');
+      if (bulkNote) bulkNote.textContent = t('exec.bulk.note');
+      timeoutLabel.textContent = t('exec.timeout', { max: TIMEOUT_MAX / 1000 });
+      renderParams();
+      paint();
+    }
 
     renderParams();
     paint();
+
+    /* Only the compact instance listens for itself. The drawer builds a fresh
+     * builder on every open and execPanel already drives its retranslate, so a
+     * listener here would accumulate one per open for no gain. */
+    if (compact) {
+      window.addEventListener('languagechange', () => {
+        if (!node.isConnected) return;
+        try { retranslate(); } catch (_) { /* a stale widget must not strand the switch */ }
+      });
+    }
 
     /* The capability read is lazy and fire-and-forget: the panel renders
      * immediately with the fence row unknown, and corrects itself when the
@@ -520,11 +722,11 @@
     return {
       node,
       command: () => input.value.trim(),
-      timeoutMS: () => Math.min(Math.max(Number(timeout.value) || TIMEOUT_DEF, TIMEOUT_MIN), TIMEOUT_MAX),
+      timeoutMS,
       input,
       refreshFence: () => fenceState().then((s) => { fence = s; renderPreflight(); }),
       latchFence: () => { latchFence(); fence = 'on'; renderPreflight(); },
-      retranslate: () => { renderParams(); paint(); },
+      retranslate,
     };
   }
 
@@ -534,7 +736,9 @@
    * drawer: the builder above, a Run button, the force+reason step, and a
    * result panel that tells the truth about what came back. */
   function execPanel(d) {
-    const builder = commandBuilder({ device: d });
+    /* onRun is Enter in the command field. run() is a hoisted declaration
+     * below, so the closure is valid here. */
+    const builder = commandBuilder({ device: d, onRun: () => run() });
 
     const out = el('pre', { class: 'out', hidden: true });
     const verdict = el('div', { class: 'cmd-verdict', hidden: true });
@@ -740,9 +944,6 @@
     }
 
     runBtn.addEventListener('click', run);
-    builder.input.addEventListener('keydown', (ev) => {
-      if (ev.key === 'Enter') { ev.preventDefault(); run(); }
-    });
 
     /* The drawer is not re-rendered on a language switch — render() dispatches
      * on state.view and never touches it — so the panel re-translates its own
@@ -769,6 +970,9 @@
   window.execPanel = execPanel;
 
   window.commandBuilder = commandBuilder;
+  /* The seam a host that is not this file uses to reach the catalogue: one
+   * call, a callback, and no knowledge of how the dialog is built. */
+  window.openCommandChooser = (onPick) => openChooser(CATALOGUE, GROUPS, onPick);
   window.execCatalogue = CATALOGUE;      /* for tests and for the console */
   window.execProbeProps = PROBE_PROPS;
 })();

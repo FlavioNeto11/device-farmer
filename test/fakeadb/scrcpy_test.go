@@ -197,8 +197,20 @@ func TestScrcpySocketNobodyPublishedIsRefused(t *testing.T) {
 
 	const wrong = "localabstract:scrcpy_deadbeef"
 	w := streamWire(t, s, devpath, wrong)
-	if _, err := io.ReadAll(w.br); err == nil {
-		t.Fatalf("a connection to a session id nobody published ended cleanly")
+	// Assert on the BYTES, not on how the socket died.
+	//
+	// This read "err == nil" until the fake stopped resetting a connection it
+	// had written nothing on. A reset discards what the peer has not yet read,
+	// and the four bytes at the front of that queue are the protocol's own
+	// OKAY — so a refusal that reset immediately raced its own acceptance and
+	// the suite failed about one run in twenty on whichever the kernel chose.
+	//
+	// What the test actually cares about is that a client asking for a socket
+	// nobody published gets nothing usable and can find out why. Whether the
+	// nothing arrives as a reset or as a clean EOF is a property of TCP timing,
+	// and asserting on it was asserting on the weather.
+	if got, _ := io.ReadAll(w.br); len(got) != 0 {
+		t.Fatalf("a connection to a session id nobody published was served %d bytes", len(got))
 	}
 	reply := lastReply(t, s, wrong)
 	if !strings.HasPrefix(reply, "ERROR: ") || !strings.Contains(reply, "scrcpy_"+testSCID) {
@@ -233,8 +245,12 @@ func TestScrcpyThirdSocketIsRefused(t *testing.T) {
 	}
 
 	third := streamWire(t, s, devpath, service)
-	if _, err := io.ReadAll(third.br); err == nil {
-		t.Fatalf("a third connection to %q was served", service)
+	// The bytes, not the manner of death — see the note in
+	// TestScrcpySocketNobodyPublishedIsRefused.
+	if got, _ := io.ReadAll(third.br); len(got) != 0 {
+		t.Fatalf("a third socket was served %d bytes; scrcpy publishes two and closes the "+
+			"listener behind them, so a third connection is a client that reconnected without "+
+			"respawning and answering it would hide that", len(got))
 	}
 	// No polling: the refusal is filed before the socket is cut, so a client
 	// that has seen the end has necessarily seen the record land.

@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"io"
+	"runtime"
 	"testing"
 )
 
@@ -293,7 +294,8 @@ func TestAnOversizedLengthIsRefusedBeforeItAllocates(t *testing.T) {
 				t.Fatalf("NewReader: %v", err)
 			}
 
-			_, err = r.Next()
+			allocated := measureAlloc(func() { _, err = r.Next() })
+
 			var tooLarge *PacketTooLargeError
 			if !errors.As(err, &tooLarge) {
 				t.Fatalf("Next() = %v, want *PacketTooLargeError", err)
@@ -306,11 +308,54 @@ func TestAnOversizedLengthIsRefusedBeforeItAllocates(t *testing.T) {
 			}
 			if endless.served != 0 {
 				t.Errorf("the reader was asked for %d bytes of payload after a length of %d was "+
-					"refused; the cap must be checked before anything is read or allocated",
+					"refused; the cap must be checked before anything is READ",
 					endless.served, c.length)
+			}
+
+			// And the other half, which the byte counter above cannot see.
+			//
+			// This test was named for allocation and asserted only on reads. An
+			// adversarial pass moved `payload := make([]byte, n)` ABOVE the cap
+			// check — leaving the check before the READ, so the counter stayed
+			// zero — and every case here still passed while Next() allocated
+			// four gigabytes. The error it returned was byte-identical, and its
+			// text says "nothing was allocated".
+			//
+			// TotalAlloc is cumulative and monotonic, so the difference across
+			// one call is what that call asked the allocator for, whether or not
+			// it was collected. The threshold is generous by four orders of
+			// magnitude against the smallest length under test: what is being
+			// distinguished here is kilobytes from megabytes-to-gigabytes, and
+			// no amount of ordinary test noise crosses that.
+			if allocated > allocCeiling {
+				t.Errorf("Next() allocated %d bytes while refusing a %d-byte length; the cap must "+
+					"be checked before make(). This is the process that answers "+
+					"POST /api/v1/leases/{id}/renew, and the length came off a socket a phone "+
+					"is on the other end of.", allocated, c.length)
 			}
 		})
 	}
+}
+
+// allocCeiling is what one refusal may cost. The smallest length these cases
+// declare is MaxPacket+1 — four megabytes — so a ceiling three orders of
+// magnitude below that separates "refused it" from "allocated it" with room for
+// the test's own bookkeeping.
+const allocCeiling = 64 << 10
+
+// measureAlloc reports how many bytes fn asked the allocator for.
+//
+// runtime.ReadMemStats stops the world, which is why this is not used casually;
+// it is used here because the property it measures is the one the package
+// exists for and no cheaper instrument can see it. The GC before the first
+// reading is what keeps a previous subtest's garbage out of this one's number.
+func measureAlloc(fn func()) uint64 {
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	fn()
+	runtime.ReadMemStats(&after)
+	return after.TotalAlloc - before.TotalAlloc
 }
 
 // TestTheLargestAdmissiblePacketIsStillAdmitted.

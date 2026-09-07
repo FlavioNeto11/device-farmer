@@ -104,9 +104,42 @@ type StreamSession struct {
 // handler's, and calling it twice does nothing the second time.
 func (s *StreamSession) Sever() { s.cut("RESET") }
 
-// cut severs once, recording reply against the request first. An empty reply
-// leaves the record alone, which is how the handler-error path severs without
-// overwriting the message it has already filed.
+// fail ends the connection after a handler returned an error, recording the
+// message against the request first. An empty reply leaves the record alone.
+//
+// IT CLOSES POLITELY, AND DOES NOT RESET, and the difference is the whole
+// reason this is separate from [StreamSession.Sever].
+//
+// A TCP reset discards what the sender has written and the peer has not yet
+// read. That queue holds the protocol's own OKAY — written by deviceStream
+// immediately before the handler ran — and anything the handler wrote before it
+// failed. Resetting here raced all of it: about one run in twenty the client
+// could not read even the four status bytes, and the test that failed was
+// whichever the kernel chose. There is no way to ask TCP to deliver these bytes
+// and THEN reset; that is not a promise the protocol makes.
+//
+// So the promise this fake makes instead is the one it can keep: what a handler
+// wrote, a client receives. A handler that fails mid-stream produces a
+// TRUNCATED stream, and truncation is detectable by the thing being truncated —
+// a video packet cut short is short, and internal/scrcpy says so. Whether the
+// end arrives as a reset or as an EOF is TCP timing, and a test asserting on it
+// is asserting on the weather.
+//
+// [StreamSession.Sever] still resets, because the STF #663 shape is a real
+// thing a fake must be able to produce. The difference is that Sever is called
+// BY a handler that knows what it has done, and the caller owns the ordering:
+// see TestASeveredStreamIsATransportErrorNotARefusal, which writes a header,
+// waits for the client to read it, and only then severs.
+func (s *StreamSession) fail(reply string) {
+	s.severed.Do(func() {
+		if s.rec != nil && reply != "" {
+			s.srv.note(s.rec, func(r *Request) { r.Reply = reply })
+		}
+		_ = s.conn.Close()
+	})
+}
+
+// cut resets the connection once, recording reply against the request first.
 func (s *StreamSession) cut(reply string) {
 	s.severed.Do(func() {
 		if s.rec != nil && reply != "" {
@@ -242,14 +275,14 @@ func (s *Server) runStream(c net.Conn, br *bufio.Reader, rec *Request, devpath, 
 
 	if err := h(sess); err != nil {
 		// RECORDED BEFORE THE SOCKET DIES, and the order is not cosmetic.
-		// The client learns the stream ended the instant the reset lands, so
-		// a test that reads the request log the moment its read fails would
-		// race a note filed afterwards — and would race it in the direction
-		// that hides the message, leaving somebody to debug a bare "RESET"
-		// for a fixture that said exactly what was wrong. The empty reply on
-		// the cut keeps this line from being overwritten by the sever's own.
+		// The note is filed BEFORE the connection ends, so a test that reads
+		// the request log the moment its own read finishes cannot race a
+		// message filed afterwards — and would have raced it in the direction
+		// that hides it, leaving somebody to debug a fixture that had said
+		// exactly what was wrong. The empty reply on fail keeps this line from
+		// being overwritten.
 		s.note(rec, func(r *Request) { r.Reply = "ERROR: " + err.Error() })
-		sess.cut("")
+		sess.fail("")
 	}
 }
 

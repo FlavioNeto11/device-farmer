@@ -177,6 +177,8 @@ ci-helm:
 ## demo: 56 simulated devices and the real control plane, no hardware
 demo: build migrate
 	FARM_API_ADDR=$${FARM_API_ADDR:-127.0.0.1:8420} \
+		FARM_SCREEN_SERVER_SHA=$${FARM_SCREEN_SERVER_SHA:-c950e8bcb79fb19a05678ba321f8694700db6e6b6b67fbddfd9f8a90d2deca43} \
+		FARM_SCREEN_SERVER_VERSION=$${FARM_SCREEN_SERVER_VERSION:-3.1} \
 		$(BIN)/farmd$(EXE) demo -hosts 2 -devices 56
 
 ## all: every control-plane role in one process, against real hosts

@@ -851,6 +851,22 @@ func runDemo(ctx context.Context, cfg *config.Config, log *slog.Logger, pool *pg
   Dashboard: http://%s/
 `, hosts, devices, cfg.APIAddr)
 
+	// The screen server the interactive-control path pushes to a device. It is a
+	// placeholder, not a jar — see internal/demo/screen.go — and it is seeded here
+	// rather than in demo.Run because the artifact store is a deployment choice
+	// (a blob directory) that internal/demo has no business making.
+	//
+	// A failure here is logged and not fatal: the screen routes then answer with
+	// a refusal that names what is missing, which is a better outcome than a
+	// simulated farm that will not start over a feature nobody has asked for.
+	if store, _, aerr := openArtifacts(cfg, pool); aerr != nil {
+		log.Warn("no artifact store for the demo screen server", "err", aerr,
+			"consequence", "a live screen answers 503 naming FARM_ARTIFACT_DIR")
+	} else if serr := demo.SeedScreenServer(ctx, store); serr != nil {
+		log.Warn("the demo screen server artifact was not seeded", "err", serr,
+			"consequence", "a live screen answers 502; the pinned digest names no blob")
+	}
+
 	// The simulation owns the hardware and the seed; the control plane runs
 	// beside it against the same database.
 	fns := map[string]func(context.Context) error{

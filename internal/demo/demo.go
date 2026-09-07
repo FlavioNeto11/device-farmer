@@ -512,6 +512,10 @@ func (r *Runner) startHosts(ctx context.Context) error {
 		// After the devices, because the battery answers are per position and
 		// the script list is consulted newest-first — see installShellScripts.
 		installShellScripts(srv, devs)
+		// A live screen on every device: a recorded clip, framed the way a
+		// handset frames one. See internal/demo/screen.go for what that
+		// proves and what it does not.
+		installScreenFixtures(srv, devs, r.log)
 		r.servers[hostID] = srv
 
 		// host_epoch increments on every adb server restart: a transport_id is

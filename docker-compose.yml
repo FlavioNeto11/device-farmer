@@ -156,6 +156,23 @@ services:
       # internal/api/auth_test.go TestAuthenticatorForAnonymousOptInAllowsOpen
       # pins this exact path and names this service.
       FARM_API_ALLOW_ANONYMOUS: "true"
+
+      # The interactive-control path: a live screen in the device drawer.
+      #
+      # THE DIGEST IS A PLACEHOLDER, NOT A SCRCPY SERVER. The demo seeds an
+      # artifact whose bytes say so and whose fake ADB replays a recorded clip;
+      # nothing on a device ever reads them. It is pinned rather than looked up
+      # by name because that is how a real farm has to do it — the artifact
+      # store is writable by operators, and resolving a server jar by name would
+      # turn "replace an artifact" into "run my code on every phone in the rack".
+      #
+      # The value is internal/demo.ScreenServerSHA, and
+      # TestTheDemoJarDigestIsWhatTheDeploymentsPin fails if this line and that
+      # constant part company. Without both variables the drawer's Screen panel
+      # answers 503 and names them, which is the correct behaviour for a farm
+      # that has not chosen a server — it is just not much of a demo.
+      FARM_SCREEN_SERVER_SHA: "c950e8bcb79fb19a05678ba321f8694700db6e6b6b67fbddfd9f8a90d2deca43"
+      FARM_SCREEN_SERVER_VERSION: "3.1"
     command: ["demo", "-hosts", "2", "-devices", "56"]
     ports:
       - "${FARM_PORT:-8420}:8080"

@@ -189,21 +189,33 @@
    density and corrects itself. Every value here is the number that was in
    style.css before the comfortable defaults above replaced it. */
 [data-density="compact"] {
+  /* ORDER OF RESOLUTION, and the bug it already caused once. A custom property
+     resolves where it is USED, not where it is written, so --fs-body: var(--fs-sm)
+     in this block resolved against the --fs-sm redefined three lines below it —
+     12px, when the density this block claims to restore had a 13px body. The
+     size the body wants is the one this scale calls --fs-md. Naming the role
+     rather than the number is what keeps the two scales honest, but only if the
+     role names the right step. */
+  --fs-xs: 11px;
+  --fs-sm: 12px;
+  --fs-md: 13px;
+  --fs-lg: 14px;
+  --fs-xl: 17px;
+
+  --fs-body: var(--fs-md);   /* 13px — what body carried before the redesign */
+  --lh:      1.45;           /* and the leading it carried with it */
+
   --pad-cell:    4px 8px;
   --pad-row:     var(--s-2);
   --pad-tile:    var(--s-2);
   --pad-toolbar: var(--s-2);
   --pad-page:    var(--s-3);
   --gap-section: var(--s-3);
+  /* 6px, not --s-2. The device grid shipped with a 6px gutter and this block
+     restores what shipped; rounding it to the 4/8 grid here would be a redesign
+     wearing the word "compact". The grid claim above governs NEW values. */
   --gap-grid:    6px;
-  --fs-body:     var(--fs-sm);
   --tile-min:    186px;
-
-  --fs-xs: 11px;
-  --fs-sm: 12px;
-  --fs-md: 13px;
-  --fs-lg: 14px;
-  --fs-xl: 17px;
 }
 
 /* ------------------------------------------------- the compatibility map - */

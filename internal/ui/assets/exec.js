@@ -19,6 +19,22 @@
  * and it is the honest cost of the split — the alternative was duplicating
  * errText's error-code translation and impactList's markup.
  *
+ * # The order on screen, which is a decision and not an accident
+ *
+ * The panel reads: the command, what goes on the wire, Run — and everything
+ * else after Run. The first version of this widget put the catalogue first, all
+ * twenty-four buttons under ten headings, and the operator met two and a half
+ * screens of reference material before reaching the field they came to type in
+ * and the button they came to press. Reference material is what you read when
+ * the thing you did failed; it is not what you read on the way in. So the
+ * catalogue now sits behind ONE button (openChooser below is the whole seam)
+ * and the pre-flight sits below the Run row in a summary that says whether
+ * anything blocks — collapsed when nothing does, opened by itself when
+ * something does, including when the fence answer lands a second late.
+ *
+ * Nothing was deleted to achieve that. Both of the things that moved are the
+ * fix for a real bug, and paragraph 1 and paragraph 2 below are why.
+ *
  * # The three facts this whole widget exists to make visible
  *
  * 1. THE COMMAND GOES TO THE DEVICE VERBATIM. adbwire.ShellService builds
@@ -209,6 +225,24 @@
   const TIMEOUT_MAX = 300000;
   const TIMEOUT_DEF = 30000;
 
+  /* The four waits worth offering, in the unit an operator thinks in.
+   *
+   * The control this replaces was a number box holding 30000, which is the
+   * unit internal/api's JSON field is written in and nobody else's: it asks a
+   * reader to divide by a thousand before they can agree with it. The list
+   * starts at ten seconds and not at TIMEOUT_MIN because the floor exists to
+   * stop a one-millisecond request coming back as a 502 that reads like a
+   * broken handset — it is a guard, not an offer. It ends at TIMEOUT_MAX
+   * itself, because the server clamps anything above maxExecTimeout SILENTLY,
+   * so a longer entry would be a wait this page promises and the server never
+   * honours. Custom keeps the raw milliseconds for the operator who wants
+   * 7500, clamped by exactly the same expression.
+   *
+   * The four are written out at their call site rather than looped over a
+   * table, so that every one of their labels is a LITERAL t() key —
+   * TestEveryKeyTheAppAsksForExists can only see literals, and a computed key
+   * here would be four strings no build checks. */
+
   const WIRE_PREFIX = 'shell,v2,raw:';
 
   /* --------------------------------------------------------------- helpers */
@@ -275,7 +309,14 @@
 
   /* ------------------------------------------------------------- the widget */
 
-  /* commandBuilder(opts) returns { node, command(), setBusy(b), onCommand }.
+  /* commandBuilder(opts) returns { node, runSlot, consentSlot, command(),
+   * timeoutMS(), input, refreshFence(), latchFence(), retranslate() }.
+   *
+   * node is the three steps in the order they are done, with two holes in it:
+   * consentSlot, between the wire line and the Run row, for a thing that has
+   * to be agreed to first; and runSlot, inside the Run row, for the host's own
+   * Run control. A host that fills neither gets a builder with no submit,
+   * which is exactly what the bulk form wants.
    *
    * opts:
    *   device   the normalised fleet row, or null for a fleet-wide form (bulk)
@@ -301,7 +342,7 @@
     const params = el('div', { class: 'cmd-params' });
     const wire = el('code', { class: 'cmd-wire-line' });
     const chosen = el('div', { class: 'cmd-chosen' });
-    const preflight = el('ul', { class: 'cmd-preflight' });
+    const pfList = el('ul', { class: 'cmd-pf-list' });
 
     const paint = () => {
       wire.textContent = WIRE_PREFIX + input.value;
@@ -325,7 +366,12 @@
       values = defaults(c);
       input.value = renderTemplate(c, values);
       renderParams();
+      closeChooser();
       paint();
+      /* Back to the field, because the command is now the thing to read and
+       * possibly edit, and because a chooser that leaves focus behind on a
+       * button it just hid strands a keyboard. */
+      input.focus();
     }
 
     /* ---- parameters: choice and int, and nothing else ----
@@ -409,54 +455,123 @@
      * handset's shell. Four boxes of which three are guesses is exactly what
      * app.js's header forbids: a dashboard that guesses is worse than no
      * dashboard, because an operator acts on it. */
-    function row(state, label, evidence) {
+    /* key names the row, because the summary below has to be able to tell one
+     * of them apart from the rest. */
+    function row(state, key, label, evidence) {
       const glyph = state === 'blocked' ? '✕' : state === 'unknown' ? '?' : '✓';
-      return el('li', { class: 'cmd-pf cmd-pf-' + state },
+      return el('li', { class: 'cmd-pf cmd-pf-' + state, dataset: { state: state, pf: key } },
         el('span', { class: 'cmd-pf-glyph', 'aria-hidden': 'true' }, glyph),
         el('span', { class: 'cmd-pf-label' }, label),
         el('span', { class: 'cmd-pf-evidence' }, evidence));
     }
 
     let fence = 'unknown';
-    function renderPreflight() {
-      preflight.replaceChildren();
+    let pfWasBlocking = false;
+    function preflightRows() {
+      const rows = [];
 
-      preflight.append(input.value.trim()
-        ? row('ok', t('exec.pf.command'), t('exec.pf.commandOk'))
-        : row('blocked', t('exec.pf.command'), t('exec.pf.commandEmpty')));
+      rows.push(input.value.trim()
+        ? row('ok', 'command', t('exec.pf.command'), t('exec.pf.commandOk'))
+        : row('blocked', 'command', t('exec.pf.command'), t('exec.pf.commandEmpty')));
 
-      preflight.append(
-        fence === 'on' ? row('blocked', t('exec.pf.fence'), t('exec.pf.fenceOn'))
-          : fence === 'off' ? row('ok', t('exec.pf.fence'), t('exec.pf.fenceOff'))
-            : row('unknown', t('exec.pf.fence'), t('exec.pf.fenceUnknown')));
+      rows.push(
+        fence === 'on' ? row('blocked', 'fence', t('exec.pf.fence'), t('exec.pf.fenceOn'))
+          : fence === 'off' ? row('ok', 'fence', t('exec.pf.fence'), t('exec.pf.fenceOff'))
+            : row('unknown', 'fence', t('exec.pf.fence'), t('exec.pf.fenceUnknown')));
 
       /* Device rows only when there is a device. The bulk form addresses a
        * selector, and claiming anything about "the device" there would be the
        * guessing failure again. */
       if (!device) {
-        preflight.append(row('unknown', t('exec.pf.targets'), t('exec.pf.targetsBulk')));
-        preflight.append(row('unknown', t('exec.pf.answer'), t('exec.pf.answerUnknown')));
-        return;
+        rows.push(row('unknown', 'targets', t('exec.pf.targets'), t('exec.pf.targetsBulk')));
+        rows.push(row('unknown', 'answer', t('exec.pf.answer'), t('exec.pf.answerUnknown')));
+        return rows;
       }
 
-      preflight.append(device.devPath
-        ? row('ok', t('exec.pf.slot'), device.devPath)
-        : row('blocked', t('exec.pf.slot'), t('exec.pf.slotNone')));
+      rows.push(device.devPath
+        ? row('ok', 'slot', t('exec.pf.slot'), device.devPath)
+        : row('blocked', 'slot', t('exec.pf.slot'), t('exec.pf.slotNone')));
 
-      preflight.append(device.adbEndpoint
-        ? row('ok', t('exec.pf.endpoint'), device.adbEndpoint)
-        : row('blocked', t('exec.pf.endpoint'), t('exec.pf.endpointNone')));
+      rows.push(device.adbEndpoint
+        ? row('ok', 'endpoint', t('exec.pf.endpoint'), device.adbEndpoint)
+        : row('blocked', 'endpoint', t('exec.pf.endpoint'), t('exec.pf.endpointNone')));
 
       const held = device.leaseState && device.leaseState !== 'released';
-      preflight.append(held
-        ? row('blocked', t('exec.pf.lease'),
+      rows.push(held
+        ? row('blocked', 'lease', t('exec.pf.lease'),
           t('exec.pf.leaseHeld', { holder: device.holder || '—', job: shortId(device.jobID) }))
-        : row('ok', t('exec.pf.lease'), t('exec.pf.leaseFree')));
+        : row('ok', 'lease', t('exec.pf.lease'), t('exec.pf.leaseFree')));
 
-      preflight.append(row('unknown', t('exec.pf.answer'), t('exec.pf.answerUnknown')));
+      rows.push(row('unknown', 'answer', t('exec.pf.answer'), t('exec.pf.answerUnknown')));
+      return rows;
     }
 
-    /* ---- the chooser ---- */
+    /* The list is behind a summary now, so the summary has to carry the one
+     * fact the list was there to deliver: does anything stop this.
+     *
+     * It counts three states and not two. "Passes" and "blocks" are verdicts;
+     * "cannot be known from here" is the third answer this pre-flight is built
+     * to be able to give — the capability report answers 503 by design when a
+     * probe fails, and the device's own answer is unknowable until it is asked.
+     * A summary that folded the unknowns into the passes would be the guess
+     * app.js's header forbids, made smaller and therefore easier to believe. */
+    function renderPreflight() {
+      const rows = preflightRows();
+      pfList.replaceChildren(...rows);
+
+      let blocked = 0;
+      let unknown = 0;
+      for (const r of rows) {
+        if (r.dataset.state === 'blocked') blocked++;
+        else if (r.dataset.state === 'unknown') unknown++;
+      }
+
+      const pass = rows.length - blocked - unknown;
+      pfGlyph.textContent = blocked ? '✕' : '✓';
+      pfSummary.className = 'cmd-pf-summary' + (blocked ? ' cmd-pf-summary-blocked' : '');
+      pfWord.textContent = blocked
+        ? (blocked === 1 ? t('exec.pf.summaryBlockedOne')
+          : t('exec.pf.summaryBlocked', { n: String(blocked) }))
+        : (pass === 1 ? t('exec.pf.summaryOkOne')
+          : t('exec.pf.summaryOk', { n: String(pass) }));
+      pfRest.textContent = unknown ? t('exec.pf.summaryUnknown', { n: String(unknown) }) : '';
+
+      /* Opened by itself when something starts blocking, and never closed by
+       * itself.
+       *
+       * The list is the answer to "why did that not run", so it must not be
+       * behind a click at the moment it becomes true — and it becomes true
+       * LATE in the two cases that matter: the capability probe resolves a
+       * second after the panel drew, and a 409 latches the fence only once the
+       * server has actually refused.
+       *
+       * Two things it deliberately does NOT do. It does not close again when
+       * the block clears, which would fight an operator who opened it on
+       * purpose. And it does not open for the empty-command row: that row
+       * blocks on every keystroke that empties the field — an ordinary way to
+       * start retyping — and expanding six rows under the button mid-keystroke
+       * to say "you have not typed one" tells the operator something the empty
+       * field two inches above already says. Every other row reports a
+       * condition they cannot see from here, which is the whole reason the
+       * list exists. */
+      const unseen = rows.filter((r) => r.dataset.state === 'blocked' && r.dataset.pf !== 'command');
+      if (unseen.length && !pfWasBlocking) preflightBox.open = true;
+      pfWasBlocking = unseen.length > 0;
+    }
+
+    /* ---- the catalogue, behind one button ----
+     *
+     * THE SEAM. openChooser is the only thing the rest of this file knows
+     * about how a command gets picked. Unit 9 replaces its body with a dialog
+     * and a two-tier segmented control; nothing outside these four short
+     * functions has to change, because everything else here talks to choose().
+     *
+     * Until then it reveals the same list, in the same two tiers, with the
+     * same twenty-four buttons — just no longer between the operator and the
+     * field they came to type in. The tiers stay visibly apart wherever this
+     * ends up living: "this project sends this to real handsets every minute"
+     * and "this generally exists on Android" are different kinds of claim, and
+     * a list that ran them together would make them look like one kind. */
     function chooserFor(verified) {
       const wrap = el('div', { class: 'cmd-groups' });
       for (const g of GROUPS) {
@@ -476,15 +591,11 @@
       return wrap;
     }
 
-    const timeout = el('input', {
-      class: 'cmd-timeout', type: 'number',
-      min: String(TIMEOUT_MIN), max: String(TIMEOUT_MAX), step: '1000',
-    });
-    timeout.value = String(TIMEOUT_DEF);
+    const catBox = el('div', { class: 'cmd-cat', hidden: true, role: 'group' });
 
-    const node = el('div', { class: 'cmd-builder' },
-      el('details', { class: 'cmd-cat', open: true },
-        el('summary', null, t('exec.catalogue')),
+    function renderChooser() {
+      catBox.setAttribute('aria-label', t('exec.catalogue'));
+      catBox.replaceChildren(
         el('div', { class: 'cmd-tier' },
           el('div', { class: 'cmd-tier-head' },
             el('span', { 'aria-hidden': 'true' }, '✓'), ' ', t('exec.tier.verified')),
@@ -494,20 +605,138 @@
           el('div', { class: 'cmd-tier-head' },
             el('span', { 'aria-hidden': 'true' }, '?'), ' ', t('exec.tier.unverified')),
           el('p', { class: 'cmd-tier-note' }, t('exec.tier.unverifiedNote')),
-          chooserFor(false))),
-      params,
-      el('div', { class: 'cmd-row' }, input),
-      chosen,
-      el('div', { class: 'cmd-wire' },
-        el('div', { class: 'cmd-wire-head' }, t('exec.wire')),
-        wire,
-        el('p', { class: 'cmd-note' }, t('exec.wireNote'))),
-      el('div', { class: 'cmd-preflight-wrap' },
-        el('div', { class: 'cmd-wire-head' }, t('exec.preflight')),
-        preflight),
-      el('label', { class: 'cmd-timeout-wrap' },
-        el('span', null, t('exec.timeout', { max: TIMEOUT_MAX / 1000 })), timeout));
+          chooserFor(false)));
+    }
 
+    function openChooser() {
+      catBox.hidden = false;
+      pickBtn.setAttribute('aria-expanded', 'true');
+      const first = catBox.querySelector('.cmd-pick');
+      if (first) first.focus();
+    }
+
+    function closeChooser() {
+      catBox.hidden = true;
+      pickBtn.setAttribute('aria-expanded', 'false');
+    }
+
+    const pickBtn = el('button', {
+      class: 'cmd-pickbtn', type: 'button', 'aria-expanded': 'false',
+      onclick: () => { if (catBox.hidden) openChooser(); else closeChooser(); },
+    });
+
+    /* ---- step 3: the timeout, in minutes and seconds ---- */
+    const timeout = el('input', {
+      class: 'cmd-timeout', type: 'number',
+      min: String(TIMEOUT_MIN), max: String(TIMEOUT_MAX), step: '1000',
+    });
+    timeout.value = String(TIMEOUT_DEF);
+
+    const timeoutPick = el('select', { class: 'cmd-timeout-pick' });
+    const timeoutHead = el('span');
+    const customHead = el('span');
+    const customWrap = el('label', { class: 'cmd-timeout-custom', hidden: true },
+      customHead, timeout);
+
+    function renderTimeoutChoices() {
+      const keep = timeoutPick.value;
+      timeoutPick.replaceChildren(
+        el('option', { value: '10000' }, t('exec.timeout.s10')),
+        el('option', { value: String(TIMEOUT_DEF) }, t('exec.timeout.s30')),
+        el('option', { value: '60000' }, t('exec.timeout.m1')),
+        el('option', { value: String(TIMEOUT_MAX) }, t('exec.timeout.m5')),
+        el('option', { value: 'custom' }, t('exec.timeout.custom')));
+      timeoutPick.value = keep || String(TIMEOUT_DEF);
+    }
+
+    timeoutPick.addEventListener('change', () => {
+      const custom = timeoutPick.value === 'custom';
+      customWrap.hidden = !custom;
+      if (custom) timeout.focus();
+    });
+
+    /* The clamp is unchanged, expression for expression, and it has to be:
+     * TIMEOUT_MIN is a floor internal/api does not have and TIMEOUT_MAX is the
+     * server's own maxExecTimeout, which it applies silently. Only the reading
+     * of the control moved. */
+    function timeoutMS() {
+      const raw = timeoutPick.value === 'custom' ? Number(timeout.value) : Number(timeoutPick.value);
+      return Math.min(Math.max(raw || TIMEOUT_DEF, TIMEOUT_MIN), TIMEOUT_MAX);
+    }
+
+    /* On the way out of the field, show what will actually be sent. The clamp
+     * is unchanged either way — this only stops the box reading 999999 while
+     * the request carries 300000, which is the panel making a promise the wire
+     * does not keep, in miniature. */
+    timeout.addEventListener('change', () => { timeout.value = String(timeoutMS()); });
+
+    /* ---- the chrome, in one place, because the language can change under it ----
+     *
+     * The drawer is not re-rendered on a language switch, so every label this
+     * widget writes itself is set here and set again from retranslate(). What
+     * is NOT re-rendered is the command, its parameters and any bytes a device
+     * sent: translating those is the one thing this whole file exists to
+     * prevent. */
+    const headCommand = el('span');
+    const headWire = el('span');
+    const headSend = el('span');
+    const wireNote = el('p', { class: 'cmd-note' });
+    const pfNote = el('p', { class: 'cmd-note' });
+    const pfGlyph = el('span', { class: 'cmd-pf-sum-glyph', 'aria-hidden': 'true' }, '✓');
+    const pfWord = el('span', { class: 'cmd-pf-sum-word' });
+    const pfRest = el('span', { class: 'cmd-pf-sum-rest' });
+
+    function renderChrome() {
+      headCommand.textContent = t('exec.step.command');
+      headWire.textContent = t('exec.wire');
+      headSend.textContent = t('exec.step.send');
+      wireNote.textContent = t('exec.wireNote');
+      pfNote.textContent = t('exec.preflight');
+      pickBtn.textContent = t('exec.pick');
+      pickBtn.title = t('exec.pickWhy');
+      timeoutHead.textContent = t('exec.timeout.head');
+      customHead.textContent = t('exec.timeout', { max: TIMEOUT_MAX / 1000 });
+      timeoutPick.title = t('exec.timeout.why');
+      renderTimeoutChoices();
+      renderChooser();
+    }
+
+    /* ---- the three steps, in the order they are done ----
+     *
+     * runSlot and consentSlot are holes the host fills. The builder owns the
+     * ORDER — command, wire, consent, Run, pre-flight — because the order is
+     * the thing that was wrong; the host owns the Run control itself, because
+     * the bulk form submits through its own and there is exactly one panel
+     * here that does not. */
+    const runSlot = el('div', { class: 'cmd-run-slot' });
+    const consentSlot = el('div', { class: 'cmd-consent' });
+    const runRow = el('div', { class: 'cmd-run-row' },
+      runSlot,
+      el('label', { class: 'cmd-timeout-wrap' }, timeoutHead, timeoutPick));
+
+    const pfSummary = el('summary', { class: 'cmd-pf-summary' },
+      pfGlyph, ' ', pfWord, ' ', pfRest);
+    const preflightBox = el('details', { class: 'cmd-preflight' },
+      pfSummary, pfNote, pfList);
+
+    const node = el('div', { class: 'cmd-builder' },
+      el('div', { class: 'cmd-step' },
+        el('div', { class: 'cmd-step-head' },
+          el('span', { class: 'cmd-step-n' }, '1'), headCommand),
+        el('div', { class: 'cmd-row' }, input, pickBtn),
+        catBox, params, chosen),
+      el('div', { class: 'cmd-step' },
+        el('div', { class: 'cmd-step-head' },
+          el('span', { class: 'cmd-step-n' }, '2'), headWire),
+        wire, wireNote),
+      consentSlot,
+      el('div', { class: 'cmd-step' },
+        el('div', { class: 'cmd-step-head' },
+          el('span', { class: 'cmd-step-n' }, '3'), headSend),
+        runRow, customWrap),
+      preflightBox);
+
+    renderChrome();
     renderParams();
     paint();
 
@@ -519,12 +748,14 @@
 
     return {
       node,
+      runSlot,      /* the host's Run control goes here — see execPanel */
+      consentSlot,  /* and anything that must be agreed to before pressing it */
       command: () => input.value.trim(),
-      timeoutMS: () => Math.min(Math.max(Number(timeout.value) || TIMEOUT_DEF, TIMEOUT_MIN), TIMEOUT_MAX),
+      timeoutMS,
       input,
       refreshFence: () => fenceState().then((s) => { fence = s; renderPreflight(); }),
       latchFence: () => { latchFence(); fence = 'on'; renderPreflight(); },
-      retranslate: () => { renderParams(); paint(); },
+      retranslate: () => { renderChrome(); renderParams(); paint(); },
     };
   }
 
@@ -536,6 +767,14 @@
   function execPanel(d) {
     const builder = commandBuilder({ device: d });
 
+    /* The result area exists before there is a result.
+     *
+     * Not politeness: a panel whose bottom half appears only after the first
+     * run changes shape under the operator at the exact moment they are
+     * reading what came back, and until then it hides the fact that there IS a
+     * place output lands. One line, always present, replaced by the first
+     * thing the handset says. */
+    const idle = el('p', { class: 'cmd-idle' }, t('exec.idle'));
     const out = el('pre', { class: 'out', hidden: true });
     const verdict = el('div', { class: 'cmd-verdict', hidden: true });
     const err = el('div', { class: 'form-error', hidden: true });
@@ -660,7 +899,10 @@
           : null);
     }
 
-    const runBtn = el('button', { class: 'primary', type: 'button' }, t('exec.run'));
+    /* The largest control in the panel, and full width, because it is the
+     * point of the panel. It used to be the smallest thing on screen, below
+     * two and a half screens of reference material. */
+    const runBtn = el('button', { class: 'primary cmd-run', type: 'button' }, t('exec.run'));
 
     async function run() {
       const cmd = builder.command();
@@ -668,6 +910,7 @@
       if (forcing && !reason.value.trim()) { reason.focus(); return; }
 
       runBtn.disabled = true;
+      idle.hidden = true;
       verdict.hidden = true;
       err.hidden = true;
       out.hidden = false;
@@ -726,13 +969,19 @@
         builder.retranslate();
         runBtn.textContent = t('exec.run');
         reason.placeholder = t('exec.reasonPlaceholder');
+        idle.textContent = t('exec.idle');
       } catch (_) { /* a stale panel must not strand the switch */ }
     });
 
+    /* The panel is the builder's three steps with this host's two pieces
+     * dropped into their slots, and the result underneath. The consent step
+     * goes ABOVE the Run row on purpose: a reason field revealed below the
+     * button that needs it is a field an operator finds by being refused. */
+    builder.consentSlot.append(forceWrap);
+    builder.runSlot.append(runBtn);
+
     return el('div', { class: 'cmd-panel' },
-      builder.node, forceWrap,
-      el('div', { class: 'cmd-actions' }, runBtn),
-      err, verdict, out);
+      builder.node, idle, err, verdict, out);
   }
 
   window.execPanel = execPanel;

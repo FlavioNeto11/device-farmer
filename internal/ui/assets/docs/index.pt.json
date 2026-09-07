@@ -1,0 +1,79 @@
+{
+  "areas": [
+    {
+      "area": "lease",
+      "label": "Leases",
+      "blurb": "O invariante que este sistema existe para proteger",
+      "title": "Leases e a falha que este sistema existe para evitar",
+      "summary": "Uma lease termina quando o job diz que terminou, quando expira um prazo que o usuário anotou, ou quando um humano a retoma. Nada mais — nem um erro de socket, nem o timeout de uma sonda, nem um dispositivo ficando offline, nem um pod morrendo. O invariante é imposto em quatro lugares independentes: uma constraint CHECK que não tem palavra para conectividade, quatro regras de trigger de guarda, um role do Postgres com SELECT revogado na tabela de saúde, e uma dependência de pacote de mão única com um teste por trás. Todas as quinze asserções em test/assertions.sql passam contra um banco migrado a partir desta árvore, e cada exemplo abaixo foi executado contra a farm real ou contra um banco descartável migrado a partir dela. O que NÃO é imposto está nomeado nas lacunas: não existe proxy de fence no lado do host, a varredura de max_runtime ignora protected e ignora o kill switch do reaper, e o witness loop está escrito e testado de ponta a ponta enquanto nada em um caminho de alocação o inicia. Quatro coisas que esta página nomeava aqui estão fechadas, e ficam registradas junto com o que as fechou em vez de apagadas: a autenticação pode ser ligada, farm.events é um livro-razão de encerramentos escrito por um trigger na mesma transação que o encerramento, a varredura de max_runtime aplica o fence e rearma como todo outro encerramento, e farm_lease_suspect começa armado em zero em um processo recém-iniciado.",
+      "sections": 17,
+      "examples": 39,
+      "gaps": 3
+    },
+    {
+      "area": "jobs",
+      "label": "Jobs",
+      "blurb": "O vocabulário de steps, execução, checkpoint e retomada",
+      "title": "Jobs: o vocabulário de steps, execução, checkpoint e retomada",
+      "summary": "Um job é uma lista ordenada de steps tirados de um vocabulário fechado de dez tipos que o banco possui (farm.step_kinds), executada contra um único dispositivo sob lease por internal/runner. Só três coisas fazem um step terminar mal: o timeout dele mesmo, um erro que nada consegue repetir, ou o max_runtime do job. Um socket ADB derrubado não é nenhuma delas — ele é repetido dentro da lease sem limite de tentativas, delimitado apenas por um prazo que o autor do job anotou. Trabalho longo pertence a um step shell_detached, porque esse é o único tipo cujo resultado vive no dispositivo em vez de em um socket que o control plane por acaso está segurando.",
+      "sections": 15,
+      "examples": 39,
+      "gaps": 1
+    },
+    {
+      "area": "devices",
+      "label": "Dispositivos",
+      "blurb": "Enrollment, identidade, topologia e saúde",
+      "title": "Dispositivos: enrollment, identidade, topologia e saúde",
+      "summary": "Um dispositivo nesta farm é identificado por onde ele está plugado, não pelo nome que dá a si mesmo: seriais de OEM colidem, e este rack tem um par clonado (0123456789ABCDEF em usb:3-1.1 e usb:3-1.2) para provar isso. A identidade é observada, depois resolvida contra uma escada de quatro degraus — uid gravado, fingerprint de hardware, serial-mais-slot, adopt — e então gravada de volta no telefone para que o degrau mais forte exista da próxima vez. Saúde é um terceiro relógio mantido estritamente separado das leases: o watchdog escreve uma tabela, não tem privilégio nenhum sobre farm.leases, e um dispositivo ficando offline nunca o tira de um job em execução. Leia as lacunas antes de confiar em qualquer parte da maquinaria de enrollment ou de topologia. O degrau de fingerprint executa agora — ele chamava min(uuid), um agregado que o PostgreSQL não tem, e a migração 00005 o reescreveu para primeiro contar e depois buscar — mas o degrau de serial ainda não consegue retornar ambiguous, e nem o enrollment nem a descoberta de topologia rodam em lugar algum além do role node do farmd, no Linux.",
+      "sections": 17,
+      "examples": 37,
+      "gaps": 5
+    },
+    {
+      "area": "recovery",
+      "label": "Recuperação",
+      "blurb": "A escada, o blast radius, quarantine e operações em massa",
+      "title": "Recuperação, quarantine, blast radius e operações em massa",
+      "summary": "A escada de recuperação repara dispositivos por baixo de leases vivas. Ela lê farm.leases em exatamente uma função, só para decidir se tem permissão de agir, e nenhum caminho de código em internal/recovery escreve uma. Cada degrau declara um blast radius e a disruption_policy mínima que uma lease viva nesse raio precisa carregar; um degrau que alcançaria uma lease que o proíbe é recusado de imediato, registrado em farm.recovery_attempts.refusal, e o dispositivo continua quebrado até que o trabalho sobre ele termine. As três coisas que costumavam custar uma noite estão corrigidas: o drain de host é imposto pelo alocador; os tiers 3 e 4 têm um cliente, uma coluna por onde encontrar um agente de host, e uma recusa que sobrevive até farm.recovery_attempts.refusal em vez de ser achatada para failed; e fechar uma quarantine agora termina onde o operador a chamou. POST /api/v1/quarantines/{id}/close escreve farm.device_runtime.health e farm.devices.admin_state na MESMA transação que closed_at e responde com devices_released e devices_reenabled, de modo que uma farm que não roda nenhum role recovery ainda recupera seus dispositivos. As métricas da própria escada também chegam a /metrics: a colisão de nomes que tornava recovery.Collectors() irregistrável sumiu, e cmd/farmd/roles.go registra o grupo de cada pacote.",
+      "sections": 15,
+      "examples": 25,
+      "gaps": 3
+    },
+    {
+      "area": "surface",
+      "label": "Interfaces",
+      "blurb": "API HTTP, a CLI ctl e artifacts",
+      "title": "A API, a CLI e os artifacts",
+      "summary": "Quarenta e uma rotas pendem de um único mux de padrões do net/http; o role que cada uma exige é escolhido no registro, em internal/api/router.go, e não dentro do handler, de modo que nenhum endpoint pode existir sem um nível. Todo corpo que não é 2xx usa o mesmo envelope, e dois dos seus códigos são estruturais: 410 fenced significa que a lease acabou e o job precisa abortar, 503 transient significa que o banco não respondeu e a lease está intocada — confundir os dois é o STF #663. Essa autorização pode ser ligada agora: cmd/farmd/roles.go chama api.AuthenticatorFor, que lê FARM_API_TOKENS e se recusa a subir um listener exposto sem credenciais em vez de iniciar aberto. O que ainda é só uma promessa é o fence — a API o incrementa em um revoke e clientes cooperativos o respeitam, mas o proxy que o imporia no socket do ADB não está escrito, e a resposta do revoke diz o contrário com todas as letras.",
+      "sections": 13,
+      "examples": 50,
+      "gaps": 0
+    },
+    {
+      "area": "operate",
+      "label": "Operação",
+      "blurb": "Roles, configuração, implantação e lacunas",
+      "title": "Colocando para rodar: roles, configuração, implantação, e o que não está construído",
+      "summary": "farmd é um único binário estático com treze subcomandos; todo role é um subcomando, de modo que um reaper nunca pode rodar um commit diferente do scheduler com o qual ele concorre. Esta página é a referência autoritativa de configuração — 28 variáveis em internal/config mais 7 lidas em outros lugares, quatro delas validadas no boot e depois ignoradas — e o inventário honesto do que não está ligado. Quatro entradas que encabeçavam esse inventário estão fechadas: a autenticação é escolhida por configuração, `farmd node` sobe, a escada de recuperação tem um cliente para o agente de host, e um chart Helm é entregue. O que resta é a lacuna de métricas, e ela é pior do que costumava constar: /metrics não carrega série própria de pacote nenhum, porque cmd/farmd/roles.go chama obs.RegisterAll sem nenhum grupo de coletores e o único ponto de chamada de Collectors() na árvore fica em um ramo que o farmd nunca toma. A única coisa para levar daqui: o SIGTERM drena o trabalho e não libera nada, deliberadamente.",
+      "sections": 12,
+      "examples": 23,
+      "gaps": 2
+    },
+    {
+      "area": "requirements",
+      "label": "Requisitos",
+      "blurb": "Todo requisito, sua origem, e se ele se sustenta — reverificado contra o HEAD",
+      "sections": 17,
+      "examples": 8,
+      "gaps": 4,
+      "summary": "Cento e um requisitos — funcionais e não funcionais — garimpados de nove commits, das 88 entradas de lacuna nas seis páginas ao lado desta, das migrações que são o contrato de verdade, e de três achados externos que nunca tocaram o código. Cada um carrega uma origem, um status verificado contra esta árvore em vez de copiado do commit que o alegou, e o comando que o decidiu.\n\n**Oitenta e seis linhas estão `met` sem ressalva**, outras onze estão `met` em uma dimensão, três estão `decided`, e **uma está em aberto**: os tiers 3 e 4 contra hardware real. Não há telefone algum conectado à máquina em que isto foi construído. Tudo que leva a `USBDEVFS_RESET` e a `uhubctl` está escrito, testado, e já rodou no Linux — a descoberta lê do próprio modo de arquivo do kernel se um hub pode chavear cada porta — mas ler que uma porta pode ser chaveada não é chaveá-la, e este registro não finge o contrário.\n\nLeia-o por três coisas que as páginas de área não conseguem mostrar. Os acoplamentos: uma única guarda em `runNode` já bloqueou quatro requisitos distintos. Os remédios errados — uma superfície que diz a um operador que algo está protegido quando não está é pior do que uma ausência documentada, e este registro encontrou cinco deles, sendo o mais recente uma especificação de referência na aba Docs que mandava operadores conferir um exit code detached com `cat`, o que julga o `cat`. E a deriva: sete linhas na rodada anterior já estavam fechadas e este arquivo não tinha acompanhado, descrevendo um sistema pior do que o que existe.",
+      "title": "Todo requisito levantado para este sistema, de onde ele veio, e se ele se sustenta"
+    }
+  ],
+  "built": {
+    "examples_run": 304,
+    "examples_fixed": 108,
+    "claims_corrected": 98
+  }
+}

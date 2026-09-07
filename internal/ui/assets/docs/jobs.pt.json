@@ -1,0 +1,619 @@
+{
+  "area": "jobs",
+  "title": "Jobs: o vocabulário de steps, a execução, o checkpoint e o resume",
+  "summary": "Um job é uma lista ordenada de steps tirados de um vocabulário fechado de dez kinds que o banco de dados possui (farm.step_kinds), executada contra um único device sob lease pelo internal/runner. Só três coisas terminam um step mal: o timeout dele próprio, um erro que nada consegue repetir, ou o max_runtime do job. Um socket ADB que cai não é nenhuma dessas três — ele é repetido dentro da lease, sem limite de tentativas, restrito apenas por um prazo que o autor do job escreveu. Trabalho longo pertence a um step shell_detached, porque esse é o único kind cujo resultado mora no device, e não em um socket que o control plane por acaso está segurando.",
+  "sections": [
+    {
+      "heading": "O que um job pode fazer com uma lease, e o que não pode",
+      "source": "internal/runner/runner.go:1-53 (package doc), 160-176 (Holder), internal/runner/steps.go:28-56 (Conn), internal/jobrunner/jobrunner.go:1-72 (package doc), internal/jobrunner/conn.go:1-105",
+      "body": "O runner recebe uma interface `Holder` de dois métodos — `Context()` e `Fenced()`. Não há `Release`, não há `Renew`, não há `Witness`. Isso é imposição, não convenção: **um erro de socket dentro de um step não tem para onde ir a não ser voltar ao seu chamador como um erro Go**, porque nada ao alcance do runner é capaz de encerrar uma lease.\n\nA mesma disciplina desce por `runner.Conn` (três métodos — Shell, Push, Pull; sem health, sem reconnect, sem handle de lease) e entra em `jobrunner.DeviceConn`, que é uma tradução sem retry e sem timeout próprio. Um timeout de cinco segundos inventado no adaptador anularia em silêncio um orçamento de trinta minutos que o autor de um job escreveu.\n\nO jobrunner enuncia a fronteira do outro lado: \"farm.leases.release_reason has no connectivity value, so there is no word for it to write.\"\n\nExistem exatamente quatro finais, e eles são o vocabulário de `farm.job_attempts.outcome`:\n\nO que importa às 3 da manhã é **abandoned**. Significa que o attempt parou sem veredito — SIGTERM, drain do node, eviction do pod, ou a lease sendo fenced. A linha do job não é tocada, a lease deliberadamente **não** é liberada, e `farm.jobs.checkpoint` fica onde está. O processo substituto readquire a mesma lease pelo id do job (`farm.lease_acquire` é idempotente em job_id e **não** avança o fence), recebe o mesmo device no **mesmo fence**, e faz resume. Liberar no shutdown entregaria a outra pessoa o device de um job de seis horas deixado pela metade.\n\nFencing não é um evento de conectividade. `lease.ErrFenced` só é devolvido quando `farm.lease_renew` casa com zero linhas (internal/lease/store.go:77-80) — o banco de dados dizendo que outro alguém detém esta lease. Uma falha de dial ou um timeout contra o Postgres explicitamente não é fencing.",
+      "bullets": [
+        "Um step que está há vinte minutos repetindo contra um socket morto continua segurando seu device. A única coisa que vai tirá-lo dali é o timeout do próprio step, o `max_runtime`, ou um ser humano.",
+        "`aborted` em `farm.job_steps.state` significa que o contexto da execução terminou no meio do step — fenced ou em shutdown. Não é o step falhando; ele foi interrompido.",
+        "A única exceção: quando o contexto da execução termina porque o `max_runtime` se esgotou, o step é registrado como `failed`, não `aborted`, porque esse relógio é do próprio usuário (runner.go:619-622)."
+      ],
+      "table": {
+        "columns": [
+          "Outcome",
+          "Significa",
+          "Lease",
+          "Linha do job"
+        ],
+        "rows": [
+          [
+            "succeeded",
+            "todo step rodou",
+            "liberada, reason `completed`",
+            "`succeeded`"
+          ],
+          [
+            "failed",
+            "um step terminou mal, ou o max_runtime se esgotou, ou a spec não parseia",
+            "liberada, reason `failed` / `max_runtime`",
+            "`failed`, ou de volta para `queued` se ainda restam attempts e a falha não é permanente"
+          ],
+          [
+            "cancelled",
+            "um ser humano o encerrou antes de este placement rodar",
+            "liberada, reason `job_cancelled`",
+            "intocada (já está `cancelled`)"
+          ],
+          [
+            "abandoned",
+            "fenced, ou o processo está em shutdown",
+            "**nada é liberado**",
+            "intocada — o checkpoint é a passagem de bastão"
+          ]
+        ]
+      }
+    },
+    {
+      "heading": "O vocabulário é fechado, e o banco de dados é o dono dele",
+      "source": "migrations/00004_operate.sql:154-174, internal/jobspec/spec.go:1-66 and 84-116, internal/jobspec/spec_test.go:27-60, internal/api/specs.go:120-145 and 618-700, internal/runner/runner.go:893-906",
+      "body": "`farm.jobs.spec` é uma coluna `jsonb` e qualquer coisa cabe em uma. É exatamente por isso que o vocabulário de steps não é definido em Go: ele são as linhas de `farm.step_kinds`, e `farm.job_steps.kind` é uma foreign key contra ela. `internal/jobspec` reafirma essas linhas, e `TestKindTableMatchesMigration` lê `migrations/00004_operate.sql` e falha se as duas alguma vez divergirem.\n\nO runner pergunta de novo ao banco de dados em tempo de execução (`loadKinds`, runner.go:1017), de modo que um binário cujas migrations estão atrasadas recusa um job em vez de executá-lo pela metade.\n\nDois booleanos por linha são comportamento, não documentação:\n\n- **idempotent** decide se um resume pode reexecutar um step interrompido. `false` significa que um crash no meio do step não é recuperável repetindo-o.\n- **needs_artifact** decide se o payload precisa nomear conteúdo por sha256. A validação exige 64 caracteres hexadecimais minúsculos, espelhando `CHECK (sha256 ~ '^[0-9a-f]{64}$')` em `farm.artifacts`.\n\nUm kind que este binário não conhece é **recusado no parse, nunca pulado** — um step pulado é um job que fez menos do que diz ter feito. `GET /api/v1/specs/kinds` reporta `supported:false` para uma linha para a qual o binário não tem tipo de payload, e `disagrees_with_build:true` para uma linha cujas flags diferem da tabela compilada, porque essa diferença decide se um resume pode repetir um step.\n\nLimites, do bloco `limits` do mesmo endpoint: `max_steps` 1000, `max_step_id_len` 128, `max_artifact_name_len` 128, `max_step_timeout_s` 21600 (6h), `max_total_timeout_s` 86400 (24h), `max_expect_exit` 256. São proteções contra uma spec que jamais poderia ter sucesso, não política — o prazo com que alguém de fato se importa é o `farm.jobs.max_runtime`.",
+      "table": {
+        "columns": [
+          "kind",
+          "idempotent",
+          "needs_artifact",
+          "campos do payload"
+        ],
+        "rows": [
+          [
+            "push",
+            "true",
+            "**true**",
+            "`sha256` (64 hex), `dest` (caminho absoluto no device), `mode` (opcional, 3-4 dígitos octais)"
+          ],
+          [
+            "install",
+            "true",
+            "**true**",
+            "`sha256` (64 hex), `reinstall` (bool → `pm install -r`), `grant` (bool → `-g`)"
+          ],
+          [
+            "uninstall",
+            "true",
+            "false",
+            "`package`"
+          ],
+          [
+            "shell",
+            "**false**",
+            "false",
+            "`command`, `expect_exit` (lista de int opcional; vazia → padrão da spec → `{0}`)"
+          ],
+          [
+            "shell_detached",
+            "**false**",
+            "false",
+            "`command`, `result_path` (absoluto, único na spec), `handle` (único na spec, `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`)"
+          ],
+          [
+            "wait_for",
+            "true",
+            "false",
+            "`probe`, `interval` (duração), `timeout` (duração)"
+          ],
+          [
+            "pull",
+            "true",
+            "false",
+            "`path` (caminho absoluto no device), `artifact` (nome, sem `/`)"
+          ],
+          [
+            "assert",
+            "true",
+            "false",
+            "`probe`, `op` (um de nove), `value`"
+          ],
+          [
+            "reset",
+            "true",
+            "false",
+            "`tier` (`none`/`soft`/`medium`/`hard`)"
+          ],
+          [
+            "sleep",
+            "true",
+            "false",
+            "`duration`"
+          ]
+        ]
+      },
+      "examples": [
+        {
+          "label": "A lista autoritativa, vinda do banco de dados",
+          "lang": "bash",
+          "code": "\"C:\\Program Files\\PostgreSQL\\17\\bin/psql.exe\" -h 127.0.0.1 -p 55432 -U farm -d device_farmer \\\n  -c \"SELECT kind, idempotent, needs_artifact FROM farm.step_kinds ORDER BY kind;\"",
+          "output": "      kind      | idempotent | needs_artifact\n----------------+------------+----------------\n assert         | t          | f\n install        | t          | t\n pull           | t          | f\n push           | t          | t\n reset          | t          | f\n shell          | f          | f\n shell_detached | f          | f\n sleep          | t          | f\n uninstall      | t          | f\n wait_for       | t          | f\n(10 linhas)"
+        },
+        {
+          "label": "A mesma lista como a API a serve, mais o que este binário entende dela",
+          "lang": "bash",
+          "code": "curl -s http://127.0.0.1:8420/api/v1/specs/kinds | jq '{kinds: [.kinds[] | {kind, idempotent, needs_artifact, supported}], limits, missing_from_database, spec_version}'",
+          "output": "{\n  \"kinds\": [\n    { \"kind\": \"assert\",         \"idempotent\": true,  \"needs_artifact\": false, \"supported\": true },\n    { \"kind\": \"install\",        \"idempotent\": true,  \"needs_artifact\": true,  \"supported\": true },\n    { \"kind\": \"pull\",           \"idempotent\": true,  \"needs_artifact\": false, \"supported\": true },\n    { \"kind\": \"push\",           \"idempotent\": true,  \"needs_artifact\": true,  \"supported\": true },\n    { \"kind\": \"reset\",          \"idempotent\": true,  \"needs_artifact\": false, \"supported\": true },\n    { \"kind\": \"shell\",          \"idempotent\": false, \"needs_artifact\": false, \"supported\": true },\n    { \"kind\": \"shell_detached\", \"idempotent\": false, \"needs_artifact\": false, \"supported\": true },\n    { \"kind\": \"sleep\",          \"idempotent\": true,  \"needs_artifact\": false, \"supported\": true },\n    { \"kind\": \"uninstall\",      \"idempotent\": true,  \"needs_artifact\": false, \"supported\": true },\n    { \"kind\": \"wait_for\",       \"idempotent\": true,  \"needs_artifact\": false, \"supported\": true }\n  ],\n  \"limits\": {\n    \"max_artifact_name_len\": 128, \"max_expect_exit\": 256, \"max_step_id_len\": 128,\n    \"max_step_timeout_s\": 21600, \"max_steps\": 1000, \"max_total_timeout_s\": 86400\n  },\n  \"missing_from_database\": [],\n  \"spec_version\": 1\n}",
+          "note": "A resposta completa também traz `description` em cada linha (de `farm.step_kinds.description`), `assert_operators` e `reset_tiers`; o filtro jq acima os descarta por questão de largura. `missing_from_database` está vazio e nenhuma linha traz `disagrees_with_build` neste deployment: schema e binário concordam."
+        }
+      ]
+    },
+    {
+      "heading": "O formato de um step, e por que um kind não pode mentir sobre seu payload",
+      "source": "internal/jobspec/spec.go:20-33, 493-552, 749-758, internal/jobspec/validate.go:449-490",
+      "body": "`Step` não tem campo `Kind` em Go. Ele tem um payload, e o kind é derivado dele (`Step.Kind`, spec.go:518). Uma struct com os dois admite `Kind: \"push\"` carregando um payload `Install`, e aí cada consumidor tem de decidir em qual dos dois acreditar.\n\nA forma que trafega na rede ainda carrega uma chave `\"kind\"` explícita — jsonb é lido pelo psql e por pessoas — e o payload mora sob uma chave **nomeada segundo seu kind** (`\"push\": {...}`), não sob um `\"with\"` genérico. Isso compra duas coisas: o jsonb fica consultável por kind a partir do SQL (`spec->'steps' @> '[{\"install\":{\"sha256\":\"…\"}}]'` encontra todo job que instalou um dado build), e uma discordância entre a chave e o payload passa a ser um erro de formato em vez de uma reinterpretação silenciosa.\n\nA decodificação é estrita nas duas direções. Uma chave desconhecida é um erro, não um campo descartado, porque um campo descartado é uma spec que significa outra coisa que não o que seu autor escreveu — e porque uma spec escrita por um control plane **mais novo** tem de ser recusada por um runner mais antigo, não executada em parte.\n\nToda duração é uma string de duração do Go entre aspas (`\"90s\"`, `\"5m\"`, `\"2h30m\"`), nunca um número solto. Um número teria de significar segundos, ou milissegundos, ou nanossegundos, e qualquer que fosse a escolha alguém acabaria supondo uma das outras duas — em um campo que decide por quanto tempo um telefone fica retido.\n\nA ordem é o único controle de fluxo. Sem desvios, sem laços, sem condicionais, porque uma spec tem de ser retomável a partir de um checkpoint em outro processo em outro dia, e \"onde eu estava\" tem de ser respondível com um índice e um id de step.\n\n`jobspec.Parse` faz o unmarshal **e** valida (spec.go:749). Qualquer coisa que chegue ao runner sem validação é recusada ali, permanentemente — com um device já sob lease. Veja Lacunas.",
+      "bullets": [
+        "`id` — único na spec, `^[A-Za-z0-9][A-Za-z0-9._:/-]*$`, ≤128 caracteres. **Estável entre edições**: `farm.jobs.checkpoint` e `farm.job_steps.step_id` apontam ambos para ele.",
+        "`timeout` — limita o step, retries incluídos. Zero herda o `default_timeout`; o valor efetivo tem de ser positivo ou a spec é rejeitada.",
+        "`continue_on_error` — deixa o job prosseguir quando **este step** falha. Trata de um exit diferente de zero ou de um assert que falhou, nunca do transporte, que jamais aparece como falha de step.",
+        "Caminhos no device são validados contra `^(/[A-Za-z0-9._-]+)+$` sem nenhum segmento `..`. Um caminho que precisaria de aspas é recusado em vez de ser escapado — essas strings são interpoladas em comandos que rodam em um device sob lease."
+      ],
+      "examples": [
+        {
+          "label": "Kind e payload discordam",
+          "lang": "bash",
+          "code": "curl -s -X POST http://127.0.0.1:8420/api/v1/specs/validate \\\n  -H 'Content-Type: application/json' -d '{\"version\":1,\"default_timeout\":\"1m\",\"steps\":[\n    {\"id\":\"s1\",\"kind\":\"push\",\"install\":{\"sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}}]}'",
+          "output": "{\"valid\":false,\"problems\":[{\"path\":\"spec\",\"message\":\"jobspec: spec: jobspec: step \\\"s1\\\" says kind \\\"push\\\" but carries a \\\"install\\\" payload; correct whichever of the two is wrong — they cannot both be honoured\"}],\"problem_count\":1,\"steps\":0}"
+        },
+        {
+          "label": "Um kind que não existe",
+          "lang": "bash",
+          "code": "curl -s -X POST http://127.0.0.1:8420/api/v1/specs/validate \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"version\":1,\"default_timeout\":\"1m\",\"steps\":[{\"id\":\"s1\",\"kind\":\"reboot\",\"reboot\":{}}]}'",
+          "output": "{\"valid\":false,\"problems\":[{\"path\":\"spec\",\"message\":\"jobspec: spec: jobspec: step: json: unknown field \\\"reboot\\\"\"}],\"problem_count\":1,\"steps\":0}",
+          "note": "Não existe kind `reboot`. Um reset hard reinicia o aparelho; veja a seção sobre reset."
+        }
+      ]
+    },
+    {
+      "heading": "Um exemplo válido por kind",
+      "source": "internal/jobspec/spec.go:279-462, internal/jobspec/validate.go:167-358; each spec below was POSTed to /api/v1/specs/validate on 127.0.0.1:8420 with profile=default, check_artifacts=false",
+      "body": "Cada step abaixo foi embrulhado em `{\"version\":1,\"steps\":[ … ]}` e enviado a `POST /api/v1/specs/validate` com `{\"profile\":\"default\",\"check_artifacts\":false}`. Todos os dez voltaram `valid:true, problem_count:0`. Os dois kinds que carregam artifact usam `check_artifacts:false` porque os digests que eles nomeiam não estão no store desta farm; com a checagem ligada, as mesmas specs reportam o digest ausente (veja a seção de validação).",
+      "examples": [
+        {
+          "label": "push — conteúdo por hash, em um caminho",
+          "lang": "json",
+          "code": "{ \"id\": \"stage/runner\", \"kind\": \"push\", \"timeout\": \"10m\",\n  \"push\": {\n    \"sha256\": \"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\",\n    \"dest\": \"/data/local/tmp/farm/run_soak.sh\",\n    \"mode\": \"0755\" } }",
+          "output": "push            valid=True problems=0 steps=1 total_timeout_s=600",
+          "note": "`mode` é re-renderizado a partir do valor parseado como quatro dígitos octais e aplicado com um chmod **verificado** (steps.go:678-691) — o mode da própria transferência é apenas indicativo em alguns backends, e um script que chega sem seu bit de execução falha vários steps depois de um jeito que ninguém rastreia de volta até aqui. A validação também impõe um artifact → um destino em toda a spec."
+        },
+        {
+          "label": "install — o nome do pacote do APK mora em farm.artifacts, não na spec",
+          "lang": "json",
+          "code": "{ \"id\": \"stage/app\", \"kind\": \"install\", \"timeout\": \"10m\",\n  \"install\": {\n    \"sha256\": \"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\",\n    \"reinstall\": true,\n    \"grant\": true } }",
+          "output": "install         valid=True problems=0 steps=1 total_timeout_s=600",
+          "note": "A spec não repete o nome do pacote nem o version code, então não tem como contradizer `farm.artifacts`. O APK é preparado em `<work_dir>/<sha256>.apk`; nada o remove depois, e `farm.device_artifacts` passa a registrar que este device tem esses bytes — que é o que permite ao próximo job pular a transferência. `pm install` é verificado duas vezes, pelo exit status **e** pela presença de `Failure` na saída (steps.go:861), porque builds mais antigos do Android saem com 0 enquanto imprimem `Failure [INSTALL_FAILED_…]`."
+        },
+        {
+          "label": "uninstall — \"este pacote está ausente depois disto\"",
+          "lang": "json",
+          "code": "{ \"id\": \"clean/harness\", \"kind\": \"uninstall\", \"timeout\": \"5m\",\n  \"uninstall\": { \"package\": \"com.acme.harness\" } }",
+          "output": "uninstall       valid=True problems=0 steps=1 total_timeout_s=300",
+          "note": "Remover um pacote que não está instalado é um **sucesso**, e `farm.step_kinds` chama o kind de idempotente exatamente por essa leitura: o executor casa `not installed` / `unknown package` na saída e registra `already_absent:true` (steps.go:889-896)."
+        },
+        {
+          "label": "shell — para comandos que terminam depressa",
+          "lang": "json",
+          "code": "{ \"id\": \"probe/sdk\", \"kind\": \"shell\", \"timeout\": \"1m\",\n  \"shell\": { \"command\": \"getprop ro.build.version.sdk\", \"expect_exit\": [0] } }",
+          "output": "shell           valid=True problems=0 steps=1 total_timeout_s=60",
+          "note": "`expect_exit` vazio recai no `default_expect_exit` da spec, e depois em `{0}`. Um stream de shell que termina sem exit status é um erro de **transporte**, não exit 0 — steps.go:263 se recusa a ler o ExitCode de valor zero como sucesso."
+        },
+        {
+          "label": "shell_detached — o device é dono do resultado",
+          "lang": "json",
+          "code": "{ \"id\": \"soak/start\", \"kind\": \"shell_detached\", \"timeout\": \"2m\",\n  \"shell_detached\": {\n    \"command\": \"sh /data/local/tmp/farm/run_soak.sh\",\n    \"result_path\": \"/data/local/tmp/farm/soak.result\",\n    \"handle\": \"soak\" } }",
+          "output": "shell_detached  valid=True problems=0 steps=1 total_timeout_s=120",
+          "note": "`result_path` e `handle` têm de ser, cada um, únicos dentro da spec: dois steps detached dividindo um mesmo arquivo de resultado é um dos dois perdendo em silêncio."
+        },
+        {
+          "label": "wait_for com probe — um prazo sobre a CONDIÇÃO, não sobre a conexão",
+          "lang": "json",
+          "code": "{ \"id\": \"idle/await\", \"kind\": \"wait_for\", \"timeout\": \"6h\",\n  \"wait_for\": {\n    \"probe\": \"[ \\\"$(dumpsys deviceidle get deep)\\\" = \\\"IDLE\\\" ]\",\n    \"interval\": \"30s\",\n    \"timeout\": \"5h59m\" } }",
+          "output": "wait_for        valid=True problems=0 steps=1 total_timeout_s=21600",
+          "note": "O timeout do próprio step tem de durar mais que o da condição, senão o step cortaria pela metade um probe que ainda tinha permissão de ter sucesso. A validação rejeita `interval > timeout` (o probe rodaria no máximo uma vez) e `wait_for.timeout > timeout do step`. Esta forma julga o probe e nada mais — **não** a aponte para o `result_path` de uma execução detached, porque `test -f` é verdadeiro para um exit status 137 com exatamente a mesma facilidade que para 0. Para isso, use a forma com handle, abaixo."
+        },
+        {
+          "label": "wait_for com handle — espera pelo EXIT STATUS de um comando detached",
+          "lang": "json",
+          "code": "{ \"id\": \"soak/start\", \"kind\": \"shell_detached\", \"timeout\": \"2m\",\n  \"shell_detached\": { \"command\": \"sh /data/local/tmp/farm/run_soak.sh\",\n                      \"result_path\": \"/data/local/tmp/farm/soak.result\",\n                      \"handle\": \"soak\" } },\n{ \"id\": \"soak/await\", \"kind\": \"wait_for\", \"timeout\": \"6h\",\n  \"wait_for\": { \"handle\": \"soak\", \"interval\": \"30s\", \"timeout\": \"5h59m\" } }",
+          "output": "{\"valid\":true,\"problems\":[],\"problem_count\":0,\"steps\":2,\"total_timeout_s\":21720}",
+          "note": "`handle` nomeia um step `shell_detached` declarado **antes** na mesma spec. O runner então faz polling do arquivo de status daquela execução através do mesmo probe que o re-attach de um resume usa, e compara o exit code publicado com `default_expect_exit` — de modo que um soak morto na quarta hora reprova o job em vez de aprová-lo. Exatamente um entre `probe` e `handle` pode estar definido: os dois é recusado (`sets both \"probe\" and \"handle\", which are two different waits … Keep one`), e também é recusado um handle declarado abaixo do wait (`handle \"soak\" is declared by steps[1], which runs after this step`) ou declarado em lugar nenhum. `shell_detached` não carrega `expect_exit` próprio, então o padrão no nível da spec é a única declaração sobre o que significa um sucesso detached — e é a mesma declaração qualquer que seja dos três lugares que lê o status."
+        },
+        {
+          "label": "pull — nomeia conteúdo que ainda não existe",
+          "lang": "json",
+          "code": "{ \"id\": \"collect/logcat\", \"kind\": \"pull\", \"timeout\": \"10m\",\n  \"pull\": {\n    \"path\": \"/data/local/tmp/farm/logcat.txt\",\n    \"artifact\": \"logcat.txt\" } }",
+          "output": "pull            valid=True problems=0 steps=1 total_timeout_s=600",
+          "note": "Diferente de push e install, o digest não é conhecido até o último byte ter sido lido, então os bytes fluem do device direto para o store endereçado por conteúdo através de um `io.Pipe` (steps.go:921-935) — uma gravação de tela de dois gigabytes é um pipe, não uma alocação. O sha256 resultante vai parar em `farm.job_steps.detail`. `artifact` é um nome, não um caminho: sem `/`."
+        },
+        {
+          "label": "assert — uma afirmação sobre a resposta do DEVICE",
+          "lang": "json",
+          "code": "{ \"id\": \"check/sdk\", \"kind\": \"assert\", \"timeout\": \"1m\",\n  \"assert\": { \"probe\": \"getprop ro.build.version.sdk\", \"op\": \"ge\", \"value\": \"29\" } }",
+          "output": "assert          valid=True problems=0 steps=1 total_timeout_s=60",
+          "note": "Nove operadores: `eq ne contains not_contains matches` (RE2 — sem backreferences, sem lookaround; compilados na validação e de novo em tempo de execução) e os quatro numéricos `gt ge lt le`. Um operador numérico com um `value` não numérico é erro de validação; um operador numérico cuja **saída do probe** não é um número é uma asserção que falhou, não um erro (steps.go:1021-1026) — \"sua comparação está quebrada\" e \"o device disse a coisa errada\" pedem reações diferentes."
+        },
+        {
+          "label": "reset — um tier, expandido em tempo de execução a partir do profile",
+          "lang": "json",
+          "code": "{ \"id\": \"prep/reset\", \"kind\": \"reset\", \"timeout\": \"20m\",\n  \"reset\": { \"tier\": \"medium\" } }",
+          "output": "reset           valid=True problems=0 steps=1 total_timeout_s=1200 reset_steps=1",
+          "note": "`tier` tem de ser escrito por extenso: `ResetTier.Valid()` rejeita a string vazia, então o fallback em `execReset` para `farm.jobs.reset_tier` é inalcançável por qualquer spec validada. Neste deployment o tier também não faz absolutamente nada — veja Lacunas."
+        },
+        {
+          "label": "sleep — esperado no CONTROL PLANE, não no device",
+          "lang": "json",
+          "code": "{ \"id\": \"soak/settle\", \"kind\": \"sleep\", \"timeout\": \"1m\",\n  \"sleep\": { \"duration\": \"30s\" } }",
+          "output": "sleep           valid=True problems=0 steps=1 total_timeout_s=60",
+          "note": "Um `sleep` mais longo que o step que o contém jamais pode terminar, e a validação diz isso. É um `time.After` no processo do runner — não sobrevive à morte do processo, mas é idempotente, então um resume simplesmente dorme de novo."
+        }
+      ]
+    },
+    {
+      "heading": "Uma spec completa e validada usando os dez kinds",
+      "source": "POST /api/v1/specs/validate on 127.0.0.1:8420, profile=default",
+      "body": "Onze steps, todos os kinds, um reset expandido contra o profile `default`.\n\nRepare no `continue_on_error` em `collect/logcat`: um `logcat -d` que falha não pode fazer você perder o pull que vem logo depois dele.\n\nRepare também no que **não** está mais aqui. Esta spec carregava um décimo segundo step, `soak/verdict`, rodando `cat …/soak.result` com `expect_exit: [0]` — e ele nunca funcionou, porque `cat` sai com 0 tanto se o arquivo contém `0` quanto se contém `137`. `soak/await` agora nomeia o handle detached, de modo que a própria espera lê o status que o wrapper publicou e o julga. Um step, e é o step que já estava esperando.",
+      "examples": [
+        {
+          "label": "full.json",
+          "lang": "json",
+          "code": "{\n  \"version\": 1,\n  \"default_timeout\": \"5m\",\n  \"default_expect_exit\": [0],\n  \"steps\": [\n    { \"id\": \"prep/reset\", \"kind\": \"reset\", \"timeout\": \"20m\",\n      \"reset\": { \"tier\": \"medium\" } },\n\n    { \"id\": \"prep/wait-boot\", \"kind\": \"wait_for\", \"timeout\": \"11m\",\n      \"wait_for\": { \"probe\": \"[ \\\"$(getprop sys.boot_completed)\\\" = \\\"1\\\" ]\",\n                    \"interval\": \"5s\", \"timeout\": \"10m\" } },\n\n    { \"id\": \"prep/push-runner\", \"kind\": \"push\", \"timeout\": \"10m\",\n      \"push\": { \"sha256\": \"1111111111111111111111111111111111111111111111111111111111111111\",\n                \"dest\": \"/data/local/tmp/farm/run_soak.sh\", \"mode\": \"0755\" } },\n\n    { \"id\": \"prep/install-app\", \"kind\": \"install\", \"timeout\": \"10m\",\n      \"install\": { \"sha256\": \"2222222222222222222222222222222222222222222222222222222222222222\",\n                   \"reinstall\": true, \"grant\": true } },\n\n    { \"id\": \"check/sdk\", \"kind\": \"assert\",\n      \"assert\": { \"probe\": \"getprop ro.build.version.sdk\", \"op\": \"ge\", \"value\": \"29\" } },\n\n    { \"id\": \"soak/start\", \"kind\": \"shell_detached\", \"timeout\": \"2m\",\n      \"shell_detached\": { \"command\": \"sh /data/local/tmp/farm/run_soak.sh\",\n                          \"result_path\": \"/data/local/tmp/farm/soak.result\",\n                          \"handle\": \"soak\" } },\n\n    { \"id\": \"soak/settle\", \"kind\": \"sleep\", \"timeout\": \"1m\",\n      \"sleep\": { \"duration\": \"30s\" } },\n\n    { \"id\": \"soak/await\", \"kind\": \"wait_for\", \"timeout\": \"6h\",\n      \"wait_for\": { \"handle\": \"soak\", \"interval\": \"30s\", \"timeout\": \"5h59m\" } },\n\n    { \"id\": \"collect/logcat\", \"kind\": \"shell\", \"timeout\": \"2m\", \"continue_on_error\": true,\n      \"shell\": { \"command\": \"logcat -d > /data/local/tmp/farm/logcat.txt\" } },\n\n    { \"id\": \"collect/pull-logcat\", \"kind\": \"pull\", \"timeout\": \"10m\",\n      \"pull\": { \"path\": \"/data/local/tmp/farm/logcat.txt\", \"artifact\": \"logcat.txt\" } },\n\n    { \"id\": \"cleanup/uninstall\", \"kind\": \"uninstall\", \"timeout\": \"5m\",\n      \"uninstall\": { \"package\": \"com.acme.harness\" } }\n  ]\n}"
+        },
+        {
+          "label": "Validada contra o control plane em execução",
+          "lang": "bash",
+          "code": "python -c \"import json;print(json.dumps({'spec':json.load(open('full.json')),'profile':'default','check_artifacts':False}))\" > req.json\ncurl -s -X POST http://127.0.0.1:8420/api/v1/specs/validate \\\n  -H 'Content-Type: application/json' --data-binary @req.json \\\n  | jq '{valid,problem_count,steps,reset_steps,total_timeout_s,artifacts,\n         resets:[.resets[]|{tier,step_count,total_timeout_s}]}'",
+          "output": "{\n  \"valid\": true,\n  \"problem_count\": 0,\n  \"steps\": 11,\n  \"reset_steps\": 1,\n  \"total_timeout_s\": 26160,\n  \"artifacts\": [\n    { \"path\": \"steps[2].push.sha256\",    \"step_id\": \"prep/push-runner\",  \"sha256\": \"1111…1111\" },\n    { \"path\": \"steps[3].install.sha256\", \"step_id\": \"prep/install-app\", \"sha256\": \"2222…2222\" }\n  ],\n  \"resets\": [ { \"tier\": \"medium\", \"step_count\": 4, \"total_timeout_s\": 1020 } ]\n}",
+          "note": "`check_artifacts:false` foi usado porque os dois digests são placeholders. Com o padrão `true`, ambos voltam `present:false` e viram dois problemas — veja a seção de validação. `total_timeout_s` 26160 são 7h16m, a soma do timeout efetivo de cada step; `MaxTotalTimeout` é 24h."
+        }
+      ]
+    },
+    {
+      "heading": "shell versus shell_detached, e por que trabalho longo tem de ser detached",
+      "source": "internal/runner/steps.go:248-277 (execShell doc), 343-452 (execShellDetached), 454-518 (reattachDetached), 550-620 (probeDetached), 636-661 (readPID), 663-710 (detachedCommand), 814-959 (execWaitForDetached), 1803-1828 (detachPrefix)",
+      "body": "Um step `shell` mantém o socket ADB aberto até o comando terminar. Isso faz do socket a fonte da verdade sobre o resultado, e sockets para um rack de telefones USB falham o tempo todo. `shell_detached` remove o acoplamento: o comando vira daemon, sua saída vai para um arquivo no **device**, e seu exit status é publicado em `result_path` por um rename atômico. A chamada ADB retorna assim que o processo é lançado.\n\nA partir desse instante nada na execução depende de uma conexão continuar de pé. O host pode perder o device por dez minutos; o pod pode sofrer eviction e ser substituído; o trabalho segue e a resposta ainda está no telefone quando o socket volta. Esta é a contramedida direta ao DeviceFarmer/STF #663, em que um ECONNRESET aos ~90 minutos encerrou a execução de várias horas de alguém.\n\nO wrapper que o runner envia é:\n\n```\nmkdir -p <dir> || exit 1; rm -f <result> <tmp> <pid>; \\\n<prefix> sh -c 'echo $$ > <pid>; ( <command> ) > <log> 2>&1; echo $? > <tmp>; mv <tmp> <result>' \\\n  < /dev/null > /dev/null 2>&1 & echo started\n```\n\nCinco detalhes sustentam a estrutura, e cada um deles é uma maneira específica de perder em silêncio uma execução de seis horas:\n\n1. **O `mkdir` é fatal.** O diretório de `result_path` vem da spec e não precisa ser um lugar onde o usuário do shell possa escrever. Tudo depois dele vai para segundo plano com a saída descartada e o comando termina em `echo started`, então sem essa proteção um diretório ausente produz exit 0 para um comando que nunca rodou — e o job então fica parado no seu `wait_for` até o timeout, esperando por um resultado que nada vai escrever.\n2. **O comando roda em um subshell `( … )`, não em um grupo de chaves.** Um grupo de chaves compartilha o shell do wrapper, então um script de harness que termina em `exit $rc` — que é como a maioria deles termina — sairia do wrapper também, antes de o status ter sido registrado.\n3. **O status é escrito em `<tmp>` e renomeado.** Um poll jamais consegue ler um status escrito pela metade e concluir que o comando saiu com 0 quando ele saiu com 137.\n4. **stdin e stdout são desacoplados do stream ADB.** Sem isso o serviço de shell fica aberto até o comando terminar, que é exatamente o acoplamento que este step existe para remover.\n5. **O pid vem de `$$` dentro do shell trabalhador, não de `$!` por fora.** O processo do próprio `setsid` sai de imediato; o pid dele não diz nada sobre o trabalho estar vivo.\n\n`detachPrefix` escolhe `nohup setsid` apenas quando o probe do prepare respondeu `setsid`; **qualquer outra resposta, inclusive uma vazia, recai no `nohup` puro**. A assimetria é deliberada: chutar `setsid` em um device que não o tem falha em silêncio (o lançamento em segundo plano ainda sai com 0 enquanto nada roda), ao passo que chutar `nohup` em um device que tem `setsid` custa apenas a garantia mais fraca.\n\n**O exit status que o wrapper publica é lido, e é lido em três lugares.** `probeDetached` pergunta ao device o que foi feito de um handle em uma única ida e volta — `if [ -f <result> ]; then echo done; cat <result>; elif [ -f <log> ]; then echo running; else echo absent; fi` — e devolve `absent`, `running`, ou `done` acompanhado do código. Ele é chamado nos três momentos em que uma execução detached pode ser julgada:\n\n1. **Imediatamente após o lançamento** (`execShellDetached`). O exit status do próprio lançamento é o *do wrapper* — \"a linha que faz o daemon chegou a rodar\" — então um comando que começa e morre na hora (um binário que não está no device, um script que sai na primeira linha) deixa isso em 0 e publica seu próprio status milissegundos depois. Esse status agora reprova o step.\n2. **Em um resume** (`reattachDetached`). Uma execução que terminou enquanto o processo anterior estava fora é julgada, não apenas notada: dar re-attach em um soak de seis horas que morreu no terceiro minuto e reportá-lo como \"re-attached\" é um job verde por cima de uma execução vermelha.\n3. **Na espera** (`execWaitForDetached`), quando um `wait_for` nomeia o handle. É desta que o ciclo de vida comum depende — lançar, esperar quatro horas, terminar, sem eviction e sem resume — e é a leitura que as outras duas não conseguem cobrir, porque ambas são momentos únicos e uma morte tardia acontece depois delas.\n\nEssa terceira leitura é o motivo de `wait_for` ter ganhado um `handle`. Um probe escrito por um operador não dá conta: `test -f …/soak.result` é verdadeiro no instante em que o wrapper publica um status, e ele publica 137 com a mesma presteza com que publica 0; `cat …/soak.result` com `expect_exit: [0]` julga o *cat*, que sai com 0 diga o arquivo o que disser. O status tem de ser lido e comparado, e onde o wrapper o escreveu é assunto do runner, não da spec.\n\nUma falha em LER o status nunca é um veredito. Ela volta como um erro de transporte comum e a pergunta é feita de novo dentro da lease — a resposta é um arquivo em um device que continua fazendo o trabalho, e nada que aconteça com um socket pode mudar o que aquele arquivo diz. O mesmo vale para uma resposta que não parseia: ela é perguntada de novo em vez de ser lida como `absent`, o que iniciaria uma segunda cópia de um comando que pode estar rodando neste exato momento.",
+      "examples": [
+        {
+          "label": "O que o runner registrou para um step detached ao vivo",
+          "lang": "sql",
+          "code": "SELECT step_id, kind, state, output, detail\n  FROM farm.job_steps\n WHERE job_id = '0954fc1b-7cf8-47ec-a2c6-42a76981d65c'\n   AND kind = 'shell_detached';",
+          "output": "step_id | soak/start\nkind    | shell_detached\nstate   | ok\noutput  | started detached: handle soak, log /data/local/tmp/.farm/soak.log,\n          result /data/local/tmp/.farm/soak.result (already finished, exit status 0)\ndetail  | {\"handle\": \"soak\",\n           \"command\": \"for i in $(seq 1 2000); do getprop sys.boot_completed >/dev/null; sleep 1; done\",\n           \"log_path\": \"/data/local/tmp/.farm/soak.log\",\n           \"pid_path\": \"/data/local/tmp/.farm/soak.pid\",\n           \"exit_code\": 0,\n           \"pid_unknown\": true,\n           \"result_path\": \"/data/local/tmp/.farm/soak.result\",\n           \"detached_with\": \"nohup\",\n           \"already_finished\": true,\n           \"transport_retries\": 0}",
+          "note": "`already_finished: true` com `exit_code: 0` é a PRIMEIRA das três leituras de status, feita milissegundos depois do lançamento: o device simulado não tem sistema de arquivos e responde `done 0` ao probe de status na mesma hora, então a execução acaba antes de o step retornar. Em hardware real este probe responde `running` e o exit code é lido depois, pelo `wait_for` que nomeia o handle. `detached_with: nohup` e `pid_unknown: true` também são honestos — os fakes respondem ao probe do setsid sem nenhum dos dois tokens, então o fallback dispara e nenhum arquivo de pid aparece; em hardware real espere `nohup setsid` e um `pid` numérico. Vale ler o `pid_unknown`: se uma espera depois de um step detached queima o timeout inteiro, este campo diz se alguma coisa chegou a começar, e o runner registra um aviso dizendo exatamente isso."
+        },
+        {
+          "label": "O par recomendado, tirado da própria spec de soak da demo em execução",
+          "lang": "json",
+          "code": "{\"version\": 1, \"default_timeout\": \"30s\", \"steps\": [\n  {\"id\": \"soak/start\", \"kind\": \"shell_detached\",\n   \"shell_detached\": {\"handle\": \"soak\",\n     \"command\": \"for i in $(seq 1 2000); do getprop sys.boot_completed >/dev/null; sleep 1; done\",\n     \"result_path\": \"/data/local/tmp/.farm/soak.result\"}},\n  {\"id\": \"soak/await\", \"kind\": \"wait_for\", \"timeout\": \"6h0m0s\",\n   \"wait_for\": {\"handle\": \"soak\",\n                \"timeout\": \"6h0m0s\", \"interval\": \"5s\"}},\n  {\"id\": \"soak/collect\", \"kind\": \"shell\",\n   \"shell\": {\"command\": \"cat /data/local/tmp/.farm/soak.result\"}}\n]}",
+          "output": " step_index |   step_id    |      kind      | state\n          0 | soak/start   | shell_detached | ok\n          1 | soak/await   | wait_for       | ok\n          2 | soak/collect | shell          | ok\n\nstep_id | soak/await\noutput  | detached handle soak finished with exit status 0;\n          its output is on the device at /data/local/tmp/.farm/soak.log\ndetail  | {\"polls\": 1, \"handle\": \"soak\", \"exit_code\": 0, \"poll_blips\": 0,\n           \"log_path\": \"/data/local/tmp/.farm/soak.log\",\n           \"result_path\": \"/data/local/tmp/.farm/soak.result\",\n           \"wait_timeout\": \"6h0m0s\", \"detached_state\": \"done\",\n           \"transport_retries\": 0}",
+          "note": "Lido de farm.jobs.spec e farm.job_steps para o job 0954fc1b-7cf8-47ec-a2c6-42a76981d65c. Dois steps fazem o trabalho: `soak/start` lança, e `soak/await` espera pelo **handle**, de modo que é a própria espera que lê o status publicado e o compara — `exit_code: 0` e `detached_state: \"done\"` na linha do step são a evidência dessa comparação. Antes era um trio, com a espera apontada para `test -f …soak.result` e um step `cat` atrás dela, e nenhum desses dois conseguia enxergar um exit diferente de zero. `soak/collect` agora existe só para constar: ele imprime o arquivo, não o julga."
+        }
+      ]
+    },
+    {
+      "heading": "Uma falha de transporte dentro de um step é repetida, e nunca reprova o job",
+      "source": "internal/runner/runner.go:75-135 (constants), 789-856 (runStep, retry), 858-878 (backoff), 924-946 (isRetryable), internal/jobrunner/conn.go:107-169 (classify), internal/runner/steps.go:716-812 (execWaitFor), 814-959 (execWaitForDetached)",
+      "body": "Quando uma chamada ao device falha, `Runner.retry` a reexecuta com backoff exponencial com jitter — base 1s, teto 30s, dobrando, e depois com jitter uniforme sobre a metade superior da janela, para que um restart do adb-server não seja atingido por todos os runners do host em uníssono.\n\n**Não há limite de tentativas.** O limite é o timeout do próprio step, um número que o autor do job escreveu. Um \"três tentativas\" fixo no código encerraria um job porque um hub USB demorou quatro segundos a mais para voltar.\n\nO padrão da classificação é **repetir**. Uma falha não classificada vinda de uma conexão com o device tem muito mais chance de ser um cabo, um hub ou um servidor adb do que uma recusa deliberada, então só os erros que comprovadamente não têm conserto são marcados `ErrNotRetryable`. Repare no que *não* recebe tratamento especial: `context.Canceled` e `context.DeadlineExceeded`. Todo chamador verifica seu próprio contexto primeiro, então um erro de contexto que chega ao `isRetryable` veio de um prazo **dentro** da conexão — um timeout de dial, um read deadline — o que é uma falha de transporte vestida de erro de contexto.\n\n`jobrunner.conn.classify` marca exatamente três coisas como não repetíveis, e vale saber em qual delas você esbarrou antes de ir olhar cabos:\n\n- **Um `ProtocolError` não transitório** — um FAIL nas próprias palavras do servidor que continuará sendo um FAIL na próxima vez. Deliberadamente ausente da lista de transitórios: `insufficient permissions`. Uma regra udev errada continua errada, e queimar o orçamento de um step para redescobrir isso manda um operador olhar cabos em vez de olhar o host.\n- **`adbwire.ErrAmbiguousTarget`** — um devpath é uma posição na árvore USB e não pode ser ambíguo, então isto significa que a visão que o servidor ADB tem da topologia está quebrada. Nenhuma quantidade de retries conserta isso.\n- **`*adbwire.UsageError`** — pego antes de qualquer coisa tocar o fio: um devpath malformado, uma requisição grande demais para caber em um frame. Um bug de quem chamou.\n\nTodo o resto é repetido, incluindo dois casos que parecem recusas:\n\n- `adbwire.ErrNotFound` é uma resposta FAIL, mas significa \"nenhum transporte naquela posição **neste momento**\" — uma reenumeração USB, um telefone reiniciando.\n- Um FAIL cujo motivo contém `offline`, `unauthorized`, `still authorizing`, `still connecting`, `connecting to`, `protocol fault` ou `closed`. Todo tier de reset acima de `none` reinicia o telefone, e essas são as palavras que o servidor fala nos segundos seguintes. A comparação é feita contra o campo `Reason` do FAIL, não contra `err.Error()`, de modo que um devpath contendo uma dessas palavras não pode fazer uma recusa genuína parecer transitória.\n\n`wait_for` é ainda mais estrito: um poll que falha no fio é **contado e ignorado**, não repetido, porque a condição sobre a qual ele perguntava não é afetada. Só o timeout da própria condição encerra a espera insatisfeita.\n\nA linha de log que o laço de retry emite é deliberadamente barulhenta — `transport failure inside a step; retrying INSIDE the lease (job NOT failed)` — e a **ausência dela no log da lease** é a prova de que a instabilidade não custou nada ao job.",
+      "examples": [
+        {
+          "label": "Steps que sobreviveram a falhas de transporte, ao vivo",
+          "lang": "sql",
+          "code": "SELECT (detail->>'transport_retries')::int AS retries, count(*),\n       count(*) FILTER (WHERE state='ok')      AS ok,\n       count(*) FILTER (WHERE state='failed')  AS failed,\n       count(*) FILTER (WHERE state='aborted') AS aborted\n  FROM farm.job_steps WHERE detail ? 'transport_retries'\n GROUP BY 1 ORDER BY 1;",
+          "output": " retries | count |   ok  | failed | aborted\n---------+-------+-------+--------+---------\n       0 | 10785 | 10771 |     14 |       0\n       1 |     1 |     0 |      1 |       0\n       2 |     2 |     2 |      0 |       0\n       5 |     7 |     7 |      0 |       0\n       6 |     8 |     0 |      8 |       0\n       7 |     3 |     0 |      0 |       3",
+          "note": "Snapshot em 2026-09-04 10:55 na frota de demonstração; os números se mexem, o formato não. Leia as três linhas interessantes: sete steps levaram cinco falhas de transporte cada um e ainda assim reportaram **ok** — essas são as execuções que o #663 teria destruído. Os oito com seis retries bateram no timeout de 30s do próprio step, que é o final correto. Os três com sete retries ainda estavam repetindo quando sua lease foi fenced, então eles estão `aborted`, não `failed` — o socket também não foi o que os encerrou."
+        },
+        {
+          "label": "Um wait_for que mal conseguia alcançar o device e ainda assim teve sucesso",
+          "lang": "sql",
+          "code": "SELECT job_id, step_id, kind, state, finished_at-started_at AS took, detail\n  FROM farm.job_steps WHERE (detail->>'poll_blips')::int > 0;",
+          "output": "job_id  | 2fa62a42-8f30-4e13-90c9-11ebe7c96235\nstep_id | soak/await\nkind    | wait_for\nstate   | ok\ntook    | 00:00:25.004908\ndetail  | {\"polls\": 6, \"poll_blips\": 5, \"transport_retries\": 0,\n           \"probe\": \"test -f /data/local/tmp/.farm/soak.result\",\n           \"wait_timeout\": \"6h0m0s\", \"output_bytes\": 1,\n           \"output_truncated\": false}",
+          "note": "Seis polls, cinco dos quais nunca alcançaram o device, `transport_retries: 0` — os blips foram absorvidos dentro do execWaitFor e nunca chegaram ao laço de retry do runner. Quando um wait_for *de fato* falha, a mensagem dele cita o probe e a contagem de blips, para que você consiga distinguir \"a condição nunca se tornou verdadeira\" de \"mal conseguimos alcançar o device durante a espera inteira\". Esta linha é anterior à forma com handle e mostra a chave `probe` da forma com probe; uma espera sobre um handle registra `handle`, `detached_state` e `exit_code` em vez disso, e absorve blips exatamente do mesmo jeito, contando-os no mesmo `poll_blips`."
+        },
+        {
+          "label": "Retries esgotando o orçamento do step — a falha honesta",
+          "lang": "sql",
+          "code": "SELECT step_id, kind, state, error, detail, finished_at-started_at AS took\n  FROM farm.job_steps\n WHERE error = 'runner: step timeout elapsed'\n ORDER BY finished_at DESC LIMIT 1;",
+          "output": "step_id | smoke/008\nkind    | shell\nstate   | failed\nerror   | runner: step timeout elapsed\ndetail  | {\"command\": \"getprop sys.boot_completed\", \"transport_retries\": 6}\ntook    | 00:00:30.001023",
+          "note": "Seis retries dentro de um orçamento de 30s do step, e então o prazo do próprio step. O job falhou; a *lease* não terminou por causa do socket — ela terminou porque o step terminou, em um relógio que a spec escreveu."
+        }
+      ]
+    },
+    {
+      "heading": "O que de fato encerra um job",
+      "source": "internal/runner/runner.go:377-390 (cancelled), 452-478 (spec/budget), 466-480 (max_runtime), 528-698 (execute's switch), 700-742 (classifyAbort), 1176-1203 (writeJobState), internal/jobrunner/jobrunner.go:855-903 (finalize)",
+      "body": "Percorrendo o switch de `execute`, na ordem em que ele se aplica:\n\n1. **Contexto da execução abortado no meio do step** → `classifyAbort` decide entre três coisas que jamais podem ser fundidas: fenced (abandonar, não tocar em nada), max_runtime (falhar, **permanente**), ou shutdown (abandonar, lease deixada retida).\n2. **O step devolveu um erro** — o timeout dele próprio, ou algo não repetível. Linha do step `failed`. Com `continue_on_error` ele é marcado `tolerated:true`, registrado como concluído no checkpoint, e o job continua.\n3. **O step rodou e o device disse não** (`Result.Failure`) — um exit diferente de zero fora de `expect_exit`, um assert que falhou, um `pm install` que imprimiu `Failure`. Mesmo tratamento de (2).\n4. Caso contrário o step é `ok` e o checkpoint avança.\n\nUma falha em (2) ou (3) deliberadamente **não** é marcada como permanente, mesmo para um erro não repetível. A mesma falha em quatro devices diferentes é o que diz a um operador que o problema é do job, e `farm.job_attempts` é a tabela que mostra isso — declarar um veredito dentro do runner substituiria essa evidência pela opinião de um processo só. Então um attempt que falhou com orçamento restante escreve `farm.jobs.state = 'queued'`, não `'failed'`, e o scheduler o coloca em outro lugar.\n\nSó duas coisas são permanentes: uma spec que não consegue parsear ou validar (ela também não vai parsear na próxima vez, e reenfileirar só queimaria devices), e um `max_runtime` esgotado.\n\nAntes do primeiro step há mais um ponto de falha: `prepare` cria o diretório de trabalho e sonda por setsid. Ele é repetido como qualquer outra chamada ao device, limitado pelo orçamento de step padrão da própria spec, e um device que permanece inalcançável durante todo esse tempo reprova o placement — **não permanentemente**, então o job volta para a queue à espera de outro telefone.\n\n`max_runtime` é calculado pelo Postgres como `max_runtime - (now() - started_at)` e entregue ao runner como uma **duração**, nunca como um instante (runner.go:983-988). Nenhum relógio de cliente é enviado e nenhum é comparado. É o único relógio fornecido pelo usuário em todo o sistema que pode encerrar uma lease por conta própria.\n\nAs duas escritas terminais são protegidas por fence no SQL, não pela esperança. `writeJobState` exige que o job esteja não terminal **e** que haja uma lease viva (`state IN ('held','suspect')`) neste fence exato; zero linhas atualizadas significa que um holder mais novo é o dono dela e que o veredito deste processo é o desatualizado. Isso é registrado em log, não levantado como erro.",
+      "examples": [
+        {
+          "label": "continue_on_error, e um assert parando o job",
+          "lang": "bash",
+          "code": "# spec: step 0 expects exit 7 (gets 0) with continue_on_error;\n#       step 1 asserts release == \"99\" (device says \"14\"); step 2 must never run.\nFARM_API_URL=http://127.0.0.1:8420 bin/farmd.exe ctl submit -f fail_job.json \\\n  --pool default --queue ci --tenant acme\n\n\"$PSQL\" -c \"SELECT attempt, step_index, step_id, kind, state, left(coalesce(error,''),60) AS error\n              FROM farm.job_steps WHERE job_id='85e0631f-76cc-4ea2-a9d4-2898539cb2b9'\n             ORDER BY step_index;\"",
+          "output": "attempt | step_index |    step_id     |  kind  | state  | error\n      1 |          0 | doc/tolerated  | shell  | failed | exit status 0 (expected 7): 14\n      1 |          1 | doc/bad-assert | assert | failed | assert doc/bad-assert: \"14\" eq \"99\" is false\n(2 linhas)   -- step 2 has no row: the job stopped\n\ndetail on step 0: {\"command\": \"getprop ro.build.version.release\", \"tolerated\": true,\n                   \"output_bytes\": 3, \"output_truncated\": false, \"transport_retries\": 0}\n\nfarm.job_attempts: attempt 1, outcome failed,\n  error 'step 1 (doc/bad-assert/assert): assert doc/bad-assert: \"14\" eq \"99\" is false'",
+          "note": "Job id 85e0631f-76cc-4ea2-a9d4-2898539cb2b9. Um step tolerado ainda ganha uma linha `failed` — esse é justamente o ponto; você consegue encontrá-lo depois — mas ele é registrado no checkpoint como concluído e o job segue."
+        },
+        {
+          "label": "Por que jobs nesta farm estão no state 'failed'",
+          "lang": "sql",
+          "code": "SELECT left(coalesce(error,'(none)'),60) AS job_error, count(*)\n  FROM farm.jobs WHERE state='failed' GROUP BY 1 ORDER BY 2 DESC;",
+          "output": "                          job_error                           | count\n--------------------------------------------------------------+-------\n (none)                                                       |    13\n job max_runtime had already elapsed when this placement star |     5\n job max_runtime elapsed during step smoke/007                |     5\n jobspec: invalid spec: steps[0].timeout: must be positive; n |     4\n job max_runtime elapsed during step smoke/003                |     3\n job max_runtime elapsed during step smoke/011                |     2\n jobspec: invalid spec, 2 problems: version: must be 1, got 0 |     2\n step 1 (doc/bad-assert/assert): assert doc/bad-assert: \"14\"  |     1\n job max_runtime elapsed during preparing the device work dir |     1\n job max_runtime elapsed during step smoke/004                |     1",
+          "note": "Snapshot às 10:55. `max_runtime` domina, e nenhum desses jobs foi reenfileirado — consistente com `classifyAbort` devolvendo `permanent:true`. As seis linhas `jobspec: invalid spec` são specs que jamais deveriam ter sido submetidas; cada uma delas pegou um device real sob lease só para descobrir isso. Veja Lacunas. As 13 linhas sem erro são escritas do worker da demo (`UPDATE farm.jobs SET state=$2` em internal/demo/demo.go:2033), não vereditos do runner."
+        }
+      ]
+    },
+    {
+      "heading": "Checkpoint: o que ele registra e por quê",
+      "source": "internal/runner/checkpoint.go (whole file), internal/runner/runner.go:407-425 (resuming), 592-598 (in-flight write), 683-687 (markDone)",
+      "body": "`farm.jobs.checkpoint` existe por causa de um único evento, e ele é o evento mais comum em um control plane Kubernetes: o pod que roda um job sofre eviction. O substituto adquire a mesma lease pelo id do job, recebe o **mesmo device no mesmo fence**, e então precisa responder a uma pergunta que o device não responde por ele — quais destes steps já aconteceram?\n\nO checkpoint carrega `version`, `attempt`, `fence`, `device_id`, `spec_hash`, `last_index`, `completed[]` e um `in_flight` opcional. `updated_at` é adicionado pelo Postgres dentro do mesmo comando; nenhum relógio de cliente toca a linha.\n\n**É o fence que torna o registro confiável.** Ele é monotônico e único por lease, então um fence que casa significa que nenhum outro holder teve o device no intervalo — ninguém o resetou, nada foi realocado, e o estado que o checkpoint descreve continua no hardware à nossa frente. Um checkpoint de outro fence não é retomável, apenas reexecutável desde o começo.\n\n`spec_hash` toma a impressão digital da lista de steps **apenas por posição, id e kind**. Mudar um timeout ou um nome de pacote não invalida o registro de quais steps já rodaram; reordená-los ou substituí-los invalida.\n\nA escrita é protegida por fence no SQL: `WHERE COALESCE((checkpoint->>'fence')::bigint, 0) <= $3`. Um processo que perdeu sua lease uma hora atrás e só agora consegue passar seu comando não pode atropelar o progresso do attempt que o substituiu. Zero linhas é um desfecho comum e registrado em log — a essa altura não sobrou nada para abortar e o checkpoint do servidor é mais novo de qualquer modo. Um checkpoint que não consegue ser gravado custa a reexecução de um step, nunca o device, então ele nunca encerra uma execução.\n\nUm checkpoint que não parseia é tratado como **ausente**: o job recomeça em um placement novo, o que é seguro, em vez de fazer resume contra uma estrutura que este binário adivinhou.\n\n**Quando o checkpoint é escrito?** Depois de cada step que se completa — e, criticamente, **antes** de qualquer step cujo kind não seja idempotente. Essa ordenação é o projeto inteiro: um crash entre a escrita do `in_flight` e a conclusão do step é recuperável como \"não sabemos\", em vez de inferido a partir do silêncio.",
+      "examples": [
+        {
+          "label": "Um checkpoint de um job executado de ponta a ponta",
+          "lang": "sql",
+          "code": "SELECT jsonb_pretty(checkpoint) FROM farm.jobs\n WHERE id = 'ac52f606-4115-43b3-a58c-c5eee949a0a3';",
+          "output": "{\n    \"fence\": 2473,\n    \"attempt\": 1,\n    \"version\": 1,\n    \"completed\": [\n        {\n            \"id\": \"doc/00-probe\",\n            \"index\": 0\n        },\n        …\n        {\n            \"id\": \"doc/06-collect\",\n            \"index\": 6\n        }\n    ],\n    \"device_id\": \"cea4d45e-39f1-49c5-a3f2-4967613de5b1\",\n    \"spec_hash\": \"02cc13f20c1cda2119a09650efb3fb3bf90696704804db8894bce68678088284\",\n    \"last_index\": 6,\n    \"updated_at\": \"2026-09-04T10:55:09.265309-03:00\"\n}",
+          "note": "Sete entradas concluídas, elididas acima por questão de largura. Não há chave `in_flight`: o último step não idempotente terminou, e `markDone` limpa o marcador. Para navegar por checkpoints em geral, use `WHERE checkpoint ? 'fence'` — filtrar por `state='running'` não devolve nada na maior parte do tempo, porque jobs nesta farm terminam em segundos."
+        },
+        {
+          "label": "Um marcador in_flight: um step não idempotente que estava no meio da execução",
+          "lang": "sql",
+          "code": "SELECT id, state, checkpoint->'in_flight' AS in_flight\n  FROM farm.jobs WHERE checkpoint ? 'in_flight' LIMIT 3;",
+          "output": "                  id                  |   state   |                    in_flight\n--------------------------------------+-----------+--------------------------------------------------\n cd2063de-011b-4e8d-b69c-06bf97ef0985 | succeeded | {\"id\": \"smoke/008\", \"kind\": \"shell\", \"index\": 8}\n 7a708ef2-3253-4595-8692-72d976e908e0 | failed    | {\"id\": \"smoke/004\", \"kind\": \"shell\", \"index\": 4}\n c4d5d1f4-34ac-433b-a711-c9c537efca5d | succeeded | {\"id\": \"smoke/004\", \"kind\": \"shell\", \"index\": 4}",
+          "note": "Existem seis linhas assim. Cada uma é um step `shell` (não idempotente) anotado antes de rodar, que então falhou no timeout do seu step, de modo que o marcador nunca foi limpo. Duas das três dizem `state = succeeded` enquanto a linha do próprio step diz `failed` — essa contradição é o worker da demo escrevendo o state do job independentemente do runner, não algo que produção produziria (veja Lacunas). Se um desses placements tivesse sofrido eviction em vez de estourar o timeout, o resume teria **recusado** — veja a próxima seção."
+        }
+      ]
+    },
+    {
+      "heading": "Resume: o que é pulado, o que é reexecutado, o que é recusado",
+      "source": "internal/runner/checkpoint.go:135-254 (plan, planResume), 256-259 (stepIsIdempotent), internal/runner/runner.go:407-425, 787-813 (reattach inside retry), internal/runner/steps.go:405-452 (reattachDetached)",
+      "body": "`planResume` é a decisão, tomada antes de o primeiro step rodar, sobre o que este attempt vai pular, reexecutar ou ao que vai dar re-attach. As regras, em ordem:\n\n1. **Não é resume** — um placement novo, `farm.jobs.resumable = false`, ou um checkpoint de outro fence: tudo roda. Placements novos recebem um device que não está carregando o nosso trabalho pela metade.\n2. **A spec tem de ser a mesma lista.** Um `spec_hash` que não bate, um índice concluído além do fim, ou um id concluído que já não fica em seu índice → recusar. Um operador editar a spec de um job em execução é raro e legítimo; fazer resume no índice 4 de uma lista que já não tem os mesmos steps em 0..3 não é.\n3. **Steps em `completed` são pulados**, e ganham uma linha `skipped` com `reason: completed in an earlier attempt of this placement`.\n4. **Um step em voo que é idempotente é simplesmente reexecutado.** A autoridade é `farm.step_kinds.idempotent`, lida do banco de dados em tempo de execução — não memorizada em Go — de modo que uma spec escrita hoje faz resume amanhã do jeito que seu autor esperava. Um kind não reconhecido é, por padrão, **não** idempotente: um step que ninguém classificou não pode ser repetido por palpite.\n5. **Um `shell_detached` em voo recebe re-attach.** Este é o caso pelo qual todo o projeto existe. O trabalho dele está rodando *no device*, então nem pulá-lo nem iniciar uma segunda cópia é correto.\n6. **Qualquer outra coisa em voo é RECUSADA**, e a recusa é marcada como permanente.\n\nA regra 6 responde \"por que um step não idempotente não é reexecutado\". `shell` é marcado como não idempotente justamente porque reexecutar um step interrompido poderia repetir um efeito colateral que talvez já tenha acontecido — uma instalação, um pagamento, um factory reset. Um job que falha com uma mensagem clara é estritamente melhor que uma farm que faz coisas duas vezes em silêncio. É permanente porque reenfileirar rodaria a spec inteira de novo em um device novo e repetiria exatamente o step que nos recusamos a repetir.\n\nRepare na assimetria com os retries: **dentro** de um step, um `shell` cujo stream morreu sem exit status *é* repetido, e portanto pode rodar duas vezes. Isso é seguro porque ainda seguramos o device, somos com certeza os únicos escrevendo, e o comando foi iniciado segundos atrás. **Através** da morte de um processo nada disso vale, então um resume recusa enquanto um retry aceita. Trabalho cuja repetição realmente faria estrago pertence a um `shell_detached`.\n\nO probe de re-attach fica **dentro** do laço de retry, não antes dele: \"esta execução já está acontecendo no device?\" é exatamente a pergunta que a um link instável não se pode permitir responder com \"não\". Suas três respostas legais são `done`, `running`, `absent`; **qualquer outra coisa é devolvida como uma falha de transporte comum e perguntada de novo**, porque a leitura na qual ela jamais pode se transformar é `absent`, que iniciaria uma segunda cópia de um comando que está rodando neste exato momento.\n\nUm resume **não** gasta um attempt. O re-attach mantém o mesmo número de attempt, porque queimar orçamento por causa de uma eviction de pod gastaria as vidas de um job com o evento mais banal que existe.",
+      "examples": [
+        {
+          "label": "A mensagem de recusa, textual, vinda do código-fonte",
+          "lang": "text",
+          "code": "runner: step %d (%s) of kind %s was interrupted and cannot be repeated safely\n(farm.step_kinds says it is not idempotent); refusing to run it a second time —\na job whose long work runs in a shell_detached step resumes here instead, because\nthe device, not this process, owns that result",
+          "note": "internal/runner/checkpoint.go:240-248. O step recusado ganha sua própria linha em `farm.job_steps` com `detail: {\"resume_refused\": true}` (runner.go:541-546), de modo que o motivo sobrevive na tabela que um operador lê. Uma recusa por `spec_hash` alterado não carrega índice de step e portanto não escreve linha nenhuma — essa você só vai encontrar no texto de erro do attempt."
+        },
+        {
+          "label": "O probe de re-attach que o runner envia",
+          "lang": "bash",
+          "code": "if [ -f \"<result_path>\" ]; then echo done; elif [ -f \"<dir>/<handle>.log\" ]; then echo running; else echo absent; fi",
+          "output": "done | running | absent",
+          "note": "internal/runner/steps.go:411-414. `done` e `running` significam ambos \"não inicie uma segunda cópia\" e produzem uma linha de step com `reattached: true` e `reattached_state`. Só `absent` — o processo anterior morreu entre escrever o checkpoint e lançar qualquer coisa — deixa o step de fato rodar. Nenhum resume exercitou este caminho neste deployment; o branch também não tem teste (veja Lacunas)."
+        }
+      ]
+    },
+    {
+      "heading": "Attempts: distinguindo um problema de job de um problema de device",
+      "source": "migrations/00004_operate.sql:200-218, internal/runner/runner.go:1048-1101 (claimAttempt, openAttempt, closeAttempt), 429-450, 494-517, internal/jobrunner/jobrunner.go:876-903",
+      "body": "`farm.job_attempts` é uma linha por vez em que um job foi colocado em um device, com chave `UNIQUE (job_id, attempt)` e carregando `device_id`, `lease_id`, `fence`, `outcome` e `error`. Seu propósito está declarado na migration: *a job that has been attempted on four devices and failed on all four is a job problem; the same failure on one device four times is a device problem.*\n\nO número do attempt é cunhado por um único `UPDATE farm.jobs SET attempt = attempt + 1 … RETURNING attempt`, de modo que dois schedulers correndo pelo mesmo job não podem cunhar o mesmo número. A linha é gravada **antes** do trabalho — e antes de qualquer motivo para recusar o trabalho — porque um placement que foi recusado ainda é um placement, e a tabela cujo propósito inteiro é distinguir esses dois casos tem de enxergá-lo.\n\n`openAttempt` faz upsert: em caso de conflito ele reseta `finished_at`, `outcome` e `error` para NULL. Então um outcome NULL significa \"este attempt está aberto\", o que cobre um attempt em execução, um retomado, **e** um órfão cujo processo morreu. Só a idade os distingue.\n\nO orçamento é `farm.jobs.max_attempts` (padrão 3, `CHECK >= 1`). Excedê-lo é, em si, uma falha com um erro nomeado. `jobrunner.finalize` espelha a decisão de reenfileiramento do runner, e quando a escrita do próprio runner não foi gravada ele reenfileira assim mesmo: esse palpite é limitado por `max_attempts`, ao passo que um `failed` errado não é recuperável de jeito nenhum.\n\nComo ler a tabela às 3 da manhã:",
+      "bullets": [
+        "**N attempts, N `device_id` distintos, mesmo `error`** → é o job. Conserte a spec.",
+        "**N attempts, um único `device_id`, mesmo `error`** → é o device. Olhe `farm.job_steps.detail->>'transport_retries'` para aquele attempt, e depois a escada de recuperação.",
+        "**`outcome = 'abandoned'`** → nada falhou. Um pod morreu ou uma lease foi fenced; o job manteve seu checkpoint. Existem três linhas assim nesta farm, todas de leases fenced no meio de um step.",
+        "**`outcome IS NULL` em uma linha com mais de alguns minutos** → o processo que a executava morreu sem fechar a linha. Nada varre essas linhas (veja Lacunas)."
+      ],
+      "examples": [
+        {
+          "label": "Um problema de device, resolvido por um segundo placement",
+          "lang": "sql",
+          "code": "SELECT attempt, device_id, fence, outcome, left(coalesce(error,''),50) AS error,\n       finished_at-started_at AS took\n  FROM farm.job_attempts\n WHERE job_id = '0dc8994a-013c-43a7-b46b-2e35194cb86f' ORDER BY attempt;",
+          "output": " attempt |              device_id               | fence |  outcome  |                       error                        |      took\n---------+--------------------------------------+-------+-----------+----------------------------------------------------+-----------------\n       1 | 12e270a8-c8ed-4785-8eb0-c5d412d7b014 |  1202 | failed    | preparing the device work directory /data/local/tm | 00:00:30.003171\n       2 | 9f0af9dd-f571-48b7-8de6-02cff30cc6e4 |  1225 | succeeded |                                                    | 00:00:06.058337",
+          "note": "O erro completo no attempt 1 é `preparing the device work directory /data/local/tmp/device-farmer/0dc8994a-…: runner: step timeout elapsed` — os retries esgotaram o orçamento de 30s da própria spec, que foi o que o encerrou. O runner escreveu `state='queued'` (não `failed`) porque o attempt 1 < max_attempts 3, o scheduler o colocou em outro telefone, e ele terminou em seis segundos. Repare que **não** existem linhas de step do attempt 1: o prepare falhou antes do primeiro step. Seis jobs nesta farm chegaram a `succeeded` no attempt 2 desse jeito."
+        },
+        {
+          "label": "Um attempt abandonado: fenced no meio do step, nada liberado",
+          "lang": "sql",
+          "code": "SELECT s.job_id, s.step_id, s.kind, s.state,\n       (s.detail->>'transport_retries')::int AS retries, s.error,\n       a.outcome, a.error AS attempt_error\n  FROM farm.job_steps s JOIN farm.job_attempts a USING (job_id, attempt)\n WHERE s.state = 'aborted';",
+          "output": "job_id        | 7f34ac2b-a154-49bb-8b06-55b0e161fb7d\nstep_id       | install-harness\nkind          | install\nstate         | aborted\nretries       | 7\nerror         | lease dfd9f7e3-00d3-4128-a188-247831df8cf6: lease: fenced\noutcome       | abandoned\nattempt_error | lease fenced during step install-harness",
+          "note": "Três linhas assim, todas com o mesmo formato. Leia-as com atenção: o step tinha absorvido sete falhas de transporte e ainda estava repetindo dentro da lease quando a lease foi tomada. O socket não encerrou isto — perder a lease encerrou, e o runner não escreveu mais nada no device e não liberou nada."
+        },
+        {
+          "label": "Distribuição de attempts em toda a farm",
+          "lang": "sql",
+          "code": "SELECT state, attempt, max_attempts, count(*) FROM farm.jobs GROUP BY 1,2,3 ORDER BY 1,2;",
+          "output": "   state   | attempt | max_attempts | count\n-----------+---------+--------------+-------\n failed    |       0 |            3 |    12\n failed    |       1 |            3 |    25\n queued    |       0 |            3 |     1\n running   |       1 |            3 |     1\n succeeded |       0 |            3 |    26\n succeeded |       1 |            3 |  1076\n succeeded |       2 |            3 |     6",
+          "note": "Snapshot às 10:53. `attempt = 0` significa que `claimAttempt` nunca rodou para aquele job — ou ele nunca foi colocado, ou um worker simulado o conduziu (veja Lacunas). O grupo `attempt = 1, failed` é dominado por `max_runtime`, que é permanente e corretamente nunca reenfileirado. `max_attempts` é 3 em todas as linhas porque nada na API ou na CLI consegue defini-lo."
+        }
+      ]
+    },
+    {
+      "heading": "Tiers de reset e suas expansões reais",
+      "source": "internal/jobspec/validate.go:505-673 (ResetSteps), 675-723 (clearCommand, uninstallUnknownCommand), internal/runner/steps.go:1044-1180 (execReset), 1182-1205 (runSub), 1273-1391 (writeDeviceStateScript, renderDeviceState), internal/api/specs.go:717-800",
+      "body": "`soft`, `medium` e `hard` não significam nada enquanto alguém não os escrever. Escritos, a partir da lista de pacotes do profile e de nada mais:\n\n- **none** — absolutamente nada.\n- **soft** — limpa os dados de aplicativo de todo pacote que o profile possui e que está de fato instalado.\n- **medium** — soft, depois desinstala todo pacote de terceiros que **não** está no profile, depois reaplica `farm.device_state`.\n- **hard** — medium, depois reinicia, espera o desligamento passar, e espera pelo `boot_completed`.\n\nA única entrada é a lista de pacotes do profile, e é isso que torna o reset genérico: a farm não precisa saber o que um job instalou, porque qualquer coisa fora do profile, por definição, não deveria estar ali. É também por isso que a desinstalação do medium é *um* step shell que enumera o device, em vez de uma lista de steps `uninstall` — o conjunto é descoberto no device, na hora do reset, não adivinhado quando a spec foi escrita.\n\nQuatro detalhes da expansão são, cada um, um bug em que alguém já esbarrou:\n\n- **`reset/clear/<pkg>` testa antes se o pacote existe.** `pm clear` imprime `Failed` para um pacote que não está instalado, e em um telefone recém-cadastrado nenhum dos pacotes do profile está instalado. Sem o teste, o primeiríssimo reset de todo device novo falha, um attempt é cobrado, e um telefone saudável vai para quarantine por estar limpo. É o `grep -qx` (não o exit code) que decide o veredito, porque `pm clear` sai com 0 enquanto imprime `Failed` em várias builds de fabricante, e o `-x` ancora a linha inteira, de modo que um nome de pacote mais longo casado pela busca por substring do `pm list packages` não pode ser confundido com este.\n- **`reset/uninstall-unknown` roda `pm list packages -3` *antes* do laço e verifica o resultado.** Embutido dentro de um `for`, um gerenciador de pacotes que não está respondendo devolve uma lista vazia, o laço roda zero vezes, e o step sai com 0 — um reset reportando sucesso sem ter removido nada, deixando o aplicativo de um tenant instalado para o próximo.\n- **`reset/reboot` carrega `continue_on_error: true`.** O reboot corta justamente o socket que reportaria o exit code dele, então o auto-relato não vale nada. Isto não é uma falha de transporte sendo tolerada; é um comando cujo sucesso só é observável do outro lado dele. `reset/boot-completed` é a prova de verdade.\n- **`reset/reboot-settle` dorme 30s (dentro de um step de 45s) e não é opcional.** Um device não cai no instante em que `reboot` retorna. Sem a pausa o probe lê `sys.boot_completed` do sistema que ainda está desligando, vê `1`, e declara o reset concluído — e o job então começa em um device que reinicia debaixo dele segundos depois. Como `reset/reboot` não pode falhar, essa pausa é a única coisa que faz a resposta do probe significar alguma coisa.\n\nTrês coisas acontecem no executor, e não na expansão. O script `device_state.sh` é **escrito antes de os sub-steps rodarem** (o conteúdo dele vem de `farm.device_state`, então ele não pode ser nomeado por hash de conteúdo em uma spec, e um arquivo ausente faz o step falhar de forma barulhenta — o que é certo, porque um script ausente significa que o estado durável *não* foi reaplicado). O ledger de artifacts é **retratado antes** de uma limpeza medium ou hard, não depois: a direção perigosa é uma afirmação `present` que sobrevive ao conteúdo. E todo sub-step roda contra uma cópia do ambiente carregando uma **spec vazia**, de modo que um job que declarou exit 1 como sucesso para seus próprios steps shell não pode, com isso, declarar um `pm clear` que falhou como um reset bem-sucedido.\n\nUma falha de transporte durante um reset reexecuta a expansão **inteira**, o que é seguro justamente porque reset é idempotente — e é por isso que a expansão é uma lista de steps pequenos em vez de um script comprido. O prazo do próprio sub-step expirando *não* é lavado como ruído de transporte; ele vira um erro não repetível que nomeia o sub-step que travou (steps.go:1146-1153).",
+      "examples": [
+        {
+          "label": "medium, expandido ao vivo contra o profile default",
+          "lang": "bash",
+          "code": "curl -s \"http://127.0.0.1:8420/api/v1/specs/resets?tier=medium&profile=default\" \\\n  | jq -r '.profile, (.packages|tostring), .device_state_script,\n           (.resets[] | \"tier \\(.tier) — \\(.step_count) steps, \\(.total_timeout_s)s\",\n            (.steps[] | \"  \\(.id)  \\(.kind)  \\(.timeout)\\n    \\(.shell.command // .sleep.duration // .wait_for.probe)\"))'",
+          "output": "default\n[\"com.android.chrome\",\"com.acme.harness\"]\n/data/local/tmp/farm/device_state.sh\ntier medium — 4 steps, 1020s\n  reset/clear/com.android.chrome  shell  1m0s\n    pm list packages com.android.chrome | grep -qx \"package:com.android.chrome\" || exit 0; pm clear com.android.chrome | grep -q Success\n  reset/clear/com.acme.harness  shell  1m0s\n    pm list packages com.acme.harness | grep -qx \"package:com.acme.harness\" || exit 0; pm clear com.acme.harness | grep -q Success\n  reset/uninstall-unknown  shell  10m0s\n    rc=0; keep=\" com.android.chrome com.acme.harness \"; pkgs=$(pm list packages -3) || { echo \"pm list packages -3 failed; the package manager is not answering, so foreign packages could not be enumerated\" >&2; exit 1; }; for p in $(echo \"$pkgs\" | cut -d: -f2); do case \"$keep\" in *\" $p \"*) continue;; esac; pm uninstall --user 0 \"$p\" | grep -q Success || rc=1; done; exit $rc\n  reset/device-state  shell  5m0s\n    sh /data/local/tmp/farm/device_state.sh"
+        },
+        {
+          "label": "none, soft e hard, mesmo profile",
+          "lang": "bash",
+          "code": "for t in none soft hard; do\n  curl -s \"http://127.0.0.1:8420/api/v1/specs/resets?tier=$t&profile=default\" \\\n    | jq -r '.resets[] | \"\\(.tier) — \\(.step_count) steps, \\(.total_timeout_s)s\",\n             ((.steps // [])[] | \"  \\(.id)  \\(.kind)  \\(.timeout)  \\(.continue_on_error // \"\")\")'\ndone",
+          "output": "none — 0 steps, 0s\nsoft — 2 steps, 120s\n  reset/clear/com.android.chrome  shell  1m0s\n  reset/clear/com.acme.harness  shell  1m0s\nhard — 7 steps, 1845s\n  reset/clear/com.android.chrome  shell  1m0s\n  reset/clear/com.acme.harness  shell  1m0s\n  reset/uninstall-unknown  shell  10m0s\n  reset/device-state  shell  5m0s\n  reset/reboot  shell  2m0s  true\n  reset/reboot-settle  sleep  45s\n  reset/boot-completed  wait_for  11m0s",
+          "note": "`none` devolve `\"steps\": null`, não um array vazio — daí a proteção `// []` no jq. `reset/reboot` é o único sub-step com `continue_on_error`. `reset/boot-completed` faz polling de `[ \"$(getprop sys.boot_completed)\" = \"1\" ]` a cada 5s por até 10m dentro de um step de 11m: getprop sai com 0 mesmo quando a propriedade não está definida, então o valor é comparado em vez de se confiar no exit code."
+        },
+        {
+          "label": "O que um reset faz quando o job não nomeia profile nenhum",
+          "lang": "sql",
+          "code": "SELECT step_id, kind, state, output, detail FROM farm.job_steps\n WHERE job_id = '17272861-0fce-4c5d-95e1-583b5963adfb' AND kind = 'reset';",
+          "output": "step_id | doc/reset-soft\nkind    | reset\nstate   | ok\noutput  | reset tier soft expanded to no steps: this job names no profile, so there is no\n          package list to clear — set farm.jobs.profile_id if this device is supposed to\n          be reset between jobs\ndetail  | {\"tier\": \"soft\", \"profile\": \"\", \"sub_steps\": 0, \"profile_packages\": 0,\n           \"transport_retries\": 0}",
+          "note": "O step reporta **ok**. Ele não fez nada, e diz isso em vez de reportar um step verde sem explicação — mas se você olhar só para os states, vai acreditar que um device foi limpo quando não foi. Neste deployment nenhum caminho de código jamais escreve `farm.jobs.profile_id`, então este é o desfecho de **todo** step de reset acima de `none`. Veja Lacunas."
+        }
+      ]
+    },
+    {
+      "heading": "Validando antes de submeter um job",
+      "source": "internal/api/specs.go:30-55 (bounds), 128-230 (views), 322-420 (handleSpecValidate), 555-600 (specSubmissionError), internal/ctl/commands.go:1292-1320, internal/jobspec/validate.go:27-62, 107-165",
+      "body": "`jobspec.Validate` devolve **todos** os problemas que encontra, não o primeiro, e cada um carrega um ponteiro JSON em forma pontuada (`steps[3].push.dest`) para que um editor consiga destacar a linha. Quem está consertando uma spec deveria precisar de uma ida e volta, não de dez.\n\n`POST /api/v1/specs/validate` aceita ou o próprio documento da spec como corpo, ou `{\"spec\": …, \"profile\": …, \"check_artifacts\": …}` — um autor cola o arquivo que está editando, uma ferramenta envia uma requisição que ela montou. Uma spec que não pode rodar volta **200 com `valid:false`**, não 4xx: a pergunta era \"isto pode rodar\", o servidor a respondeu, e a requisição teve sucesso.\n\nAlém das regras puras, o endpoint responde às duas perguntas que `jobspec` deliberadamente não responde, porque quem é dono delas é o banco de dados:\n\n- **O conteúdo existe?** Todo digest de `push`/`install` é procurado em `farm.artifacts` em uma única ida e volta. Descobrir aqui custa uma requisição; descobrir depois custa uma lease.\n- **No que um reset se expande *aqui*?** Só com um `profile`, porque sem um a farm não sabe quais pacotes o tier possui e adivinhar mostraria a um operador um plano que não é o plano. Isso também pega colisões de id de step: `ResetSteps` produz ids estáveis para um tier e uma lista de pacotes, então dois resets do mesmo tier se expandem em ids idênticos — que `farm.jobs.checkpoint` não conseguiria distinguir em um resume.\n\nOs limites de resposta existem por uma razão medida: antes deles, uma requisição autenticada produziu um corpo de resposta de 1,4 GB em 21 segundos de CPU, e `writeJSON` faz o marshal em um buffer antes de escrever. Um control plane que sofre OOM não consegue responder renovações, e aí todo holder estoura seu TTL e perde seu device — o #663 alcançado pela porta da frente. Então `problems` é limitado a 500, expansões a 16, steps de reset renderizados a 2000 — com as contagens verdadeiras sempre reportadas ao lado do limite.\n\n**Duas coisas a saber antes de depender de qualquer coisa disto.** `POST /api/v1/jobs` não valida nada, e `ctl validate` / `ctl submit` parseiam *localmente* e nunca chamam este endpoint — então a CLI não consegue dizer a você que um digest está faltando nem que dois resets colidem. Só `POST /api/v1/specs/validate` roda as checagens do banco de dados. Ambas estão em Lacunas.",
+      "examples": [
+        {
+          "label": "Dez defeitos, uma ida e volta",
+          "lang": "bash",
+          "code": "cat > bad.json <<'JSON'\n{ \"version\": 1, \"steps\": [\n  { \"id\": \"a\", \"kind\": \"shell\", \"shell\": { \"command\": \"true\" } },\n  { \"id\": \"a\", \"kind\": \"sleep\", \"timeout\": \"10s\", \"sleep\": { \"duration\": \"1m\" } },\n  { \"id\": \"b\", \"kind\": \"wait_for\", \"timeout\": \"1m\",\n    \"wait_for\": { \"probe\": \"true\", \"interval\": \"10m\", \"timeout\": \"5m\" } },\n  { \"id\": \"c\", \"kind\": \"push\", \"timeout\": \"1m\",\n    \"push\": { \"sha256\": \"nope\", \"dest\": \"../etc/passwd\" } },\n  { \"id\": \"d\", \"kind\": \"shell_detached\", \"timeout\": \"1m\",\n    \"shell_detached\": { \"command\": \"true\", \"result_path\": \"/data/local/tmp/r\", \"handle\": \"h\" } },\n  { \"id\": \"e\", \"kind\": \"shell_detached\", \"timeout\": \"1m\",\n    \"shell_detached\": { \"command\": \"true\", \"result_path\": \"/data/local/tmp/r\", \"handle\": \"h\" } },\n  { \"id\": \"f\", \"kind\": \"assert\", \"timeout\": \"1m\",\n    \"assert\": { \"probe\": \"true\", \"op\": \"gt\", \"value\": \"banana\" } }\n] }\nJSON\nFARM_API_URL=http://127.0.0.1:8420 bin/farmd.exe ctl validate -f bad.json; echo \"exit=$?\"",
+          "output": "10 problems\n\nWHERE                                PROBLEM\n-----------------------------------  -------------------------------------------------------------\nsteps[0].timeout                     must be positive; neither the step nor the spec's default_timeout sets one\nsteps[1].id                          duplicate step id \"a\", already used by steps[0]\nsteps[1].sleep.duration              1m0s is longer than the step's 10s timeout, so the step could never finish\nsteps[2].wait_for.interval           10m0s is longer than the 5m0s this step waits, so the probe would run once at most\nsteps[2].wait_for.timeout            5m0s is longer than the step's 1m0s timeout, which would cut the probe short\nsteps[3].push.sha256                 must be 64 lowercase hex characters (farm.artifacts.sha256), got \"nope\"\nsteps[3].push.dest                   \"../etc/passwd\" must be an absolute device path; prefix it with \"/\", there is no working directory to resolve it against\nsteps[5].shell_detached.result_path  \"/data/local/tmp/r\" is already written by steps[4]; two detached steps sharing one result file is one of them losing\nsteps[5].shell_detached.handle       duplicate handle \"h\", already used by steps[4]; a handle is how a reconnected runner finds this process again\nsteps[6].assert.value                operator \"gt\" compares numbers, and \"banana\" is not one; use \"eq\" or \"contains\" to compare it as text\nctl: bad.json is not a valid job spec\nexit=1"
+        },
+        {
+          "label": "Conteúdo que nunca foi enviado, pego antes de um device entrar sob lease",
+          "lang": "bash",
+          "code": "curl -s -X POST http://127.0.0.1:8420/api/v1/specs/validate \\\n  -H 'Content-Type: application/json' --data-binary @full.json \\\n  | jq '{valid, problem_count, problems, artifacts}'",
+          "output": "{\n  \"valid\": false,\n  \"problem_count\": 2,\n  \"problems\": [\n    { \"path\": \"steps[2].push.sha256\",\n      \"message\": \"farm.artifacts holds no content with this digest; upload the bytes before submitting a job that names them, or the step fails at provisioning with a device already leased\" },\n    { \"path\": \"steps[3].install.sha256\", \"message\": \"…same…\" }\n  ],\n  \"artifacts\": [\n    { \"path\": \"steps[2].push.sha256\", \"step_id\": \"prep/push-runner\",\n      \"sha256\": \"1111…1111\", \"present\": false },\n    { \"path\": \"steps[3].install.sha256\", \"step_id\": \"prep/install-app\",\n      \"sha256\": \"2222…2222\", \"present\": false }\n  ]\n}",
+          "note": "O documento inteiro da spec foi enviado como corpo, sem envelope, e `check_artifacts` assumiu o padrão true. `present` é um ponteiro no tipo da resposta, para que \"a farm não tem isto\" e \"ninguém perguntou\" sejam distinguíveis — um cliente que confundisse os dois mandaria um autor subir conteúdo que já está lá. O mesmo arquivo através do `ctl validate` sai com **0**: a CLI não faz esta checagem."
+        },
+        {
+          "label": "Uma spec que é válida, submetida e executada de ponta a ponta",
+          "lang": "bash",
+          "code": "export FARM_API_URL=http://127.0.0.1:8420\nbin/farmd.exe ctl validate -f demo_job.json\nbin/farmd.exe ctl submit -f demo_job.json --pool default --queue ci --tenant acme",
+          "output": "steps:         7\ntotal timeout: 8m00s\nreset steps:   1\nchecked by:    http://127.0.0.1:8420/api/v1/specs/validate\n\nthis spec resets a device (1 reset step), and with no --profile what those steps\nwould actually run is unknown: the package list lives in farm.profiles.\n\ndemo_job.json will run: 7 steps, validated by http://127.0.0.1:8420\n\njob:                30f04216-303e-4cf9-8af5-dba82917011a\nstate:              queued\npool:               default\nqueue:              ci\ntenant:             acme\n\nsteps:              7\nspec total timeout: 8m00s\nprofile:            none — a reset in this job expands against an empty package list and cleans nothing\n\nmax runtime:        none — this lease ends when the job ends or a human revokes it\n\nnothing is scheduled yet: the scheduler turns this row into a lease.",
+          "note": "O quarto step da spec é um `shell_detached` com `handle: docrun`, e o sexto é um `wait_for` que nomeia esse handle — não um probe pelo arquivo de resultado. `ctl validate` pergunta ao SERVIDOR (`/api/v1/specs/validate`), de modo que um control plane mais antigo que não conhecesse a forma com handle recusaria a spec aqui em vez de executá-la entendida pela metade. Ela chegou a `succeeded` no device 8b5ea7cd no fence 96, e a lease foi liberada com reason `completed`."
+        }
+      ]
+    },
+    {
+      "heading": "Lendo uma execução depois que ela terminou",
+      "source": "migrations/00004_operate.sql:177-218, internal/runner/runner.go:1103-1174 (recordStepStart, recordStep), internal/runner/steps.go:208-232 (stepDetail), 1494-1543 (captureText, sanitiseText), 22-30 (DefaultMaxOutput), 96-104 (DefaultWorkRoot)",
+      "body": "Não há API para as linhas de step. Tudo abaixo é SQL contra `farm.job_steps` e `farm.job_attempts` (veja Lacunas).\n\nOs states de step são `pending`, `running`, `ok`, `failed`, `skipped`, `aborted`. `aborted` significa que o contexto da execução terminou no meio do step — fencing ou shutdown — o que não é o step falhando; ele foi interrompido. `failed` com `error = 'runner: job max_runtime elapsed'` é o único caso em que um abort é registrado como falha, porque esse relógio é do próprio usuário.\n\n`detail` é jsonb e carrega, para cada step, os campos do próprio payload (de `stepDetail`) mais `transport_retries`, mais o que quer que o executor tenha acrescentado. `recordStep` mescla com `detail || EXCLUDED.detail`, de modo que um step registrado de novo acumula em vez de substituir.\n\nA saída é limitada a **64 KiB** por step (`DefaultMaxOutput`), aplicado aos slices de bytes *antes* de qualquer conversão para string — um único teste instrumentado pode emitir centenas de megabytes, e converter tudo isso só para guardar os primeiros 64 KiB copiaria cada byte para o heap duas vezes em um host rodando sessenta desses. A truncagem anexa `… [truncated: N bytes captured, M stored]` e define `output_truncated`. Todos os bytes vindos do device passam por `strings.ToValidUTF8` e têm os NULs removidos, porque o Postgres rejeita `U+0000` de saída e um único NUL vindo de um processo que quebrou perderia a linha inteira que explica por que o job falhou.\n\nO diretório de trabalho do job no device é `/data/local/tmp/device-farmer/<job-uuid>` (`DefaultWorkRoot`, chaveado pelo id do job para que dois jobs que dividem um device ao longo do tempo nunca leiam os arquivos um do outro). APKs preparados vão parar em `<work_dir>/<sha256>.apk`. Logs e arquivos de resultado detached vão para onde `result_path` disser, que não precisa ser dentro do diretório de trabalho — e é por isso que o `mkdir` do wrapper é fatal.",
+      "table": {
+        "columns": [
+          "chave de detail",
+          "Em quais steps",
+          "O que ela diz a você"
+        ],
+        "rows": [
+          [
+            "`transport_retries`",
+            "todo step",
+            "Quantas vezes o fio falhou e foi repetido dentro da lease. Diferente de zero em um step `ok` é um device para observar, não um job para consertar."
+          ],
+          [
+            "`polls`, `poll_blips`",
+            "wait_for",
+            "Total de probes vs. probes que nunca alcançaram o device. Distingue \"a condição nunca se tornou verdadeira\" de \"mal conseguíamos alcançar o device\"."
+          ],
+          [
+            "`tolerated`",
+            "qualquer step que falhou com continue_on_error",
+            "O step falhou e a spec mandou seguir em frente."
+          ],
+          [
+            "`reattached`, `reattached_state`",
+            "shell_detached depois de um resume",
+            "Este attempt encontrou os arquivos marcadores da execução anterior e não iniciou uma segunda cópia."
+          ],
+          [
+            "`pid`, `pid_unknown`, `detached_with`",
+            "shell_detached",
+            "Se alguma coisa está de fato rodando, e se `setsid` estava disponível."
+          ],
+          [
+            "`pushed`",
+            "push, install",
+            "False significa que a transferência foi pulada porque `farm.device_artifacts` já afirmava que o conteúdo estava neste caminho."
+          ],
+          [
+            "`deduplicated`",
+            "pull",
+            "Os bytes trazidos já existiam no store sob o mesmo digest."
+          ],
+          [
+            "`resume_refused`",
+            "o step que um resume recusou",
+            "Veja a seção sobre resume."
+          ],
+          [
+            "`ledger_forgotten`, `ledger_error`",
+            "reset (medium/hard)",
+            "Quantas afirmações de artifact foram retratadas antes da limpeza, ou por que não foram."
+          ],
+          [
+            "`sub_steps`, `profile`, `profile_packages`",
+            "reset",
+            "No que o tier de fato se expandiu neste job. `sub_steps: 0` significa que ele não fez nada."
+          ],
+          [
+            "`output_bytes`, `output_truncated`",
+            "qualquer coisa que captura saída",
+            "Contagem verdadeira de bytes vs. o que foi armazenado."
+          ]
+        ]
+      },
+      "examples": [
+        {
+          "label": "A única consulta para rodar quando um job falhou",
+          "lang": "sql",
+          "code": "SELECT attempt, step_index, step_id, kind, state, exit_code,\n       finished_at - started_at AS took,\n       (detail->>'transport_retries')::int AS retries,\n       left(coalesce(error,''), 120) AS error\n  FROM farm.job_steps\n WHERE job_id = '<uuid>'\n ORDER BY attempt, step_index;",
+          "output": " attempt | step_index |      step_id      |      kind      | state | exit_code |      took       | retries\n---------+------------+-------------------+----------------+-------+-----------+-----------------+---------\n       1 |          0 | doc/00-probe      | shell          | ok    |         0 | 00:00:00.002834 |       0\n       1 |          1 | doc/01-assert     | assert         | ok    |         0 | 00:00:00.001666 |       0\n       1 |          2 | doc/02-reset-none | reset          | ok    |           | 00:00:00.000848 |       0\n       1 |          3 | doc/03-start      | shell_detached | ok    |         0 | 00:00:00.606751 |       0\n       1 |          4 | doc/04-settle     | sleep          | ok    |           | 00:00:03.00105  |       0\n       1 |          5 | doc/05-await      | wait_for       | ok    |         0 | 00:00:00.002114 |       0\n       1 |          6 | doc/06-collect    | shell          | ok    |         0 | 00:00:00.001683 |       0",
+          "note": "Saída real do job 30f04216-303e-4cf9-8af5-dba82917011a. `exit_code` é NULL para kinds que não têm um próprio — `reset` e `sleep` aqui. Ele NÃO é nulo para as duas linhas detached: `doc/03-start` carrega um código porque o probe do lançamento encontrou o comando já encerrado, e `doc/05-await` carrega um porque um `wait_for` que nomeia um handle lê o status que o wrapper publicou e o registra. Um `wait_for` com probe registra, em vez disso, o exit code do seu probe, que é uma afirmação sobre o probe."
+        },
+        {
+          "label": "Isto é um problema de job ou um problema de device?",
+          "lang": "sql",
+          "code": "-- for one job:\nSELECT attempt, device_id, fence, outcome, left(coalesce(error,''),100) AS error\n  FROM farm.job_attempts WHERE job_id = '<uuid>' ORDER BY attempt;\n\n-- fleet-wide, which devices keep losing attempts:\nSELECT device_id,\n       count(*) FILTER (WHERE outcome='failed') AS failed,\n       count(*) AS attempts\n  FROM farm.job_attempts GROUP BY 1\n HAVING count(*) FILTER (WHERE outcome='failed') > 0\n ORDER BY failed DESC;\n\n-- and the fleet-wide outcome census:\nSELECT outcome, count(*) FROM farm.job_attempts GROUP BY 1 ORDER BY 2 DESC;",
+          "output": "  outcome  | count\n-----------+-------\n succeeded |  1164\n failed    |    40\n abandoned |     3\n           |     1     -- NULL: one row nothing ever closed",
+          "note": "Snapshot às 10:55. As três linhas `abandoned` são leases fenced no meio de um step — nada falhou. A linha NULL tinha 19 minutos de idade com seu step ainda em `running`; nada a varre (veja Lacunas). Uma linha NULL com segundos de idade é apenas um attempt em voo."
+        }
+      ]
+    },
+    {
+      "heading": "Lacunas fechadas desde que esta página foi escrita",
+      "body": "A lista de lacunas abaixo foi escrita contra uma árvore anterior, e parte dela já foi corrigida desde então. Essas entradas ficam registradas aqui em vez de apagadas: quem lê e se lembra de uma lacuna precisa conseguir distinguir **corrigida** de **nunca existiu**, e a mudança que fechou uma delas costuma ser a descrição verdadeira mais curta do que o comportamento é agora.\n\nA regra desta tabela é a regra da própria lista de lacunas. Uma entrada só se move para cá depois que o código foi lido e a afirmação conferida contra ele, nunca porque uma mensagem de commit disse que sim — que é exatamente como a lista ficou desatualizada em primeiro lugar. Tudo que continua aberto está em **O que não está construído aqui**, logo abaixo.",
+      "table": {
+        "columns": [
+          "o que estava errado",
+          "o que fechou a lacuna"
+        ],
+        "rows": [
+          [
+            "Nesta máquina de demonstração um worker simulado (`actor='demo'`, internal/demo/demo.go:1233-1260 e 2033) conduz alguns dos mesmos jobs que o jobrunner real está executando, libera as leases deles, e escreve `farm.jobs.state` diretamente. Linhas de job e de step se contradizem aqui de maneiras que produção não produziria, e a contradição não é passiva — ela dá fence em execuções reais. Observe o job 42f3c6be: `job_attempt_started` do actor `runner` às 10:52:20 no device e0d50645 no fence 2389; `job_succeeded` do actor `demo` às 10:52:35 alegando `steps: 4`; a lease liberada com reason `completed` às 10:52:35 pela demo; e o próprio step push do runner, ainda repetindo, terminando `aborted` com `lease: fenced`. Em toda a frota, `farm.events` mostra 92 eventos `job_succeeded` vindos de `demo` ao lado de 1183 `job_attempt_finished` vindos de `runner`. Ao ler esta farm, confie nas linhas do actor `runner`, e trate um state de job que nenhuma linha de attempt sustenta como artefato da demo.",
+            "A simulação agenda apenas os jobs que ela mesma enfileirou. `farm.jobs.created_by` é `'demo-feeder'` no tráfego dela e nada mais escreve esse valor, de modo que um job submetido pela API vai para o scheduler real e para o jobrunner real — que rodam no mesmo processo — em vez de ser liberado depois de quatro segundos com base no modelo de trabalho do simulador, que é a CONTAGEM de steps e não o que os steps dizem. Dois testes em `internal/demo` seguram isso."
+          ],
+          [
+            "`POST /api/v1/jobs` não validava a spec. `specSubmissionError` estava documentado como \"the gate POST /api/v1/jobs applies to a spec\" e não era chamado de lugar nenhum; `handleJobCreate` inseria `req.Spec` direto em `farm.jobs.spec`. Sete jobs chegaram a `failed` com `jobspec: invalid spec`, cada um deles tendo queimado um device real.",
+            "`internal/api/jobs.go:331` chama `s.ValidateJobSubmission` antes do insert. O portão é `internal/api/jobs_submit.go`, e ele alcança `specSubmissionError` na linha 215; uma recusa nomeia todos os problemas de uma vez, com seu ponteiro JSON, em vez de falhar no primeiro."
+          ],
+          [
+            "`ctl validate` e `ctl submit` nunca chamavam o validador do servidor. Ambos rodavam `jobspec.Parse` localmente, então `ctl validate` saía com 0 em uma spec que nomeava digests que não estão no store — o mesmo arquivo voltava `valid:false` por HTTP.",
+            "Os dois comandos agora passam por `POST /api/v1/specs/validate` — `internal/ctl/commands_spec.go`, ligado em `internal/ctl/ctl.go:701-702`. O parse local ainda roda primeiro, de modo que uma spec com nove defeitos produz nove mensagens e nenhum job criado pela metade, e `-o json` renderiza o schema da própria API em vez de um segundo."
+          ],
+          [
+            "`farm.jobs.profile_id` não era escrito por nenhum caminho de código, então todo step `reset` acima do tier `none` se expandia em zero sub-steps, reportava `state = ok`, e não limpava nada.",
+            "`JobSubmissionOptions` (`internal/api/jobs_submit.go:75-78`) o carrega, `handleJobCreate` o escreve (`internal/api/jobs.go:343-346`), e `ctl submit --profile` define a coluna em vez de uma chave de seletor. Um profile desconhecido é recusado na submissão, com a lista de permitidos anexada."
+          ],
+          [
+            "`reset_tier`, `max_attempts` e `resumable` — três colunas que o runner lê a cada placement — não eram configuráveis pela API nem pela CLI. Todo job na farm rodava com `max_attempts` 3 e `resumable` true, servisse isso a ele ou não.",
+            "Os três estão em `JobSubmissionOptions`, validados contra os domínios do CHECK e contra o teto `int32` de `farm.jobs.max_attempts` (que a constraint não consegue pegar), e expostos como `ctl submit --reset-tier` e `--max-attempts`. `resumable:false` é uma escolha real e `max_attempts:0` é um bug que vale nomear, então ambos são ponteiros em vez de valores zero."
+          ],
+          [
+            "Nem `farm.job_steps` nem `farm.job_attempts` tinham qualquer rota, comando de CLI ou superfície no dashboard. As duas tabelas construídas para responder \"qual step falhou\" e \"isto é um problema de job ou um problema de device\" só eram alcançáveis pelo psql.",
+            "`GET /api/v1/jobs/{id}/steps` e `GET /api/v1/jobs/{id}/attempts` (`internal/api/jobsteps.go`, registradas em `cmd/farmd/roles.go:147-154`), com o mesmo escopo que `GET /api/v1/jobs/{id}` usa e sem escrever nada; mais `ctl job steps <id>` e `ctl job attempts <id>` (`internal/ctl/commands_job.go`)."
+          ],
+          [
+            "Nada fechava uma linha de attempt ou de step cujo processo tinha morrido. `farm.job_steps` e `farm.job_attempts` tinham um escritor e nenhum varredor, então um job podia aparecer como `succeeded` enquanto sua linha de step ficava em `running` para sempre e sua linha de attempt mantinha `outcome` NULL.",
+            "`internal/janitor` as varre, e a regra dele é a LEASE, nunca o relógio: um step é órfão quando o job dele não tem lease viva ou quando a lease do seu próprio attempt está terminal. Um step `shell_detached` de seis horas nunca é varrido por parecer lento — isso seria o #663 usando outro chapéu. Ele também reenfileira ou reprova um job cujo placement desapareceu, e fecha alvos de bulk e attempts de recovery desatualizados."
+          ],
+          [
+            "`internal/api` não tinha nenhum arquivo de teste.",
+            "`auth_test.go` e `method_test.go`. `internal/runner` e `internal/jobrunner` continuam vazios — veja a lacuna abaixo."
+          ],
+          [
+            "`jobrunner.Collectors()` (`internal/jobrunner/jobrunner.go:1649`) devolve dezenove métricas e nunca é chamado. `cmd/farmd/roles.go:86` chama `obs.RegisterAll(reg, log)` sem grupos variádicos, e a assinatura é `RegisterAll(r, log, groups ...[]prometheus.Collector)` — então o registry recebe os nove collectors do próprio internal/obs e mais nada. Dez pacotes definem `Collectors()` (adbwire, enroll, janitor, jobrunner, node, reaper, recovery, scheduler, topo, watchdog) e a árvore inteira contém exatamente UM ponto de chamada: `internal/api/server.go:369`, para adbwire — e essa linha fica dentro de `if ownRegistry`, um branch que o `farmd` nunca toma, porque `runAPI` fornece o registry ele mesmo em `roles.go:138`. Então, no binário entregue, os collectors de nenhum pacote chegam a `/metrics`, os do adbwire inclusive. `internal/runner` não define métrica alguma — o pacote não importa prometheus.",
+            "Registrados junto com os outros nove grupos em `newRegistry`, com um teste que reprova o build se o grupo de um pacote for descartado. Os quatro states terminais de `farm_jobrunner_outcomes_total` também são tocados no registro: um CounterVec sem filhos não exporta absolutamente nada, então o alerta de taxa de falha sobre ele ficava desarmado em silêncio em qualquer farm onde nenhum job tivesse terminado ainda."
+          ],
+          [
+            "`internal/runner` e `internal/jobrunner` não têm nenhum arquivo de teste. `go test ./internal/runner/ ./internal/jobrunner/` reporta `[no test files]` para os dois. `internal/api` está coberto agora (veja a tabela acima) e `./internal/jobspec` passa, incluindo `TestKindTableMatchesMigration`, que prende o vocabulário Go à migration.",
+            "3.904 linhas em seis arquivos. O que precisou de uma costura é `TestAFencedProcessReleasesNothing`: `releaseLease` se recusa a liberar uma lease da qual este processo foi fenced, e isso NÃO é redundante com o banco de dados, porque `farm.lease_acquire` faz re-attach no mesmo fence e um processo fenced portanto ainda apresenta um fence que casa. Só o holder consegue distinguir os dois placements, então `leaseHolder` — Fenced e Release, nada que consiga adquirir ou renovar — permite que um stub o conduza."
+          ],
+          [
+            "O exit code de um comando `shell_detached` nunca é verificado pelo runner. `execShellDetached` (internal/runner/steps.go:340) retorna assim que o lançamento tem sucesso; `reattachDetached` (steps.go:411-414) só testa a existência de `result_path`; nada em lugar nenhum lê o conteúdo dele.",
+            "`probeDetached` o lê, e ele é chamado nos três momentos em que uma execução detached pode ser julgada: logo depois do lançamento (`execShellDetached`), em um resume (`reattachDetached`), e ao longo da espera, quando um `wait_for` nomeia o `handle` da execução (`execWaitForDetached`). O terceiro é o de que o ciclo de vida comum precisa — lançar, esperar quatro horas, terminar, sem eviction — e é o motivo de `wait_for` ter ganhado um `handle`: `test -f …/soak.result` é verdadeiro para 137 com a mesma facilidade que para 0, e `cat …/soak.result` com `expect_exit: [0]` julga o `cat`. O probe aceita exatamente três formatos: `absent`, `running`, e `done` seguido de um exit status. Qualquer outra coisa é uma resposta que não entendemos, e a leitura na qual ela jamais pode se transformar é \"absent\" — que iniciaria uma segunda cópia de um comando que pode muito bem ainda estar rodando. Em vez disso, ela é repetida dentro da lease."
+          ]
+        ]
+      },
+      "source": "internal/api/jobs_submit.go, internal/api/jobsteps.go, internal/ctl/commands_spec.go, internal/ctl/commands_job.go, internal/janitor/janitor.go, cmd/farmd/roles.go"
+    }
+  ],
+  "gaps": [
+    {
+      "what": "push, install e pull nunca se completaram neste deployment, e push falha ativamente. `farm.job_steps` contém uma linha `push` e duas linhas `install`, todas no state `aborted`, e nenhuma linha `pull`. Toda tentativa de push registra uma linha `state = 'failed'` em `farm.device_artifacts` com `detail.error` = `adbwire: stream_write: peer_closed … wsasend: An established connection was aborted` — três devices até agora.",
+      "consequence": "Submeti o job 42f3c6be-4ee5-4b58-8df2-e16072885708 (push → install → shell → pull) contra o único artifact real no store (harness.apk, a27cf114…3deca). O push repetiu o fio sete vezes ao longo de 60 segundos dentro da sua lease e nunca transferiu um byte; o step terminou `aborted` quando a lease foi fenced. Os caminhos de execução documentados acima a partir do código — o pulo pelo ledger de `EnsureOnDevice` e sua verificação, o fallback de cópia no lado do device, o pull transmitido direto para o content store, a dupla checagem do `pm install` — não foram observados funcionando em nenhum device aqui. Teste-os em hardware de staging antes de depender deles. Uma coisa que vale saber: uma linha `failed` em `farm.device_artifacts` é um registro, não uma pílula envenenada — `EnsureOnDevice` só pula quando `state = 'present'` (internal/artifacts/store.go:875), então o próximo job faz push de novo.",
+      "status": "unverified"
+    }
+  ],
+  "verified": "Toda afirmação abaixo vem de um arquivo que eu abri em C:\\git\\device-farmer ou de um comando que rodei contra o sistema vivo em 127.0.0.1:8420 e postgres://farm@127.0.0.1:55432/device_farmer. As contagens de snapshot estão carimbadas em 2026-09-04 10:53-10:56 -03; a demo continua rodando, então as consultas são a parte durável e os números se mexem. Não editei nenhum arquivo do repositório.\n\nARQUIVOS LIDOS NA ÍNTEGRA OU NOS TRECHOS CITADOS: internal/runner/runner.go (todas as 1263 linhas ao longo de várias passagens), internal/runner/steps.go (1542), internal/runner/checkpoint.go (299, arquivo inteiro), internal/jobrunner/jobrunner.go (doc do pacote, Collectors, finalize, writeJob), internal/jobrunner/conn.go (todo o caminho de classify), internal/jobspec/spec.go (doc do pacote, bounds, Step, stepEnvelope, Parse, ResetTier), internal/jobspec/validate.go (Validate, checkStep, regexes, ResetSteps, clearCommand, uninstallUnknownCommand), internal/jobspec/spec_test.go (TestKindTableMatchesMigration), internal/api/specs.go (bounds, views, specSubmissionError), internal/api/jobs.go (jobCreateRequest, handleJobCreate), internal/api/router.go (tabela de rotas completa), internal/api/server.go (registro de métricas), internal/artifacts/store.go (EnsureOnDevice, PushFunc), internal/ctl/commands.go (submit/validate), internal/ui/assets/app.js (readJobForm, submit do job-form), internal/lease/holder.go e store.go (semântica de ErrFenced), internal/demo/demo.go (complete/abandon), migrations/00004_operate.sql:140-232 e 460-500.\n\nRODADO CONTRA A API AO VIVO: GET /api/v1/specs/kinds (10 kinds, limits, missing_from_database vazio, nenhum disagrees_with_build); GET /api/v1/specs/resets para tier=none/soft/medium/hard com profile=default (0/2/4/7 steps, 0/120/1020/1845s, texto completo dos comandos, continue_on_error apenas em reset/reboot, steps:null para none); POST /api/v1/specs/validate dez vezes, uma spec mínima por kind, todas valid:true problem_count:0 com o total_timeout_s citado em cada exemplo; POST validate na spec de referência de então 12 steps com check_artifacts=false → valid:true, steps:12, reset_steps:1, total_timeout_s:26460 (essa spec tem 11 steps / 26160s nesta página agora — veja o adendo); o mesmo arquivo como corpo nu com check_artifacts assumindo o padrão true → valid:false, dois problemas \"farm.artifacts holds no content with this digest\" e present:false nas duas referências; POST validate em uma incompatibilidade kind/payload e em um kind desconhecido → as duas strings de recusa citadas textualmente; curl /metrics | grep -c farm_jobrunner → 0, e a lista HELP completa para estabelecer quais métricas farm_* SÃO servidas.\n\nRODADO PELA CLI: ctl validate em bad.json (10 problemas, exit 1, cada linha citada); ctl validate em demo_job.json e em full.json (este último sai com 0 apesar de nomear dois digests ausentes — isso é uma lacuna); ctl job eb9f08f6…; ctl artifacts (uma linha, harness.apk — o \"store está vazio\" do rascunho está desatualizado); ctl submit duas vezes.\n\nJOBS QUE SUBMETI E ACOMPANHEI ATÉ O FIM: ac52f606-4115-43b3-a58c-c5eee949a0a3 — a spec de 7 steps cobrindo shell, assert, reset, shell_detached, sleep, wait_for, shell; teve sucesso no device cea4d45e no fence 2473, lease liberada 'completed', todas as sete linhas de step ok com transport_retries 0, checkpoint citado textualmente. 42f3c6be-4ee5-4b58-8df2-e16072885708 — push/install/shell/pull contra o único artifact real; o push repetiu o fio 7 vezes ao longo de 60s dentro da sua lease, não transferiu nada, e terminou 'aborted' quando o worker da demo liberou a lease debaixo dele às 10:52:35 com reason 'completed'; farm.events para esse job mostra os actors runner e demo se contradizendo linha a linha.\n\nCONSULTADO NA FARM EM EXECUÇÃO: farm.step_kinds (bate com a API e com a migration linha a linha); farm.job_steps agrupado por kind e state; a distribuição de transport_retries (7 steps ok depois de 5 retries, 8 falharam com 6 retries em um orçamento de 30s, 3 abortados com 7 retries por fencing); o único wait_for com poll_blips 5 / polls 6 que voltou ok com transport_retries 0; um checkpoint concluído e os seis checkpoints in_flight com os states reais dos seus jobs; os outcomes de farm.job_attempts (1164 succeeded / 40 failed / 3 abandoned / 1 NULL) e os dois attempts do job 0dc8994a em dois devices com o texto completo do erro de prepare; os motivos de falha em farm.jobs; as linhas de attempt e de step abertas com suas idades; farm.artifacts e farm.device_artifacts; os sete jobs de spec ruim e os sete devices distintos que cada um deles pegou sob lease; farm.events agrupado por actor e kind; as linhas de lease dos dois jobs que submeti.\n\nCHECAGENS DE BUILD: go test ./internal/runner/ ./internal/jobrunner/ ./internal/api/ ./internal/jobspec/ → \"[no test files]\" para os três primeiros, ok para jobspec. greps por specSubmissionError, profile_id, resumable, reset_tier, Collectors(), job_steps/job_attempts em api|ui|ctl, e specs/validate em internal/ctl.\n\nCHECAGEM DE INVARIANTE: li cada seção procurando qualquer coisa que sugerisse que uma falha de conectividade pode encerrar uma lease. Dois pontos do rascunho chegaram perto e agora estão corrigidos. Primeiro, as linhas de install/push no state 'aborted' eram descritas como terminando \"depois de 7 retries de transporte\", o que se lê como se os retries as tivessem encerrado; o erro real delas é 'lease: fenced' com outcome de attempt 'abandoned', e o texto agora diz isso e as usa como contraexemplo. Segundo, tanto a linha 'failed' da tabela de attempts quanto o exemplo de falha de prepare precisavam ter o relógio nomeado explicitamente — o timeout do próprio step que falhou, ou o default_timeout da spec no caso do prepare — para que nenhum dos dois se leia como \"o device estava inalcançável, então a lease terminou\". Também confirmei em internal/lease/store.go:77-80 que lease.ErrFenced só é levantado quando farm.lease_renew casa com zero linhas, de modo que um blip do banco de dados não é fencing, e em internal/jobrunner/jobrunner.go:27-33 que farm.leases.release_reason não tem valor de conectividade para este laço escrever.\n\nPASSAGEM DE REVERIFICAÇÃO DAS LACUNAS. A lista de lacunas desta página foi reconferida contra a árvore, linha a linha, depois das migrations 00005, 00006 e 00007 e das mudanças em Go que vieram com elas. Cada entrada movida para \"Lacunas fechadas desde que esta página foi escrita\" foi confirmada lendo o código que a fechou, não confiando em uma mensagem de commit. Três afirmações se revelaram desatualizadas na direção oposta e foram reabertas: reaper.Collectors(), jobrunner.Collectors() e os collectors de recovery/node continuam todos não registrados, porque cmd/farmd/roles.go:86 chama obs.RegisterAll(reg, log) sem grupos variádicos e o único ponto de chamada de Collectors() na árvore fica em um branch que o farmd nunca toma. Uma afirmação era simplesmente falsa quando foi escrita — farm.slots.power_domain_id existe desde migrations/00001_core.sql:91 — e foi corrigida no lugar. Duas afirmações sobre cobertura de testes foram estreitadas em vez de fechadas: internal/lease e internal/api estão cobertos agora; internal/reaper, internal/scheduler, internal/runner e internal/jobrunner continuam com zero arquivos de teste. Só os seis arquivos JSON de área foram editados por esta passagem; nenhum código Go, SQL ou de UI foi tocado.\n\nADENDO, 2026-09-05 — o handle do wait_for. `wait_for` ganhou uma segunda forma, que espera pelo exit status publicado por um step `shell_detached` em vez de esperar por um probe, e esta página foi reconferida contra ela em vez de editada a partir do diff. Contra uma farm construída da mesma árvore: POST /api/v1/specs/validate na spec de referência, agora com 11 steps, com check_artifacts=false → valid:true, steps:11, reset_steps:1, total_timeout_s:26160, as mesmas duas referências de artifact; no exemplo de dois steps com handle → valid:true, steps:2, total_timeout_s:21720; em um wait_for definindo `probe` e `handle` ao mesmo tempo, e em um que nomeia um handle declarado abaixo dele → as duas strings de recusa citadas textualmente naquela seção. JOB SUBMETIDO E ACOMPANHADO ATÉ O FIM: 30f04216-303e-4cf9-8af5-dba82917011a, a spec de 7 steps do próprio passo a passo, com `doc/05-await` nomeando o handle `docrun` em vez de sondar pelo arquivo de resultado — teve sucesso no device 8b5ea7cd no fence 96, lease liberada 'completed', todas as sete linhas de step ok com transport_retries 0, e `doc/05-await` carregando exit_code 0 lido do próprio arquivo de status do device. A spec de soak da demo usa a mesma forma agora; o job 0954fc1b-7cf8-47ec-a2c6-42a76981d65c é a gravação citada acima, e seis jobs de soak rodaram desse jeito com todos os steps ok. A transcrição da tabela de steps que abria o passo a passo foi substituída em vez de editada, porque ela não pode ser reproduzida por este binário: `ctl validate` é atendido por cmdSpecValidate, que pergunta ao servidor e imprime um resumo, e o renderizador de tabela que aquela transcrição mostra (cmdValidate, internal/ctl/commands.go:1398) não está mais ligado a comando nenhum. Arquivos editados por esta passagem: este, mais as mudanças em Go e no README que o adendo descreve."
+}

@@ -231,7 +231,7 @@ func TestEveryKeyTheAppAsksForExists(t *testing.T) {
 	en := dictionary(t, src, "en")
 
 	used := map[string][]string{}
-	for _, name := range []string{"assets/app.js", "assets/docs.js", "assets/index.html"} {
+	for _, name := range []string{"assets/app.js", "assets/docs.js", "assets/exec.js", "assets/index.html"} {
 		b, err := embedded.ReadFile(name)
 		if err != nil {
 			t.Fatalf("read %s: %v", name, err)

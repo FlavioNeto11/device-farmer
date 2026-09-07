@@ -290,6 +290,10 @@ function normDevice(raw) {
     rackSlot: pick(raw, 'rack_slot'),
     usbPath: pick(raw, 'usb_path'),
     devPath: pick(raw, 'adb_devpath'),
+    /* The exec pre-flight reads this: a host with no recorded ADB endpoint is a
+     * 409 the panel can predict from a row it already has, rather than a
+     * refusal an operator meets after composing a command. */
+    adbEndpoint: pick(raw, 'adb_endpoint'),
     slotState: pick(raw, 'slot_state'),
     hubID: pick(raw, 'hub_id'),
     hubPath: pick(raw, 'hub_path'),
@@ -2197,7 +2201,7 @@ let pendingConfirm = null;
 
 function impactList(subject, lines) {
   return el('div', null,
-    el('div', null, 'Subject: ', el('span', { class: 'subject' }, subject)),
+    el('div', null, t('confirm.subject') + ' ', el('span', { class: 'subject' }, subject)),
     el('ul', null, lines.map((l) => el('li', null, l))));
 }
 
@@ -2479,29 +2483,13 @@ function renderDeviceBody(d) {
       kv('reclaimable', d.reclaimableAt ? fmtAbs(d.reclaimableAt) + ' (' + fmtRel(d.reclaimableAt) + ')' : '—'))
     : emptyState('No live lease.', 'This device is free. Health has nothing to do with that: an offline device can still be held, and a healthy one can be idle.');
 
-  const execInput = el('input', { type: 'text', placeholder: 'shell getprop ro.build.fingerprint', 'aria-label': 'ADB command to run on this device' });
-  const execOut = el('pre', { class: 'out', hidden: true });
-  const execBtn = el('button', {
-    class: 'primary', onclick: async () => {
-      const cmd = execInput.value.trim();
-      if (!cmd) return;
-      execBtn.disabled = true;
-      execOut.hidden = false;
-      execOut.textContent = 'running…';
-      try {
-        const resp = await api.post('devices/' + encodeURIComponent(d.id) + '/exec', { command: cmd, timeout_ms: 30000 });
-        const code = pick(resp, 'exit_code');
-        const stderr = pick(resp, 'stderr');
-        execOut.textContent = 'exit_code ' + (code === undefined ? '?' : code) + '\n\n' +
-          (pick(resp, 'output') || '(no output)') + (stderr ? '\n\n--- stderr ---\n' + stderr : '');
-      } catch (e) {
-        execOut.textContent = 'refused: ' + errText(e) +
-          (e instanceof ApiError && e.detail !== undefined ? '\n' + JSON.stringify(e.detail, null, 2) : '');
-      } finally {
-        execBtn.disabled = false;
-      }
-    }
-  }, 'Run');
+  /* The command box is exec.js's, and it is a whole widget rather than an input
+   * and a button. What used to be here posted a fixed 30-second timeout and
+   * rendered `'exit_code ' + code`, which is wrong in a way worth remembering:
+   * the API returns exit_code -1 with exited:false as a 200 when the shell
+   * stream carried no exit frame, and that is not a result — it means the
+   * command may still be running on the phone. See exec.js's header. */
+  const execBox = execPanel(d);
 
   const actions = el('div', { class: 'actions' },
     hasLease ? el('button', {
@@ -2518,16 +2506,16 @@ function renderDeviceBody(d) {
     }, 'Drain host ' + d.host) : null);
 
   body.replaceChildren(
-    el('h3', { class: 'section-h' }, 'Identity'), identity,
-    el('h3', { class: 'section-h' }, 'Physical position'), position,
-    el('h3', { class: 'section-h' }, 'Health'), health,
-    el('h3', { class: 'section-h' }, 'Lease'), lease,
-    el('h3', { class: 'section-h' }, 'Operator actions'), actions,
-    el('h3', { class: 'section-h' }, 'Run one ADB command'),
-    el('div', { class: 'exec-row' }, execInput, execBtn), execOut,
-    el('h3', { class: 'section-h' }, 'Screen'), screenPanel(d),
-    el('h3', { class: 'section-h' }, 'Raw API row'),
-    el('details', null, el('summary', null, 'every field the API returned'),
+    el('h3', { class: 'section-h' }, t('device.identity')), identity,
+    el('h3', { class: 'section-h' }, t('device.position')), position,
+    el('h3', { class: 'section-h' }, t('device.health')), health,
+    el('h3', { class: 'section-h' }, t('device.lease')), lease,
+    el('h3', { class: 'section-h' }, t('device.actions')), actions,
+    el('h3', { class: 'section-h' }, t('exec.title')),
+    execBox,
+    el('h3', { class: 'section-h' }, t('device.screen')), screenPanel(d),
+    el('h3', { class: 'section-h' }, t('device.raw')),
+    el('details', null, el('summary', null, t('device.rawSummary')),
       el('pre', { class: 'out' }, JSON.stringify(d.raw, null, 2))));
 }
 

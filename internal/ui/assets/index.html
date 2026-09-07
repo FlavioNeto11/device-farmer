@@ -12,6 +12,7 @@
      and correcting itself. -->
 <script src="i18n.js" defer></script>
 <script src="docs.js" defer></script>
+<script src="exec.js" defer></script>
 <script src="app.js" defer></script>
 </head>
 <body>
@@ -246,7 +247,7 @@
         <label for="bulk-selector">Selector (JSON)</label>
         <textarea id="bulk-selector" name="selector" rows="3" spellcheck="false">{"pool":""}</textarea>
         <label for="bulk-command">Command</label>
-        <input id="bulk-command" name="command" required placeholder="shell getprop ro.build.fingerprint">
+        <input id="bulk-command" name="command" required placeholder="getprop ro.build.fingerprint">
         <div class="row2">
           <div>
             <label for="bulk-max">Max per hub</label>

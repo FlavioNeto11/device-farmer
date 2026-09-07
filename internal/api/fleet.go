@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/flaviopadilha/device-farmer/internal/adbwire"
+	"github.com/flaviopadilha/device-farmer/internal/config"
 )
 
 // scanner is the shared shape of pgx.Row and pgx.Rows, so one scan function
@@ -509,6 +510,93 @@ type execResponse struct {
 	LeaseID string `json:"lease_id,omitempty"`
 }
 
+// refuseExecBehindTheFence answers POST /devices/{id}/exec on a farm whose hosts
+// run the fence proxy, and reports whether it answered.
+//
+// # The decision, and why it is this one
+//
+// internal/fenceproxy admits a connection that carries no lease fence only to an
+// exact list of ADB service strings, and this route's service string is
+// "shell,v2,raw:" followed by whatever an operator typed. Three shapes of fix
+// were on the table and two of them are worse than refusing:
+//
+//   - A regexp over the command. The proxy does admit two patterns already, so
+//     this is not forbidden in principle — but both of them bound a command whose
+//     SHAPE is fixed, with one variable region that can hold nothing but hex
+//     digits or a bounded version number. A pattern over an operator's command
+//     has no fixed shape to bound. The only pattern that would admit the commands
+//     operators actually run — logcat, dumpsys, pm, am, cat — is one that admits
+//     a safe ALPHABET, and a safe alphabet is still `rm -rf /sdcard`,
+//     `pm uninstall` and `cat /data/...` on every handset in the rack. It would
+//     pass the "cannot be extended with ';'" test and still hand a stolen
+//     maintenance credential the root shell the whole class is bounded to
+//     prevent. Passing that test is necessary, not sufficient.
+//
+//   - A separate, narrower class with its own certificate. It contains the blast
+//     radius to a separately issued credential, which is a real improvement, and
+//     it does not make the command any less arbitrary: the class would still need
+//     a rule admitting an unbounded shell, and ServiceRules cannot express one
+//     safely. It also needs issuance machinery this tree does not have — there is
+//     one knob for the classes that carry no fence and every role shares it.
+//
+//   - Refuse, and say so. That is this. The capability is not expressible, so the
+//     honest thing is to state it in one place, in code and in
+//     docs/design/fence-proxy.md, rather than ship a pattern that looks bounded.
+//
+// # Why it is refused HERE and not left to the proxy
+//
+// The proxy already refuses it, with a readable FAIL frame — but that reaches the
+// operator as a 502 Bad Gateway saying the command "did not complete against this
+// device", which reads like a wedged handset. An operator chasing a broken phone
+// that is not broken is the failure this function prevents: 501 with a code of
+// its own, a message naming the policy, and the two things to do instead.
+//
+// # What this does not cover
+//
+// POST /api/v1/devices/bulk/exec dials through the same factory and is refused by
+// the proxy in the same way, but its handler is in ops.go, which is under a
+// standing rule not to be edited. A bulk run on a fenced farm therefore still
+// reports the proxy's own FAIL text per target rather than this refusal. The text
+// is readable; the status is the same 502 this function exists to avoid.
+func (s *Server) refuseExecBehindTheFence(r *http.Request, w http.ResponseWriter, command string) bool {
+	if s.cfg == nil || !s.cfg.FenceClient.Enabled() {
+		return false
+	}
+
+	// Counted and logged, because an attempt to run an arbitrary shell on a
+	// handset is the most security-relevant thing this route sees and a refusal
+	// that leaves no trace leaves nobody able to say how often it is tried. No
+	// audit row: farm.audit_log records what was DONE to a device, this request
+	// never resolved one, and a refusal that wrote a row per attempt would give
+	// an unauthenticated-adjacent caller a way to fill that table.
+	if s.metrics != nil {
+		s.metrics.execs.WithLabelValues("not_admitted").Inc()
+	}
+	if s.log != nil && r != nil {
+		s.log.WarnContext(r.Context(), "refused an operator exec: this farm enforces the fence at the ADB socket",
+			"actor", actor(r.Context()), "device_id", strings.TrimSpace(r.PathValue("id")),
+			"command", command,
+			"note", "nothing was sent to the device and no lease was affected")
+	}
+
+	writeError(w, http.StatusNotImplemented, CodeExecNotAdmitted,
+		"this farm enforces the lease fence at the ADB socket ("+config.EnvFenceClientCert+" is set), "+
+			"and an arbitrary shell command is not a service the fence proxy admits to any "+
+			"credential this process holds. The command was NOT sent to the device. Nothing about "+
+			"this is a lease verdict and no lease was affected. To run a command on a device, "+
+			"either run it as a job step under a lease — the job runner's connections carry a "+
+			"fence and are not held to a service whitelist — or use the operator actions that are "+
+			"admitted: reboot, reconnect, detach/attach, USB reset and port power. If an operator "+
+			"shell on a fenced farm is genuinely needed, it is a change to "+
+			"internal/fenceproxy's whitelist and to docs/design/fence-proxy.md, not a retry.",
+		map[string]any{
+			"command":      command,
+			"policy":       "fenceproxy maintenance whitelist",
+			"lease_effect": "none",
+		})
+	return true
+}
+
 // handleDeviceExec serves POST /api/v1/devices/{id}/exec.
 //
 // This runs one shell command at a PHYSICAL POSITION — slots.adb_devpath, never
@@ -542,6 +630,13 @@ func (s *Server) handleDeviceExec(w http.ResponseWriter, r *http.Request) {
 		if timeout > maxExecTimeout {
 			timeout = maxExecTimeout
 		}
+	}
+
+	// Answered before the device is even looked up, because the answer does not
+	// depend on the device: on a fenced farm this route is off for every device
+	// on every host.
+	if s.refuseExecBehindTheFence(r, w, req.Command) {
+		return
 	}
 
 	d, err := s.lookupDevice(r.Context(), id)

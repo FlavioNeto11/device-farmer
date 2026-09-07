@@ -564,27 +564,175 @@ hat — `getprop ro\.serialno` would otherwise admit
 the config. `TestWhitelistIsExactNotPrefix` puts a deliberately unanchored
 pattern on a whitelist and asserts the extension is still refused.
 
-That list covers `internal/recovery/adbactuator.go` completely — tiers 1, 2 and
-5 are `Control` verbs, tier 7 is `reboot:` — and `internal/watchdog`, which uses
-only `host:track-devices-l`.
+That list is the part that is **fixed for every deployment**, and it is not the
+whole of what the maintenance class dials. An earlier version of this section
+said it "covers `internal/recovery/adbactuator.go` completely — tiers 1, 2 and 5
+are `Control` verbs, tier 7 is `reboot:` — and `internal/watchdog`, which uses
+only `host:track-devices-l`". Three of those clauses were wrong, and the second
+one cost a feature:
+
+* Tiers 1 and 2 are `Control` verbs; tier **5** is `reboot:`; tier **7** is
+  `host:kill`, which is refused — see 7.4.
+* `internal/watchdog` does not use only `host:track-devices-l`. Its battery
+  reader opens `shell,v2,raw:dumpsys battery` on every device in state
+  `device`, once a minute. With the proxy on and the list above, that probe was
+  refused on every handset in the farm — and the watchdog correctly records a
+  device that did not answer as having said nothing, so
+  `farm.device_runtime.battery_pct` simply stopped being written, with no error
+  anywhere that named the proxy.
+
+The general rule that failure produced is section 7.5: **a whitelist entry that
+is a shell command is owned by the package that builds the command, and is
+published from there.**
 
 ### 7.3 Enrolment gets its own class, because enrolment needs a shell
 
-`internal/enroll` reads properties off a brand-new phone with
-`identity.go:293`'s `probeCommand` and `brand.go:63`'s `brandReadCmd`. Both are
-package-level values built from constants — they are *fixed literals at runtime*
-— so exact matching works on them unchanged, which is a happy accident of how
-they were already written.
+`internal/enroll` reads properties off a brand-new phone with `identity.go`'s
+`probeCommand` and `brand.go`'s `brandReadCmd`. Both are package-level values
+built from constants — they are *fixed literals at runtime* — so exact matching
+works on them unchanged, which is a happy accident of how they were already
+written.
 
-`brand.go:74`'s `brandWriteCmd(uid)` is the exception: it interpolates a uid. It
-is admitted by a compiled pattern whose only variable region is `[0-9a-f-]{36}`,
-so the shape of the command is fixed and the uid cannot carry a metacharacter.
+`brandWriteCmd(uid)` and `brandReplaceCmd(uid, prev)` are the exceptions: they
+interpolate a farm uid. They are admitted by compiled patterns that are
+`regexp.QuoteMeta` of the commands themselves with the uid regions replaced by
+`(?P<uid>df-[0-9a-f]{32})` — the regexp form of the CHECK constraint on
+`farm.devices.farm_uid`. Everything outside the uid is literal text, so the
+shape of the command is fixed and the uid cannot carry a metacharacter.
+`internal/enroll/fence.go` builds them from the same command builders the wire
+path uses, so the pattern cannot describe a command the package no longer sends,
+and it panics at package initialisation if the two come apart.
+
+**The groups are named, and the name is load-bearing.** Each of those commands
+interpolates its uid into more than one place — once into a guard ("the file is
+absent, empty, or already holds this uid") and once into the install — and RE2
+has **no backreferences**, so substitution alone produces two *independent*
+regions and admits `guard(A) + install(B)`. That string is built from the right
+template out of the right alphabet, carries no second command, and is one no
+code path in `internal/enroll` builds: it says "check that the phone holds A,
+then write B onto it", which walks straight through the device-side guard whose
+whole job is to stop one phone being rebranded over another's identity. So
+`ServiceRules` enforces the correlation the engine cannot: **capture groups
+sharing a name must capture the same text.** Groups with different names, and
+unnamed groups, are unconstrained, so the `control()` patterns are unaffected.
+`enroll.FenceDeviceNearMisses()` returns exactly those strings and
+`cmd/farmd`'s guard test asserts each is refused.
 
 `ClassEnroll` gets a separate certificate and a separate whitelist from
-`ClassMaintenance` because it is the only class that may open a `shell:` at all,
-and the blast radius of the two should not be pooled.
+`ClassMaintenance` because it is the only class whose *reason for existing* is a
+shell, and the blast radius of the two should not be pooled.
 
-### 7.4 What the proxy deliberately does not decide
+Two honest caveats about it, as of today:
+
+* **Nothing in the tree issues an enroll-class certificate.** There is one knob
+  for the classes that carry no fence (`FARM_FENCE_CLIENT_CERT/KEY/CA`) and
+  every role that uses it announces `maintenance`. `ClassEnroll`'s whitelist is
+  therefore populated ahead of the credential that will reach it, not behind it.
+* **The brand commands are reached with the maintenance certificate.**
+  `POST /api/v1/slots/{id}/rebrand` builds an `enroll.Brander` over the API
+  server's ADB client, which announces `maintenance`, so the brand read and the
+  two brand writes are on that class's list too. That is a widening and it is
+  written down where it is made (`cmd/farmd`'s `fencePolicy`). The bound, stated
+  without flattery: the write can put nothing but a well-formed farm uid at one
+  path this project owns, and it cannot smuggle a second command — but a rebrand
+  *legitimately* overwrites the uid the operator authorised it against, and the
+  whitelist cannot tell an authorised rebrand from an unauthorised one. With the
+  brand read admitted as well, **a holder of the maintenance certificate can read
+  a phone's uid and rebrand it to any well-formed uid**, which is the capability
+  the route exposes to an authenticated operator, reached without the API. The
+  way out is not a narrower pattern; it is giving the API server an enroll-class
+  certificate of its own, so this stops being pooled with the recovery ladder's
+  reach. Until that exists, this is the price of the route working at all on a
+  fenced farm.
+
+### 7.4 `host:kill` and `POST /devices/{id}/exec` are refused, and stay refused
+
+Two callers in this tree ask for something the whitelist will not grant. Both
+refusals are deliberate, and naming them here is what stops the next reader
+filing them as bugs.
+
+**`host:kill` — the recovery ladder's tier 7.** `internal/recovery`'s
+`restartServer` restarts a host's ADB server with it. It is on no class's list in
+`DefaultPolicy` and it is not added at the wiring point either: it severs every
+device on the host, including the ones under live leases, so admitting it would
+make one stolen maintenance credential a farm-wide outage. Behind the proxy tier
+7 is refused; the ladder records the refusal as a rung disposition and climbs on.
+That is the trade, taken knowingly.
+
+**An operator's arbitrary shell — `POST /api/v1/devices/{id}/exec`.** That route
+builds `shell,v2,raw:<whatever the operator typed>`. Three fixes were considered:
+
+1. *A pattern over the command.* Two patterns already ship, so this is not
+   forbidden in principle — but both of them bound a command whose **shape** is
+   fixed, with one variable region that can hold nothing but hex digits or a
+   bounded version number. An operator's command has no fixed shape. The only
+   pattern that would admit what operators actually run is one that restricts the
+   **alphabet**, and a safe alphabet is still `rm -rf /sdcard`, `pm uninstall`
+   and `cat /data/…` on every handset in the rack. It would pass the
+   "cannot be extended with `;`" test and still hand a stolen maintenance
+   credential the root shell this class is bounded to prevent. Passing that test
+   is necessary, not sufficient.
+2. *A separate, narrower class with its own certificate.* It contains the blast
+   radius, which is a real improvement, and it does not make the command any less
+   arbitrary: the class would still need a rule admitting an unbounded shell.
+3. *Refuse, and say so.* This is what ships.
+
+`internal/api` refuses the route **before it dials**, with 501 and
+`"code": "exec_not_admitted"`, a message naming the policy and the two things to
+do instead. That matters because the proxy's own refusal arrives at the API as a
+`*adbwire.ProtocolError` and is reported as 502 Bad Gateway saying the command
+"did not complete against this device" — which reads like a wedged handset and
+sends an operator to look at a phone that is fine. The code is deliberately not
+`fenced`: a route switched off by a deployment's admission policy must never
+share the code a lease holder aborts a six-hour job on.
+
+`POST /api/v1/devices/bulk/exec` is refused by the proxy in the same way and
+still reports it per target as a 502; its handler is in `internal/api/ops.go`,
+which is under a standing no-edit rule.
+
+### 7.5 Where a shell command on a whitelist lives
+
+`DefaultPolicy` holds the entries that are fixed for every deployment: the host
+queries, the position-addressed verbs, and `reboot:`, which is a bare protocol
+word with nothing templated into it.
+
+It deliberately holds **no shell command belonging to another package**. It
+cannot: `internal/fenceproxy` imports no database driver and no HTTP client, and
+`internal/watchdog` and `internal/enroll` bring both. Retyping their commands
+into it is what produced the defect in 7.2 — the string lives in two files and
+only one of them gets edited.
+
+So the owning package exports the service strings it dials
+(`watchdog.FenceDeviceServices`, `enroll.FenceDeviceServices`,
+`enroll.FenceDevicePatterns`, `recovery.DeviceRebootService`) and the role that
+builds the proxy publishes them:
+
+    cmd/farmd fencePolicy  ->  fenceproxy.Policy.AllowingDeviceServices
+                           ->  node.FenceConfig.Policy
+                           ->  the policy the listener serves
+
+`AllowingDeviceServices` takes **device services and nothing else** — there is no
+way to reach `Host`, `HostTargetVerbs` or `Transport` through it, so `host:kill`
+cannot arrive that way — and it rejects a literal that does not parse as a device
+service rather than silently filing it where nothing matches it. An error from
+the policy function is fatal to the node agent: a proxy that served a policy
+which had quietly dropped a widening would refuse the watchdog at the socket, and
+that failure looks like hardware.
+
+Two tests hold this together, and both walk the classes rather than a list
+written by hand, because the hand-written list is what drifted:
+
+* `cmd/farmd`'s `TestEveryServiceThisBinaryDialsIsClassified` ranges over
+  `fenceproxy.Classes()`, requires every class to have a written-down set of
+  service strings derived from the owning packages, and checks each against the
+  policy this binary actually serves. A refusal must be marked deliberate and
+  carry its reason.
+* `internal/node`'s `TestAPublishedShellReachesTheDeviceThroughTheProxy` puts the
+  watchdog's own probe through a real proxy on a real mTLS listener to a real
+  fake ADB server and reads the output back. The defect in 7.2 survived every
+  unit test in both packages; it could only be caught on a wire.
+
+### 7.6 What the proxy deliberately does not decide
 
 A maintenance connection may run a whitelisted verb **regardless of any live
 lease on the device**. That is intentional: tiers 3 and 4 exist to repair a USB
@@ -598,7 +746,11 @@ no lease row and no business re-litigating it. Duplicating the check here would
 produce two answers that drift.
 
 The residual is stated plainly: **a stolen maintenance credential can reboot
-every phone on a host.** Mitigations, in order of importance: a separate issuing
+every phone on a host**, read their battery state, read the farm uid on them, and
+rebrand any of them to any well-formed uid (7.3 says why that last one is the
+price of `POST /api/v1/slots/{id}/rebrand` working at all, and what removes it).
+It cannot open an arbitrary shell, and it cannot stop a host's ADB server — those
+are 7.4. Mitigations, in order of importance: a separate issuing
 intermediate so the credential cannot be minted by whatever mints lease certs; a
 short lifetime (section 9); and an INFO-level audit line on every maintenance
 admission carrying subject, devpath and the exact service string — the one place

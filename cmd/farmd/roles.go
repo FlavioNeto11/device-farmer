@@ -1120,7 +1120,125 @@ func nodeFenceConfig(cfg *config.Config) node.FenceConfig {
 		Advertise:    cfg.Fence.Advertise,
 		PollInterval: cfg.Fence.PollInterval,
 		MaxStaleness: cfg.Node.SelfFenceTimeout,
+		Policy:       fencePolicy,
 	}
+}
+
+// fencePolicy is where the shipped admission whitelist meets THIS BINARY'S
+// callers.
+//
+// # Why the wiring is here and not in the proxy
+//
+// fenceproxy.DefaultPolicy holds the service strings that are fixed for every
+// deployment. It cannot hold the ones that are SHELL COMMANDS, because a shell
+// command belongs to the package that builds it and internal/fenceproxy may not
+// import those packages: it imports no database driver and no HTTP client, and
+// internal/watchdog and internal/enroll bring both. The alternative — retyping
+// their commands into the proxy — is the defect this function exists to close.
+// It had already happened: DefaultPolicy's comment asserted that
+// "internal/watchdog uses only host:track-devices-l", the watchdog's battery
+// probe had been opening "shell,v2,raw:dumpsys battery" the whole time, and on
+// every farm with the proxy switched on that probe was refused at the ADB socket
+// on every device, so farm.device_runtime.battery_pct quietly stopped being
+// written.
+//
+// This function is the composition root's answer: every literal travels as a
+// VALUE from the package that owns it, so the command on the wire and the rule
+// that admits it are the same string by construction.
+// TestEveryServiceThisBinaryDialsIsClassified walks the classes and asserts it.
+//
+// # What is now reachable that was not
+//
+// Widening a whitelist is a security decision, so here is the whole of it.
+// Relative to fenceproxy.DefaultPolicy(), a connection presenting one of these
+// certificates may now additionally open:
+//
+//   - maintenance: "shell,v2,raw:dumpsys battery", and internal/enroll's four
+//     brand commands — the probe, the brand read, and the two brand writes whose
+//     only variable region is a thirty-two-hex-digit farm uid.
+//   - enroll: the same four enroll commands.
+//
+// Why that is acceptable, item by item:
+//
+//   - The battery probe is a read. `dumpsys battery` prints level, scale and
+//     temperature and changes nothing on the device. A stolen maintenance
+//     credential that can already reboot every phone on the host (section 7.4 of
+//     docs/design/fence-proxy.md states that residual plainly) gains the ability
+//     to read their charge.
+//
+//   - The brand read is a `cat` of one path this project owns,
+//     /data/local/tmp/.farm/uid.
+//
+//   - The brand writes are the real widening: a file write to the device. They
+//     are on the maintenance list because POST /api/v1/slots/{id}/rebrand builds
+//     its Brander over the API server's ADB client, which announces the
+//     maintenance class — so without this the rebrand route was refused at the
+//     socket.
+//
+//     What the pattern bounds: the command is a LITERAL TEMPLATE, so it can
+//     write nothing but a well-formed farm uid, to nothing but
+//     /data/local/tmp/.farm/uid, with no character outside [0-9a-f] able to
+//     enter it and no second command able to ride along. It also declares that
+//     its repeated uid regions must AGREE, which is the constraint RE2 cannot
+//     express and which stops "guard that the phone holds A, then write B" —
+//     a string built from the same template that walks through the device-side
+//     guard. internal/enroll.FenceDeviceNearMisses is exactly those strings and
+//     the guard test asserts each is refused.
+//
+//     What it does NOT bound, stated plainly: a rebrand command legitimately
+//     overwrites a uid the operator authorised it against, and the whitelist
+//     cannot tell an authorised rebrand from an unauthorised one. Since the
+//     brand READ is admitted too, a holder of this certificate can read a
+//     phone's uid and then rebrand it to any well-formed uid — the same
+//     capability POST /api/v1/slots/{id}/rebrand exposes to an authenticated
+//     operator, reached without the API. That is the price of the route working
+//     on a fenced farm, and the way out is not a narrower pattern: it is issuing
+//     the API server an enroll-class certificate of its own so that this
+//     capability stops being pooled with the recovery ladder's. Section 7.3 of
+//     docs/design/fence-proxy.md says the same and says why the credential does
+//     not exist yet.
+//
+//   - Nothing here grants a host service, a host-target verb or a transport. The
+//     signature of AllowingDeviceServices makes that impossible rather than
+//     merely unintended, so host:kill cannot arrive through this function.
+//
+// # What stays refused, deliberately
+//
+//   - host:kill, which internal/recovery's tier 7 uses to restart a host's ADB
+//     server. It severs every device on the host including the ones under live
+//     leases, it is on no class's list in DefaultPolicy, and it is not added
+//     here. Tier 7 is refused behind the proxy; the ladder records the refusal as
+//     a rung disposition and climbs on.
+//
+//   - An operator's arbitrary shell through POST /api/v1/devices/{id}/exec. No
+//     exact list enumerates it and no pattern bounds it without handing a stolen
+//     maintenance credential a shell on every handset. internal/api refuses that
+//     route up front on a fenced farm, with a message that says so.
+func fencePolicy(pol fenceproxy.Policy) (fenceproxy.Policy, error) {
+	// The maintenance class is what every role in this binary announces when
+	// FARM_FENCE_CLIENT_CERT is set: the watchdog, the recovery ladder and the
+	// API server's ADB client all share that one certificate.
+	pol, err := pol.AllowingDeviceServices(fenceproxy.ClassMaintenance,
+		append(watchdog.FenceDeviceServices(), enroll.FenceDeviceServices()...),
+		enroll.FenceDevicePatterns())
+	if err != nil {
+		return fenceproxy.Policy{}, fmt.Errorf("maintenance: %w", err)
+	}
+
+	// The enroll class is bounded ahead of the credential that will reach it.
+	// Nothing in this tree issues an enroll-class certificate yet — there is one
+	// knob for the classes that carry no fence and every role announces
+	// maintenance with it — so this list admits nobody today. It is published
+	// anyway, because the class whose whole reason for existing is that enrolment
+	// needs a shell should not be bounded to nothing on the day that certificate
+	// arrives.
+	pol, err = pol.AllowingDeviceServices(fenceproxy.ClassEnroll,
+		enroll.FenceDeviceServices(), enroll.FenceDevicePatterns())
+	if err != nil {
+		return fenceproxy.Policy{}, fmt.Errorf("enroll: %w", err)
+	}
+
+	return pol, nil
 }
 
 func runCtl(ctx context.Context, cfg *config.Config, args []string, stdout, stderr io.Writer) int {

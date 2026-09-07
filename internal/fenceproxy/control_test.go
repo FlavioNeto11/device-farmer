@@ -207,11 +207,16 @@ func TestAClassBoundedByNothingIsRefused(t *testing.T) {
 // TestEveryValidClassIsBounded is the guard that makes the test above
 // unnecessary to remember. It walks the classes rather than a list written
 // here, so a fifth class cannot be added without answering the question.
+//
+// It used to walk a list written here, which was the same list retyped — and
+// TestClassesIsEveryClassValidAccepts now holds [Classes] to Class.Valid by
+// parsing both, so walking Classes is walking the classes rather than a copy of
+// them that somebody has to remember to extend.
 func TestEveryValidClassIsBounded(t *testing.T) {
 	t.Parallel()
 
 	pol := DefaultPolicy()
-	for _, c := range []Class{ClassLease, ClassMaintenance, ClassEnroll, ClassControl} {
+	for _, c := range Classes() {
 		if !c.Valid() {
 			t.Errorf("%s is in this list and not in Class.Valid", c)
 			continue

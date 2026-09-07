@@ -89,6 +89,17 @@ const (
 	// CodeUINotMounted accompanies 404 at "/" when the binary was built or
 	// wired without the dashboard handler.
 	CodeUINotMounted = "ui_not_mounted"
+
+	// CodeExecNotAdmitted accompanies 501 from POST /devices/{id}/exec on a farm
+	// whose hosts run the fence proxy: an arbitrary operator shell is not a
+	// service any credential this process holds may open, so the command is
+	// refused here instead of at the ADB socket.
+	//
+	// The word "fenced" is deliberately NOT in this code. CodeFenced is the
+	// terminal verdict a lease holder aborts on, and a route that is switched off
+	// by a deployment's admission policy must never be confusable with it: no
+	// lease is involved in this refusal and none is affected by it.
+	CodeExecNotAdmitted = "exec_not_admitted"
 )
 
 // statusClientClosed is nginx's non-standard 499. Used when the caller

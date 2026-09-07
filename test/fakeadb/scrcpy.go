@@ -69,9 +69,42 @@ const (
 	scrcpyPTSMask      uint64 = scrcpyFlagKeyFrame - 1
 )
 
-// scrcpyVideoHeaderLen is the session header: codec id, width, height, each a
-// big-endian uint32.
+// The same three fields in the layout a server that sends SESSION HEADERS
+// uses, which [ScrcpyConfig.VideoSessionHeader] selects.
+//
+// The two layouts differ by one bit position and the difference is not
+// cosmetic. A server that can re-announce its video geometry mid-stream needs a
+// way to say "this twelve-byte header is a geometry, not a frame", and the only
+// unclaimed space is the top bit — so the top bit became the discriminator and
+// the flags below it each moved down one. That is the layout internal/scrcpy
+// parses, documented against app/src/demuxer.c at the top of its video.go:
+//
+//	bit 63  this header is a session header
+//	bit 62  the packet is codec configuration
+//	bit 61  the packet is a key frame
+//	bits 60..0  the presentation timestamp
+//
+// WRITING ONE LAYOUT'S FLAGS UNDER THE OTHER'S FRAMING IS NOT A NEAR MISS. A
+// config packet in the older layout sets bit 63, which a reader expecting the
+// newer one reads as a session header — so it takes the packet's payload length
+// for a video height, reports a geometry nobody announced, and resynchronises
+// somewhere inside a frame. Which is why the two sets are one choice and not
+// two, and why VideoSessionHeader moves the flags as well as adding the header.
+const (
+	scrcpyFlagSession         uint64 = 1 << 63
+	scrcpySessionFlagConfig   uint64 = 1 << 62
+	scrcpySessionFlagKeyFrame uint64 = 1 << 61
+	scrcpySessionPTSMask      uint64 = scrcpySessionFlagKeyFrame - 1
+)
+
+// scrcpyVideoHeaderLen is the preamble a server without session headers
+// writes: codec id, width, height, each a big-endian uint32, all twelve bytes
+// of it before the first packet and never repeated.
 const scrcpyVideoHeaderLen = 12
+
+// scrcpyCodecIDLen is the codec id on its own, which is what precedes a
+// SESSION header rather than being packed into it.
+const scrcpyCodecIDLen = 4
 
 // scrcpyPacketHeaderLen is flags+PTS (uint64) then the payload length
 // (uint32).
@@ -90,10 +123,18 @@ type ScrcpyPacket struct {
 	// KeyFrame marks a frame a decoder may start from.
 	KeyFrame bool
 
-	// Data is the payload, Annex-B H.264 in the real thing and arbitrary
-	// bytes here: this fixture never decodes anything, and a test that
-	// asserts on recognisable bytes is easier to read than one that ships a
-	// real frame nobody can eyeball.
+	// Data is the payload: Annex-B H.264 in the real thing, and either that or
+	// arbitrary bytes here.
+	//
+	// Recognisable ASCII is still the right choice for a test about the
+	// FRAMING, because an assertion against "SPS-PPS" reads as an assertion and
+	// one against a hex dump reads as noise. It is the wrong choice for
+	// everything downstream of the framing, which is why
+	// [ScrcpyPacketsFromAnnexB] exists: a browser's VideoDecoder does not care
+	// what a Go test asserted, and a payload no decoder accepts leaves the
+	// whole decode path with no coverage and an operator with a black
+	// rectangle. Use real bytes when the test is about video and readable ones
+	// when it is about bytes.
 	Data []byte
 }
 
@@ -139,7 +180,68 @@ type ScrcpyConfig struct {
 	// holding it open. The default models a live screen, which does not end;
 	// set this when the test wants a stream that finishes so it can read to
 	// EOF.
+	//
+	// It contradicts VideoLoop, and the contradiction is a panic at install
+	// time rather than a precedence rule: see the note on VideoLoop.
 	VideoEOF bool
+
+	// VideoLoop replays Packets forever instead of parking after the last one,
+	// with PTS continuing to advance across loops.
+	//
+	// A fixture clip is seconds long and a screen session is minutes long. A
+	// four-second loop of a test pattern is a live screen for every purpose a
+	// test or a demo has; the same four seconds played once is a screen that
+	// froze four seconds after somebody opened it, which is exactly the
+	// symptom a stalled transport produces and therefore exactly the symptom
+	// nobody can use the fixture to rule out.
+	//
+	// THE TIMESTAMPS ADVANCE, THEY DO NOT RESTART, and that is the whole
+	// subtlety of looping a clip. A decoder uses the presentation timestamp to
+	// decide when a frame is due. Hand it a stream whose time jumps back four
+	// seconds at the splice and every frame of the next pass is already late:
+	// a forgiving decoder drops the lot, a strict one treats the sequence as
+	// corrupt and stops, and either way the failure appears four seconds in,
+	// which is long enough after the connection that it reads as a transport
+	// fault. So each pass adds the duration of one whole pass to every
+	// timestamp in it, and the sequence the client sees never goes backwards.
+	//
+	// Each pass replays from packet zero, config packet included. That is not
+	// laziness about the loop boundary — it is what a real server does for a
+	// decoder that joined late, and the fixture's clip repeats its parameter
+	// sets on every keyframe for the same reason.
+	//
+	// VideoLoop and VideoEOF are contradictory: one says the stream never ends
+	// and the other says it ends now. [ScrcpyFixture] PANICS when both are set
+	// rather than picking a winner, because both orders of precedence are
+	// defensible and neither is guessable from the call site — a test that
+	// asked for both has a bug in its own setup, and the stack trace of a panic
+	// points at the line that wrote it. A silent precedence would instead give
+	// that test a stream it did not ask for and let it pass or hang for reasons
+	// nowhere near the mistake.
+	VideoLoop bool
+
+	// VideoSessionHeader writes the video geometry as an in-stream session
+	// header instead of as a preamble packed in beside the codec id.
+	//
+	// WHICH ONE IS RIGHT DEPENDS ON WHICH SERVER YOU ARE PRETENDING TO BE, AND
+	// THE TWO ARE NOT INTERCHANGEABLE. Left off, the socket opens with twelve
+	// bytes — codec id, width, height — and then packets whose flags sit at
+	// bits 63 and 62. That is the shape internal/adbwire's own duplex test
+	// reads off the wire by offset, and it is the default so that test keeps
+	// describing what the fixture does. Turned on, the socket opens with the
+	// four-byte codec id and then a twelve-byte session header marked by the
+	// top bit, and the packet flags move down to bits 62 and 61 — which is the
+	// shape internal/scrcpy's Reader parses, and therefore the only shape whose
+	// frames reach a decoder at all.
+	//
+	// A fixture that could only write the first shape could not be read by this
+	// repository's own parser: internal/scrcpy would take the width for the top
+	// half of a header, find the flags where it expects a length, and fail with
+	// PacketTooLargeError before the first frame. A fake whose output the
+	// production reader rejects is not a fake of anything. Hence the knob, and
+	// hence TestTheFixturesVideoIsReadableByInternalScrcpy, which is the only
+	// test in this package that makes the two halves meet.
+	VideoSessionHeader bool
 
 	// ServerLog is written to the spawn's stdout as one shell v2 packet, the
 	// way the server jar announces itself. Nothing parses it.
@@ -179,6 +281,21 @@ func ScrcpyFixture(cfg ScrcpyConfig) Fixture {
 	return func(s *Server) {
 		if cfg.Devpath == "" {
 			panic("fakeadb: ScrcpyFixture needs a Devpath — the physical position is the key")
+		}
+		if cfg.VideoLoop && cfg.VideoEOF {
+			panic("fakeadb: ScrcpyFixture was given both VideoLoop and VideoEOF — " +
+				"one says the screen never ends and the other says it ends after the last packet; " +
+				"a fixture that picked a winner would hand this test a stream it did not ask for")
+		}
+		if cfg.VideoLoop && len(cfg.Packets) == 0 {
+			// Refused rather than served, because there is no reading of "replay
+			// nothing forever" that a caller could have meant, and the shape it
+			// produces is the worst one available: a loop whose body does not
+			// block, spinning a core until the viewer disconnects. A fixture that
+			// pegs a CPU is found by whoever notices the fan, not by whoever
+			// wrote the line.
+			panic("fakeadb: ScrcpyFixture was given VideoLoop with no Packets — " +
+				"replaying an empty list forever is a busy loop, not a screen")
 		}
 		if cfg.SCID == "" {
 			cfg.SCID = scrcpyDefaultSCID(cfg.Devpath)
@@ -227,11 +344,33 @@ func ScrcpyFixture(cfg ScrcpyConfig) Fixture {
 // lives here rather than on Server, so two scripted handsets in one farm
 // cannot see each other's control traffic.
 type scrcpyDevice struct {
-	mu           sync.Mutex
-	cfg          ScrcpyConfig
-	scid         string
-	spawns       []string
-	sockets      int
+	mu     sync.Mutex
+	cfg    ScrcpyConfig
+	scid   string
+	spawns []string
+
+	// The three fields below belong to the CURRENT session and not to the
+	// device's whole lifetime, which is the whole of the fix described on
+	// serveSpawn.
+	//
+	// session is that session's generation, bumped by every spawn. It exists so
+	// that a handler still running from a superseded session cannot write into
+	// the new one's state: see videoWentLive, where a stale handler doing
+	// exactly that would silently re-open the gate the new session is relying
+	// on.
+	session int
+
+	// sockets is how many roles this session has handed out: zero means the
+	// next connection is the video socket, one means it is the control socket,
+	// two means the session's listener is spent.
+	sockets int
+
+	// videoLive says the video socket of this session has got as far as writing
+	// its session header, which is what lets serveSocket tell a client that
+	// connected its two sockets in order from one that connected them at the
+	// same time. See the comment there; this field is the whole mechanism.
+	videoLive bool
+
 	controlBytes []byte
 }
 
@@ -242,6 +381,20 @@ func (d *scrcpyDevice) config() ScrcpyConfig {
 }
 
 // serveSpawn answers the app_process command line.
+//
+// A SPAWN STARTS A NEW SESSION, AND A NEW SESSION GETS A NEW PAIR OF SOCKETS.
+// It did not, and the bug that came of it had a misleading error message
+// attached. The socket counter was the device's rather than the session's, so
+// it only ever went up: the first session took counts zero and one, and the
+// second session — which is what a viewer reconnecting, a fence bump or a lease
+// handover produces, none of them rare — found the counter at two and had every
+// one of its connections refused by the arm that exists to catch a client
+// reconnecting to a spent listener. The refusal named the client. The cause was
+// the fixture.
+//
+// Resetting here is also the faithful order. A real spawn is a new server
+// process that binds a new listener; the old process's listener does not
+// survive it, and neither does the count of what it had accepted.
 func (d *scrcpyDevice) serveSpawn(sess *StreamSession) error {
 	cmd := strings.TrimPrefix(sess.Service, "shell,v2,raw:")
 
@@ -250,6 +403,9 @@ func (d *scrcpyDevice) serveSpawn(sess *StreamSession) error {
 	if scid, ok := scrcpyArg(cmd, "scid"); ok {
 		d.scid = scid
 	}
+	d.session++
+	d.sockets = 0
+	d.videoLive = false
 	log := d.cfg.ServerLog
 	d.mu.Unlock()
 
@@ -268,28 +424,88 @@ func (d *scrcpyDevice) serveSpawn(sess *StreamSession) error {
 	return nil
 }
 
-// serveSocket answers a connection to an abstract socket. The first goes to
-// the video stream and the second to the control stream, which is the order
-// scrcpy's own client connects them in.
+// serveSocket answers a connection to an abstract socket: the first goes to the
+// video stream and the second to the control stream.
+//
+// ORDER IS THE ONLY SIGNAL THERE IS, AND THAT IS THE PROTOCOL'S DOING. A real
+// scrcpy server publishes ONE localabstract socket and the client connects it
+// twice, video first. The second connection carries no field, no handshake and
+// no length distinguishing it from the first; the server tells them apart by
+// which one it accepted first and nothing else. So a fake cannot invent a
+// better signal, and the only question is what it does when the signal is
+// ambiguous.
+//
+// It used to swap the roles, about half the time. Each connection arrives on its
+// own goroutine, so two connections opened at the same instant reached the
+// counter below in whichever order the scheduler chose, and the client that
+// meant to open video got the control handler — which writes nothing, so the
+// symptom was a video socket that produced no bytes, and a doc comment here
+// asserted the client's ordering as though this code enforced it.
+//
+// What makes the role deterministic now is that a SECOND role is not handed out
+// until the FIRST one is live, where live means its video handler has written
+// the session header. THAT IS A REQUIREMENT ON THE CLIENT AND IT IS WRITTEN DOWN
+// HERE BECAUSE IT IS THE ONLY PLACE IT CAN BE: open the video socket, read its
+// session header, and only then open the control socket. A client that opens
+// both without waiting is refused on the second, by name, because two sockets
+// racing is a client bug that a real handset resolves by coin flip and a fake
+// that resolved it the same way would be the least useful possible version of
+// this fixture. One of the two is served video, the other is told what it did.
+// Which one is refused is still the scheduler's choice; that a role is never
+// silently swapped is not.
+//
+// The gate is armed by the CLAIM and released by the HEADER, and the span
+// between those two is short but not empty — it is the time it takes the video
+// handler to get from here into serveVideo and out through one write. A client
+// that has read the header cannot be inside that span, which is why the reading
+// is the requirement rather than a suggestion.
+//
+// A video socket that dies before its header goes out GIVES THE ROLE BACK, in
+// serveVideo. Without that the gate is a trap: the claim is spent, nothing will
+// ever set videoLive, and every later connection — including the client's honest
+// retry of the video socket — is refused with a message about racing that has
+// nothing to do with what happened. Only a respawn would recover, and a fake
+// that needs a respawn to recover from a dropped connection is not modelling
+// anything a handset does.
+//
+// The session id is read under the same lock as the role, so a respawn that
+// renames the sockets cannot be half applied. A socket named after the previous
+// session's id is then refused, which is correct and not a race: the previous
+// session's listener is gone with the process that bound it. The message says
+// how many spawns have happened so that a log reads as "you asked for the old
+// one" rather than as a mystery.
 func (d *scrcpyDevice) serveSocket(sess *StreamSession) error {
 	name := strings.TrimPrefix(sess.Service, "localabstract:")
 
 	d.mu.Lock()
 	want := "scrcpy_" + d.scid
+	spawns := len(d.spawns)
+	gen := d.session
 	n := d.sockets
-	if name == want {
+	racing := n == 1 && !d.videoLive
+	if name == want && !racing {
 		d.sockets++
 	}
 	d.mu.Unlock()
 
 	if name != want {
-		return fmt.Errorf("fakeadb: %s has no abstract socket %q; this session published %q",
-			sess.Devpath, name, want)
+		return fmt.Errorf("fakeadb: %s has no abstract socket %q; after %d spawn(s) the live session published %q",
+			sess.Devpath, name, spawns, want)
+	}
+	if racing {
+		// The role was NOT consumed, so the video socket this raced is still
+		// the video socket and the next orderly connection is still the control
+		// socket. Refusing without consuming is what keeps one client's mistake
+		// from costing the session a socket nobody ever used.
+		return fmt.Errorf("fakeadb: %s: a second connection to %q arrived before the first had "+
+			"written its session header; scrcpy's two sockets are told apart by connection order "+
+			"alone, so they must be opened one after the other — open video, read its session "+
+			"header, then open control", sess.Devpath, name)
 	}
 
 	switch n {
 	case 0:
-		return d.serveVideo(sess)
+		return d.serveVideo(sess, gen)
 	case 1:
 		return d.serveControl(sess)
 	default:
@@ -307,51 +523,73 @@ func (d *scrcpyDevice) serveSocket(sess *StreamSession) error {
 // screen stream is the ordinary way a screen stream ends, and calling it a
 // fixture failure would sever a socket the client already closed and put a
 // scary line in the request log for the least interesting event there is.
-func (d *scrcpyDevice) serveVideo(sess *StreamSession) error {
+func (d *scrcpyDevice) serveVideo(sess *StreamSession, gen int) error {
 	cfg := d.config()
 
 	if len(cfg.VideoPrefix) > 0 {
 		if _, err := sess.Write(cfg.VideoPrefix); err != nil {
+			d.videoGaveUp(gen)
 			return nil
 		}
 	}
 
-	var hdr [scrcpyVideoHeaderLen]byte
-	binary.BigEndian.PutUint32(hdr[0:4], cfg.Codec)
-	binary.BigEndian.PutUint32(hdr[4:8], cfg.Width)
-	binary.BigEndian.PutUint32(hdr[8:12], cfg.Height)
-	if _, err := sess.Write(hdr[:]); err != nil {
+	if err := d.writeVideoHeader(sess, cfg); err != nil {
+		// The client went away before it had a session header. It never had a
+		// video socket, so the session must not go on believing it handed one
+		// out: see videoGaveUp.
+		d.videoGaveUp(gen)
 		return nil
 	}
 
-	for _, p := range cfg.Packets {
-		if cfg.PacketGap > 0 {
-			t := time.NewTimer(cfg.PacketGap)
-			select {
-			case <-t.C:
-			case <-sess.Done:
-				t.Stop()
+	// The session is live from here, which is what releases the control socket.
+	// It is marked AFTER the header is on the wire rather than when this handler
+	// was entered, because the thing the client is required to wait for before
+	// opening its second socket is the header — so marking it here is what makes
+	// serveSocket's gate invisible to a client that follows the rule and visible
+	// to one that does not.
+	d.videoWentLive(gen)
+
+	period := scrcpyLoopPeriod(cfg.Packets)
+	for pass := uint64(0); ; pass++ {
+		// Checked at the top of every pass as well as in the gap below, so a
+		// gapless loop against a client that has gone away ends here rather
+		// than on whichever write the kernel happens to refuse first.
+		select {
+		case <-sess.Done:
+			return nil
+		default:
+		}
+
+		for _, p := range cfg.Packets {
+			if cfg.PacketGap > 0 {
+				t := time.NewTimer(cfg.PacketGap)
+				select {
+				case <-t.C:
+				case <-sess.Done:
+					t.Stop()
+					return nil
+				}
+			}
+			var ph [scrcpyPacketHeaderLen]byte
+			binary.BigEndian.PutUint64(ph[0:8], scrcpyMeta(p, p.PTS+pass*period, cfg.VideoSessionHeader))
+			binary.BigEndian.PutUint32(ph[8:12], uint32(len(p.Data)))
+			// Header and payload go out as two writes on purpose. A client that
+			// only works when both arrive in one read is a client that works
+			// against this fixture and not against a phone.
+			if _, err := sess.Write(ph[:]); err != nil {
+				// The viewer closed the tab. Ending the loop on a failed write
+				// is the same rule the rest of this handler follows and it is
+				// the only thing stopping a loop from spinning on a dead socket
+				// for the life of the server.
+				return nil
+			}
+			if _, err := sess.Write(p.Data); err != nil {
 				return nil
 			}
 		}
-		var ph [scrcpyPacketHeaderLen]byte
-		meta := p.PTS & scrcpyPTSMask
-		if p.Config {
-			meta |= scrcpyFlagConfig
-		}
-		if p.KeyFrame {
-			meta |= scrcpyFlagKeyFrame
-		}
-		binary.BigEndian.PutUint64(ph[0:8], meta)
-		binary.BigEndian.PutUint32(ph[8:12], uint32(len(p.Data)))
-		// Header and payload go out as two writes on purpose. A client that
-		// only works when both arrive in one read is a client that works
-		// against this fixture and not against a phone.
-		if _, err := sess.Write(ph[:]); err != nil {
-			return nil
-		}
-		if _, err := sess.Write(p.Data); err != nil {
-			return nil
+
+		if !cfg.VideoLoop {
+			break
 		}
 	}
 
@@ -360,6 +598,148 @@ func (d *scrcpyDevice) serveVideo(sess *StreamSession) error {
 	}
 	<-sess.Done
 	return nil
+}
+
+// videoWentLive records that the video socket of session gen has its header out,
+// which is what lets the next connection be the control socket.
+//
+// THE GENERATION CHECK IS NOT DEFENSIVE PROGRAMMING. A spawn can land while a
+// previous session's video handler is still parked in the write of a long
+// VideoPrefix — the old handler does not know it has been superseded, because
+// nothing tells it. Without the check that handler's eventual success would mark
+// the NEW session's video socket live, which nobody has connected yet, and the
+// new session's gate would be open from the moment it began. Two of its sockets
+// opened at once would then be assigned by scheduler order again: the exact bug
+// the gate exists to prevent, reintroduced by the fix to a different one.
+func (d *scrcpyDevice) videoWentLive(gen int) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.session == gen {
+		d.videoLive = true
+	}
+}
+
+// videoGaveUp hands the video role back after a socket died before it ever
+// carried a session header.
+//
+// The claim is spent at the moment serveSocket hands out role zero, and nothing
+// after that point can set videoLive if the write never lands. A session left in
+// that state is WEDGED, not merely odd: every subsequent connection sees one role
+// handed out and no live video, which is the racing condition, so it is refused —
+// including the client's own honest retry of the video socket, and including the
+// retry after that. The refusal blames the client for opening two sockets at once
+// when it has none open at all, and only a respawn recovers.
+//
+// A client whose video socket dropped is the ordinary case this has to survive: a
+// closed tab, a lease that moved, a proxy that hiccuped. So the role goes back,
+// under the same conditions that prove it is still ours to return — this
+// session's, still the only one handed out, still not live.
+func (d *scrcpyDevice) videoGaveUp(gen int) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.session == gen && d.sockets == 1 && !d.videoLive {
+		d.sockets = 0
+	}
+}
+
+// writeVideoHeader opens the video socket in whichever of the two shapes
+// [ScrcpyConfig.VideoSessionHeader] asked for. The bytes are described there
+// and the layouts are described against the flag constants; what is here is
+// only the encoding.
+func (d *scrcpyDevice) writeVideoHeader(sess *StreamSession, cfg ScrcpyConfig) error {
+	if !cfg.VideoSessionHeader {
+		var hdr [scrcpyVideoHeaderLen]byte
+		binary.BigEndian.PutUint32(hdr[0:4], cfg.Codec)
+		binary.BigEndian.PutUint32(hdr[4:8], cfg.Width)
+		binary.BigEndian.PutUint32(hdr[8:12], cfg.Height)
+		_, err := sess.Write(hdr[:])
+		return err
+	}
+
+	var id [scrcpyCodecIDLen]byte
+	binary.BigEndian.PutUint32(id[:], cfg.Codec)
+	if _, err := sess.Write(id[:]); err != nil {
+		return err
+	}
+
+	// The flag is written as the whole top uint64 and then partly overwritten,
+	// rather than as a literal 0x80 in byte zero, so that the one constant
+	// naming this bit is the one the header is built from. client_resized is
+	// the low bit of byte three and stays clear: this fixture's geometry is the
+	// device's, never a response to a resize the client asked for.
+	var sh [scrcpyPacketHeaderLen]byte
+	binary.BigEndian.PutUint64(sh[0:8], scrcpyFlagSession)
+	binary.BigEndian.PutUint32(sh[4:8], cfg.Width)
+	binary.BigEndian.PutUint32(sh[8:12], cfg.Height)
+	_, err := sess.Write(sh[:])
+	return err
+}
+
+// scrcpyMeta packs one packet's flags and timestamp into the top eight bytes of
+// its header, in whichever revision's bit layout the socket is speaking.
+func scrcpyMeta(p ScrcpyPacket, pts uint64, sessionHeaders bool) uint64 {
+	if sessionHeaders {
+		meta := pts & scrcpySessionPTSMask
+		if p.Config {
+			meta |= scrcpySessionFlagConfig
+		}
+		if p.KeyFrame {
+			meta |= scrcpySessionFlagKeyFrame
+		}
+		return meta
+	}
+	meta := pts & scrcpyPTSMask
+	if p.Config {
+		meta |= scrcpyFlagConfig
+	}
+	if p.KeyFrame {
+		meta |= scrcpyFlagKeyFrame
+	}
+	return meta
+}
+
+// scrcpyLoopPeriod is how much time one whole pass of the packet list takes, in
+// the microseconds the packets' own timestamps are in. It is what each loop adds
+// to every timestamp in the next pass.
+//
+// The last packet's timestamp plus one frame interval, because the last frame is
+// DISPLAYED for an interval and the pass is not over until it has been: summing
+// to the last timestamp alone would make the last frame of one pass and the
+// first of the next due at the same instant, and a decoder handed two frames
+// with one timestamp has been told the stream stuttered.
+//
+// The interval is inferred from the gap between the last two distinct
+// timestamps, because a packet list carries no frame rate and the alternative —
+// another field on ScrcpyConfig that every caller has to keep consistent with
+// the timestamps it already wrote — is a field that will disagree with them. A
+// list with fewer than two distinct timestamps has no interval to infer and gets
+// one microsecond, which is enough to keep the sequence from repeating itself
+// and is the honest answer for a clip that is one frame long.
+func scrcpyLoopPeriod(packets []ScrcpyPacket) uint64 {
+	var high, last, prev uint64
+	seen := 0
+	for _, p := range packets {
+		if p.PTS > high {
+			high = p.PTS
+		}
+		if seen > 0 && p.PTS == last {
+			// The config packet shares its timestamp with the frame it
+			// describes, so the list's first two entries are not an interval.
+			continue
+		}
+		prev, last = last, p.PTS
+		seen++
+	}
+	interval := uint64(1)
+	if seen >= 2 && last > prev {
+		interval = last - prev
+	}
+	// Measured from the HIGHEST timestamp rather than the last one, so that a
+	// packet list somebody wrote out of order still produces a period larger
+	// than everything in it. The promise this makes the decoder is that the
+	// sequence never goes backwards, and that promise has to survive a list the
+	// fixture did not generate.
+	return high + interval
 }
 
 // serveControl records what the client sends and sends nothing back.

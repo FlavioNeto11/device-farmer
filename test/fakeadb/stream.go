@@ -57,6 +57,17 @@ const streamReadBuffer = 1 << 20
 // on a goroutine parked on a condition only that handler could satisfy.
 var errServerClosed = errors.New("fakeadb: server closed")
 
+// errHandlerReturned is the same unblock for the other, far more common end of a
+// session: the HANDLER finished.
+//
+// It is a separate value from errServerClosed because the two are separate
+// events and only one of them is a shutdown. A session ends whenever its device
+// service ends — which on a farm is constantly — and the server goes on running
+// for the rest of the process. Reporting the ordinary end of one service as "the
+// server closed" would be a lie in the one place somebody reads when they are
+// trying to work out why a drain stopped.
+var errHandlerReturned = errors.New("fakeadb: the device service ended")
+
 // StreamSession is one live device service, handed to a StreamHandler after
 // the protocol's OKAY has gone out. From there the bytes are raw in both
 // directions — no framing, no length, nothing this package imposes — which is
@@ -272,6 +283,32 @@ func (s *Server) runStream(c net.Conn, br *bufio.Reader, rec *Request, devpath, 
 		}
 	}()
 	sess.Done = done
+
+	// THE BUFFER IS CLOSED WHEN THE HANDLER RETURNS, and nothing else in this
+	// package can do it.
+	//
+	// Without this line a session whose handler returned while its receive
+	// buffer was full leaked both goroutines above and the megabyte between
+	// them, every time. The drain in that state is parked in streamBuf.Write on
+	// a condition variable — not on the socket — so closing the connection wakes
+	// nothing at all: gone never closes, the Done watcher waits on gone for the
+	// life of the process, and the buffer stays reachable from both of them.
+	//
+	// A handler that writes and never reads is not an unusual shape, it is the
+	// ordinary shape of a screen stream, and a client that writes anyway is the
+	// ordinary shape of a control socket pointed at the wrong service. So this
+	// is the common case, not the corner.
+	//
+	// It was invisible in this package's own tests because Server.Close is their
+	// cleanup and Close closes s.done, which the watcher above turns into a
+	// buffer close — so every leak was collected by the end of the test that
+	// made it. internal/demo keeps one server for the whole life of the process,
+	// which is where the same code is a leak per session and nothing ever
+	// collects it. That is precisely the class watchPeer's own comment says this
+	// harness exists to prevent: a goroutine still holding a socket after a
+	// session ends does not fail the test that leaked it, it flakes the next
+	// one.
+	defer buf.closeWith(errHandlerReturned)
 
 	if err := h(sess); err != nil {
 		// RECORDED BEFORE THE SOCKET DIES, and the order is not cosmetic.

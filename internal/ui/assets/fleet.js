@@ -36,6 +36,14 @@ function fleetRows() {
     if (f.lease) {
       const live = d.leaseState === 'held' || d.leaseState === 'suspect';
       if (f.lease === 'free' && live) return false;
+      /* "live" is every device somebody is on: held OR suspect. It exists
+       * because "how much of the farm is busy right now" was the one question
+       * the lease filter could not answer — `held` alone silently drops the
+       * suspect leases, and a suspect lease is NOT a released one. The summary
+       * strip's "In use" card counts leased = held + suspect, so it needs a
+       * filter that means the same thing, or the card would send an operator
+       * to a grid holding fewer devices than the number they clicked. */
+      if (f.lease === 'live' && !live) return false;
       if (f.lease === 'held' && d.leaseState !== 'held') return false;
       if (f.lease === 'suspect' && d.leaseState !== 'suspect') return false;
       if (f.lease === 'protected' && !(live && d.protected)) return false;
@@ -80,6 +88,225 @@ function hubParamOf(d) {
   return d.hubPath ? String(d.hubPath) : '';
 }
 
+/* ------------------------------------------------------------------ *
+ * THE SUMMARY STRIP
+ *
+ * Five numbers above the grid that answer "is the farm OK?" before a single
+ * device is read. Before it, the landing page of a control plane was an
+ * inventory: fifty-six cards and a hundred and seventy-eight coloured chips,
+ * with no line anywhere on it that said whether anything was wrong.
+ *
+ * # Two kinds of number, kept apart on purpose
+ *
+ * `state.data.counts` is what the SERVER counted, over the slice it was asked
+ * for — the host, hub, health, pool and q filters go to the API, so the counts
+ * narrow when those do. `fleetRows()` is what is ON THE SCREEN, which is the
+ * server's rows minus the one filter this page applies by itself (lease).
+ *
+ * They are different numbers and the strip never mixes them: the five cards
+ * are the server's, the note under them is the screen's. Conflating the two is
+ * how an operator ends up acting on data that is not in front of them.
+ *
+ * # Clicking a card
+ *
+ * Each card touches ONLY its own axis — health for two of them, lease for two,
+ * both for Total — so the number you clicked is the number you land on. A card
+ * that is already applied clears itself, which is what makes the strip a
+ * drill-down you can walk back out of rather than a one-way trip through
+ * filters. setFilters() is the one path that applies them; the host and hub
+ * links use it too, and a second one would fire a second /fleet request whose
+ * response could land in either order.
+ * ------------------------------------------------------------------ */
+
+/* fleetServerCounts normalises the server's counts object, and computes the
+ * same five numbers from the rows when a server has not sent one. The fallback
+ * is not decoration: an older API, or any response that omits `counts`, would
+ * otherwise render a strip of zeroes over a full grid — a page asserting the
+ * farm is empty while showing fifty-six devices. */
+function fleetServerCounts(all) {
+  const c = state.data.counts;
+  const n = (v) => (typeof v === 'number' && isFinite(v) ? v : 0);
+  /* Every field is checked, not just the object. A `counts` that is present
+   * but missing `leased` would otherwise take this branch and coerce to zero —
+   * "In use 0, Free 0, Needs attention 0" printed over a full grid, which is
+   * the exact failure this fallback exists to prevent, arriving through the
+   * door the fallback left open. `health.offline` is NOT required: the server
+   * builds that map from the rows it saw, so an absent key means none, and
+   * demanding it would send a healthy farm down the slow path. */
+  const has = (k) => c && typeof c[k] === 'number' && isFinite(c[k]);
+  if (c && typeof c === 'object' && has('total') && has('unhealthy') && has('leased') && has('free')) {
+    const health = (c.health && typeof c.health === 'object') ? c.health : {};
+    return {
+      total: n(c.total), unhealthy: n(c.unhealthy), leased: n(c.leased),
+      free: n(c.free), offline: n(health.offline)
+    };
+  }
+  const out = { total: 0, unhealthy: 0, leased: 0, free: 0, offline: 0 };
+  for (const d of all || []) {
+    out.total++;
+    const h = d.health || 'unknown';
+    if (isFault(h)) out.unhealthy++;
+    if (h === 'offline') out.offline++;
+    if (d.leaseState === 'held' || d.leaseState === 'suspect') out.leased++;
+    else out.free++;
+  }
+  return out;
+}
+
+/* fleetCardSpecs is built per render rather than declared once, because every
+ * label in it goes through t() and the language can change between two paints.
+ * The keys are written out literally so the Go test that walks this file for
+ * t('…') can see them; a computed key is invisible to it and renders as itself
+ * on screen forever.
+ *
+ * `zeroIsGood` is what turns an inventory into an instrument. A card whose
+ * count is zero because nothing is wrong says so with a tick and goes quiet,
+ * instead of holding a red 0 that an eye still has to stop on. */
+function fleetCardSpecs() {
+  const f = state.filters;
+  return [
+    {
+      key: 'attention', tone: 'cri', glyph: '▲', zeroIsGood: true,
+      value: (c) => c.unhealthy,
+      label: t('fleet.sum.attention'), sub: t('fleet.sum.attentionSub'), help: t('fleet.sum.attentionHelp'),
+      active: f.health === 'unhealthy',
+      apply: { health: 'unhealthy' }, clear: { health: '' }
+    },
+    {
+      key: 'inuse', tone: 'inf', glyph: '●',
+      value: (c) => c.leased,
+      label: t('fleet.sum.inUse'), sub: t('fleet.sum.inUseSub'), help: t('fleet.sum.inUseHelp'),
+      active: f.lease === 'live',
+      apply: { lease: 'live' }, clear: { lease: '' }
+    },
+    {
+      key: 'free', tone: 'pos', glyph: '○',
+      value: (c) => c.free,
+      label: t('fleet.sum.free'), sub: t('fleet.sum.freeSub'), help: t('fleet.sum.freeHelp'),
+      active: f.lease === 'free',
+      apply: { lease: 'free' }, clear: { lease: '' }
+    },
+    {
+      key: 'offline', tone: 'cri', glyph: '✕', zeroIsGood: true,
+      value: (c) => c.offline,
+      label: t('fleet.sum.offline'), sub: t('fleet.sum.offlineSub'), help: t('fleet.sum.offlineHelp'),
+      active: f.health === 'offline',
+      apply: { health: 'offline' }, clear: { health: '' }
+    },
+    {
+      key: 'total', tone: 'quiet', glyph: null,
+      value: (c) => c.total,
+      label: t('fleet.sum.total'), sub: t('fleet.sum.totalSub'), help: t('fleet.sum.totalHelp'),
+      active: !f.health && !f.lease,
+      apply: { health: '', lease: '' }, clear: { health: '', lease: '' }
+    }
+  ];
+}
+
+/* The five buttons, kept across repaints.
+ *
+ * The Fleet redraws roughly every two seconds under the event stream. If this
+ * strip were rebuilt each time, every one of those redraws would detach a
+ * focused card — an operator tabbing to "Needs attention" would be thrown back
+ * to the top of the document before they could press it, twice a minute, with
+ * nothing on screen to explain why. So the nodes are made once and their text
+ * is written over; only the numbers move.
+ *
+ * The click handler is attached once and looks its spec up FRESH, rather than
+ * closing over the one that built it. A closure would be reading a filter state
+ * from whenever the button happened to be created, which is the same class of
+ * bug as a stale element reference and just as quiet. */
+const fleetCardNodes = new Map();
+
+function fleetCardNode(key) {
+  let node = fleetCardNodes.get(key);
+  if (node) return node;
+  node = el('button', { type: 'button', class: 'sum-card' },
+    el('span', { class: 'sum-n' },
+      el('span', { class: 'sum-g', 'aria-hidden': 'true' }),
+      el('b', null, '')),
+    el('span', { class: 'sum-label' }),
+    el('span', { class: 'sum-sub' }));
+  node.addEventListener('click', () => {
+    const spec = fleetCardSpecs().find((s) => s.key === key);
+    if (spec) setFilters(spec.active ? spec.clear : spec.apply);
+  });
+  fleetCardNodes.set(key, node);
+  return node;
+}
+
+function renderFleetSummary(all, rows) {
+  const strip = $('#fleet-summary');
+  if (!strip) return;
+
+  // Nothing has been loaded, or the load failed and left us with nothing: a
+  // strip of zeroes would be an assertion about a farm we have not read.
+  if (!Array.isArray(all)) { strip.hidden = true; return; }
+  strip.hidden = false;
+
+  let cards = $('.sum-cards', strip);
+  let note = $('.sum-note', strip);
+  if (!cards || !note) {
+    cards = el('div', { class: 'sum-cards' });
+    note = el('p', { class: 'sum-note' });
+    strip.replaceChildren(cards, note);
+  }
+
+  const c = fleetServerCounts(all);
+  for (const spec of fleetCardSpecs()) {
+    const node = fleetCardNode(spec.key);
+    if (node.parentNode !== cards) cards.append(node);
+    paintFleetCard(node, spec, c);
+  }
+
+  /* The note is the one place on this page where the two kinds of number are
+   * told apart in words, so it says three separate things and never merges
+   * them into one hedge:
+   *
+   *  - `served`: a filter the SERVER applied. The counts above narrowed with
+   *    it, so they are about a slice and must not be read as the farm.
+   *  - `screened`: the page filtered further by itself. `lease` never reaches
+   *    the API, so the cards stay whole-farm while the grid does not — and
+   *    calling that "a filter is on: these numbers count that slice" would be
+   *    a false confession, telling an operator the five numbers had narrowed
+   *    when they had not.
+   *  - `capped`: the server stopped at its limit. Then the counts describe the
+   *    rows that came back and nothing else — an all-clear computed over the
+   *    first thousand of twelve hundred devices is the worst sentence this
+   *    page could print. truncChip says the same thing in the toolbar; it did
+   *    sit beside these numbers before they moved up here. */
+  const f = state.filters;
+  const served = !!(f.host || f.hub || f.health || f.pool || state.q.trim());
+  const screened = rows.length !== c.total;
+  const capped = !!state.truncated.fleet;
+
+  const words = [];
+  if (!served && !screened && !capped && c.unhealthy === 0) words.push(t('fleet.sum.allClear'));
+  if (capped) words.push(t('fleet.sum.truncated'));
+  else words.push(served ? t('fleet.sum.filtered', { served: String(c.total) }) : t('fleet.sum.wholeFarm'));
+  if (screened) words.push(t('fleet.sum.onScreen', { shown: String(rows.length) }));
+
+  note.className = 'sum-note' + (capped ? ' capped' : '');
+  note.replaceChildren();
+  // A glyph as well as the colour, for the same reason every chip on this page
+  // carries one: the sentence has to survive a greyscale screenshot.
+  append(note, [capped ? el('span', { 'aria-hidden': 'true' }, '▲ ') : null, words.join(' ')]);
+}
+
+function paintFleetCard(node, spec, c) {
+  const n = spec.value(c);
+  // A zero that is good news says so and goes quiet. A red 0 is still
+  // something an eye has to stop on and decide about.
+  const quiet = spec.zeroIsGood && n === 0;
+  node.className = 'sum-card tone-' + (quiet ? 'quiet' : spec.tone);
+  node.setAttribute('aria-pressed', spec.active ? 'true' : 'false');
+  node.title = spec.help;
+  $('.sum-g', node).textContent = quiet ? '✓' : (spec.glyph || '');
+  $('.sum-n b', node).textContent = String(n);
+  $('.sum-label', node).textContent = spec.label;
+  $('.sum-sub', node).textContent = spec.sub;
+}
+
 function renderFleet() {
   const body = $('#fleet-body');
   const alerts = $('#fleet-alerts');
@@ -88,11 +315,15 @@ function renderFleet() {
   const all = state.data.fleet;
   const rows = fleetRows();
 
-  // Counts: whatever the server computed, plus what is on screen after
-  // filtering, so the two are never confused with each other.
+  // The five server-computed numbers now live in the summary strip above the
+  // grid, where they are large enough to read from a doorway and each one can
+  // be clicked. countChips() rendered the same six values here as six grey
+  // pills in the corner of a toolbar; keeping both would put the same arithmetic
+  // on the page twice, differently worded, which is how two numbers that must
+  // agree start disagreeing.
   const counts = $('#fleet-counts');
   counts.replaceChildren();
-  append(counts, [countChips(state.data.counts)]);
+  renderFleetSummary(all, rows);
   if (all) {
     counts.append(el('span', { class: 'count', title: 'rows currently rendered after filters' },
       t('fleet.showing') + ' ', el('b', null, String(rows.length)), ' / ' + all.length));
@@ -231,46 +462,244 @@ function renderFleet() {
   alerts.replaceChildren();
 }
 
+/* ------------------------------------------------------------------ *
+ * THE DEVICE CARD
+ *
+ * # The chip budget: two per device, hard
+ *
+ * A device states its worst state ONCE. One condition chip, one availability
+ * chip, and everything else collapses into a single ⚠ that opens the sheet.
+ *
+ * The rule exists because the grid used to spend up to five chips on one
+ * device and repeat itself doing it: a quarantined handset carried a health
+ * chip reading "quarantined", a quarantine chip reading "quarantined" and an
+ * admin_state chip reading "quarantined", three times in one card, in three
+ * colours. Fifty-six devices came to a hundred and seventy-eight chips, and
+ * the count GREW with the incident — the worse the farm got, the more
+ * identical words there were to read. Two per device is a constant, so a bad
+ * day now looks different from a good one instead of merely looking louder.
+ *
+ * Nothing is deleted. Everything demoted is on the ⚠, in its aria-label and in
+ * the device sheet; the fence string and the raw adb_state moved to the sheet
+ * outright, because neither is a thing you scan a wall of cards for.
+ * ------------------------------------------------------------------ */
+
+/* CONDITION_RANK is the precedence a device's ONE condition chip is chosen by,
+ * lowest first.
+ *
+ * Only one comparison in this file consults it, and only one CAN: health is a
+ * single column, so the sole contest is between an open quarantine record and
+ * whatever health says. Quarantine sits at 0 and therefore always wins today —
+ * which is the intended answer, because quarantine is the state that stops the
+ * scheduler, and it is an answer this table can be edited to change rather than
+ * a constant buried in an `if`.
+ *
+ * The rest of the order is here to be read, not executed: it is the sequence a
+ * reviewer needs when deciding where a NEW state belongs, and where a future
+ * second source of condition would slot in. parked and retired sit below the
+ * faults and above healthy because they are decisions somebody made rather
+ * than breakage — the distinction NOT_A_FAULT draws in app.js and style.css
+ * records for the grey chip. */
+const CONDITION_RANK = {
+  quarantined: 0, offline: 1, missing: 1, unauthorized: 2, degraded: 3,
+  unknown: 4, recovering: 5, booting: 5, parked: 6, retired: 6, healthy: 7
+};
+
+function deviceCondition(d) {
+  const h = d.health || 'unknown';
+  if (!d.quarantineID) return h;
+  const hr = CONDITION_RANK[h];
+  return (hr === undefined || CONDITION_RANK.quarantined <= hr) ? 'quarantined' : h;
+}
+
+/* conditionHelp is the plain-English sentence behind a one-word value. The
+ * value itself is never translated — `degraded` is what the health column
+ * says and what an operator greps a log for — so the explanation goes NEXT to
+ * it, in the tooltip and in the device sheet, and the word stays put.
+ *
+ * A switch of literal keys rather than a lookup table: t() calls with a
+ * computed key are invisible to TestEveryKeyTheAppAsksForExists, and a key it
+ * cannot see is one that renders as itself, in every language, forever. */
+function conditionHelp(c) {
+  switch (c) {
+    case 'healthy': return t('fleet.cond.healthy');
+    case 'degraded': return t('fleet.cond.degraded');
+    case 'offline': return t('fleet.cond.offline');
+    case 'missing': return t('fleet.cond.missing');
+    case 'unauthorized': return t('fleet.cond.unauthorized');
+    case 'recovering': return t('fleet.cond.recovering');
+    case 'booting': return t('fleet.cond.booting');
+    case 'quarantined': return t('fleet.cond.quarantined');
+    case 'parked': return t('fleet.cond.parked');
+    case 'retired': return t('fleet.cond.retired');
+    default: return t('fleet.cond.unknown');
+  }
+}
+
+function conditionChip(cond) {
+  return el('span', { class: 'chip chip-' + cond, title: conditionHelp(cond) },
+    el('span', { 'aria-hidden': 'true' }, HEALTH_GLYPH[cond] || '?'), cond);
+}
+
+/* availabilityOf collapses the lease into the one thing an operator wants off
+ * a wall of cards: can I take this device, and if not, who has it.
+ *
+ * `protected` and `suspect` are both properties OF a live lease rather than
+ * alternatives to it, so they rank above plain `held` here — a lease nothing
+ * but a human can end, and a lease whose holder stopped answering, are the two
+ * that change what you do next. */
+function availabilityOf(d) {
+  const st = d.leaseState;
+  if (st !== 'held' && st !== 'suspect') return 'free';
+  if (st === 'suspect') return 'suspect';
+  return d.protected ? 'protected' : 'held';
+}
+
+const AVAIL_GLYPH = { free: '○', held: '●', suspect: '◐', protected: '★' };
+
+/* Every one of these four reads differently in greyscale: a different glyph and
+ * a different word, never a different colour alone. "In use · suspect" keeps
+ * the raw lease-state value on the face precisely because it is the state an
+ * operator must not mistake for a healthy one — the device is NOT released and
+ * the job may be running fine. */
+function availabilityWord(a) {
+  switch (a) {
+    case 'free': return t('fleet.avail.free');
+    case 'suspect': return t('fleet.avail.suspect');
+    case 'protected': return t('fleet.avail.protected');
+    default: return t('fleet.avail.inUse');
+  }
+}
+
+function availabilityHelp(d, a) {
+  switch (a) {
+    case 'free': return t('fleet.avail.freeHelp');
+    // A suspect lease that is also protected is the combination the leases
+    // view counts on its own; the tooltip says both, because the chip cannot.
+    case 'suspect': return d.protected
+      ? t('fleet.avail.suspectHelp') + ' ' + t('fleet.avail.protectedHelp')
+      : t('fleet.avail.suspectHelp');
+    case 'protected': return t('fleet.avail.protectedHelp');
+    default: return t('fleet.avail.heldHelp');
+  }
+}
+
+function availabilityChip(d, a) {
+  return el('span', { class: 'chip chip-' + a, title: availabilityHelp(d, a) },
+    el('span', { 'aria-hidden': 'true' }, AVAIL_GLYPH[a]), availabilityWord(a));
+}
+
+/* The one short sentence under the chips. It carries the holder, which is the
+ * half of "in use" that tells you who to go and ask, and it deliberately does
+ * not repeat the chip's own word.
+ *
+ * It is also where a protected lease that has gone suspect is stated. The chip
+ * can only hold one of the two and suspect is the one that changes with the
+ * clock, so protection — the fact that decides whether this device comes back
+ * on its own or waits for a human — is written out here in full rather than
+ * left to the colour of a chip it lost. A suspect plain lease and a suspect
+ * protected lease have opposite next actions and must never look alike. */
+function availabilityLine(d, a) {
+  const who = nz(d.holder) === null ? t('fleet.avail.someoneElse') : String(d.holder);
+  switch (a) {
+    case 'free': return t('fleet.avail.freeLine');
+    case 'suspect': return d.protected
+      ? t('fleet.avail.suspectProtectedLine', { holder: who })
+      : t('fleet.avail.suspectLine', { holder: who });
+    case 'protected': return t('fleet.avail.protectedLine', { holder: who });
+    default: return t('fleet.avail.heldLine', { holder: who });
+  }
+}
+
+/* tileFlags is everything true of this device that did not earn one of the two
+ * chips. It is demotion, not deletion: the list is the ⚠'s accessible name, its
+ * tooltip, and part of the tile's own aria-label, and the sheet has all of it
+ * in full. */
+function tileFlags(d, cond) {
+  const out = [];
+  const health = d.health || 'unknown';
+  if (d.quarantineID && nz(d.quarantineReason) !== null) {
+    out.push(t('fleet.flag.quarantine', { reason: String(d.quarantineReason) }));
+  }
+  // The condition chip is showing something other than what health says —
+  // quarantine outranked it. Name the value it covered up.
+  if (cond !== health) out.push(t('fleet.flag.health', { health: health }));
+  if (d.serialAmbiguous) out.push(t('fleet.flag.dupSerial'));
+  if (nz(d.adminState) !== null && d.adminState !== 'enabled') {
+    out.push(t('fleet.flag.adminState', { state: String(d.adminState) }));
+  }
+  return out;
+}
+
+/* A span and not a button: the tile IS a button, and a button inside a button
+ * is invalid HTML that browsers resolve by dropping one of them. role="img"
+ * with an aria-label is how a glyph gets a name without becoming a second
+ * control — and because the tile carries its own aria-label, which suppresses
+ * everything inside it for a screen reader, the same text is folded into the
+ * tile's label too. */
+function tileFlag(flags) {
+  if (!flags.length) return null;
+  const label = t('fleet.flag.label') + ' ' + flags.join('; ') + '. ' + t('fleet.flag.open');
+  return el('span', { class: 'tile-flag', role: 'img', 'aria-label': label, title: label }, '⚠');
+}
+
 function deviceTile(d) {
-  const rack = d.rackSlot
-    ? el('span', null, d.rackSlot)
-    : el('span', { class: 'unslotted', title: 'this device has no rack_slot label; a human cannot be told where to walk' },
-      d.usbPath ? 'usb ' + d.usbPath : 'unslotted');
+  const cond = deviceCondition(d);
+  const avail = availabilityOf(d);
+  const flags = tileFlags(d, cond);
 
-  const name = [d.rackSlot || d.usbPath || shortId(d.id), d.model || 'unknown model',
-    'health ' + (d.health || 'unknown'),
-    d.leaseState === 'held' || d.leaseState === 'suspect'
-      ? 'lease ' + d.leaseState + (d.protected ? ' protected' : '') : 'no lease'].join(', ');
+  const modelText = [d.manufacturer, d.model].filter(Boolean).join(' ') || t('fleet.tile.unknownModel');
+  const slotText = nz(d.rackSlot) === null
+    ? (nz(d.usbPath) === null ? shortId(d.id) : 'usb ' + d.usbPath)
+    : String(d.rackSlot);
 
-  const tile = el('button', {
+  /* The aria-label is the oldest human sentence on this page and it stays. It
+   * used to be the ONLY one — the card beside it was chips and monospace — and
+   * now the card says nearly the same thing, so the two are written from the
+   * same pieces and cannot drift apart.
+   *
+   * Battery is in here and only in here for a screen reader: an element with an
+   * aria-label suppresses everything inside it, so the meter's own title is
+   * unreachable from the tile. */
+  const pct = (d.battery === null || d.battery === undefined) ? null : Math.round(Number(d.battery));
+  const name = [
+    slotText,
+    modelText,
+    d.android ? 'Android ' + d.android : null,
+    'health ' + cond,
+    avail === 'free' ? 'no lease' : 'lease ' + d.leaseState + (d.protected ? ' protected' : ''),
+    pct === null ? 'battery not reported' : 'battery ' + pct + '%'
+  ].concat(flags).filter(Boolean).join(', ');
+
+  return el('button', {
     type: 'button',
-    class: 'tile h-' + (d.health || 'unknown'),
+    class: 'tile h-' + cond,
     'aria-label': name,
-    title: (d.manufacturer ? d.manufacturer + ' ' : '') + (d.model || '') +
-      (d.android ? '  Android ' + d.android : '') + (d.serial ? '  serial ' + d.serial : ''),
     onclick: () => openDevice(d)
   },
-    el('span', { class: 'slot' }, rack),
-    el('span', { class: 'model' },
-      [d.manufacturer, d.model].filter(Boolean).join(' ') || 'unknown model',
-      d.android ? ' · ' + d.android : ''),
-    el('span', { class: 'chips' },
-      healthChip(d.health),
-      leaseChips(d),
-      d.quarantineID ? el('span', { class: 'chip chip-quarantined', title: d.quarantineReason || 'open quarantine' }, el('span', { 'aria-hidden': 'true' }, '■'), 'quarantined') : null,
-      d.serialAmbiguous ? el('span', { class: 'chip chip-degraded', title: 'this ADB serial is not unique in the farm; address it by devpath only' }, 'dup serial') : null,
-      d.adminState && d.adminState !== 'enabled' ? el('span', { class: 'chip chip-plain' }, d.adminState) : null),
+    el('span', { class: 'slot' }, nz(d.rackSlot) === null
+      ? el('span', { class: 'unslotted', title: t('fleet.tile.unslottedHelp') }, slotText)
+      : slotText),
+    el('span', {
+      class: 'model',
+      title: modelText + (d.android ? ' · Android ' + d.android : '') + (d.serial ? ' · ' + d.serial : '')
+    }, modelText, d.android ? ' · Android ' + d.android : ''),
+    el('span', { class: 'chips' }, conditionChip(cond), availabilityChip(d, avail), tileFlag(flags)),
+    el('span', { class: 'avail' }, availabilityLine(d, avail)),
+    /* The meter stays exactly as it was: batteryEl sets element.style.width
+     * through the CSSOM, which the Content-Security-Policy permits and an
+     * inline style attribute would not. It is labelled now, because a bare
+     * "44%" beside a bar is a number whose unit the reader has to guess.
+     *
+     * When nothing has been reported there is nothing to meter, so the meter
+     * is not drawn at all — batteryEl's own "batt —" under a "Battery" label
+     * would read "Battery batt —", which is the abbreviation and the word for
+     * the same thing, twice. */
     el('span', { class: 'foot' },
-      batteryEl(d.battery),
-      el('span', { title: 'adb_state' }, d.adbState || 'adb ?'),
-      // The fence is null for a tenant looking at another tenant's lease: the
-      // API withholds it rather than omitting it, so "—" here means "not
-      // yours", never "unknown".
-      d.leaseState === 'held' || d.leaseState === 'suspect'
-        ? el('span', { class: 'mono', title: d.fence === undefined ? 'lease fence: withheld, another tenant holds this device' : 'lease fence' },
-          d.fence === undefined ? '—' : 'f' + d.fence)
-        : null));
-  return tile;
+      el('span', { class: 'foot-k' }, t('fleet.tile.battery')),
+      pct === null
+        ? el('span', { class: 'batt', title: t('fleet.tile.noBattery') }, '—')
+        : batteryEl(d.battery)));
 }
 
 function refreshFilterOptions(rows) {

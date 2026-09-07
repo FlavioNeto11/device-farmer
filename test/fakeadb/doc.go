@@ -47,6 +47,30 @@
 // Start registers cleanup with t, so the listener, every open connection and
 // every scripted goroutine are gone when the test returns.
 //
+// # Progressive and duplex services
+//
+// Respond scripts a device service as one payload written after the OKAY,
+// which cannot express a service that writes over time or reads at all — and
+// a live screen is both. RespondStream is the sibling for that case: the
+// script owns the socket, writes as it likes, reads what the client sent, and
+// can Sever the connection mid-stream to produce the reset a client must
+// classify as a transport failure and nothing more.
+//
+//	srv.RespondStream(devpath, "localabstract:", func(s *fakeadb.StreamSession) error {
+//		for _, frame := range frames {
+//			if _, err := s.Write(frame); err != nil {
+//				return nil
+//			}
+//		}
+//		<-s.Done // a live screen does not end; the viewer leaves
+//		return nil
+//	})
+//
+// ScrcpyFixture is that seam pointed at one device: it answers the
+// app_process spawn, streams a video header and packets on the first abstract
+// socket, and records every byte written to the second, which ControlWrites
+// hands back as whole control messages.
+//
 // # Concurrency
 //
 // Every exported method is safe to call from any goroutine, including while

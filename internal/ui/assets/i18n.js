@@ -257,6 +257,24 @@ const STRINGS = {
     'conn.down': 'no connection',
     'conn.downNote': 'This page cannot reach the API. It says nothing about the farm: leases are held in PostgreSQL and are unaffected by a browser that lost its connection.',
 
+    /* The command chooser, and the bulk form that mounts the same builder.
+     * The catalogue's own entries are further up; these are the frame around
+     * them. No command is here, in either dictionary, for the reason stated at
+     * the top of this file. */
+    'exec.commandLabel': 'The command, exactly as the handset will receive it',
+    'exec.chooser.open': 'Pick a command…',
+    'exec.chooser.filter': 'Filter by command or by what it does',
+    'exec.chooser.tiers': 'Which tier of the catalogue to show',
+    'exec.chooser.close': 'Close',
+    'exec.chooser.none': 'Nothing in this tier matches that.',
+    'exec.chooser.otherTier': '{n} in the other tier do — switch above.',
+    'exec.bulk.preflight': 'What a fleet-wide command means here',
+    'exec.bulk.note': 'Whatever is on the wire above goes to every device the selector matched, verbatim, a few per hub at a time. In the drawer a wrong command reaches one handset; here it reaches all of them.',
+    'exec.bulk.fenceOn': 'this farm enforces the fence at the device. A bulk run is not refused up front the way one device is — it starts, and every target answers with a transport failure of its own',
+    'exec.bulk.targets': 'decided by the selector above. A device holding a live lease is never commanded: it is recorded as skipped, with the lease that stopped it',
+    'exec.bulk.answer': 'one result row per device, as each one answers or gives up',
+    'exec.bulk.empty': 'Type a command, or pick one from the catalogue, before starting a run.',
+
     /* Filters, shared across views */
     'filter.host': 'Host',
     'filter.hub': 'Hub',
@@ -606,6 +624,24 @@ const STRINGS = {
     'conn.connecting': 'conectando',
     'conn.down': 'sem conexão',
     'conn.downNote': 'Esta página não alcança a API. Isso não diz nada sobre a fazenda: as leases vivem no PostgreSQL e não são afetadas por um navegador que perdeu a conexão.',
+
+    /* O seletor de comandos, e o formulário em massa que monta o mesmo widget.
+     * As entradas do catálogo estão mais acima; isto é a moldura em volta
+     * delas. Nenhum comando aparece aqui, em nenhum dos dois dicionários, pela
+     * razão declarada no topo deste arquivo. */
+    'exec.commandLabel': 'O comando, exatamente como o aparelho vai recebê-lo',
+    'exec.chooser.open': 'Escolher um comando…',
+    'exec.chooser.filter': 'Filtrar pelo comando ou pelo que ele faz',
+    'exec.chooser.tiers': 'Qual camada do catálogo mostrar',
+    'exec.chooser.close': 'Fechar',
+    'exec.chooser.none': 'Nada nesta camada corresponde a isso.',
+    'exec.chooser.otherTier': '{n} na outra camada correspondem — troque acima.',
+    'exec.bulk.preflight': 'O que um comando para toda a frota significa aqui',
+    'exec.bulk.note': 'O que estiver no fio acima vai para cada dispositivo que o seletor casou, literalmente, alguns por hub de cada vez. Na gaveta um comando errado alcança um aparelho; aqui alcança todos eles.',
+    'exec.bulk.fenceOn': 'esta farm impõe a fence no aparelho. Uma execução em massa não é recusada de antemão como a de um dispositivo só — ela começa, e cada alvo responde com uma falha de transporte própria',
+    'exec.bulk.targets': 'decidido pelo seletor acima. Um dispositivo com lease viva nunca é comandado: ele é registrado como pulado, com a lease que o impediu',
+    'exec.bulk.answer': 'uma linha de resultado por dispositivo, conforme cada um responde ou desiste',
+    'exec.bulk.empty': 'Digite um comando, ou escolha um do catálogo, antes de iniciar uma execução.',
 
     /* Filtros, comuns a várias visões */
     'filter.host': 'Host',

@@ -112,7 +112,7 @@ const STRINGS = {
     'exec.timeout': 'Give up after (ms, at most {max}s)',
     'exec.reasonPlaceholder': 'why you are running this on a device somebody is using',
     'exec.force.head': 'This device holds a live lease',
-    'exec.force.reason': 'Reason',
+    'exec.force.reason': 'Reason — required because this device is leased',
     'exec.force.audit': 'The reason and the command are written to farm.audit_log next to your name. Six weeks from now they are the only record of why.',
     'exec.force.holder': 'Holder {holder} is using this device now.',
     'exec.force.job': 'Job {job} is running on it.',
@@ -315,6 +315,42 @@ const STRINGS = {
     'error.ui_not_mounted': 'This process serves the API but not the dashboard.',
     'error.client_closed': 'The client hung up before the answer was written.',
 
+    /* The reason field, and who is actually asking for it.
+     *
+     * Two labels, because there are two cases and the dashboard used to know
+     * only one. Five of the six confirmable actions are refused by the server
+     * with no reason; POST /api/v1/jobs/{id}/cancel is not. The label says
+     * which case this is, in the server's terms — the page is reporting a rule,
+     * not inventing one — and the suggestions turn the required case from a
+     * sentence typed from nothing into one click. */
+    'confirm.reason.required': 'Reason — the server refuses this action without one. It is written to farm.audit_log next to your name.',
+    'confirm.reason.optional': 'Reason — optional. It is written to farm.audit_log if you give one.',
+    'confirm.notSent': 'Nothing was sent.',
+    'confirm.reasonMissing': 'POST /api/v1/{route} answers 400 without a reason. Type one, or pick a suggestion.',
+    'confirm.suggest.label': 'Reason suggestions',
+    'confirm.suggest.last': 'last: {reason}',
+    'confirm.suggest.maintenance': 'scheduled maintenance',
+    'confirm.suggest.hostUnhealthy': 'host is unhealthy',
+    'confirm.suggest.agentRollout': 'agent rollout on this host',
+    'confirm.suggest.backInService': 'fault fixed, back in service',
+    'confirm.suggest.maintenanceDone': 'maintenance finished',
+    'confirm.suggest.holderGone': 'holder is gone and the job is abandoned',
+    'confirm.suggest.deviceNeeded': 'device needed for an urgent run',
+    'confirm.suggest.leaseStuck': 'lease is stuck; the job will not finish',
+    'confirm.suggest.adbOffline': 'device is offline in adb',
+    'confirm.suggest.wedged': 'device is wedged; power is the last resort',
+    'confirm.suggest.cableReplaced': 'cable replaced, fault fixed',
+    'confirm.suggest.healthyAgain': 'device re-enumerated and is healthy',
+    'confirm.suggest.notNeeded': 'no longer needed',
+    'confirm.suggest.superseded': 'superseded by a newer run',
+    'confirm.suggest.wrongTarget': 'submitted against the wrong target',
+
+    /* The force step in the command box. The condition is the server's, from
+     * internal/api/fleet.go: a reason is required BECAUSE the device is
+     * leased, not because every command needs one. */
+    'exec.force.reasonMissingHead': 'Nothing was sent.',
+    'exec.force.reasonMissing': 'This device holds a live lease, and POST /api/v1/devices/{id}/exec answers 400 without a reason. Say why you are running this on a device somebody is using.',
+
     /* Auth */
     'auth.needed': 'This API needs a credential.',
     'auth.setToken': 'Set API token',
@@ -327,7 +363,7 @@ const STRINGS = {
     'confirm.title': 'Confirm',
     'confirm.subject': 'Subject:',
     'confirm.reason': 'Reason',
-    'confirm.reasonNote': 'Recorded in farm.audit_log next to your name. Six weeks from now it is the only record of why.',
+    'confirm.reasonNote': 'Six weeks from now it is the only record of why.',
     'confirm.yes': 'Confirm',
     'confirm.no': 'Cancel',
   },
@@ -382,7 +418,7 @@ const STRINGS = {
     'exec.timeout': 'Desistir depois de (ms, no máximo {max}s)',
     'exec.reasonPlaceholder': 'por que você está rodando isto num dispositivo que alguém está usando',
     'exec.force.head': 'Este dispositivo tem uma lease viva',
-    'exec.force.reason': 'Motivo',
+    'exec.force.reason': 'Motivo — obrigatório porque este dispositivo está com uma lease',
     'exec.force.audit': 'O motivo e o comando são escritos em farm.audit_log ao lado do seu nome. Daqui a seis semanas são o único registro do porquê.',
     'exec.force.holder': 'O holder {holder} está usando este dispositivo agora.',
     'exec.force.job': 'O job {job} está rodando nele.',
@@ -585,6 +621,42 @@ const STRINGS = {
     'error.ui_not_mounted': 'Este processo serve a API, mas não o painel.',
     'error.client_closed': 'O cliente desligou antes de a resposta ser escrita.',
 
+    /* O campo motivo, e quem de fato está pedindo por ele.
+     *
+     * Dois rótulos, porque há dois casos e o painel só conhecia um. Cinco das
+     * seis ações confirmáveis são recusadas pelo servidor sem motivo; POST
+     * /api/v1/jobs/{id}/cancel não é. O rótulo diz qual é o caso, nos termos do
+     * servidor — a página relata uma regra, não inventa uma — e as sugestões
+     * transformam o caso obrigatório de uma frase escrita do zero em um
+     * clique. */
+    'confirm.reason.required': 'Motivo — o servidor recusa esta ação sem um. É escrito em farm.audit_log ao lado do seu nome.',
+    'confirm.reason.optional': 'Motivo — opcional. É escrito em farm.audit_log se você der um.',
+    'confirm.notSent': 'Nada foi enviado.',
+    'confirm.reasonMissing': 'POST /api/v1/{route} responde 400 sem um motivo. Escreva um, ou escolha uma sugestão.',
+    'confirm.suggest.label': 'Sugestões de motivo',
+    'confirm.suggest.last': 'último: {reason}',
+    'confirm.suggest.maintenance': 'manutenção programada',
+    'confirm.suggest.hostUnhealthy': 'o host não está saudável',
+    'confirm.suggest.agentRollout': 'atualização do agente neste host',
+    'confirm.suggest.backInService': 'falha corrigida, de volta ao serviço',
+    'confirm.suggest.maintenanceDone': 'manutenção concluída',
+    'confirm.suggest.holderGone': 'o holder sumiu e o job foi abandonado',
+    'confirm.suggest.deviceNeeded': 'dispositivo necessário para uma execução urgente',
+    'confirm.suggest.leaseStuck': 'a lease travou; o job não vai terminar',
+    'confirm.suggest.adbOffline': 'o dispositivo está offline no adb',
+    'confirm.suggest.wedged': 'dispositivo travado; energia é o último recurso',
+    'confirm.suggest.cableReplaced': 'cabo trocado, falha corrigida',
+    'confirm.suggest.healthyAgain': 'o dispositivo reenumerou e está saudável',
+    'confirm.suggest.notNeeded': 'não é mais necessário',
+    'confirm.suggest.superseded': 'substituído por uma execução mais nova',
+    'confirm.suggest.wrongTarget': 'enviado contra o alvo errado',
+
+    /* O passo de forçar na caixa de comandos. A condição é a do servidor, de
+     * internal/api/fleet.go: o motivo é obrigatório PORQUE o dispositivo está
+     * com uma lease, não porque todo comando precisa de um. */
+    'exec.force.reasonMissingHead': 'Nada foi enviado.',
+    'exec.force.reasonMissing': 'Este dispositivo tem uma lease viva, e POST /api/v1/devices/{id}/exec responde 400 sem um motivo. Diga por que você está rodando isto num dispositivo que alguém está usando.',
+
     /* Autenticação */
     'auth.needed': 'Esta API exige uma credencial.',
     'auth.setToken': 'Definir token da API',
@@ -597,7 +669,7 @@ const STRINGS = {
     'confirm.title': 'Confirmar',
     'confirm.subject': 'Alvo:',
     'confirm.reason': 'Motivo',
-    'confirm.reasonNote': 'Registrado em farm.audit_log ao lado do seu nome. Daqui a seis semanas é o único registro do porquê.',
+    'confirm.reasonNote': 'Daqui a seis semanas é o único registro do porquê.',
     'confirm.yes': 'Confirmar',
     'confirm.no': 'Cancelar',
   },

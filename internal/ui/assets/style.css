@@ -463,6 +463,25 @@ dialog h2 { margin: 0 0 8px; font-size: var(--fs-lg); }
   white-space: pre-wrap; overflow-wrap: anywhere;
 }
 
+/* The reason suggestions. Where the server refuses an action without a reason,
+   this row is the difference between a demand and an offer: one click writes a
+   whole sentence into the field, which is why the field itself is never
+   pre-filled — see paintReason in app.js for that argument.
+
+   An author `display` beats the user agent's `[hidden] { display: none }` no
+   matter how low its specificity, and this row is shown and hidden, so it says
+   so itself. That bug has shipped twice from this file already. */
+.reason-suggest { display: flex; flex-wrap: wrap; gap: var(--s-1); margin-top: var(--s-1); }
+.reason-suggest[hidden] { display: none !important; }
+.reason-chip {
+  font: inherit; font-size: var(--fs-xs); line-height: var(--lh-tight);
+  padding: 3px var(--s-2); max-width: 100%;
+  color: var(--txt-2); background: var(--srf-sunken);
+  border: 1px solid var(--brd-subtle); border-radius: var(--r-pill);
+  cursor: pointer; text-align: left;
+}
+.reason-chip:hover { background: var(--srf-hover); color: var(--txt-1); border-color: var(--brd-strong); }
+
 form label { display: block; margin: 8px 0 3px; color: var(--dim); font-size: var(--fs-sm); }
 form input, form select, form textarea {
   width: 100%; font: inherit; padding: var(--pad-cell); color: var(--text);

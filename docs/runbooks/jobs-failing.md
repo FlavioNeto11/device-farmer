@@ -134,6 +134,17 @@ find the blob — every job with an install step then fails, on every device, an
 it looks exactly like a fleet-wide hardware problem. That needs a
 `ReadWriteMany` claim, not a rack visit.
 
+The api is a friendly liar about this: it serves back the bytes it accepted, so
+`GET /api/v1/artifacts/{sha}/content` answers 200 from the replica that took the
+upload while every jobrunner sees nothing. When that same route answers 410
+`blob_missing` you are looking at the identical fault from the other side — a
+row that outlived its bytes — which is what a restarted api answers about an
+upload it took before it lost its `emptyDir`.
+
+On compose the farm profile mounts one named volume on the api and both
+jobrunners for exactly this reason, so a compose farm is here only if that
+volume was dropped or its roles were spread across machines.
+
 ## What to do
 
 - **A job problem** → it is the tenant's. Give them the failing step and the

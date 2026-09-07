@@ -298,7 +298,7 @@ function overviewPanel(d) {
     el('h3', { class: 'sheet-h' }, t('device.availability')),
     el('dl', { class: 'kv' },
       kv(t('device.f.pool'), d.pool, { raw: 'pool_id', term: 'pool' }),
-      kv(t('device.f.adminState'), d.adminState, { raw: 'admin_state', term: 'admin_state' }),
+      kv(t('device.f.adminState'), d.adminState, { raw: 'admin_state', term: 'adminState' }),
       kv(t('device.f.android'), androidText(d), { raw: 'android_release / sdk_int' }),
       kv(t('device.f.battery'), batteryEl(d.battery), { raw: 'battery_pct' }),
       kv(t('device.f.lastSeen'), whenCell(d.lastSeen), { raw: 'last_seen_at' })),
@@ -437,7 +437,7 @@ function identifiersBlock(d) {
   append(dl, kv(t('device.f.devpath'), identValue(d.devPath), { raw: 'adb_devpath', term: 'devpath' }));
   append(dl, kv(t('device.f.slotID'),
     identValue(d.slotID === undefined || d.slotID === null ? null : String(d.slotID)),
-    { raw: 'slot_id', term: 'slot' }));
+    { raw: 'slot_id' }));
   /* labels used to be printed as JSON.stringify(d.labels) — a single
    * unwrappable line of braces and quotes that an operator had to parse by eye
    * to answer "is this an sdk 35 device". One chip per pair answers it by
@@ -537,7 +537,7 @@ function healthPanel(d) {
         d.batteryTempDC !== undefined && d.batteryTempDC !== null
           ? (Number(d.batteryTempDC) / 10).toFixed(1) + ' °C' : null,
         { raw: 'battery_temp_dc' }),
-      kv(t('device.f.slotState'), d.slotState, { raw: 'slot_state', term: 'slot' }),
+      kv(t('device.f.slotState'), d.slotState, { raw: 'slot_state', term: 'slotState' }),
       kv(t('device.f.consecBad'), d.consecBad, { raw: 'consec_bad' }),
       kv(t('device.f.nextRung'), d.nextLadderTier, { raw: 'next_ladder_tier', term: 'rung' }),
       kv(t('device.f.failureScore'), d.failureScore !== undefined && d.failureScore !== null

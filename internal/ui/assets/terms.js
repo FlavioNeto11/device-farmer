@@ -56,6 +56,13 @@
      vocabulary first, then the work that asks for a lease, then the hardware
      underneath, then the two states a human acts on. */
   const TERMS = [
+    /* lease and health are the two words the whole product turns on, and both
+       were missing: the device sheet glossed them as 'lease' and 'health',
+       ids no table ever had, so term() returned the bare word and nothing
+       said so. Their absence is why that failed silently rather than why it
+       was written wrong. */
+    { id: 'lease', area: 'lease', heading: 'What a lease is' },
+    { id: 'health', area: 'devices', heading: 'The device state machine' },
     { id: 'fence', area: 'lease', heading: 'The fence: what it protects, and where it is not checked' },
     { id: 'witness', area: 'lease', heading: 'Witness extensions and their cap' },
     { id: 'holder', area: 'lease', heading: 'What a lease is' },

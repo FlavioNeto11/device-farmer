@@ -749,6 +749,10 @@ const STRINGS = {
     'term.identLabel': 'In the database, in the API and in the logs',
     'term.identNote': 'That name never changes with the language on this page. It is what psql, ctl and a log line say, and matching them by eye is the whole reason this word is not translated.',
 
+    'term.lease.short': 'A claim on one device, held by one holder, until the job says it is done, until a deadline the user wrote down elapses, or until a human takes it back. Nothing else ends one — not a lost heartbeat, not a device going offline. A device that is unreachable is still leased, and a healthy device can sit idle.',
+    'term.lease.ident': 'farm.leases',
+    'term.health.short': 'What the watchdog last measured about the device itself, and nothing more. It says nothing about whether the device is in use: an offline device can still be held by a running job, and a healthy one can be free. Reclamation is not allowed to read it.',
+    'term.health.ident': 'farm.devices.health',
     'term.fence.short': 'A number stamped on a lease that says which holder is the current one. Ending a lease raises the device\'s floor above it, so every later call from the old holder is refused — but nothing in this build refuses an ADB command that carries a stale fence.',
     'term.fence.ident': 'farm.leases.fence',
     'term.witness.short': 'On-device proof that the HOLDER is still alive — a marker file its own agent touches — which buys a job that has lost the control plane more room before the reaper may reclaim it. It is not evidence about the device\'s health, and it is capped, so a wedged agent cannot hold a phone forever.',
@@ -1721,6 +1725,10 @@ const STRINGS = {
     'term.identLabel': 'No banco, na API e nos logs',
     'term.identNote': 'Esse nome não muda com o idioma desta página. É o que o psql, o ctl e uma linha de log dizem, e poder compará-los a olho é o motivo inteiro de esta palavra não ser traduzida.',
 
+    'term.lease.short': 'Uma reserva de um dispositivo, segurada por um holder, até o job dizer que terminou, até um prazo que o usuário escreveu se esgotar, ou até um humano retomar. Nada mais encerra uma — nem um heartbeat perdido, nem um aparelho sair do ar. Um dispositivo inalcançável continua reservado, e um dispositivo saudável pode estar parado.',
+    'term.lease.ident': 'farm.leases',
+    'term.health.short': 'O que o watchdog mediu por último sobre o próprio aparelho, e nada além disso. Não diz se ele está em uso: um aparelho fora do ar pode continuar segurado por um job rodando, e um saudável pode estar livre. A retomada não tem permissão para ler isto.',
+    'term.health.ident': 'farm.devices.health',
     'term.fence.short': 'Um número gravado na lease que diz qual holder é o atual. Terminar uma lease sobe o piso do dispositivo acima dele, então toda chamada posterior do holder antigo é recusada — mas nada neste build recusa um comando ADB que carregue um fence velho.',
     'term.fence.ident': 'farm.leases.fence',
     'term.witness.short': 'Prova no próprio aparelho de que o HOLDER continua vivo — um arquivo marcador que o agente dele toca — e que compra mais folga para um job que perdeu o control plane antes que o reaper possa retomar o dispositivo. Não é evidência sobre a saúde do aparelho, e tem teto, para que um agente travado não segure um telefone para sempre.',

@@ -52,10 +52,17 @@
 
   /* Text roles, not text colours. --txt-3 is for a value that is present but
      not the reason you are looking at the row: a raw identifier, a column
-     name, a unit. */
+     name, a unit.
+
+     --txt-3 IS STILL BODY TEXT AND STILL HAS TO BE READ. It shipped at #78838f
+     and measured 3.22 to 3.86 against the four light surfaces — under 4.5:1 on
+     every one of them, and worst on --srf-hover, so it was least legible on the
+     row the reader had just put the mouse on. Quiet is a smaller role, not a
+     fainter colour. These values clear 4.5:1 on every surface in their scheme;
+     the check that says so is in the commit that changed them. */
   --txt-1: #1a2027;
   --txt-2: #55616f;
-  --txt-3: #78838f;
+  --txt-3: #616b77;
   --txt-on-brand: #ffffff;
 
   /* ------------------------------------------------------------- brand --- */
@@ -161,7 +168,7 @@
 
     --txt-1: #e8ecf1;
     --txt-2: #a4b0bd;
-    --txt-3: #7f8b98;
+    --txt-3: #8d99a6;   /* 4.12 on --srf-hover before; 4.93 worst now */
     --txt-on-brand: #0b1520;
 
     --brand-700: #8cbcf0;

@@ -538,6 +538,15 @@ const STRINGS = {
     'screen.key.recents': 'Recents',
     'screen.key.power': 'Power',
 
+    /* The fleet grid holding still. The grid reconciles rather than rebuilds,
+     * and while somebody is working inside it — focus on a tile, or the device
+     * sheet open — it keeps updating what each tile SAYS but stops devices
+     * appearing, leaving or moving under them. This is that fact, said out
+     * loud in the live region, with the control that applies it. */
+    'fleet.held': '{n} devices changed. The grid is holding still while you are working in it.',
+    'fleet.heldApply': 'Update the grid',
+    'fleet.undrain': 'Undrain',
+
     /* Panel and table states */
     'state.loading': 'Loading…',
     'state.failed': 'Could not be loaded',
@@ -1126,6 +1135,16 @@ const STRINGS = {
     'screen.key.home': 'Início',
     'screen.key.recents': 'Recentes',
     'screen.key.power': 'Ligar',
+
+    /* A grade da frota parada. A grade reconcilia em vez de reconstruir, e
+     * enquanto alguém está trabalhando dentro dela — foco em um card, ou a
+     * gaveta do dispositivo aberta — ela continua atualizando o que cada card
+     * DIZ, mas para de fazer dispositivos aparecerem, sumirem ou mudarem de
+     * lugar embaixo da pessoa. Isso é esse fato, dito em voz alta na região
+     * viva, com o controle que aplica a mudança. */
+    'fleet.held': '{n} dispositivos mudaram. A grade está parada enquanto você trabalha nela.',
+    'fleet.heldApply': 'Atualizar a grade',
+    'fleet.undrain': 'Desdrenar',
 
     /* Estados de painel e tabela */
     'state.loading': 'Carregando…',

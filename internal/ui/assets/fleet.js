@@ -86,6 +86,12 @@ function fleetNarrowedOnServer() {
  * racing ones. */
 function clearFleetFilters() {
   state.q = '';
+  /* Clearing the filters is a structural change to the grid and it is the one
+   * the operator just asked for. Without this release the button — which lives
+   * INSIDE #fleet-body, in the empty panel — takes focus, the interaction guard
+   * sees focus in the grid, and the answer to "show me everything again" is the
+   * same empty grid plus a banner saying some devices changed. */
+  fleetReleaseOnce = true;
   setFilters({ host: '', hub: '', health: '', pool: '', lease: '' });
 }
 
@@ -117,6 +123,408 @@ function hubKeyOf(d) {
 function hubParamOf(d) {
   if (d.hubID !== undefined && d.hubID !== null) return String(d.hubID);
   return d.hubPath ? String(d.hubPath) : '';
+}
+
+/* The bucket devices the API returned with no host are grouped into. It is a
+ * display string AND a grouping key AND the one value in that column that
+ * names no host, so it exists once rather than three times — and everywhere
+ * this page turns a group back into a request it has to be checked for:
+ * ?host=(unassigned host) matches nothing, and there is no host to drain. */
+const UNASSIGNED_HOST = '(unassigned host)';
+
+/* ------------------------------------------------------------------ *
+ * KEYED RECONCILIATION
+ *
+ * This grid is the only view on the page that repaints under a live event
+ * stream, and it used to repaint by throwing itself away: renderFleet ended in
+ * body.replaceChildren(frag), so every stream event, every poll and every
+ * fifteen-second clock tick destroyed every tile on screen and built new ones.
+ *
+ * What that cost, measured against a running demo rather than guessed at: the
+ * fleet body was rebuilt six times in twelve seconds; a tile that was focused
+ * and then left alone for eight seconds was no longer in the document, with
+ * document.activeElement fallen back to <body>; and browser automation could
+ * not click a device at all, because the element it had just read went stale
+ * before the click landed. A human moving a mouse toward a tile is in exactly
+ * the same race, and a keyboard operator loses their place every few seconds.
+ *
+ * So nodes are kept and updated instead. Every reconciled node carries
+ * data-key — the identity of the thing it stands for — and data-sig, a join of
+ * exactly the fields it renders. Per render: same key and same signature and
+ * nothing is touched at all; same key and a changed signature and the node's
+ * contents are rewritten while the element itself survives, and with it focus,
+ * hover, :active, the text selection and any automation handle.
+ *
+ * THE RISK THIS TRADES FOR IS WORSE THAN THE ONE IT REMOVES IF IT IS GOT
+ * WRONG. A patch applied to the wrong node shows one device's data under
+ * another device's name, which is how an operator power-cycles the wrong
+ * handset — and unlike a rebuild, it looks completely fine. Two rules keep it
+ * from happening, and neither is negotiable:
+ *
+ *   1. The key is the device id and nothing else. Never a rack slot, a serial
+ *      or a usb path: those are labels a human can edit, duplicate or leave
+ *      off, and two rows sharing a key is precisely the bug above.
+ *   2. patch re-renders EVERY field the signature covers. It never tries to
+ *      work out which one changed, because that is where the second copy of
+ *      the tile's field list would live and the second copy is the one that
+ *      goes stale.
+ *
+ * It is generic on purpose. The card grid keys host blocks, hub blocks and
+ * tiles with it; the table keys its <tr> rows with it. One diff, one set of
+ * rules, one place to get right.
+ * ------------------------------------------------------------------ */
+
+/* The children each container owns, by key. On the container rather than in
+ * one flat table, so a whole host block dropping out of the DOM takes its hub
+ * blocks, its grids and their entries with it: nothing here needs cleaning up
+ * by hand, which is the failure mode a flat table would have. */
+const keyedChildren = new WeakMap();
+
+/* fleetSubject: the item a reconciled node currently stands for.
+ *
+ * A node now outlives the object it was first built from — that is the whole
+ * point — so a handler that closed over the row it was created with would act
+ * on whatever the device looked like the first time it was drawn. Every
+ * handler on a reconciled node reads its subject from here instead, and
+ * reconcile refreshes it on every pass, signature change or not. */
+const fleetSubject = new WeakMap();
+
+function subjectOf(node, fallback) {
+  const v = fleetSubject.get(node);
+  return v === undefined ? fallback : v;
+}
+
+/* signature joins the values a node renders into one comparable string.
+ *
+ * JSON rather than a join on some separator, because a separator has to be a
+ * character no field can contain and there is no such character in a model
+ * name typed by whoever assembled the rack. JSON also keeps the types apart:
+ * the string "0" and the number 0 are different signatures, as they should be.
+ *
+ * undefined gets an object of its own, because undefined and null are
+ * different answers here and JSON would collapse both to null. A lease fence
+ * of undefined is WITHHELD — another tenant holds this device — and prints
+ * "—", while a fence of 0 prints "f0". No scalar field can stringify to an
+ * object, so the two can never be confused.
+ *
+ * THE LANGUAGE IS PART OF EVERY SIGNATURE, and it is here rather than in each
+ * caller's list because forgetting it is silent and specific: switching to
+ * Portuguese left every host head in English, because none of the numbers in
+ * it had changed and the reconciler therefore had nothing to repaint. A
+ * signature is a claim about what a node renders, and which dictionary was in
+ * force is part of that whether the caller thought about it or not. */
+const SIG_UNDEFINED = { undefinedValue: true };
+
+function signature(parts) {
+  return JSON.stringify([currentLang()].concat(parts.map((v) => (v === undefined ? SIG_UNDEFINED : v))));
+}
+
+/* reconcile brings container's children into line with items, keeping the
+ * elements that are already right.
+ *
+ *   keyOf(item, i)  identity. Stable across renders or nothing below works.
+ *   sigOf(item)     the fields the node renders, joined. See signature().
+ *   create(item)    a new element for an item that has no node yet.
+ *   patch(node,item) rewrite the node's contents in place. Every field.
+ *                   Return false if it could NOT finish — the guard below
+ *                   makes that possible — and the node keeps its old
+ *                   signature so the next pass tries again. Stamping the new
+ *                   signature over a half-applied patch would leave the node
+ *                   permanently wrong and permanently considered up to date.
+ *
+ * opts.frozen defers STRUCTURAL change — insertion, removal, reordering —
+ * and reports how much it deferred, while still patching content in place.
+ * That is the interaction guard: content stays live, the ground does not move
+ * under someone who is working in the grid right now.
+ *
+ * Returns { added, removed, moved, held }, counting DOM operations performed
+ * and, in held, the ones a frozen pass declined to perform.
+ */
+function reconcile(container, items, keyOf, sigOf, create, patch, opts) {
+  const frozen = !!(opts && opts.frozen);
+  let known = keyedChildren.get(container);
+  if (!known) { known = new Map(); keyedChildren.set(container, known); }
+
+  const out = { added: 0, removed: 0, moved: 0, held: 0 };
+  const want = [];
+  const seen = new Set();
+  const fresh = new Set();
+
+  let i = -1;
+  for (const item of items) {
+    i += 1;
+    const key = String(keyOf(item, i));
+    /* Two items under one key would make one node stand for both, and the
+     * second one's data would appear under the first one's name. Drop the
+     * duplicate rather than render that: the caller's key is wrong, and
+     * guessing which row was meant is not this function's business. */
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    const sig = sigOf(item);
+    let node = known.get(key);
+    if (!node) {
+      if (frozen) { out.held += 1; continue; }
+      node = create(item);
+      node.dataset.key = key;
+      fleetSubject.set(node, item);
+      node.dataset.sig = sig;
+      known.set(key, node);
+      fresh.add(node);
+      out.added += 1;
+    } else {
+      // Always, signature change or not: the node's handlers read their
+      // subject from here, and two rows can render identically while carrying
+      // different lease fences into a confirmation dialog.
+      fleetSubject.set(node, item);
+      if (node.dataset.sig !== sig && patch(node, item) !== false) {
+        node.dataset.sig = sig;
+      }
+    }
+    want.push(node);
+  }
+
+  for (const [key, node] of Array.from(known)) {
+    if (seen.has(key)) continue;
+    if (frozen) { out.held += 1; continue; }
+    known.delete(key);
+    node.remove();
+    out.removed += 1;
+  }
+
+  const owned = ownedChildren(container, known);
+
+  if (frozen) {
+    /* Nothing was inserted or removed, so the nodes that stayed are exactly
+     * the ones wanted — count the positions that would have to move. */
+    const stay = owned.filter((n) => seen.has(n.dataset.key));
+    for (let n = 0; n < want.length; n += 1) if (stay[n] !== want[n]) out.held += 1;
+    return out;
+  }
+
+  /* Order, walking backwards: each node is inserted before the one that must
+   * follow it, which is a no-op for a node already in that position — so a
+   * farm whose order has not changed moves nothing at all. Children this
+   * reconciler does not own — a host head, the notice panel — are never
+   * touched, because the tail starts at whatever currently follows the last
+   * owned node rather than at the end of the container. */
+  let tail = owned.length ? owned[owned.length - 1].nextSibling : null;
+  for (let n = want.length - 1; n >= 0; n -= 1) {
+    const node = want[n];
+    if (node.parentNode !== container || node.nextSibling !== tail) {
+      container.insertBefore(node, tail);
+      if (!fresh.has(node)) out.moved += 1;
+    }
+    tail = node;
+  }
+  return out;
+}
+
+/* The children of container that this reconciler owns, in document order. */
+function ownedChildren(container, known) {
+  const out = [];
+  for (const n of Array.from(container.children)) {
+    const k = n.dataset ? n.dataset.key : undefined;
+    if (k !== undefined && known.get(k) === n) out.push(n);
+  }
+  return out;
+}
+
+function keyedChild(container, key) {
+  const known = keyedChildren.get(container);
+  return known ? known.get(String(key)) : undefined;
+}
+
+/* clearKeyed empties a container AND forgets what it owned.
+ *
+ * Emptying alone would leave the key table pointing at detached nodes, which
+ * the next pass would silently re-attach — the hidden pane's five hundred rows
+ * coming back from the dead the moment somebody switched modes. The pane
+ * elements themselves are never replaced; only their contents go. */
+function clearKeyed(container) {
+  if (!container.firstChild && !keyedChildren.has(container)) return;
+  keyedChildren.delete(container);
+  container.replaceChildren();
+}
+
+/* syncAttributes copies every attribute the freshly built node carries onto
+ * the node being kept.
+ *
+ * Every attribute rather than a named list of the ones a tile carries today:
+ * four units edit this file, and a tile that grows an attribute must not
+ * become a tile whose one new attribute is silently never updated. That is how
+ * the aria-label unit 3 builds from the same pieces as the visible card stays
+ * in step with the card. data-key and data-sig belong to the reconciler and
+ * are never on the fresh node. */
+function syncAttributes(node, built) {
+  for (const a of Array.from(built.attributes)) {
+    if (node.getAttribute(a.name) !== a.value) node.setAttribute(a.name, a.value);
+  }
+  for (const a of Array.from(node.attributes)) {
+    if (a.name === 'data-key' || a.name === 'data-sig') continue;
+    if (!built.hasAttribute(a.name)) node.removeAttribute(a.name);
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * The interaction guard
+ * ------------------------------------------------------------------ */
+
+/* Consumed by the NEXT fleet render, which is then never held back.
+ *
+ * Set by the "update the grid" control, and by the controls inside the grid
+ * whose whole purpose IS a structural change — narrowing to one hub, sorting a
+ * column, clearing the filters. None of those is something to protect an
+ * operator from; each is what they just asked for, and deferring it would
+ * answer the click with the same grid plus a banner. */
+let fleetReleaseOnce = false;
+
+/* The last time somebody typed or clicked inside the grid. See below. */
+let fleetTouchedAt = 0;
+let fleetWatchWired = false;
+
+/* Past this much silence the guard lets go. An operator who tabbed into the
+ * grid and then went to lunch is not mid-action, and a grid that has stopped
+ * telling the truth about the farm because a tile still has focus is the
+ * failure this whole change exists to avoid, arrived at from the other side.
+ * Half a minute is long enough to read a tile and decide, short enough that
+ * nobody is looking at a stale farm without knowing it. */
+const FLEET_HOLD_MS = 30000;
+
+function watchFleetInteraction() {
+  if (fleetWatchWired) return;
+  const body = $('#fleet-body');
+  if (!body) return;
+  fleetWatchWired = true;
+  const touch = () => { fleetTouchedAt = Date.now(); };
+  for (const ev of ['keydown', 'pointerdown', 'focusin']) body.addEventListener(ev, touch);
+}
+
+/* fleetHeldBack: is somebody working inside this grid right now?
+ *
+ * The device sheet being open is the easy half: the grid behind it is what the
+ * operator came from and will return to.
+ *
+ * The other half is focus, and the first version of this got it wrong in a way
+ * worth writing down. `#fleet-body.contains(document.activeElement)` is true
+ * for a KEYBOARD operator part-way through something — and it is also true for
+ * anybody who has ever clicked a tile, because a click leaves focus behind and
+ * closing the device sheet puts it back. That froze the grid permanently for
+ * every mouse user on the page: devices that left the farm never disappeared,
+ * new ones never arrived, and every render raised a banner about it.
+ *
+ * :focus-visible is the browser's own answer to that exact distinction — it is
+ * how it decides whether to draw a focus ring — so it is what decides here.
+ * Plus a silence bound, because "focused" is not the same as "still working".
+ *
+ * Content is never frozen, only structure. A grid that shows yesterday's health
+ * because somebody tabbed into it is a worse failure than one that moves. */
+function fleetHeldBack() {
+  if (fleetReleaseOnce) return false;
+  const dlg = $('#dlg-device');
+  if (dlg && dlg.open) return true;
+  const body = $('#fleet-body');
+  const a = document.activeElement;
+  if (!a || !body || !body.contains(a)) return false;
+  if (Date.now() - fleetTouchedAt > FLEET_HOLD_MS) return false;
+  // A browser without :focus-visible holds the grid rather than moving it: the
+  // conservative answer, and the one this had before the selector existed.
+  try { return a.matches(':focus-visible'); } catch (_) { return true; }
+}
+
+let heldNoteCount = 0;
+let heldNote = null;
+let heldDismissed = false;
+
+/* announceHeld says out loud what the guard is holding back, in the page's
+ * existing aria-live region, and offers the control that applies it.
+ *
+ * Only when the NUMBER changes. Re-raising the same sentence on every stream
+ * event would make a polite live region announce itself several times a second
+ * to a screen reader, which is a worse interruption than the one the guard
+ * exists to prevent — and it would also put back a banner the operator had
+ * just dismissed, on the next event, forever.
+ *
+ * The exception is a banner that was not dismissed but PUSHED OUT: the strip
+ * holds five and drops the oldest, and an alert burst is exactly the moment
+ * this notice is most likely to be evicted and least likely to be missed. A
+ * full strip is most of how the two are told apart — a dismissal leaves room
+ * behind it, an eviction does not — but only at the instant of dismissal, so
+ * an actual dismissal is remembered as well. See below for what that costs
+ * when it is left to the room test alone. */
+function announceHeld(n) {
+  /* A modal <dialog> makes the rest of the page inert: while the device sheet
+   * is open the banner strip cannot be read by a screen reader and the control
+   * it offers cannot be pressed. So nothing is said — the grid behind the sheet
+   * is not being read either — and the first render after it closes says it if
+   * it is still true. */
+  const dlg = $('#dlg-device');
+  if (dlg && dlg.open) return;
+
+  const strip = $('#banners');
+  const evicted = heldNote && !heldNote.isConnected && !heldDismissed &&
+    strip && strip.children.length >= 5;
+  if (heldNoteCount === n && !evicted) return;
+  heldNoteCount = n;
+  if (!n) { clearBanner('fleet-held'); heldNote = null; heldDismissed = false; return; }
+  heldDismissed = false;
+  heldNote = banner('warn', t('fleet.held', { n: String(n) }), {
+    key: 'fleet-held',
+    action: { label: t('fleet.heldApply'), run: applyHeldFleetChanges }
+  });
+  /* A click anywhere in this banner is the operator dealing with it — the
+   * control that applies the change, or the × beside it. Either way it must not
+   * come back on its own, and the room test alone cannot tell: an alert burst
+   * refills the strip within seconds, at which point a DISMISSED notice also
+   * satisfies "no room behind it" and is re-raised, render after render, each
+   * new copy evicted by the next alert and put back by the one after. That is
+   * the live-region churn this whole function exists to prevent, arrived at
+   * from the other side and at the moment the strip is busiest. */
+  if (!heldNote.dataset.heldWired) {
+    heldNote.dataset.heldWired = '1';
+    heldNote.addEventListener('click', () => { heldDismissed = true; });
+  }
+}
+
+function applyHeldFleetChanges() {
+  /* Not a plain renderFleet() call: the operator pressed a button, which moved
+   * focus to the banner and away from the grid, and the render must happen
+   * with the guard released whatever focus does next. */
+  fleetReleaseOnce = true;
+  renderFleet();                 // consumes the release and clears it
+  clearBanner('fleet-held');
+  heldNote = null;
+  heldNoteCount = 0;
+  /* The button that was just pressed went with the banner. Put the keyboard on
+   * the grid it was asked to update rather than at the top of the document —
+   * unless the device sheet is open, in which case the browser will refuse to
+   * focus anything behind it and is right to. */
+  const first = $('.tile, .rowlink', $('#fleet-body'));
+  if (first) first.focus();
+}
+
+/* heldDeviceCount counts, in devices, the difference between what is drawn and
+ * what the data says — which is what the guard is holding back. It reads the
+ * DOM rather than the reconcilers' own tallies because "devices" is the unit
+ * the sentence is written in, and a held-back host block is several of them.
+ *
+ * `want` is the keys the render asked for, in order; `drawn` is the nodes that
+ * actually carry a device — tiles in the card grid, rows in the table. Both
+ * modes key on the same deviceKey, so one function answers for both.
+ *
+ * When the two sets agree, the difference is order: count the positions that
+ * do not match, so a device that would move is still news. */
+function heldDeviceCount(want, drawn) {
+  const have = drawn.map((n) => n.dataset.key || '');
+  const wantSet = new Set(want);
+  const haveSet = new Set(have);
+  let n = 0;
+  for (const k of wantSet) if (!haveSet.has(k)) n += 1;
+  for (const k of haveSet) if (!wantSet.has(k)) n += 1;
+  if (n === 0) {
+    for (let i = 0; i < want.length; i += 1) if (want[i] !== have[i]) n += 1;
+  }
+  return n;
 }
 
 /* ------------------------------------------------------------------ *
@@ -338,19 +746,251 @@ function paintFleetCard(node, spec, c) {
   $('.sum-sub', node).textContent = spec.sub;
 }
 
+/* ------------------------------------------------------------------ *
+ * Grouping: the rows, arranged as they are drawn
+ * ------------------------------------------------------------------ */
+
+/* fleetGroups turns the filtered rows into the host → hub → device tree the
+ * card grid draws, with every number each level shows computed once.
+ * Separating it from the drawing is what lets a signature be compared without
+ * building a node to compare it against. */
+function fleetGroups(rows) {
+  const byHost = new Map();
+  for (const d of rows) {
+    const host = d.host || UNASSIGNED_HOST;
+    let hubs = byHost.get(host);
+    if (!hubs) { hubs = new Map(); byHost.set(host, hubs); }
+    const hk = hubKeyOf(d);
+    if (!hubs.has(hk)) hubs.set(hk, []);
+    hubs.get(hk).push(d);
+  }
+
+  const hostMeta = new Map((state.data.hosts || []).map((h) => [String(h.id), h]));
+  const hubMeta = new Map((state.data.hubs || [])
+    .filter((h) => h.id !== undefined && h.id !== null).map((h) => [String(h.id), h]));
+
+  const out = [];
+  for (const host of Array.from(byHost.keys()).sort(cmp)) {
+    const hubs = byHost.get(host);
+    const hubKeys = Array.from(hubs.keys()).sort((a, b) => {
+      const da = hubs.get(a)[0], db = hubs.get(b)[0];
+      return cmp(da.hubPath || a, db.hubPath || b);
+    });
+    const hubItems = hubKeys.map((hk) => hubGroup(host, hk, hubs.get(hk), hubMeta.get(hk)));
+
+    const hostDevices = [];
+    for (const hub of hubItems) for (const d of hub.devices) hostDevices.push(d);
+
+    const meta = hostMeta.get(String(host));
+    const adminState = (meta && meta.adminState) ||
+      (hostDevices[0] && hostDevices[0].hostAdminState) || 'enabled';
+
+    out.push({
+      host: host,
+      adminState: adminState,
+      count: hostDevices.length,
+      unhealthy: hostDevices.filter((d) => isFault(d.health)).length,
+      live: hostDevices.filter((d) => d.leaseState === 'held' || d.leaseState === 'suspect').length,
+      // The RENDERED relative time, not the timestamp: "4m ago" goes stale on
+      // its own, and a signature over the timestamp would freeze it there.
+      seen: meta && meta.lastSeen ? fmtRel(meta.lastSeen) : null,
+      rows: hostDevices,
+      hubs: hubItems
+    });
+  }
+  return out;
+}
+
+function hubGroup(host, hk, list, meta) {
+  const devices = list.slice().sort((a, b) => cmp(a.rackSlot || a.usbPath, b.rackSlot || b.usbPath));
+  const first = devices[0];
+  const hubPath = first.hubPath || (hk === 'nohub' ? null : hk);
+
+  // Prefer the server's v_hub_health numbers (they count every device on the
+  // hub, not just the ones passing the current filter).
+  const total = meta && meta.devices !== undefined ? Number(meta.devices) : devices.length;
+  const unhealthyList = devices.filter((d) => isFault(d.health));
+  const unhealthy = meta && meta.unhealthy !== undefined ? Number(meta.unhealthy) : unhealthyList.length;
+  let since = meta && meta.worstSince ? meta.worstSince : null;
+  if (!since) {
+    for (const d of unhealthyList) {
+      const ts = parseTime(d.healthSince);
+      if (ts && (!since || ts > parseTime(since))) since = d.healthSince;
+    }
+  }
+
+  // The server sets `correlated` on a hub with more than one unhealthy device;
+  // the ratio test is the fallback when it does not.
+  const correlated = unhealthy >= 2 && total > 0 &&
+    ((meta && meta.correlated) || unhealthy / total >= 0.4);
+
+  return {
+    key: hk,
+    host: host,
+    hubPath: hubPath,
+    hubParam: hubParamOf(first),
+    model: meta && meta.model ? meta.model : null,
+    vbus: !!(meta && meta.vbus),
+    count: devices.length,
+    total: total,
+    unhealthy: unhealthy,
+    since: since,
+    correlated: correlated,
+    severe: correlated && unhealthy / total >= 0.75,
+    devices: devices
+  };
+}
+
+/* ------------------------------------------------------------------ *
+ * Keys and signatures
+ * ------------------------------------------------------------------ */
+
+/* deviceKey: the device id and nothing else — see the two rules above. It is
+ * the key in BOTH modes, because a tile and a row stand for the same handset
+ * and switching modes must not renumber the farm.
+ *
+ * A row the API returned without an id cannot be reconciled at all, so it is
+ * keyed by its position instead and repaints the way the whole grid used to.
+ * That is the honest fallback: the alternatives are dropping it, or letting
+ * every id-less row in the container share one node. */
+function deviceKey(d, index) {
+  const id = d.id;
+  return id === undefined || id === null || id === '' ? 'pos:' + index : 'id:' + String(id);
+}
+
+/* deviceSig covers EXACTLY the fields deviceTile renders. It is a contract
+ * between two functions in one file, and both halves have to be edited
+ * together: a field the tile shows and this omits freezes on screen, and a
+ * field here that the tile does not show repaints for nothing.
+ *
+ * The list is not the same one this file shipped with. Unit 3's two-chip
+ * budget took `fence` and the raw `adb_state` off the tile face — both moved
+ * to the device sheet — and put `holder` on it, in the one sentence under the
+ * chips that says who to go and ask. Signing a field the tile no longer draws
+ * would repaint fifty-six tiles for a lease fence nobody can see; not signing
+ * `holder` would freeze a name on screen after the lease moved.
+ *
+ * TestTheTileSignatureCoversEveryFieldTheTileRenders in internal/ui derives
+ * this list from deviceTile itself — following the helpers the tile hands the
+ * whole row to — and fails in both directions, because "remember to update the
+ * other one" is not a mechanism. */
+function deviceSig(d) {
+  return signature([
+    d.rackSlot, d.usbPath, d.id,
+    d.manufacturer, d.model, d.android, d.serial,
+    d.health,
+    d.leaseState, d.protected, d.holder,
+    d.quarantineID, d.quarantineReason,
+    d.serialAmbiguous, d.adminState,
+    d.battery
+  ]);
+}
+
+/* The table row shows a different set: no battery percentage in words, no
+ * holder, but the host, the hub path, the host's admin_state — a drained host
+ * takes every device on it out of the pool and a table has no host header to
+ * say so — and a last-seen clock.
+ *
+ * lastSeen is signed as BOTH the timestamp and the rendered distance. The cell
+ * prints "4m ago", which goes stale with no change to the data behind it, so a
+ * signature over the timestamp alone would stop that clock the moment the row
+ * was first drawn.
+ *
+ * TestTheTableRowSignatureCoversEveryFieldTheRowRenders holds this list to the
+ * columns the same way. */
+function fleetRowSig(d) {
+  return signature([
+    d.rackSlot, d.usbPath, d.id,
+    d.manufacturer, d.model, d.android, d.serial, d.serialAmbiguous,
+    d.host, d.hubPath,
+    d.health, d.quarantineID, d.quarantineReason,
+    d.leaseState, d.protected, d.adminState, d.hostAdminState,
+    d.battery,
+    d.lastSeen, fmtRel(d.lastSeen)
+  ]);
+}
+
+function hostKey(h) { return String(h.host); }
+
+function hostSig(h) {
+  return signature([h.host, h.adminState, h.count, h.unhealthy, h.live, h.seen]);
+}
+
+function hubKey(h) { return String(h.key); }
+
+function hubSig(h) {
+  return signature([h.hubPath, h.model, h.count, h.vbus, h.host,
+    h.correlated, h.severe, h.unhealthy, h.total,
+    // The rendered forms, for the same reason the host's "seen" is: these are
+    // clocks, and a signature over the timestamp would stop them.
+    h.since ? fmtClock(h.since) : null,
+    h.since ? fmtAbs(h.since) : null,
+    h.since ? fmtRel(h.since) : null]);
+}
+
+/* ------------------------------------------------------------------ *
+ * Render
+ * ------------------------------------------------------------------ */
+
+/* The not-yet / failed / nothing-here panel, kept as a sibling of the two
+ * panes. It is tracked in a variable rather than found by class because the
+ * one thing this file must never do again is decide what the fleet body
+ * contains by replacing all of it.
+ *
+ * It is a sibling of BOTH panes and not a child of either, because
+ * nothingToShow() is one decision for both modes — "this farm has no devices"
+ * and "the filters hid all of them" have opposite next actions — and one
+ * decision drawn in one place cannot drift into two. */
+let fleetNotice = null;
+
+function fleetNoticeTo(body, node) {
+  if (!node) {
+    if (fleetNotice && fleetNotice.isConnected) fleetNotice.remove();
+    fleetNotice = null;
+    return;
+  }
+  // Same words as last time: leave the node alone, so a polite live region is
+  // not told "Loading from the API…" once per event, and a <details> somebody
+  // just opened is not re-collapsed under them.
+  if (fleetNotice && fleetNotice.isConnected && fleetNotice.textContent === node.textContent) return;
+  if (fleetNotice && fleetNotice.isConnected) fleetNotice.remove();
+  fleetNotice = node;
+  body.append(node);
+}
+
+/* The state of the pass currently running.
+ *
+ * A patch function is called whether or not the pass is frozen, because
+ * content must stay live either way — but one of them, patchCorrelation, has a
+ * structural half: the correlation box appears and disappears, and it carries
+ * a button. It reads its permission from here rather than from a parameter
+ * threaded through reconcile, which would put "are we frozen" in the signature
+ * of every patch on the page for the sake of the one that needs it. */
+const fleetPass = { frozen: false, held: 0 };
+
+/* fleetDrawn: the nodes currently on screen that stand for one device, in
+ * whichever mode is being drawn — tiles in the card grid, rows in the table.
+ * Two decisions read it and they must read the same thing: whether there is
+ * anything for the interaction guard to protect, and whether the grid has
+ * anything on it at all. */
+function fleetDrawn(mode, boxes) {
+  return mode === 'table' ? $$('tbody tr', boxes.table) : $$('.tile', boxes.cards);
+}
+
 function renderFleet() {
   const body = $('#fleet-body');
   const alerts = $('#fleet-alerts');
   body.setAttribute('aria-busy', state.loading.fleet ? 'true' : 'false');
+  watchFleetInteraction();
 
   const all = state.data.fleet;
   const rows = fleetRows();
 
-  // The five server-computed numbers now live in the summary strip above the
-  // grid, where they are large enough to read from a doorway and each one can
-  // be clicked. countChips() rendered the same six values here as six grey
-  // pills in the corner of a toolbar; keeping both would put the same arithmetic
-  // on the page twice, differently worded, which is how two numbers that must
+  // The five server-computed numbers live in the summary strip above the grid,
+  // where they are large enough to read from a doorway and each one can be
+  // clicked. countChips() rendered the same six values here as six grey pills
+  // in the corner of a toolbar; keeping both would put the same arithmetic on
+  // the page twice, differently worded, which is how two numbers that must
   // agree start disagreeing.
   const counts = $('#fleet-counts');
   counts.replaceChildren();
@@ -372,6 +1012,14 @@ function renderFleet() {
   const mode = fleetMode(all);
   syncFleetModeControl(mode);
 
+  /* Both panes always exist and are never replaced — they are the containers
+   * the reconcilers key their children on, and a container that is swapped out
+   * takes every kept node with it. Exactly one is visible, and only the
+   * visible one is ever filled: a hidden table of five hundred rows is five
+   * hundred rows of work nobody asked for, on a view that repaints under a
+   * live event stream. */
+  const boxes = fleetModeBoxes(body);
+
   /* A farm with no devices and a filter that hides every device read
    * identically — "No devices match" — and they are not the same situation at
    * all. The first is answered by a person walking to the rack; the second by
@@ -384,21 +1032,46 @@ function renderFleet() {
     : emptyState(t('empty.fleet.none'),
       [t('empty.fleet.noneDetail'), provenance(t('empty.fleet.where'))],
       emptyAction(t('empty.openDocs'), () => setView('docs'))));
-  if (problem) { body.replaceChildren(problem); alerts.replaceChildren(); return; }
 
-  /* Both panes always exist; exactly one is visible, and only the visible one
-   * is ever filled — a hidden table of five hundred rows is five hundred rows
-   * of work nobody asked for, on a view that repaints under a live event
-   * stream. */
-  const boxes = fleetModeBoxes(body);
-  boxes.cards.hidden = mode !== 'cards';
-  boxes.table.hidden = mode !== 'table';
+  /* The guard never holds a grid back behind a panel that says the grid could
+   * not be loaded: those two states contradict each other on screen, and the
+   * only way to reach one with tiles still drawn is a farm that has just gone
+   * from rows to none. Let that one through.
+   *
+   * And NOTHING DRAWN IS NOTHING TO PROTECT. A frozen pass defers creation as
+   * well as removal, so freezing a pass that is drawing into an empty pane
+   * produces an empty pane — and the page then prints "No devices match" over a
+   * farm with fifty-six devices in it. That is reachable without anything
+   * unusual: the fleet fetch fails, the loading panel takes the whole body, the
+   * operator tabs to its Retry button and presses it, and the good response
+   * lands with focus still :focus-visible inside #fleet-body. A mode flip
+   * reaches it too — fleetMode re-derives cards-or-table from the farm's size
+   * on every unfiltered response, so a farm hovering either side of forty can
+   * change panes with nobody touching anything. */
+  const frozen = !problem && fleetDrawn(mode, boxes).length > 0 && fleetHeldBack();
+  fleetReleaseOnce = false;
+  fleetPass.frozen = frozen;
+  fleetPass.held = 0;
+
+  if (problem) {
+    clearKeyed(boxes.cards);
+    clearKeyed(boxes.table);
+    boxes.cards.hidden = true;
+    boxes.table.hidden = true;
+    fleetNoticeTo(body, problem);
+    announceHeld(0);
+    alerts.replaceChildren();
+    return;
+  }
+
+  // The keys this render asked for, in drawing order, so the held-back count
+  // below can be stated in devices rather than in DOM operations.
+  const want = [];
+  let held = 0;
 
   if (mode === 'table') {
-    boxes.cards.replaceChildren();
-    boxes.table.replaceChildren(rows.length
-      ? fleetTable(rows)
-      : nothingToShow(all));
+    clearKeyed(boxes.cards);
+    held += fleetTableInto(boxes.table, rows, want);
     /* The in-context hub-correlation box below is not drawn here, and it is
      * worth being exact about what that costs. The box belongs beside the hub
      * it accuses, and a table sorted by battery has no hub to stand beside.
@@ -406,137 +1079,243 @@ function renderFleet() {
      * the alert stream with the hub id on it and fills the banner region at
      * the top of the page, which is above this table too.
      *
-     * What is not reproduced is the client-side fallback below — the ratio
-     * test that fires when the server did not flag the hub itself. In table
-     * mode that hub is visible only as several unhealthy rows sharing a hub
-     * path, which is a thing an operator can sort by and not a thing the page
-     * says out loud. That is a real gap and it is written down here rather
-     * than papered over. */
-    alerts.replaceChildren();
-    return;
-  }
-  boxes.table.replaceChildren();
-
-  // Group by host, then by hub: the physical failure unit, in the order a
-  // human walks the room.
-  const byHost = new Map();
-  for (const d of rows) {
-    const host = d.host || '(unassigned host)';
-    if (!byHost.has(host)) byHost.set(host, new Map());
-    const hubs = byHost.get(host);
-    const hk = hubKeyOf(d);
-    if (!hubs.has(hk)) hubs.set(hk, []);
-    hubs.get(hk).push(d);
+     * What is not reproduced is the client-side fallback — the ratio test that
+     * fires when the server did not flag the hub itself. In table mode that
+     * hub is visible only as several unhealthy rows sharing a hub path, which
+     * is a thing an operator can sort by and not a thing the page says out
+     * loud. That is a real gap and it is written down here rather than papered
+     * over. */
+  } else {
+    clearKeyed(boxes.table);
+    held += renderFleetCards(boxes.cards, fleetGroups(rows), frozen, want);
   }
 
-  const hostMeta = new Map((state.data.hosts || []).map((h) => [String(h.id), h]));
-  const hubMeta = new Map((state.data.hubs || []).filter((h) => h.id !== undefined && h.id !== null).map((h) => [String(h.id), h]));
+  held += fleetPass.held;
 
-  const frag = document.createDocumentFragment();
+  /* What is actually on screen decides which pane is shown and whether the
+   * "nothing to show" panel is drawn — not `rows.length`. A frozen pass keeps
+   * tiles the data no longer contains, and a grid full of tiles under a panel
+   * saying no devices match is the page contradicting itself. */
+  const drawn = fleetDrawn(mode, boxes);
+  boxes.cards.hidden = mode !== 'cards' || !drawn.length;
+  boxes.table.hidden = mode !== 'table' || !drawn.length;
+  fleetNoticeTo(body, drawn.length ? null : nothingToShow(all));
 
-  for (const host of Array.from(byHost.keys()).sort(cmp)) {
-    const hubs = byHost.get(host);
-    const hostDevices = rows.filter((d) => (d.host || '(unassigned host)') === host);
-    const meta = hostMeta.get(String(host));
-    const adminState = (meta && meta.adminState) || (hostDevices[0] && hostDevices[0].hostAdminState) || 'enabled';
-    const live = hostDevices.filter((d) => d.leaseState === 'held' || d.leaseState === 'suspect');
-    const bad = hostDevices.filter((d) => isFault(d.health));
-
-    const head = el('div', { class: 'host-head' },
-      el('span', { class: 'host-name' }, host),
-      adminState !== 'enabled'
-        ? el('span', { class: 'chip chip-drain', title: 'host admin_state' }, el('span', { 'aria-hidden': 'true' }, '⏸'), adminState)
-        : el('span', { class: 'chip chip-ok', title: 'host admin_state' }, el('span', { 'aria-hidden': 'true' }, '✓'), 'enabled'),
-      el('span', { class: 'count' }, 'devices ', el('b', null, String(hostDevices.length))),
-      el('span', { class: 'count' }, 'unhealthy ', el('b', null, String(bad.length))),
-      el('span', { class: 'count' }, 'live leases ', el('b', null, String(live.length))),
-      meta && meta.lastSeen ? el('span', { class: 'count' }, 'seen ', el('b', null, fmtRel(meta.lastSeen))) : null,
-      el('span', { class: 'host-actions' },
-        adminState === 'draining' || adminState === 'disabled'
-          ? el('button', { class: 'mini', onclick: () => undrainHost(host, hostDevices) }, 'Undrain')
-          : el('button', { class: 'mini', onclick: () => drainHost(host, hostDevices) }, 'Drain')));
-
-    const block = el('div', { class: 'host-block' }, head);
-
-    const hubKeys = Array.from(hubs.keys()).sort((a, b) => {
-      const da = hubs.get(a)[0], db = hubs.get(b)[0];
-      return cmp(da.hubPath || a, db.hubPath || b);
-    });
-
-    for (const hk of hubKeys) {
-      const devices = hubs.get(hk).slice().sort((a, b) => cmp(a.rackSlot || a.usbPath, b.rackSlot || b.usbPath));
-      const first = devices[0];
-      const hubPath = first.hubPath || (hk === 'nohub' ? null : hk);
-      const meta2 = hubMeta.get(hk);
-
-      // Prefer the server's v_hub_health numbers (they count every device on
-      // the hub, not just the ones passing the current filter).
-      const total = meta2 && meta2.devices !== undefined ? Number(meta2.devices) : devices.length;
-      const unhealthyList = devices.filter((d) => isFault(d.health));
-      const unhealthy = meta2 && meta2.unhealthy !== undefined ? Number(meta2.unhealthy) : unhealthyList.length;
-      let since = meta2 && meta2.worstSince ? meta2.worstSince : null;
-      if (!since) {
-        for (const d of unhealthyList) {
-          const t = parseTime(d.healthSince);
-          if (t && (!since || t > parseTime(since))) since = d.healthSince;
-        }
-      }
-
-      const hubHead = el('div', { class: 'hub-head' },
-        el('span', { class: 'hub-name' }, hubPath ? 'hub ' + hubPath : 'no hub recorded'),
-        meta2 && meta2.model ? el('span', null, meta2.model) : null,
-        el('span', null, devices.length + (devices.length === 1 ? ' device' : ' devices')),
-        meta2 && meta2.vbus ? el('span', { class: 'chip chip-plain', title: 'this hub can switch VBUS per port' }, 'switchable') : null);
-
-      const hubBlock = el('div', { class: 'hub-block' }, hubHead);
-
-      // The correlation banner: several devices failing on one hub is one hub
-      // fault, not several phone faults. Saying so out loud is the difference
-      // between an operator replacing five phones and an operator replacing
-      // one hub.
-      // The server sets `correlated` on a hub with more than one unhealthy
-      // device; the ratio test is the fallback when it does not.
-      if (unhealthy >= 2 && total > 0 && ((meta2 && meta2.correlated) || unhealthy / total >= 0.4)) {
-        const severe = unhealthy / total >= 0.75;
-        const line = unhealthy + ' of ' + total + ' devices on hub ' + (hubPath || '(unknown)') +
-          ' unhealthy' + (since ? ' since ' + fmtClock(since) : '') + ' — suspect the hub, not the phones.';
-        hubBlock.append(el('div', { class: 'correlate' + (severe ? ' correlate-bad' : '') },
-          el('span', { 'aria-hidden': 'true' }, '▲'),
-          el('span', null, line,
-            el('span', { class: 'c-sub' },
-              'Blast radius is this hub, on host ' + host + '. Leases on these devices are untouched and their clocks keep running.'),
-            el('span', { class: 'c-sub' },
-              since ? 'Worst health_since: ' + fmtAbs(since) + ' (' + fmtRel(since) + ').' : 'The API reported no health_since for these devices.')),
-          el('button', {
-            class: 'mini ghost',
-            onclick: () => setFilters({ host: host === '(unassigned host)' ? '' : host, hub: hubParamOf(first) })
-          }, 'Focus this hub')));
-
-        // No top-level banner is raised from here. Hub correlation is also
-        // computed server-side from farm.v_hub_health and arrives on the alert
-        // stream, which carries the hub id and can offer a jump action. Raising
-        // it here as well produced two banners per failing hub, worded slightly
-        // differently, which is precisely how a real correlated failure gets
-        // lost in its own noise. The in-context box above the affected devices
-        // is the better placement and stays.
-      }
-
-      const grid = el('div', { class: 'grid' });
-      for (const d of devices) grid.append(deviceTile(d));
-      hubBlock.append(grid);
-      block.append(hubBlock);
-    }
-
-    frag.append(block);
-  }
-
-  if (!rows.length) frag.append(nothingToShow(all));
-
-  boxes.cards.replaceChildren(frag);
+  /* The sentence counts devices, so it is only raised when the difference can
+   * be stated in devices. A held-back correlation box is a real deferral and
+   * is counted above, but "0 devices changed" would be a worse thing to say
+   * than nothing; the guard lets go on its own within FLEET_HOLD_MS. */
+  announceHeld(held ? heldDeviceCount(want, drawn) : 0);
 
   // Alerts inside the view are rendered content; the announcement goes to the
   // aria-live banner region once per new correlation, not on every repaint.
   alerts.replaceChildren();
+}
+
+/* renderFleetCards reconciles the host → hub → tile tree into the cards pane
+ * and returns how much a frozen pass held back. */
+function renderFleetCards(pane, hosts, frozen, want) {
+  let held = reconcile(pane, hosts, hostKey, hostSig, createHostBlock, patchHostBlock, { frozen }).held;
+
+  for (const h of hosts) {
+    /* Every device this render asked for, counted BEFORE the two guards below.
+     * A host block a frozen pass declined to create is the case where saying
+     * nothing is worst — a host registering with twenty-four devices on it is
+     * twenty-four devices the operator cannot see — and counting these after
+     * the `continue` made the want set match the DOM exactly, which reads as
+     * "nothing is being held back" and silently cleared the banner.
+     *
+     * The index is the device's position ON ITS HUB, because that is the index
+     * the grid's own reconciler keys an id-less row by; a running total across
+     * hubs would compare two different keys for one tile. */
+    for (const hub of h.hubs) hub.devices.forEach((d, i) => want.push(deviceKey(d, i)));
+
+    const block = keyedChild(pane, hostKey(h));
+    if (!block) continue;                       // held back; its hubs are not drawn yet
+    held += reconcile(block, h.hubs, hubKey, hubSig, createHubBlock, patchHubBlock, { frozen }).held;
+    for (const hub of h.hubs) {
+      const hubBlock = keyedChild(block, hubKey(hub));
+      if (!hubBlock) continue;
+      held += reconcile($('.grid', hubBlock), hub.devices, deviceKey, deviceSig,
+        deviceTile, patchTile, { frozen }).held;
+    }
+  }
+  return held;
+}
+
+/* ------------------------------------------------------------------ *
+ * The host block
+ *
+ * A head and its hub blocks. The head's volatile half lives in .facts and is
+ * rewritten wholesale; the button beside it is never detached, because
+ * detaching a focused button blurs it and this head is repainted whenever a
+ * device on the host changes health.
+ * ------------------------------------------------------------------ */
+
+function createHostBlock(item) {
+  const block = el('div', { class: 'host-block' },
+    el('div', { class: 'host-head' },
+      el('span', { class: 'facts' }),
+      el('span', { class: 'host-actions' },
+        el('button', {
+          class: 'mini',
+          onclick: () => {
+            const h = subjectOf(block, item);
+            if (h.host === UNASSIGNED_HOST) return;
+            if (h.adminState === 'draining' || h.adminState === 'disabled') undrainHost(h.host, h.rows);
+            else drainHost(h.host, h.rows);
+          }
+        }))));
+  patchHostBlock(block, item);
+  return block;
+}
+
+function patchHostBlock(block, item) {
+  const head = $('.host-head', block);
+  const facts = $('.facts', head);
+  facts.replaceChildren();
+  append(facts, [
+    el('span', { class: 'host-name' }, item.host),
+    item.adminState !== 'enabled'
+      ? el('span', { class: 'chip chip-drain', title: 'host admin_state' },
+        el('span', { 'aria-hidden': 'true' }, '⏸'), item.adminState)
+      : el('span', { class: 'chip chip-ok', title: 'host admin_state' },
+        el('span', { 'aria-hidden': 'true' }, '✓'), 'enabled'),
+    el('span', { class: 'count' }, t('fleet.devices') + ' ', el('b', null, String(item.count))),
+    el('span', { class: 'count' }, t('fleet.unhealthy') + ' ', el('b', null, String(item.unhealthy))),
+    el('span', { class: 'count' }, t('fleet.liveLeases') + ' ', el('b', null, String(item.live))),
+    item.seen ? el('span', { class: 'count' }, t('fleet.seen') + ' ', el('b', null, item.seen)) : null
+  ]);
+
+  const drained = item.adminState === 'draining' || item.adminState === 'disabled';
+  const btn = $('.host-actions button', head);
+  btn.textContent = drained ? t('fleet.undrain') : t('fleet.drain');
+  /* There is no host behind the unassigned bucket, so there is nothing to
+   * drain: POST hosts/(unassigned host)/drain would take a confirmation from
+   * an operator and answer it with a 404. Buttons on this page do not exist to
+   * be refused. Nothing sets display on a button, so [hidden] alone is enough
+   * here — see the note in fleet.css for when it is not. */
+  btn.hidden = item.host === UNASSIGNED_HOST;
+}
+
+/* ------------------------------------------------------------------ *
+ * The hub block
+ * ------------------------------------------------------------------ */
+
+/* The correlation box is built once and hidden, never inserted and removed.
+ * It carries a button, and a button that leaves the document takes the focus
+ * on it with it — which is the defect this whole file is about. */
+function createHubBlock(item) {
+  const block = el('div', { class: 'hub-block' },
+    el('div', { class: 'hub-head' }),
+    el('div', { class: 'correlate', hidden: true },
+      el('span', { class: 'facts' }),
+      el('button', {
+        class: 'mini ghost',
+        onclick: () => {
+          const h = subjectOf(block, item);
+          /* Narrowing to one hub IS a structural change, and it is the one the
+           * operator just asked for. Without this release the click focuses
+           * this button, the guard sees focus inside the grid, and the answer
+           * to "show me only this hub" is the same grid plus a banner saying
+           * some devices changed. */
+          fleetReleaseOnce = true;
+          setFilters({ host: h.host === UNASSIGNED_HOST ? '' : h.host, hub: h.hubParam });
+        }
+      }, 'Focus this hub')),
+    el('div', { class: 'grid' }));
+  patchHubBlock(block, item);
+  return block;
+}
+
+function patchHubBlock(block, item) {
+  const head = $('.hub-head', block);
+  head.replaceChildren();
+  append(head, [
+    el('span', { class: 'hub-name' }, item.hubPath ? 'hub ' + item.hubPath : 'no hub recorded'),
+    item.model ? el('span', null, item.model) : null,
+    el('span', null, item.count + (item.count === 1 ? ' device' : ' devices')),
+    item.vbus
+      ? el('span', { class: 'chip chip-plain', title: 'this hub can switch VBUS per port' }, 'switchable')
+      : null
+  ]);
+  return patchCorrelation(block, item);
+}
+
+/* The correlation banner: several devices failing on one hub is one hub fault,
+ * not several phone faults. Saying so out loud is the difference between an
+ * operator replacing five phones and an operator replacing one hub.
+ *
+ * No top-level banner is raised from here. Hub correlation is also computed
+ * server-side from farm.v_hub_health and arrives on the alert stream, which
+ * carries the hub id and can offer a jump action. Raising it here as well
+ * produced two banners per failing hub, worded slightly differently, which is
+ * precisely how a real correlated failure gets lost in its own noise. The
+ * in-context box above the affected devices is the better placement and stays.
+ *
+ * ONLY ONE OF THE FOUR CASES IS EVER DEFERRED, and getting that wrong was
+ * worse than not deferring at all. The first version deferred every change of
+ * visibility and returned before writing the box's words, which meant a hub
+ * that went bad while somebody was working in the grid raised no alarm at all —
+ * silently, because a deferral counted in boxes cannot be announced by a
+ * sentence written in devices — and a hub that RECOVERED kept its accusation on
+ * screen. So:
+ *
+ *   - appearing is never deferred. It moves the tiles below it down by one box,
+ *     which is exactly the thing the guard exists to prevent, and it is still
+ *     the right trade: the box is an alarm about those same tiles, and an alarm
+ *     nobody is shown is not a smaller problem than a grid that shifted.
+ *   - disappearing is deferred ONLY while the focus is inside the box, which is
+ *     the whole reason any of this is structural: hiding an element blurs
+ *     whatever it contains. That case is one operator with their hand on this
+ *     hub's own button at the moment the hub recovers; they can see the box
+ *     they are standing on, so nothing needs announcing, and the next pass
+ *     hides it as soon as they move.
+ *   - the WORDS are rewritten on every pass a correlated box is drawn on, so a
+ *     box that is up and staying up says what is true now. The one box that is
+ *     up and on its way down keeps its last sentence rather than being handed
+ *     the numbers of a hub that has recovered.
+ */
+function patchCorrelation(block, item) {
+  const box = $('.correlate', block);
+  const show = !!item.correlated;
+  let deferred = false;
+  if (box.hidden === show) {
+    if (!show && fleetPass.frozen && box.contains(document.activeElement)) {
+      fleetPass.held += 1;
+      deferred = true;
+    } else {
+      box.hidden = !show;
+    }
+  }
+  /* A box left on screen by the one deferral above keeps the sentence it was
+   * last given, which was true when it was written. It is NOT rewritten from
+   * this item: the hub is no longer correlated, so "1 of 7 devices on hub 3-1
+   * unhealthy — suspect the hub, not the phones" would be an accusation the
+   * data has already withdrawn. Returning false leaves the hub's signature
+   * unstamped, so the next pass hides it. */
+  if (box.hidden || !show) return !deferred;
+
+  box.className = 'correlate' + (item.severe ? ' correlate-bad' : '');
+
+  const line = item.unhealthy + ' of ' + item.total + ' devices on hub ' +
+    (item.hubPath || '(unknown)') + ' unhealthy' +
+    (item.since ? ' since ' + fmtClock(item.since) : '') + ' — suspect the hub, not the phones.';
+
+  const facts = $('.facts', box);
+  facts.replaceChildren();
+  append(facts, [
+    el('span', { 'aria-hidden': 'true' }, '▲'),
+    el('span', null, line,
+      el('span', { class: 'c-sub' },
+        'Blast radius is this hub, on host ' + item.host +
+        '. Leases on these devices are untouched and their clocks keep running.'),
+      el('span', { class: 'c-sub' },
+        item.since
+          ? 'Worst health_since: ' + fmtAbs(item.since) + ' (' + fmtRel(item.since) + ').'
+          : 'The API reported no health_since for these devices.'))
+  ]);
+  return true;
 }
 
 /* ------------------------------------------------------------------ *
@@ -748,11 +1527,15 @@ function deviceTile(d) {
     pct === null ? 'battery not reported' : 'battery ' + pct + '%'
   ].concat(flags).filter(Boolean).join(', ');
 
-  return el('button', {
+  /* subjectOf, not d. This element is kept across renders — that is the whole
+   * point of the reconciler — so the row it was first built from is the one row
+   * it must never open. Two devices can render identically and carry different
+   * ids into the sheet. */
+  const tile = el('button', {
     type: 'button',
     class: 'tile h-' + cond,
     'aria-label': name,
-    onclick: () => openDevice(d)
+    onclick: () => openDevice(subjectOf(tile, d))
   },
     el('span', { class: 'slot' }, nz(d.rackSlot) === null
       ? el('span', { class: 'unslotted', title: t('fleet.tile.unslottedHelp') }, slotText)
@@ -777,6 +1560,29 @@ function deviceTile(d) {
       pct === null
         ? el('span', { class: 'batt', title: t('fleet.tile.noBattery') }, '—')
         : batteryEl(d.battery)));
+  return tile;
+}
+
+/* patchTile rewrites a tile from the tile builder itself.
+ *
+ * Deliberately not a set of targeted edits. Working out which span holds the
+ * changed field would be a second, silent copy of deviceTile's layout, and the
+ * copy is the one that goes wrong — quietly, on one field, showing an old
+ * value beside five fresh ones. Building the tile again and moving its
+ * children across costs a few microseconds and cannot drift.
+ *
+ * syncAttributes copies EVERY attribute rather than a named list, which is what
+ * keeps the aria-label in step: unit 3 built it from the same pieces as the
+ * visible card so the two cannot say different things, and a patch that
+ * refreshed the card while leaving the label alone would break exactly that.
+ *
+ * The <button> itself is what survives, and it is the whole point: focus,
+ * hover, :active, an in-flight click and any automation reference are all
+ * properties of that element. Its children are not focusable. */
+function patchTile(node, d) {
+  const built = deviceTile(d);
+  syncAttributes(node, built);
+  node.replaceChildren(...built.childNodes);
 }
 
 /* ------------------------------------------------------------------ *
@@ -869,17 +1675,24 @@ function setFleetMode(next) {
 
 /* fleetModeBoxes returns the two containers, making them if they are not there.
  *
- * They are rebuilt rather than assumed because renderFleet empties #fleet-body
- * outright whenever the API has not answered yet or answered with nothing —
- * the loading and error states own the whole box, and the modes come back
- * under them on the next good render. */
+ * Made ONCE and never replaced. They used to be rebuilt whenever the API had
+ * not answered yet or answered with nothing, because the loading and error
+ * states owned the whole box — and that is now the one thing this file must
+ * not do: these two elements are the containers the reconcilers key their
+ * children on, so swapping either of them out throws away every kept tile and
+ * every kept row along with it. The empty and failed states are a THIRD
+ * sibling instead (see fleetNoticeTo), and the panes are emptied and hidden
+ * under it rather than replaced. */
 function fleetModeBoxes(body) {
   let cards = $('#fleet-cards', body);
   let tbl = $('#fleet-table', body);
-  if (!cards || !tbl) {
+  if (!cards) {
     cards = el('div', { id: 'fleet-cards', class: 'fleet-pane' });
+    body.append(cards);
+  }
+  if (!tbl) {
     tbl = el('div', { id: 'fleet-table', class: 'fleet-pane' });
-    body.replaceChildren(cards, tbl);
+    body.append(tbl);
   }
   return { cards: cards, table: tbl };
 }
@@ -914,6 +1727,12 @@ function setFleetSort(key) {
   fleetSort = fleetSort.key === key
     ? { key: key, dir: fleetSort.dir === 'asc' ? 'desc' : 'asc' }
     : { key: key, dir: 'asc' };
+  /* Reordering the rows is a structural change, and the header button that
+   * asked for it lives inside #fleet-body — so without this release the
+   * interaction guard would see focus in the grid and answer a click on
+   * "Battery" with the same order plus a banner. Sorting is the one thing a
+   * reader presses a column header to get. */
+  fleetReleaseOnce = true;
   render();
 }
 
@@ -1038,29 +1857,148 @@ function nothingToShow(all) {
     emptyAction(t('empty.clearFilters'), () => clearFleetFilters()));
 }
 
-function fleetTable(rows) {
-  const cols = [
-    { label: t('fleet.col.slot'), sort: 'slot', cls: 'f-slot', cell: slotCell },
-    { label: t('fleet.col.model'), sort: 'model', cls: 'f-model', cell: modelCell },
-    { label: t('fleet.col.where'), sort: 'where', cls: 'f-where', cell: whereCell },
-    { label: t('fleet.col.condition'), sort: 'condition', cls: 'f-cond', cell: conditionCell },
-    { label: t('fleet.col.availability'), sort: 'availability', cls: 'f-avail', cell: availabilityCell },
+/* The seven columns, built per call rather than declared once, because every
+ * label goes through t() and the language can change between two paints.
+ *
+ * Each cell is written as `(d) => cell(d)` rather than as the bare function
+ * name, and that is not style. TestTheTableRowSignatureCoversEveryFieldTheRow-
+ * Renders derives the row's field list by following the helpers a row is handed
+ * whole to, and a bare `cell: slotCell` is a reference this file passes along
+ * rather than a call it makes — invisible to that walk, and therefore a column
+ * whose fields nobody would check against fleetRowSig. */
+function fleetColumns() {
+  return [
+    { label: t('fleet.col.slot'), sort: 'slot', cls: 'f-slot', cell: (d) => slotCell(d) },
+    { label: t('fleet.col.model'), sort: 'model', cls: 'f-model', cell: (d) => modelCell(d) },
+    { label: t('fleet.col.where'), sort: 'where', cls: 'f-where', cell: (d) => whereCell(d) },
+    { label: t('fleet.col.condition'), sort: 'condition', cls: 'f-cond', cell: (d) => conditionCell(d) },
+    { label: t('fleet.col.availability'), sort: 'availability', cls: 'f-avail', cell: (d) => availabilityCell(d) },
     { label: t('fleet.col.battery'), sort: 'battery', cls: 'f-batt', cell: (d) => batteryEl(d.battery) },
     { label: t('fleet.col.lastSeen'), sort: 'lastSeen', cls: 'f-seen', cell: (d) => timeCell(d.lastSeen) }
   ];
+}
 
+function fleetTable(rows) {
   /* .tscroll is not optional and never has been: html and body clip sideways
    * overflow, so a wide thing without its own scroller is a wide thing nobody
    * can reach. The seven columns above are chosen to fit a 1280px laptop
    * without using it — see fleet.css, which relaxes the 900px floor that the
    * global table rule sets for the denser views. */
   return el('div', { class: 'tscroll fleet-tbl' },
-    table(cols, fleetSorted(rows), {
-      onRowClick: (d) => openDevice(d),
+    table(fleetColumns(), fleetSorted(rows), {
+      // subjectOf, not the row this <tr> was built from: rows are kept across
+      // renders here exactly as tiles are, so the object a handler closes over
+      // is a snapshot and the element outlives it.
+      onRowClick: (d, ev) => openDevice(subjectOf(ev.currentTarget, d)),
       sortKey: fleetSort.key,
       sortDir: fleetSort.dir,
       onSort: setFleetSort
     }));
+}
+
+/* ------------------- the table, reconciled -------------------- *
+ *
+ * The grid keeps its tiles and the table keeps its rows, for the same reasons
+ * and through the same diff. A table is where a five-hundred-device farm is
+ * actually read, so it is the mode where a rebuild costs most: five hundred
+ * <tr> elements thrown away twice a second, a sort header that loses focus
+ * mid-press, and a row that goes stale between the read and the click.
+ *
+ * Two layers. The SHELL — the scroller, the header row and an empty tbody — is
+ * built by fleetTable itself and rebuilt only when the header changes, which is
+ * the sort column, its direction, or the language its labels are written in.
+ * The ROWS are reconciled into the tbody on deviceKey, the same key a tile uses,
+ * so switching modes does not renumber the farm.
+ * ------------------------------------------------------------------ */
+
+/* fleetRowNode builds one <tr>, through the same tableRow() that fills every
+ * other table on this page rather than beside it. A hand-written row would be a
+ * second copy of the column list and of what table() does with it — the click
+ * handling, the cell classes, the order — and the second copy is the one that
+ * goes stale.
+ *
+ * `cols` is passed in so a five-hundred-row pass builds the column list once
+ * instead of five hundred times; it defaults for the single-row callers. */
+function fleetRowNode(d, cols) {
+  return tableRow(cols || fleetColumns(), d, {
+    // subjectOf, not the row this <tr> was built from: rows are kept across
+    // renders here exactly as tiles are, so the object a handler closes over is
+    // a snapshot and the element outlives it.
+    onRowClick: (row, ev) => openDevice(subjectOf(ev.currentTarget, row))
+  });
+}
+
+/* patchFleetRow: the row's cells rewritten from the same builder, every column,
+ * never a guess at which one changed. Same argument as patchTile.
+ *
+ * THE CELLS, NOT THE ROW. patchTile can replace a tile's children outright
+ * because the focusable element there is the tile itself; a table row is the
+ * other way round — the <tr> announces itself as nothing, and the row's ONE
+ * keyboard control is a button inside its first cell. Replacing the row's
+ * children would detach that button on every repaint, which in this mode is
+ * every fifteen seconds at the latest, because fleetRowSig signs the rendered
+ * "4m ago" so the clock in the last column cannot freeze. That is the original
+ * defect, reintroduced in the mode a farm of more than forty devices opens in.
+ * So the cells are patched one at a time and the button is kept. */
+function patchFleetRow(node, d, cols) {
+  const built = fleetRowNode(d, cols);
+  syncAttributes(node, built);
+  const kept = Array.from(node.children);
+  const fresh = Array.from(built.children);
+  // A row whose column count changed is not a row this can patch cell by cell;
+  // the shell is rebuilt on a header change, so this is the belt to that brace.
+  if (kept.length !== fresh.length) { node.replaceChildren(...built.childNodes); return; }
+  for (let i = 0; i < kept.length; i += 1) patchFleetCell(kept[i], fresh[i]);
+}
+
+/* One <td>. Its contents are rewritten wholesale, EXCEPT when the cell is
+ * exactly the row's link button in both the kept row and the freshly built one
+ * — then the button survives and only its contents and attributes are written
+ * over, so focus, hover, an in-flight click and any automation handle stay with
+ * it. Same trade as .facts in the host head, for the same reason. */
+function patchFleetCell(kept, built) {
+  const a = kept.firstElementChild;
+  const b = built.firstElementChild;
+  if (a && b && kept.children.length === 1 && built.children.length === 1 &&
+    a.classList.contains('rowlink') && b.classList.contains('rowlink')) {
+    syncAttributes(a, b);
+    a.replaceChildren(...b.childNodes);
+    return;
+  }
+  syncAttributes(kept, built);
+  kept.replaceChildren(...built.childNodes);
+}
+
+/* fleetTableInto draws the table into `pane`, keeping what is already right,
+ * and appends the keys it asked for to `want`. Returns what a frozen pass held
+ * back. */
+function fleetTableInto(pane, rows, want) {
+  const sorted = fleetSorted(rows);
+  sorted.forEach((d, i) => want.push(deviceKey(d, i)));
+
+  /* The shell carries its own signature. Sort key, direction and language are
+   * everything the header renders; a change to any of them rewrites the header
+   * and nothing else, and the rows below are reconciled into the new tbody on
+   * the next line rather than rebuilt. */
+  const shell = signature([fleetSort.key, fleetSort.dir]);
+  let scroll = $('.fleet-tbl', pane);
+  let rebuilt = false;
+  if (!scroll || scroll.dataset.shell !== shell) {
+    scroll = fleetTable([]);
+    scroll.dataset.shell = shell;
+    clearKeyed(pane);
+    pane.append(scroll);
+    rebuilt = true;
+  }
+
+  const cols = fleetColumns();
+  return reconcile($('tbody', scroll), sorted, deviceKey, fleetRowSig,
+    (d) => fleetRowNode(d, cols), (node, d) => patchFleetRow(node, d, cols),
+    /* A rebuilt shell has an empty body, and a frozen pass creates nothing:
+     * freezing this one would draw a header over no rows and let the caller
+     * conclude the farm is empty. There is nothing to hold still either —
+     * whatever the guard was protecting went with the old table. */
+    { frozen: fleetPass.frozen && !rebuilt }).held;
 }
 
 /* The first cell is the row's keyboard control, and the only one: a table of
@@ -1073,7 +2011,12 @@ function slotCell(d) {
     type: 'button',
     class: 'rowlink',
     'aria-label': t('fleet.openDevice', { device: fleetRowName(d) }),
-    onclick: () => openDevice(d)
+    /* The row this button sits in outlives the object the button was built
+     * from — rows are reconciled, not rebuilt — so it asks the row what device
+     * it currently stands for instead of trusting the one it closed over. The
+     * <tr> is what carries the subject; this button is replaced whenever the
+     * row's signature changes, and between those it must not go stale. */
+    onclick: (ev) => openDevice(subjectOf(ev.currentTarget.closest('tr'), d))
   }, label
     ? el('span', { class: 'mono' }, label)
     : el('span', { class: 'unslotted', title: t('fleet.unslottedWhy') }, t('fleet.unslotted')));

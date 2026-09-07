@@ -612,6 +612,59 @@ const STRINGS = {
     'auth.save': 'Save',
     'auth.cancel': 'Cancel',
 
+    /* The glossary. Seventeen words this page prints bare, each with the one
+     * sentence a newcomer needs and the name the same thing has in the
+     * database. terms.js builds the control, docs.js carries the long form.
+     *
+     * A `.short` states what the thing IS and then corrects the misconception
+     * the reader is about to have. A gloss that only restates the word is the
+     * failure this block exists to fix.
+     *
+     * A `.ident` is NEVER translated. It is byte-identical in both dictionaries
+     * and TestNoTermIdentifierIsTranslated fails the build otherwise: the whole
+     * argument for keeping these words in English is that an operator matches
+     * them by eye against psql, ctl and a log line, and a translated column
+     * name is one they cannot find. */
+    'term.close': 'Close',
+    'term.readMore': 'Read the full definition',
+    'term.identLabel': 'In the database, in the API and in the logs',
+    'term.identNote': 'That name never changes with the language on this page. It is what psql, ctl and a log line say, and matching them by eye is the whole reason this word is not translated.',
+
+    'term.fence.short': 'A number stamped on a lease that says which holder is the current one. Ending a lease raises the device\'s floor above it, so every later call from the old holder is refused — but nothing in this build refuses an ADB command that carries a stale fence.',
+    'term.fence.ident': 'farm.leases.fence',
+    'term.witness.short': 'On-device proof that the HOLDER is still alive — a marker file its own agent touches — which buys a job that has lost the control plane more room before the reaper may reclaim it. It is not evidence about the device\'s health, and it is capped, so a wedged agent cannot hold a phone forever.',
+    'term.witness.ident': 'farm.leases.witness_at',
+    'term.holder.short': 'The name of the process that took the lease, kept for the audit log. Ownership is keyed on the job and not on this name: it confers nothing, and a replacement process re-attaches to the same lease at the same fence.',
+    'term.holder.ident': 'farm.leases.holder',
+    'term.suspect.short': 'The control plane has not heard a heartbeat from the holder since the lease\'s deadline passed. It does not mean the device is broken and nothing has been released: a heartbeat arriving later heals the lease at the same fence, with no work lost.',
+    'term.suspect.ident': 'farm.leases.state',
+    'term.protected.short': 'A lease the reaper will never reclaim: only the job or a human ends it. A job either asks for this or gets it for an expected duration over 30 minutes — it is no defence against an operator revoke, and none against max_runtime.',
+    'term.protected.ident': 'farm.leases.protected',
+    'term.guards.short': 'The two things a job declares to limit what may be done to it while it runs: whether the reaper may reclaim its lease, and the worst disruption recovery may inflict on its device. Both are copied onto the lease when it is acquired, so changing them on the job afterwards does not change a lease that is already live.',
+    'term.guards.ident': 'farm.jobs.protected, farm.jobs.disruption_policy',
+    'term.tenant.short': 'Who the work belongs to, and the boundary the API enforces: a tenant-scoped caller reads and releases its own tenant\'s leases and nobody else\'s. It does not decide which devices a job can have — the pool does.',
+    'term.tenant.ident': 'farm.jobs.tenant_id',
+    'term.pool.short': 'The named set of devices a job may be placed on; allocation only ever considers devices whose pool matches the job\'s. A job filed against a pool with nothing free waits — it never borrows from another pool.',
+    'term.pool.ident': 'farm.devices.pool_id',
+    'term.queue.short': 'One tenant\'s line of waiting jobs, with a priority and a device cap of its own. It decides the order work is placed in, not which device it lands on — the pool decides that.',
+    'term.queue.ident': 'farm.jobs.queue_id',
+    'term.disruptionPolicy.short': 'The worst thing a job will let recovery do to the device under it: no_disruption, allow_soft_reset or allow_port_power_cycle. A rung that needs more than this is refused outright and written down — never quietly downgraded to a cheaper one.',
+    'term.disruptionPolicy.ident': 'farm.jobs.disruption_policy',
+    'term.rung.short': 'One step of the recovery ladder, from observing at rung 0 to draining a whole host at rung 8. The ladder climbs from the cheapest rung upward and acts on behalf of the holder: the lease keeps its device, its clock keeps ticking and the fence never moves.',
+    'term.rung.ident': 'farm.recovery_tiers.tier',
+    'term.blastRadius.short': 'What else a rung disturbs besides the one device: device, power_domain, hub or host. Every live lease inside that radius has to permit the rung, so it is usually a neighbour\'s job rather than your own that refuses a power cycle.',
+    'term.blastRadius.ident': 'farm.recovery_tiers.blast_radius',
+    'term.quarantine.short': 'An open row saying a fault was found at some scope — device, slot, power domain, hub or host — which stops new allocations there. Live leases are untouched; close it because the fault is fixed, not to clear the screen, or the watchdog will simply open it again.',
+    'term.quarantine.ident': 'farm.quarantines',
+    'term.drain.short': 'Marking a host so the allocator places no new lease on it. It ends nothing: the leases already running there keep their devices and run to completion, and no part of a drain releases them.',
+    'term.drain.ident': 'farm.hosts.admin_state',
+    'term.devpath.short': 'The USB position a command is addressed to — bus, hub and port, in the usb:3-1.4 form. Hardware actions use it and never a serial: OEM serials collide, and a command addressed by serial can land on a healthy phone holding somebody else\'s six-hour lease.',
+    'term.devpath.ident': 'farm.slots.adb_devpath',
+    'term.adminState.short': 'A decision a human or the recovery ladder made about a device: enabled, disabled, quarantined or retired. It is not health — a perfectly healthy phone that is disabled is still refused by the allocator, and the watchdog has no permission to write this column.',
+    'term.adminState.ident': 'farm.devices.admin_state',
+    'term.slotState.short': 'Whether a physical position may be scheduled: active, disabled or maintenance. A slot is never deleted because the phone in it stopped answering — only the port itself vanishing retires one, and even then the row stays, so a six-month-old lease still resolves to a place a human can walk to.',
+    'term.slotState.ident': 'farm.slots.state',
+
     /* Confirmations */
     'confirm.title': 'Confirm',
     'confirm.subject': 'Subject:',
@@ -1147,6 +1200,59 @@ const STRINGS = {
     'auth.tokenNote': 'Guardado só nesta aba, e enviado como header — nunca numa URL.',
     'auth.save': 'Salvar',
     'auth.cancel': 'Cancelar',
+
+    /* O glossário. Dezessete palavras que esta página imprime cruas, cada uma
+     * com a frase que quem chega precisa e o nome que a mesma coisa tem no
+     * banco. terms.js monta o controle, docs.js carrega a forma longa.
+     *
+     * Um `.short` diz o que a coisa É e depois corrige o mal-entendido que o
+     * leitor está prestes a ter. Uma definição que só repete a palavra é
+     * exatamente a falha que este bloco existe para consertar.
+     *
+     * Um `.ident` NUNCA é traduzido. É byte a byte igual nos dois dicionários e
+     * o TestNoTermIdentifierIsTranslated quebra o build se não for: o motivo
+     * inteiro de manter estas palavras em inglês é que um operador as compara a
+     * olho com o psql, o ctl e uma linha de log, e um nome de coluna traduzido é
+     * um nome que ele não acha. */
+    'term.close': 'Fechar',
+    'term.readMore': 'Ler a definição completa',
+    'term.identLabel': 'No banco, na API e nos logs',
+    'term.identNote': 'Esse nome não muda com o idioma desta página. É o que o psql, o ctl e uma linha de log dizem, e poder compará-los a olho é o motivo inteiro de esta palavra não ser traduzida.',
+
+    'term.fence.short': 'Um número gravado na lease que diz qual holder é o atual. Terminar uma lease sobe o piso do dispositivo acima dele, então toda chamada posterior do holder antigo é recusada — mas nada neste build recusa um comando ADB que carregue um fence velho.',
+    'term.fence.ident': 'farm.leases.fence',
+    'term.witness.short': 'Prova no próprio aparelho de que o HOLDER continua vivo — um arquivo marcador que o agente dele toca — e que compra mais folga para um job que perdeu o control plane antes que o reaper possa retomar o dispositivo. Não é evidência sobre a saúde do aparelho, e tem teto, para que um agente travado não segure um telefone para sempre.',
+    'term.witness.ident': 'farm.leases.witness_at',
+    'term.holder.short': 'O nome do processo que pegou a lease, guardado para o log de auditoria. A posse é chaveada no job e não neste nome: ele não confere nada, e um processo substituto faz reattach na mesma lease e no mesmo fence.',
+    'term.holder.ident': 'farm.leases.holder',
+    'term.suspect.short': 'O control plane não ouve um heartbeat do holder desde que o prazo da lease passou. Não significa que o dispositivo está quebrado e nada foi liberado: um heartbeat que chegue depois cura a lease no mesmo fence, sem perder trabalho.',
+    'term.suspect.ident': 'farm.leases.state',
+    'term.protected.short': 'Uma lease que o reaper nunca vai retomar: só o job ou um humano a termina. Um job pede por isso, ou ganha por ter duração esperada acima de 30 minutos — não protege contra um revoke de operador, nem contra o max_runtime.',
+    'term.protected.ident': 'farm.leases.protected',
+    'term.guards.short': 'As duas coisas que um job declara para limitar o que pode ser feito com ele enquanto roda: se o reaper pode retomar a lease dele, e a pior perturbação que o recovery pode causar no dispositivo. As duas são copiadas para a lease na aquisição, então mudá-las no job depois não muda uma lease que já está viva.',
+    'term.guards.ident': 'farm.jobs.protected, farm.jobs.disruption_policy',
+    'term.tenant.short': 'De quem é o trabalho, e a fronteira que a API impõe: um chamador com escopo de tenant lê e libera as leases do próprio tenant e de mais ninguém. Não decide quais dispositivos um job pode ter — quem decide é o pool.',
+    'term.tenant.ident': 'farm.jobs.tenant_id',
+    'term.pool.short': 'O conjunto nomeado de dispositivos em que um job pode ser colocado; a alocação só considera dispositivos cujo pool é o do job. Um job enviado a um pool sem nada livre espera — nunca toma emprestado de outro pool.',
+    'term.pool.ident': 'farm.devices.pool_id',
+    'term.queue.short': 'A fila de jobs esperando de um tenant, com prioridade e teto de dispositivos próprios. Decide a ordem em que o trabalho é colocado, não em qual dispositivo ele cai — isso quem decide é o pool.',
+    'term.queue.ident': 'farm.jobs.queue_id',
+    'term.disruptionPolicy.short': 'O pior que um job deixa o recovery fazer com o dispositivo embaixo dele: no_disruption, allow_soft_reset ou allow_port_power_cycle. Uma rung que precisa de mais do que isso é recusada de vez e registrada — nunca rebaixada em silêncio para uma mais barata.',
+    'term.disruptionPolicy.ident': 'farm.jobs.disruption_policy',
+    'term.rung.short': 'Um degrau da escada de recovery, de observar na rung 0 até drenar um host inteiro na rung 8. A escada sobe do degrau mais barato para cima e age em nome do holder: a lease mantém o dispositivo, o relógio dela continua correndo e o fence nunca se move.',
+    'term.rung.ident': 'farm.recovery_tiers.tier',
+    'term.blastRadius.short': 'O que mais uma rung perturba além daquele dispositivo: device, power_domain, hub ou host. Toda lease viva dentro desse raio precisa permitir a rung, então quem recusa um ciclo de energia costuma ser o job do vizinho, e não o seu.',
+    'term.blastRadius.ident': 'farm.recovery_tiers.blast_radius',
+    'term.quarantine.short': 'Uma linha aberta dizendo que uma falha foi encontrada em algum escopo — device, slot, power domain, hub ou host — e que impede novas alocações ali. Leases vivas não são tocadas; feche porque a falha foi corrigida, e não para limpar a tela, ou o watchdog simplesmente abre de novo.',
+    'term.quarantine.ident': 'farm.quarantines',
+    'term.drain.short': 'Marcar um host para que o alocador não coloque nenhuma lease nova nele. Não termina nada: as leases que já rodam ali mantêm seus dispositivos e vão até o fim, e nenhuma parte de um drain as libera.',
+    'term.drain.ident': 'farm.hosts.admin_state',
+    'term.devpath.short': 'A posição USB para a qual um comando é endereçado — barramento, hub e porta, na forma usb:3-1.4. As ações de hardware usam isto e nunca um serial: seriais de fábrica colidem, e um comando endereçado por serial pode cair num telefone saudável que segura a lease de seis horas de outra pessoa.',
+    'term.devpath.ident': 'farm.slots.adb_devpath',
+    'term.adminState.short': 'Uma decisão que um humano ou a escada de recovery tomou sobre um dispositivo: enabled, disabled, quarantined ou retired. Não é saúde — um telefone perfeitamente saudável que está disabled continua sendo recusado pelo alocador, e o watchdog não tem permissão para escrever nesta coluna.',
+    'term.adminState.ident': 'farm.devices.admin_state',
+    'term.slotState.short': 'Se uma posição física pode ser escalada: active, disabled ou maintenance. Um slot nunca é apagado porque o telefone nele parou de responder — só a porta em si sumir aposenta um, e mesmo aí a linha fica, para que uma lease de seis meses atrás ainda resolva para um lugar até onde um humano pode caminhar.',
+    'term.slotState.ident': 'farm.slots.state',
 
     /* Confirmações */
     'confirm.title': 'Confirmar',

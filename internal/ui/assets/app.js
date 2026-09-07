@@ -2912,6 +2912,7 @@ function setView(view) {
   const sec = $('#view-' + view);
   if (sec) sec.focus();
 }
+window.setView = setView;   /* docs.js openDocs() switches to the Docs view */
 
 function setFilter(name, value) {
   setFilters({ [name]: value });

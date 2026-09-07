@@ -3,4 +3,142 @@
 
    Owned by unit 10. The underline is the point. A title attribute is invisible
    until you hover, unreachable on a touch screen, and gives a reader scanning
-   the page no reason to believe an explanation exists. A visible marker does. */
+   the page no reason to believe an explanation exists. A visible marker does.
+
+   COLOUR IS NEVER THE ONLY SIGNAL, and that law is why the marker is a dotted
+   underline rather than a tint: it survives a colour-blind reader, a washed-out
+   projector and the greyscale screenshot somebody pastes into a ticket. Nothing
+   here may replace the underline with a colour.
+
+   THE [hidden] TRAP. An author rule that writes display beats the user-agent
+   [hidden] rule regardless of specificity, so every rule below that sets
+   display is paired with the guard at the bottom of this file. The "read the
+   full definition" control is hidden with the hidden attribute when docs.js did
+   not load, and it sits inside a flex row; without the guard that control would
+   paint anyway and lead nowhere. This has shipped as a real bug twice
+   elsewhere in this tree. */
+
+/* ------------------------------------------------------------- the word --- */
+
+/* A button, because it is clicked and because a screen reader must announce it
+   as one. Everything a button brings with it — its own font, its centring, its
+   padding, its border — is undone so the word sits in the sentence it belongs
+   to and not in a box of its own. */
+.term {
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: 0;
+  margin: 0;
+  padding: 0;
+  text-align: inherit;
+  line-height: inherit;
+  vertical-align: baseline;
+  cursor: help;
+
+  /* The marker. text-decoration rather than a border-bottom so it follows the
+     word across a line break instead of underlining the whole box.
+
+     currentColor, not a quieter grey. A term is glossed inside a chip, inside a
+     table cell and inside the dim prose of a hint, each with its own foreground
+     over its own background; a fixed grey that reads well in one of those sits
+     near the 3:1 floor in another — measured at 11px inside a chip in the light
+     scheme, which is exactly the smallest and faintest place this appears.
+     Tying the marker to the word makes it exactly as visible as the word it
+     marks, everywhere, by construction. */
+  text-decoration-line: underline;
+  text-decoration-style: dotted;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+  text-decoration-color: currentColor;
+}
+
+/* Solid on hover and on keyboard focus: the same shape, more of it. Not a
+   colour change, for the reason at the top of this file. */
+.term:hover,
+.term:focus-visible {
+  text-decoration-style: solid;
+}
+
+.term:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: var(--r-sm);
+}
+
+/* A term inside a table heading or a chip inherits that context's weight and
+   size already, through font: inherit above. The one thing it must not inherit
+   is a chip's tight line box swallowing the underline. */
+.chip .term,
+th .term {
+  text-underline-offset: 2px;
+}
+
+/* ----------------------------------------------------------- the dialog --- */
+
+/* Narrower than the device sheet on purpose: this is one word, one sentence and
+   one identifier, and a 860px column for three short lines reads as a page
+   rather than as an answer. */
+#dlg-term .term-body {
+  width: min(460px, 92vw);
+  padding: var(--s-4);
+}
+
+#dlg-term .term-word {
+  font-family: var(--mono);
+  font-size: var(--fs-lg);
+}
+
+#dlg-term .term-short {
+  margin: 0;
+  color: var(--txt-1);
+  font-size: var(--fs-body);
+  line-height: var(--lh-prose);
+}
+
+/* The identifier block. It is set apart because it is the half of this dialog
+   that does NOT change with the language, and a reader who is about to type it
+   into psql should be able to see where the prose stops. */
+#dlg-term .term-ident-row {
+  display: grid;
+  gap: var(--s-1);
+  margin: var(--s-4) 0 0;
+  padding: var(--s-3);
+  background: var(--srf-sunken);
+  border: 1px solid var(--brd-subtle);
+  border-left: 4px solid var(--brd-strong);
+  border-radius: var(--r);
+}
+
+#dlg-term .term-ident-label {
+  color: var(--txt-2);
+  font-size: var(--fs-xs);
+}
+
+#dlg-term .term-ident {
+  font-family: var(--mono);
+  font-size: var(--fs-sm);
+  color: var(--txt-1);
+  overflow-wrap: anywhere;
+}
+
+#dlg-term .term-ident-note {
+  margin: var(--s-3) 0 0;
+  color: var(--txt-2);
+  font-size: var(--fs-xs);
+  line-height: var(--lh);
+}
+
+#dlg-term .term-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--s-2);
+  margin: var(--s-4) 0 0;
+  padding: 0;
+}
+
+/* ---------------------------------------------------------- the guard ---- */
+
+/* Paired with every display above. See the note at the top of this file. */
+#dlg-term [hidden],
+.term[hidden] { display: none !important; }

@@ -504,6 +504,13 @@ func cmdDevice(ctx context.Context, s *session, args []string) error {
 	if len(args) > 0 && args[0] == "exec" {
 		return cmdDeviceExec(ctx, s, args[1:])
 	}
+	// screen is a sub-verb of device rather than a top-level command because it
+	// addresses exactly one phone by the same id exec does, and because the two
+	// are the same act at different bandwidths: a process started on a handset
+	// somebody may be using. See commands_screen.go.
+	if len(args) > 0 && args[0] == "screen" {
+		return cmdDeviceScreen(ctx, s, args[1:])
+	}
 	fs := newFlags("device", s.err)
 	var g globals
 	g.bind(fs)
@@ -512,7 +519,8 @@ func cmdDevice(ctx context.Context, s *session, args []string) error {
 		return err
 	}
 	if len(rest) != 1 {
-		return usageErrf("usage: ctl device <id|farm_uid>  |  ctl device exec <id> -- <command>")
+		return usageErrf("usage: ctl device <id|farm_uid>  |  ctl device exec <id> -- <command>  |  " +
+			"ctl device screen <id> [--out f] [--tap x,y]")
 	}
 	e, err := s.open(&g)
 	if err != nil {

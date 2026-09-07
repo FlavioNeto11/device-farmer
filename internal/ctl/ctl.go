@@ -726,7 +726,9 @@ type command struct {
 // them: look at the farm, then at one thing in it, then change something.
 var commands = []command{
 	{"fleet", "[--host h] [--hub p] [--health s] [--pool p]", "every device, grouped by host and hub", cmdFleet},
-	{"device", "<id|farm_uid> | exec <id> -- <command>", "one device in detail, or a shell command on it", cmdDevice},
+	// The signature is trimmed to fit the 52-column clip in usage(): a row that
+	// clips loses its last verb, and the last verb here is the new one.
+	{"device", "<id|farm_uid> | exec <id> -- <cmd> | screen", "one device in detail, a shell command on it, or its live screen", cmdDevice},
 	{"hosts", "", "the hosts, with what a drain would have to wait for", cmdHosts},
 	{"host", "drain|undrain <id> --reason r", "stop or resume placement on a host", cmdHost},
 	{"slot", "list [--host h] | register ... | label <id> ... | reslot <device> ... | rebrand <device> ...", "the physical positions: list, register, label, re-slot a device, rebrand a phone", cmdSlot},

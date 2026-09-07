@@ -988,9 +988,13 @@ const loaders = {
   }
 };
 
-function loadFor(view) {
+/* loadFor refetches what `view` needs. `skip` is a Set of resource names to
+ * leave alone — the fallback poller uses it to keep its hands off a resource
+ * the event stream is already delivering. */
+function loadFor(view, skip) {
   for (const key of VIEW_NEEDS[view] || []) {
     if (key === 'bulkRun') continue;   // driven by the bulk loader and the run poller
+    if (skip && skip.has(key)) continue;
     loaders[key]();
   }
 }
@@ -2183,9 +2187,29 @@ function setConn(mode, text) {
         : 'Opening the event stream…';
 }
 
+const POLL_SKIP_FLEET = new Set(['fleet']);
+
+/* startPolling is the fallback for a farm whose event stream will not stay up:
+ * every five seconds it refetches the open view, plus the fleet, which every
+ * view labels its rows from.
+ *
+ * It leaves the FLEET alone while the connection is live, and that exception
+ * earns its keep. This timer and the stream overlap: stopPolling runs when the
+ * stream opens and again on the first event after it recovers, but a request
+ * already in flight, a mode flip between the two, or a stream that comes back
+ * between ticks all leave one interval where both are feeding the same view.
+ * The fleet is the one view that repaints under the stream and the one an
+ * operator works inside, so a redundant refetch of it is not free: it is a
+ * second, unsynchronised source of truth for the grid, and every one of its
+ * answers reaches the reconciler as a change to apply. When the stream is
+ * live it is already telling us; asking again adds nothing but repaints. */
 function startPolling() {
   if (pollTimer) return;
-  pollTimer = setInterval(() => { loadFor(state.view); if (state.view !== 'fleet') loaders.fleet(); }, 5000);
+  pollTimer = setInterval(() => {
+    const streamHasIt = state.conn.mode === 'live';
+    loadFor(state.view, streamHasIt ? POLL_SKIP_FLEET : null);
+    if (state.view !== 'fleet' && !streamHasIt) loaders.fleet();
+  }, 5000);
 }
 
 function stopPolling() {

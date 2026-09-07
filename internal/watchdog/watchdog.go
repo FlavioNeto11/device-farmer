@@ -204,6 +204,11 @@ type Watchdog struct {
 	// workers is one goroutine per host, keyed by host id.
 	workers map[string]*worker
 	wg      sync.WaitGroup
+
+	// saidNoHosts keeps the "nothing to watch" line in reconcileWorkers to one
+	// per spell of emptiness. Touched only from the timed cycle, which is the
+	// single goroutine that calls reconcileWorkers, so it needs no lock.
+	saidNoHosts bool
 }
 
 type worker struct {
@@ -404,7 +409,33 @@ func (w *Watchdog) reconcileWorkers(ctx context.Context, hosts []hostRow) {
 		}()
 		w.log.Info("started host reader", "host", h.ID, "endpoint", h.Endpoint, "epoch", h.Epoch)
 	}
-	hostsGauge.Set(float64(len(w.workers)))
+	n := len(w.workers)
+	hostsGauge.Set(float64(n))
+
+	// Having nothing to watch is not a fault, and this loop does not stop for
+	// it. A farm whose schema has just been migrated has an empty farm.hosts
+	// by definition — hosts arrive by enrolment, from a `farmd node` that may
+	// be started days later — so an empty list is the normal first state of a
+	// new installation. Treating it as a startup error is what made the
+	// watchdog role exit non-zero and restart forever on every fresh farm
+	// profile; see cmd/farmd's watchdogConfig for the rest of that story.
+	//
+	// It still has to be SAID, because the alternative is "watchdog loop
+	// starting" followed by permanent silence, which reads exactly like a
+	// health plane that is working. Said on the TRANSITION and not every
+	// Interval: a farm waiting for its first enrolment waits for hours, and a
+	// line every five seconds is how an operator learns to stop reading this
+	// log — which would cost more than the message is worth.
+	switch {
+	case n == 0 && !w.saidNoHosts:
+		w.log.Info("no hosts to watch yet; farm.hosts is empty or every matching row is "+
+			"administratively disabled. This loop keeps running and beating, and starts a "+
+			"reader for each host as it is enrolled",
+			"host_filter", orAll(w.cfg.HostID), "next_check_in", w.cfg.Interval)
+		w.saidNoHosts = true
+	case n > 0:
+		w.saidNoHosts = false
+	}
 }
 
 // watchHost consumes one host's track-devices stream until its context ends.

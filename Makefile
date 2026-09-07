@@ -144,6 +144,24 @@ ci-helm:
 	echo "$$out" | grep -q FARM_FENCE_CLIENT_CERT || { echo "a fenced farm renders no FARM_FENCE_CLIENT_CERT"; exit 1; }; \
 	test "$$(echo "$$out" | awk '/^# Source:/{src=$$0} /FARM_FENCE_CONTROL_CERT/{print src}' | sort -u)" \
 		= "# Source: device-farmer/templates/api.yaml" || { echo "the control certificate reaches more than the api"; exit 1; }
+# The fleet-wide watchdog: the one branch ci-values.yaml never compiles, because
+# it sets hosts[] and this shape is the `else`. It must render exactly one
+# Deployment and must NOT be pinned with FARM_HOST_ID — see the step of the same
+# name in .github/workflows/ci.yml for what each half of that catches.
+	@fleet=$$(helm template ci deploy/helm/device-farmer -n device-farmer \
+		--set database.dsn=postgres://farm@pg:5432/device_farmer --set auth.tokens=ci-token:operator:ci \
+		--set watchdog.superviseAllHosts=true); \
+	n=$$(echo "$$fleet" | awk '/^# Source:/{src = ($$0 == "# Source: device-farmer/templates/watchdog.yaml")} /^kind: Deployment$$/{if (src) c++} END{print c+0}'); \
+	test "$$n" = 1 || { echo "the fleet-wide watchdog renders $$n Deployments, want 1"; exit 1; }; \
+	test -z "$$(echo "$$fleet" | awk '/^# Source:/{src=$$0} /^[[:space:]]*(- name: FARM_HOST_ID$$|FARM_HOST_ID:)/{print src}' | sort -u)" \
+		|| { echo "the fleet-wide watchdog is pinned to one host, so the others are watched by nobody"; exit 1; }
+# Among them, not exactly them: templates/node.yaml sets FARM_HOST_ID from
+# spec.nodeName and is legitimately allowed to. "Nothing else sets it" is the
+# previous render's assertion, where the node DaemonSet is off.
+	@helm template ci deploy/helm/device-farmer -n device-farmer -f deploy/helm/ci-values.yaml \
+		| awk '/^# Source:/{src=$$0} /^[[:space:]]*(- name: FARM_HOST_ID$$|FARM_HOST_ID:)/{print src}' | sort -u \
+		| grep -qx "# Source: device-farmer/templates/watchdog.yaml" \
+		|| { echo "with hosts[] populated, templates/watchdog.yaml must set FARM_HOST_ID"; exit 1; }
 	@! helm template ci deploy/helm/device-farmer -n device-farmer > /dev/null 2>&1 || \
 		{ echo "the chart rendered with no database configured"; exit 1; }
 	@! helm template ci deploy/helm/device-farmer -n device-farmer \

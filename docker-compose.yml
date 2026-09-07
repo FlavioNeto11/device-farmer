@@ -260,17 +260,39 @@ services:
     <<: *farmd
     profiles: ["farm"]
     # With no FARM_HOST_ID this is the fleet-wide shape: one process
-    # supervising every row in farm.hosts. It enumerates them ONCE at startup,
-    # so a host enrolled later is not watched until this container restarts —
-    # fine while a farm is being brought up, and the reason the chart defaults
-    # watchdog.superviseAllHosts to false and renders nothing instead.
+    # supervising every row in farm.hosts. It re-reads that list every
+    # FARM_WATCHDOG_INTERVAL (5s) and starts a reader for each host as it
+    # appears, so a host enrolled an hour from now is watched within five
+    # seconds of enrolment and this container never needs restarting for it.
     #
-    # On a fresh farm that table is empty and the role exits 1 with "no hosts
-    # registered; set FARM_HOST_ID or seed farm.hosts". That is expected, not a
-    # broken deployment: the inherited restart policy retries until the first
-    # `farmd node` enrols a host, and the retry is what re-runs the
-    # enumeration. Docker's backoff caps at about a minute, so it catches up
-    # within a minute of the first enrolment.
+    # This service deliberately does NOT name FARM_HOST_ID, and that is a
+    # passthrough left out on purpose rather than one forgotten. The node
+    # profile is started as `FARM_HOST_ID=h01 docker compose --profile farm
+    # --profile node up -d`, so on a single-machine farm that variable is in the
+    # shell — and naming it here would let it reach this container and pin the
+    # fleet-wide watchdog to h01. On a farm with one host that is harmless; on a
+    # farm with six it is five hosts watched by nobody, with nothing logged and
+    # every container Up. Compose forwards a host variable only to a service
+    # that names it, which is what keeps the two shapes apart.
+    #
+    # On a fresh farm that table is EMPTY, and this service stays Up: a farm
+    # whose schema was just migrated has no hosts until the first `farmd node`
+    # enrols one, so an empty list is the normal first state of a new
+    # installation rather than a misconfiguration. The role beats under
+    # "watchdog" in farm.component_heartbeat from its first cycle, which is
+    # what makes /api/v1/capabilities report the health plane as running-and-
+    # idle instead of dead.
+    #
+    # It did not used to. `farmd watchdog` enumerated farm.hosts once and
+    # exited 1 on an empty table with "no hosts registered; set FARM_HOST_ID or
+    # seed farm.hosts", and the comment that used to stand here called that
+    # expected and pointed at the inherited restart policy. What it actually
+    # produced, measured on this machine: 14 hours of restart loop, 911
+    # restarts, an operator reading `docker compose ps` as a broken
+    # deployment, and — because a process that is not running writes no
+    # heartbeat — a farm that reported its health plane dead for as long as it
+    # had no phones in it. A restart policy is not a retry loop for a decision
+    # the code got wrong.
     command: ["watchdog"]
 
   recovery:

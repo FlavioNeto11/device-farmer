@@ -42,6 +42,11 @@ RUN --mount=type=cache,target=/go/pkg/mod \
       -ldflags "-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.buildDate=${BUILD_DATE}" \
       -o /out/farmd ./cmd/farmd
 
+# An empty directory for the runtime stage to stamp the artifact blob root
+# from; see the COPY that carries it across. Made here because distroless has
+# no shell to mkdir with, and made empty because it must stay empty.
+RUN mkdir -p /out/artifacts
+
 # Vet and test the whole tree in the configuration the binary above ships in.
 # On by default, and not the duplicate of CI's `go` job it looks like — but it
 # was, until the env stopped stopping at the first command.
@@ -97,6 +102,32 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 FROM gcr.io/distroless/static-debian12:nonroot
 
 COPY --from=build /out/farmd /usr/local/bin/farmd
+
+# The artifact store's blob root, in the image only so that a volume mounted
+# here inherits its ownership.
+#
+# Docker initialises a fresh named volume from whatever the image has at the
+# mount path, ownership included, and creates a root:root 0755 one when the
+# image has nothing there. This image runs as nonroot, so without this line the
+# shared artifact volume docker-compose.yml mounts on the api and the
+# jobrunners is a directory none of them may write: the api logs "artifact
+# endpoints are disabled" with a permission denied and serves without those
+# routes, and `farmd jobrunner` exits 1 on the same error and restarts forever.
+# Measured rather than reasoned, in both directions: a fresh volume mounted at
+# a path this image pre-owns comes up owned by 65532 and one mounted anywhere
+# else comes up root:root, and pointing a `farmd api` and a `farmd jobrunner`
+# at a root-owned volume produced exactly the two outcomes above.
+#
+# Kubernetes needs none of this — the chart sets fsGroup 65532 and the kubelet
+# chowns the volume — which is exactly why the image is where compose had to be
+# answered.
+#
+# It must stay EMPTY, because Docker copies whatever is here into every fresh
+# volume. The blob sweep reads exactly <root>/<xx>/<sha256> and counts anything
+# else as unrecognised without ever removing it, so a file shipped in this
+# directory is one that appears in every new farm's blob store and that no
+# maintenance path can reclaim.
+COPY --from=build --chown=nonroot:nonroot /out/artifacts /var/lib/device-farmer/artifacts
 
 # What this image is, in the one place a registry, a scanner and an admission
 # policy all know how to read it. `docker inspect` reported `Labels: null`:

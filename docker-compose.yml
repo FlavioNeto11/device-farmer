@@ -215,7 +215,45 @@ services:
       # `docker compose --profile farm logs api`; it names this variable and
       # what an open control plane would cost.
       FARM_API_TOKENS: ${FARM_API_TOKENS:-}
+      # Where an uploaded APK's bytes land, and the same path and the same
+      # named volume are mounted on the jobrunners below. Both halves are load
+      # bearing: unset, openArtifacts in cmd/farmd/roles.go falls back to
+      # os.TempDir()/device-farmer-artifacts, and with no volume that fallback
+      # is a directory inside THIS container's own writable layer.
+      #
+      # That was this file's shape until now, and it is the bad kind of broken
+      # because the other half of the store is genuinely shared. farm.artifacts
+      # rows live in Postgres, so an upload through POST /api/v1/artifacts is
+      # committed, listed by `farmd ctl artifacts`, and legal to name in a job
+      # spec — while its bytes exist only in this container. The job's push or
+      # install step is the first thing to open the blob, it opens it on a
+      # jobrunner, and it fails at READ time with "artifact bytes are absent
+      # from the backend" — not-retryable, on every device the job was
+      # scheduled to. A whole fleet failing the same step looks like a rack
+      # problem; docs/runbooks/jobs-failing.md calls this one the classic.
+      #
+      # Measured against this file, with an api role given the old per-container
+      # directory: GET /api/v1/artifacts/{sha} answers 200 with the full row,
+      # size and uploader, and GET /api/v1/artifacts/{sha}/content answers 410
+      # blob_missing for the same digest in the same process. Half a store.
+      #
+      # jobrunner runs 2 replicas below, which turns likely into certain: no
+      # replica happens to hold the bytes, because the container that took the
+      # upload does not run jobs at all.
+      #
+      # The chart has always treated this as a decision to make rather than one
+      # to fall into — deploy/helm/device-farmer/values.yaml `artifacts:`, whose
+      # persistence claim must be ReadWriteMany for exactly this reason. On a
+      # single machine a named volume IS that shared filesystem.
+      #
+      # The demo service needs neither line: it runs the api and the jobrunner
+      # in ONE process, so its per-container fallback directory is already
+      # shared with itself, and it re-seeds its screen-server artifact at every
+      # start rather than expecting to find one.
+      FARM_ARTIFACT_DIR: /var/lib/device-farmer/artifacts
     command: ["api"]
+    volumes:
+      - artifacts:/var/lib/device-farmer/artifacts
     ports:
       - "${FARM_PORT:-8420}:8080"
       - "${FARM_METRICS_PORT:-9420}:9090"
@@ -229,8 +267,33 @@ services:
     <<: *farmd
     profiles: ["farm"]
     command: ["jobrunner"]
+    environment:
+      <<: *farmd-env
+      # The other end of the api's artifact store: same variable, same path,
+      # same volume, and it is one store only because all three match.
+      #
+      # This side reads — a push or install step opens the blob by digest — and
+      # it also WRITES: a pull step stores what it copied off the device as a
+      # new artifact (execPull, internal/runner/steps.go), and it is the api
+      # that hands those bytes back to whoever asked for them. Unshared, that
+      # direction fails after the job has already succeeded: the run is green,
+      # the row is there, and the tenant's download answers 410.
+      #
+      # Unlike the api, this role does not degrade without a usable blob
+      # directory. openArtifacts is on runJobRunner's error path, so a
+      # directory it cannot write is `farmd jobrunner: artifact backend at
+      # ...: permission denied` and exit 1 — measured — rather than a runner
+      # that starts and takes jobs it cannot finish.
+      FARM_ARTIFACT_DIR: /var/lib/device-farmer/artifacts
+    volumes:
+      - artifacts:/var/lib/device-farmer/artifacts
     # Safe to scale: jobs are claimed with SKIP LOCKED and a lease is
     # re-attached by job_id, so two replicas never fight over one device.
+    #
+    # The volume above is the other half of that. Without it, scaling this role
+    # scaled the number of runners that cannot read what an operator uploaded,
+    # and the replica count was the thing that made a per-container blob
+    # directory certain to fail instead of only usually.
     deploy:
       replicas: 2
 
@@ -421,3 +484,18 @@ services:
 volumes:
   pgdata:
   promdata:
+  # The artifact blob store: uploads written by the api, results written by
+  # either jobrunner, and every one of them read by the other side. The api
+  # service above says what it costs when this is not shared.
+  #
+  # A local volume is one machine's filesystem, which is the farm this file
+  # describes. Move a role to another host and the bytes stop following it:
+  # that farm needs real shared storage mounted at the same path, which is what
+  # the chart's ReadWriteMany claim is for.
+  #
+  # `docker compose down` keeps it, `down -v` deletes it. The farm.artifacts
+  # rows in pgdata do not go with it, so a farm that loses only this volume
+  # keeps rows whose bytes are gone — the same failure this volume exists to
+  # prevent, and `farmd ctl artifacts` cannot see the difference. Delete both
+  # or neither.
+  artifacts:

@@ -24,6 +24,28 @@
 .sum-cards[hidden],
 .sum-card[hidden] { display: none !important; }
 
+/* .facts is the volatile half of a head — the host block's counts and admin
+   chip, the correlation box's sentences. The reconciler in fleet.js rewrites
+   it wholesale whenever those change while leaving its siblings alone, because
+   those siblings are BUTTONS: detaching a focused button blurs it, and these
+   heads repaint whenever a device below them changes health.
+
+   display:contents keeps the wrapper out of the flex layout, so the spans
+   inside it lay out and wrap exactly as they did when they were direct
+   children of .host-head and .correlate. And because it sets display, it ships
+   its own [hidden] pair — see the paragraph above. */
+.facts { display: contents; }
+.facts[hidden] { display: none !important; }
+
+/* The correlation box is built with every hub block and shown or hidden,
+   rather than inserted and removed, because it contains a button and a button
+   that leaves the document takes the focus on it with it.
+
+   That makes it a hidden element with an author display rule — .correlate sets
+   display:flex in style.css — which is the trap above in its live form: the
+   author rule wins and the box paints on every healthy hub in the farm. */
+.correlate[hidden] { display: none !important; }
+
 /* ------------------------------------------------------------------------ *
  * THE SUMMARY STRIP
  *

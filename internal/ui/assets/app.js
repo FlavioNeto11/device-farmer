@@ -1007,9 +1007,13 @@ const loaders = {
   }
 };
 
-function loadFor(view) {
+/* loadFor refetches what `view` needs. `skip` is a Set of resource names to
+ * leave alone — the fallback poller uses it to keep its hands off a resource
+ * the event stream is already delivering. */
+function loadFor(view, skip) {
   for (const key of VIEW_NEEDS[view] || []) {
     if (key === 'bulkRun') continue;   // driven by the bulk loader and the run poller
+    if (skip && skip.has(key)) continue;
     loaders[key]();
   }
 }
@@ -1135,32 +1139,40 @@ function table(cols, rows, opts) {
   const o = opts || {};
   const head = el('tr', null, cols.map((c) => headerCell(c, o)));
   const body = el('tbody');
-  for (const r of rows) {
-    const tr = el('tr', { class: o.rowClass ? o.rowClass(r) : null });
-    if (o.onRowClick) {
-      /* A convenience for the mouse, and only that. The keyboard path is a
-       * real control INSIDE the row — see the fleet table's first cell —
-       * because a <tr> with a tabindex announces itself as nothing, and a
-       * keydown handler on it is a button no assistive technology can find. */
-      tr.addEventListener('click', (ev) => {
-        if (ev.target.closest('button, a, input, select, textarea, summary, label')) return;
-        /* A drag that selected text ends in a click on the row. Opening a
-         * drawer over the serial somebody was half way through copying is the
-         * kind of thing that makes a table feel like it is fighting back, so
-         * a click that finished a selection does nothing. */
-        const sel = window.getSelection();
-        if (sel && !sel.isCollapsed && tr.contains(sel.anchorNode)) return;
-        o.onRowClick(r, ev);
-      });
-    }
-    for (const c of cols) {
-      const td = el('td', { class: c.cls || null });
-      append(td, [c.cell(r)]);
-      tr.append(td);
-    }
-    body.append(tr);
-  }
+  for (const r of rows) body.append(tableRow(cols, r, o));
   return el('table', null, el('thead', null, head), body);
+}
+
+/* tableRow is one <tr>, and it is its own function because the fleet's table
+ * keeps its rows across renders and therefore builds them ONE AT A TIME — see
+ * fleetRowNode in fleet.js. Rebuilding a whole table to get one row back cost a
+ * discarded header per row; writing a second row builder beside this one would
+ * have cost a second copy of what a row is, to be kept in step with the column
+ * list by memory. This is the third answer: one builder, called from both. */
+function tableRow(cols, r, o) {
+  const tr = el('tr', { class: o.rowClass ? o.rowClass(r) : null });
+  if (o.onRowClick) {
+    /* A convenience for the mouse, and only that. The keyboard path is a
+     * real control INSIDE the row — see the fleet table's first cell —
+     * because a <tr> with a tabindex announces itself as nothing, and a
+     * keydown handler on it is a button no assistive technology can find. */
+    tr.addEventListener('click', (ev) => {
+      if (ev.target.closest('button, a, input, select, textarea, summary, label')) return;
+      /* A drag that selected text ends in a click on the row. Opening a
+       * drawer over the serial somebody was half way through copying is the
+       * kind of thing that makes a table feel like it is fighting back, so
+       * a click that finished a selection does nothing. */
+      const sel = window.getSelection();
+      if (sel && !sel.isCollapsed && tr.contains(sel.anchorNode)) return;
+      o.onRowClick(r, ev);
+    });
+  }
+  for (const c of cols) {
+    const td = el('td', { class: c.cls || null });
+    append(td, [c.cell(r)]);
+    tr.append(td);
+  }
+  return tr;
 }
 
 /* headerCell is one <th>. Sortable or not, it is a real th with scope="col",
@@ -2730,9 +2742,29 @@ function setConn(mode, text) {
         : 'Opening the event stream…';
 }
 
+const POLL_SKIP_FLEET = new Set(['fleet']);
+
+/* startPolling is the fallback for a farm whose event stream will not stay up:
+ * every five seconds it refetches the open view, plus the fleet, which every
+ * view labels its rows from.
+ *
+ * It leaves the FLEET alone while the connection is live, and that exception
+ * earns its keep. This timer and the stream overlap: stopPolling runs when the
+ * stream opens and again on the first event after it recovers, but a request
+ * already in flight, a mode flip between the two, or a stream that comes back
+ * between ticks all leave one interval where both are feeding the same view.
+ * The fleet is the one view that repaints under the stream and the one an
+ * operator works inside, so a redundant refetch of it is not free: it is a
+ * second, unsynchronised source of truth for the grid, and every one of its
+ * answers reaches the reconciler as a change to apply. When the stream is
+ * live it is already telling us; asking again adds nothing but repaints. */
 function startPolling() {
   if (pollTimer) return;
-  pollTimer = setInterval(() => { loadFor(state.view); if (state.view !== 'fleet') loaders.fleet(); }, 5000);
+  pollTimer = setInterval(() => {
+    const streamHasIt = state.conn.mode === 'live';
+    loadFor(state.view, streamHasIt ? POLL_SKIP_FLEET : null);
+    if (state.view !== 'fleet' && !streamHasIt) loaders.fleet();
+  }, 5000);
 }
 
 function stopPolling() {

@@ -1,72 +1,14 @@
-/* device-farmer operator dashboard.
-   Dense over airy: during an incident the scarce resource is screen, not ink.
-   Colour is never the only signal — every health and lease state also carries
-   a glyph and a word, so the page survives a colour-blind operator, a washed
-   out projector and a greyscale screenshot pasted into a ticket. */
+/* device-farmer operator dashboard: component rules.
+   Every colour, size, space and shadow comes from tokens.css, which loads
+   first and owns :root. This file composes them; it declares no raw value.
 
-:root {
-  color-scheme: light dark;
+   Legible by default, dense on demand — the density law and its revision are
+   argued in tokens.css, which is where the two scales live.
 
-  --bg:        #f2f4f6;
-  --panel:     #ffffff;
-  --panel-2:   #e9edf1;
-  --panel-3:   #dde3e9;
-  --text:      #10151b;
-  --dim:       #55606e;
-  --line:      #cbd3db;
-  --line-2:    #aab5c0;
-  --accent:    #0a5cba;
-  --accent-fg: #ffffff;
-
-  --ok:        #146c43;
-  --ok-bg:     #d8f0e2;
-  --warn:      #8a5300;
-  --warn-bg:   #fdeccd;
-  --bad:       #a41d1d;
-  --bad-bg:    #fadadb;
-  --info:      #17518f;
-  --info-bg:   #d9e7f8;
-  --violet:    #5b31a8;
-  --violet-bg: #e6dcf9;
-  --magenta:   #8f2168;
-  --magenta-bg:#f8dcee;
-  --gray:      #4d5764;
-  --gray-bg:   #e2e6eb;
-
-  --mono: ui-monospace, "SFMono-Regular", "Cascadia Mono", "JetBrains Mono", Consolas, monospace;
-  --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-  --r: 5px;
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg:        #0d1117;
-    --panel:     #161b22;
-    --panel-2:   #1c232c;
-    --panel-3:   #262d38;
-    --text:      #e6edf3;
-    --dim:       #9aa7b4;
-    --line:      #2b3440;
-    --line-2:    #3d4854;
-    --accent:    #4f9dff;
-    --accent-fg: #06121f;
-
-    --ok:        #58d68d;
-    --ok-bg:     #123123;
-    --warn:      #f0b849;
-    --warn-bg:   #33260a;
-    --bad:       #ff7b72;
-    --bad-bg:    #3d1a19;
-    --info:      #79b8ff;
-    --info-bg:   #10263f;
-    --violet:    #c4a6ff;
-    --violet-bg: #241a3d;
-    --magenta:   #ff8ac9;
-    --magenta-bg:#3a1730;
-    --gray:      #a9b4c0;
-    --gray-bg:   #232a33;
-  }
-}
+   Colour is never the only signal. Every health and lease state also carries a
+   glyph and a word, so the page survives a colour-blind operator, a washed out
+   projector and a greyscale screenshot pasted into a ticket. That rule did not
+   change and is not negotiable. */
 
 * { box-sizing: border-box; }
 
@@ -76,7 +18,7 @@ body {
   margin: 0;
   background: var(--bg);
   color: var(--text);
-  font: 13px/1.45 var(--sans);
+  font: var(--fs-body)/var(--lh) var(--sans);
 }
 
 :focus-visible {

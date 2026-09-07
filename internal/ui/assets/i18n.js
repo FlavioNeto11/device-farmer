@@ -44,6 +44,17 @@
 const LANG_KEY = 'device-farmer.lang';
 const LANGS = ['en', 'pt'];
 
+/* Density lives here for one reason: this file is the only script that runs
+ * before the first paint, and density has to be decided before it. A page that
+ * paints comfortable and snaps to compact a frame later is worse than either.
+ *
+ * It is a reading preference, like the language, so it is stored the same way:
+ * localStorage, per browser, never on the server. Two operators sharing a
+ * control plane can want different densities and neither can change the
+ * other's. */
+const DENSITY_KEY = 'device-farmer.density';
+const DENSITIES = ['comfortable', 'compact'];
+
 /* The dictionaries.
  *
  * Ordered as the page is: chrome first, then per view, then the pieces shared
@@ -633,6 +644,41 @@ function setLang(next) {
   window.dispatchEvent(new CustomEvent('languagechange', { detail: { lang: next } }));
 }
 
+/* ------------------------------------------------------------------ *
+ * Density
+ * ------------------------------------------------------------------ */
+
+/* pickInitialDensity. A stored choice outranks everything. There is no
+ * browser signal for "how much do you want on screen", so the default is the
+ * comfortable one — see the density law in tokens.css for why that is the
+ * default and not the fallback. */
+function pickInitialDensity() {
+  try {
+    const saved = localStorage.getItem(DENSITY_KEY);
+    if (DENSITIES.includes(saved)) return saved;
+  } catch (_) { /* private mode */ }
+  return 'comfortable';
+}
+
+let density = pickInitialDensity();
+
+function currentDensity() { return density; }
+
+/* setDensity retunes the whole page by writing one attribute.
+ *
+ * Nothing re-renders. Every rule that spaces anything reads a component token
+ * from tokens.css, and the [data-density="compact"] block redefines those
+ * tokens — so the browser restyles in place, keeping scroll position, focus,
+ * open dialogs and any in-flight command. That is the entire reason density is
+ * a token swap rather than a class every component has to know about. */
+function setDensity(next) {
+  if (!DENSITIES.includes(next) || next === density) return;
+  density = next;
+  try { localStorage.setItem(DENSITY_KEY, next); } catch (_) { /* not fatal */ }
+  document.documentElement.setAttribute('data-density', next);
+  window.dispatchEvent(new CustomEvent('densitychange', { detail: { density: next } }));
+}
+
 /* t looks a key up in the current language.
  *
  * A MISSING KEY RETURNS THE KEY ITSELF, loudly and visibly, rather than falling
@@ -688,6 +734,7 @@ function i18nKeys(which) { return Object.keys(STRINGS[which] || {}); }
  * itself. The DOM below this script does not exist yet, so a second pass runs
  * on DOMContentLoaded. */
 document.documentElement.lang = lang === 'pt' ? 'pt-BR' : 'en';
+document.documentElement.setAttribute('data-density', density);
 if (document.readyState === 'loading') {
   document.addEventListener('DOMContentLoaded', () => applyTranslations(document));
 } else {

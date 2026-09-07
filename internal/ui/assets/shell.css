@@ -1,0 +1,14 @@
+/* The page shell: the brand, the navigation rail, the top bar, the per-view
+   page header and the width the content is allowed to take.
+
+   Owned by unit 2. Everything here is layout and chrome; no view knows this
+   file exists.
+
+   THE TRAP THIS FILE IS MOST LIKELY TO SPRING. The seven views are shown and
+   hidden with the hidden attribute (app.js showView). A [hidden] element is
+   hidden by a user-agent rule, and any author rule that sets display on the
+   same element beats it regardless of specificity. The moment a rule here
+   writes display on .view — or on the children of a grid that contains it —
+   all seven views paint at once. Every such rule must be paired with
+   .view[hidden] { display: none !important } in the same commit. This has
+   shipped as a real bug twice; see style.css for the other two occurrences. */

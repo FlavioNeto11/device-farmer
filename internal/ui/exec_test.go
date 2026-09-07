@@ -336,16 +336,37 @@ func TestTheExecPanelImposesTheTimeoutFloorTheAPIDoesNot(t *testing.T) {
 	}
 }
 
-// TestEveryScriptTheDashboardLoadsIsEmbeddedAndRequired.
+// TestEveryScriptTheDashboardLoadsIsEmbeddedAndRequired and its stylesheet
+// twin.
 //
 // Adding an asset needs three edits in two files, and forgetting the third is
-// silent: the file is embedded, served, and absent from the required-asset list,
-// so a build that omits it starts happily and 404s at runtime. This generalises
-// past the command builder — it is the check that makes that registration table
-// enforce itself.
+// silent: the file is embedded, served, and absent from the required-asset
+// list, so a build that omits it starts happily and 404s at runtime. This
+// generalises past any one feature — it is the check that makes the
+// registration table enforce itself.
 //
-// Falsify: add a <script src> to index.html and touch nothing else.
+// The stylesheet half exists because the script half did not cover it. A
+// missing script dies loudly on a ReferenceError; a missing stylesheet dies
+// quietly, as a page that renders with no colours and no layout and no error
+// anywhere. That is the worse of the two failures and it was the one nothing
+// checked.
+//
+// Falsify: add a <script src> or a <link rel="stylesheet"> to index.html and
+// touch nothing else.
 func TestEveryScriptTheDashboardLoadsIsEmbeddedAndRequired(t *testing.T) {
+	assertLoadedAssetsAreRegistered(t, `<script src="([^"]+)"`, "script", 5)
+}
+
+func TestEveryStylesheetTheDashboardLoadsIsEmbeddedAndRequired(t *testing.T) {
+	assertLoadedAssetsAreRegistered(t, `<link rel="stylesheet" href="([^"]+)"`, "stylesheet", 3)
+}
+
+// assertLoadedAssetsAreRegistered is the body both of the above share. floor is
+// the number of tags below which the test assumes the markup changed shape and
+// it has gone blind, rather than reporting success over zero findings.
+func assertLoadedAssetsAreRegistered(t *testing.T, pattern, kind string, floor int) {
+	t.Helper()
+
 	page, err := embedded.ReadFile("assets/index.html")
 	if err != nil {
 		t.Fatalf("read the embedded index.html: %v", err)
@@ -355,21 +376,22 @@ func TestEveryScriptTheDashboardLoadsIsEmbeddedAndRequired(t *testing.T) {
 		t.Fatalf("read internal/ui/ui.go: %v", err)
 	}
 
-	scripts := regexp.MustCompile(`<script src="([^"]+)"`).FindAllStringSubmatch(string(page), -1)
-	if len(scripts) < 3 {
-		t.Fatalf("found %d scripts in index.html; the tag shape changed and this test is blind",
-			len(scripts))
+	found := regexp.MustCompile(pattern).FindAllStringSubmatch(string(page), -1)
+	if len(found) < floor {
+		t.Fatalf("found %d %s tags in index.html, want at least %d; the tag shape changed "+
+			"and this test is blind", len(found), kind, floor)
 	}
-	for _, m := range scripts {
+	for _, m := range found {
 		name := m[1]
 		if _, err := embedded.ReadFile("assets/" + name); err != nil {
 			t.Errorf("index.html loads %s and it is not in the //go:embed list: %v", name, err)
 		}
 		if !strings.Contains(string(uiGo), `"`+name+`"`) {
-			t.Errorf("index.html loads %s and internal/ui/ui.go does not require it.\n\n"+
+			t.Errorf("index.html loads the %s %s and internal/ui/ui.go does not require it.\n\n"+
 				"A missing required asset is caught at startup; one that is merely embedded "+
-				"and unlisted 404s at runtime, and the page dies on a ReferenceError with "+
-				"nothing in the server log.", name)
+				"and unlisted 404s at runtime. A script that 404s dies on a ReferenceError; "+
+				"a stylesheet that 404s renders an unstyled page with nothing in any log.",
+				kind, name)
 		}
 	}
 }

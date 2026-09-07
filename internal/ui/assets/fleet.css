@@ -1,0 +1,6 @@
+/* The Fleet view: the summary strip, the device cards and the device table.
+
+   Owned by units 3, 4 and 5. The Fleet is the landing page and the only view
+   that repaints under a live event stream, so its rules are separated from the
+   rest: a change to how a device reads should not put a reviewer in front of
+   the docs typography. */

@@ -231,7 +231,17 @@ func TestEveryKeyTheAppAsksForExists(t *testing.T) {
 	en := dictionary(t, src, "en")
 
 	used := map[string][]string{}
-	for _, name := range []string{"assets/app.js", "assets/docs.js", "assets/exec.js", "assets/index.html"} {
+	// Every script the page loads, plus the page. A file missing from this list
+	// is not a failure — it is worse: its t() calls are never checked, so a key
+	// that exists in neither dictionary renders as the raw key forever and no
+	// test says so. TestEveryScriptTheDashboardLoadsIsEmbeddedAndRequired keeps
+	// index.html and ui.go honest with each other; this list is the third place
+	// and has to be edited by hand.
+	for _, name := range []string{
+		"assets/app.js", "assets/docs.js", "assets/exec.js",
+		"assets/terms.js", "assets/fleet.js", "assets/device.js",
+		"assets/index.html",
+	} {
 		b, err := embedded.ReadFile(name)
 		if err != nil {
 			t.Fatalf("read %s: %v", name, err)

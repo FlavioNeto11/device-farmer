@@ -1,5 +1,15 @@
-// Package ui serves the operator dashboard: one HTML page, one stylesheet,
-// one script, embedded in the farmd binary.
+// Package ui serves the operator dashboard: one HTML page plus the stylesheets
+// and scripts it names, embedded in the farmd binary.
+//
+// The page loads several of each rather than one of each, and the split is by
+// who edits the file, not by size. tokens.css is the design system and is
+// edited by whoever changes the palette; fleet.js and device.js are the two
+// views dense enough that a change to one should not put a reviewer in front
+// of the other; terms.js is a glossary edited by whoever adds a domain word.
+// Every one of them is registered in four places, and
+// TestEveryScriptTheDashboardLoadsIsEmbeddedAndRequired plus its stylesheet
+// twin fail the build when a fifth file is added and one of the four is
+// forgotten.
 //
 // # Why embedded, and why no build step
 //
@@ -25,8 +35,8 @@
 // # Dev mode
 //
 // Handler(WithDevDir(dir)) — or the FARM_UI_DEV_DIR environment variable —
-// reads the three files from disk on every request with Cache-Control:
-// no-store, so an editor save plus a browser reload is the whole edit loop.
+// reads every asset from disk on every request with Cache-Control: no-store,
+// so an editor save plus a browser reload is the whole edit loop.
 // Production is the embedded path and needs no flag.
 package ui
 
@@ -54,7 +64,11 @@ const EnvDevDir = "FARM_UI_DEV_DIR"
 // The embed patterns are explicit rather than a directory glob so that a stray
 // editor swap file or a .DS_Store in assets/ cannot become a served asset.
 //
-//go:embed assets/index.html assets/app.js assets/docs.js assets/exec.js assets/i18n.js assets/style.css
+//go:embed assets/index.html
+//go:embed assets/i18n.js assets/docs.js assets/exec.js assets/terms.js
+//go:embed assets/fleet.js assets/device.js assets/app.js
+//go:embed assets/tokens.css assets/style.css assets/shell.css
+//go:embed assets/fleet.css assets/drawer.css assets/terms.css
 //go:embed assets/docs
 var embedded embed.FS
 
@@ -134,7 +148,12 @@ func newEmbeddedHandler(fsys fs.FS) (*embeddedHandler, error) {
 	// binary that serves a blank dashboard during an incident is worse than one
 	// that refuses to start: the first is discovered by an operator at 3am, the
 	// second at build time. Handler turns this into a panic for that reason.
-	for _, required := range [...]string{"index.html", "app.js", "docs.js", "exec.js", "i18n.js", "style.css", "docs/index.json"} {
+	for _, required := range [...]string{
+		"index.html",
+		"i18n.js", "docs.js", "exec.js", "terms.js", "fleet.js", "device.js", "app.js",
+		"tokens.css", "style.css", "shell.css", "fleet.css", "drawer.css", "terms.css",
+		"docs/index.json",
+	} {
 		if _, ok := h.assets[required]; !ok {
 			return nil, fmt.Errorf("%s missing from the embedded assets", required)
 		}

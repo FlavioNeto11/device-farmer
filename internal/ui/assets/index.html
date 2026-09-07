@@ -4,15 +4,33 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>device-farmer</title>
-<!-- Relative hrefs so the dashboard survives being mounted under a prefix. -->
+<!-- Relative hrefs so the dashboard survives being mounted under a prefix.
+
+     ORDER IS LOAD-BEARING. tokens.css owns :root and every later sheet only
+     composes its variables, so it must come first; a sheet that redefines a
+     token wins by being later, which is exactly the accident this ordering
+     prevents. The rest are component sheets and are mutually independent. -->
+<link rel="stylesheet" href="tokens.css">
 <link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="shell.css">
+<link rel="stylesheet" href="fleet.css">
+<link rel="stylesheet" href="drawer.css">
+<link rel="stylesheet" href="terms.css">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%23167a4a'/%3E%3Crect x='5' y='3' width='6' height='10' rx='1' fill='%23fff'/%3E%3C/svg%3E">
-<!-- i18n first: it sets document.lang and fills every data-i18n element, so the
-     first paint is already in the reader's language instead of flashing English
-     and correcting itself. -->
+<!-- i18n first: it sets document.lang and the density attribute and fills every
+     data-i18n element, so the first paint is already in the reader's language
+     and at the reader's density instead of flashing one and correcting itself.
+
+     app.js LAST. Every other script here defines functions into the shared
+     lexical scope of classic scripts; app.js is the one that calls them at
+     load. Ordering it earlier turns a working page into a ReferenceError with
+     nothing in the server log. -->
 <script src="i18n.js" defer></script>
 <script src="docs.js" defer></script>
 <script src="exec.js" defer></script>
+<script src="terms.js" defer></script>
+<script src="fleet.js" defer></script>
+<script src="device.js" defer></script>
 <script src="app.js" defer></script>
 </head>
 <body>

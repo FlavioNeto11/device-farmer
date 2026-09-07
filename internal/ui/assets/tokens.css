@@ -1,0 +1,233 @@
+/* The design system: every colour, size, space and shadow the dashboard is
+   allowed to use.
+
+   This file loads before style.css and owns :root outright. No other stylesheet
+   may declare a raw colour or a raw spacing value; they compose these tokens.
+   That is the whole reason the file exists — before it, thirty distinct padding
+   pairs and a ten-pixel type floor had accumulated across a thousand lines with
+   nobody able to see them all at once.
+
+   # The density law, revised
+
+   The old rule at the top of style.css read "Dense over airy: during an
+   incident the scarce resource is screen, not ink." It is not wrong; it is
+   over-generalised. The scarce resource during an incident is screen. The
+   scarce resource on every other day — and most days are every other day — is
+   understanding. A control plane that is unreadable until you already know it
+   has bought density with the one thing a new operator does not have.
+
+   So: legible by default, dense on demand. The comfortable scale below is what
+   loads. The [data-density="compact"] block near the bottom restores the old
+   density exactly, from one control in the header, remembered per browser.
+   Neither is a downgrade of the other.
+
+   # The law that does NOT change
+
+   Colour is never the only signal. Every health and lease state also carries a
+   glyph and a word, so the page survives a colour-blind operator, a washed out
+   projector and a greyscale screenshot pasted into a ticket. A corporate
+   palette is quieter, not more ambiguous.
+
+   # Why the old names are still here
+
+   The twenty-four colour tokens this project started with (--panel, --ok,
+   --bad, --warn, --info, --violet, --magenta, --gray and their -bg pairs) are
+   referenced by eighteen .chip variants, nine .h-* health rails, .conn,
+   .banner-*, .rung.blast-*, .batt and the entire .doc-* block — sixty-odd call
+   sites across three files. Renaming them would touch every one and conflict
+   with every parallel change. So they are kept and redefined as aliases over
+   the ramp below. New rules use the new names; nothing old had to move. */
+
+:root {
+  color-scheme: light dark;
+
+  /* ---------------------------------------------------------- surfaces --- */
+  --srf-canvas: #f6f7f9;
+  --srf-raised: #ffffff;
+  --srf-sunken: #eef1f4;
+  --srf-hover:  #e6ebf0;
+
+  --brd-subtle: #dfe4ea;
+  --brd-strong: #c2cad4;
+
+  /* Text roles, not text colours. --txt-3 is for a value that is present but
+     not the reason you are looking at the row: a raw identifier, a column
+     name, a unit. */
+  --txt-1: #1a2027;
+  --txt-2: #55616f;
+  --txt-3: #78838f;
+  --txt-on-brand: #ffffff;
+
+  /* ------------------------------------------------------------- brand --- */
+  /* Navy rather than the dashboard blue this started with. The old #0a5cba is
+     the accent colour of a developer tool; a control plane that a business
+     runs its device fleet on reads as an instrument, not as an IDE. */
+  --brand-700: #143f70;
+  --brand-600: #1a4f8a;
+  --brand-500: #2563a6;
+  --brand-50:  #e9f0f8;
+
+  /* ------------------------------------------------------------ status --- */
+  /* Each pair is foreground-on-its-own-background. Every one of these is at
+     least 4.5:1 against its paired background, because a chip is text. */
+  --pos-fg: #1a6b40;  --pos-bg: #e4f3ea;
+  --cau-fg: #855400;  --cau-bg: #fcf0d9;
+  --cri-fg: #a01f1f;  --cri-bg: #fbe7e8;
+  --inf-fg: #1a4f8a;  --inf-bg: #e6eff9;
+  --vio-fg: #573a9c;  --vio-bg: #ebe4f9;
+  --mag-fg: #8a2761;  --mag-bg: #f9e2ef;
+  --neu-fg: #4d5764;  --neu-bg: #e7eaee;
+
+  /* ------------------------------------------------------------ typeface - */
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --mono: ui-monospace, "SFMono-Regular", "Cascadia Mono", "JetBrains Mono", Consolas, monospace;
+
+  /* The floor is 12px. It used to be 10px, on the tab hotkey badges and the
+     tab pips, and forty-four of the fifty-six font-size rules in style.css sat
+     below 13px. Sub-12 type is the single loudest thing that made this page
+     read as a terminal rather than as an instrument. */
+  --fs-xs:  12px;
+  --fs-sm:  13px;
+  --fs-md:  14px;
+  --fs-lg:  16px;
+  --fs-xl:  20px;
+  --fs-2xl: 26px;
+
+  --lh-tight: 1.3;
+  --lh:       1.5;
+  --lh-prose: 1.65;
+
+  --fw-normal: 400;
+  --fw-medium: 500;
+  --fw-semi:   600;
+
+  /* ------------------------------------------------------------- space --- */
+  /* A strict 4/8 grid. Nothing outside this list. */
+  --s-1:  4px;
+  --s-2:  8px;
+  --s-3: 12px;
+  --s-4: 16px;
+  --s-5: 24px;
+  --s-6: 32px;
+  --s-7: 48px;
+
+  /* ------------------------------------------------------- shape, depth --- */
+  --r-sm:   4px;
+  --r:      6px;
+  --r-lg:  10px;
+  --r-pill: 999px;
+
+  --elev-1: 0 1px 2px rgba(16, 21, 27, .06);
+  --elev-2: 0 2px 8px rgba(16, 21, 27, .10);
+  --elev-3: 0 12px 32px rgba(16, 21, 27, .18);
+
+  /* ---------------------------------------------------------- measures --- */
+  /* A measure is only meaningful against the font it is resolved in: ch is the
+     width of "0" in the element's OWN font. Any container using these must set
+     its font first. style.css records the bug that taught us this. */
+  --measure-prose: 72ch;
+  --page-max: 1440px;
+  --rail-w: 240px;
+  --rail-w-collapsed: 56px;
+
+  /* -------------------------------------------------------- components --- */
+  /* The four values density swaps, plus the two gaps. Components reference
+     these rather than the raw scale, so one attribute on <html> retunes the
+     whole page without any rule knowing density exists. */
+  --pad-cell:    10px 14px;
+  --pad-row:     var(--s-3);
+  --pad-tile:    var(--s-3);
+  --pad-toolbar: var(--s-3);
+  --pad-page:    var(--s-5);
+  --gap-section: var(--s-5);
+  --gap-grid:    var(--s-3);
+  --fs-body:     var(--fs-md);
+  --tile-min:    220px;
+}
+
+/* -------------------------------------------------------------- dark ----- */
+/* Not GitHub's dark-dimmed ramp, which is what #0d1117 / #161b22 / #e6edf3
+   were, verbatim. Borrowing a developer tool's palette is a large part of what
+   made this look like one. */
+@media (prefers-color-scheme: dark) {
+  :root {
+    --srf-canvas: #11151b;
+    --srf-raised: #1a2027;
+    --srf-sunken: #0d1116;
+    --srf-hover:  #232b35;
+
+    --brd-subtle: #2a323c;
+    --brd-strong: #3b4552;
+
+    --txt-1: #e8ecf1;
+    --txt-2: #a4b0bd;
+    --txt-3: #7f8b98;
+    --txt-on-brand: #0b1520;
+
+    --brand-700: #8cbcf0;
+    --brand-600: #6ea8e8;
+    --brand-500: #5c99dd;
+    --brand-50:  #15283c;
+
+    --pos-fg: #5fce93;  --pos-bg: #10291d;
+    --cau-fg: #e9b356;  --cau-bg: #2d2309;
+    --cri-fg: #f0817a;  --cri-bg: #331716;
+    --inf-fg: #7bb4ee;  --inf-bg: #12253a;
+    --vio-fg: #bda3f5;  --vio-bg: #211936;
+    --mag-fg: #f08ac6;  --mag-bg: #32162a;
+    --neu-fg: #a4b0bd;  --neu-bg: #1e242c;
+
+    --elev-1: 0 1px 2px rgba(0, 0, 0, .40);
+    --elev-2: 0 2px 8px rgba(0, 0, 0, .48);
+    --elev-3: 0 12px 32px rgba(0, 0, 0, .60);
+  }
+}
+
+/* ------------------------------------------------------------ density ---- */
+/* Compact is the density this dashboard shipped with. It is one attribute on
+   <html>, written by i18n.js before first paint so the page never flashes one
+   density and corrects itself. Every value here is the number that was in
+   style.css before the comfortable defaults above replaced it. */
+[data-density="compact"] {
+  --pad-cell:    4px 8px;
+  --pad-row:     var(--s-2);
+  --pad-tile:    var(--s-2);
+  --pad-toolbar: var(--s-2);
+  --pad-page:    var(--s-3);
+  --gap-section: var(--s-3);
+  --gap-grid:    6px;
+  --fs-body:     var(--fs-sm);
+  --tile-min:    186px;
+
+  --fs-xs: 11px;
+  --fs-sm: 12px;
+  --fs-md: 13px;
+  --fs-lg: 14px;
+  --fs-xl: 17px;
+}
+
+/* ------------------------------------------------- the compatibility map - */
+/* Everything below is an alias. It exists so that a thousand lines of existing
+   CSS keep working unchanged while the palette above is the only thing that
+   decides what a colour is. Do not add new rules that reference these names —
+   they are a bridge, not an API. */
+:root {
+  --bg:        var(--srf-canvas);
+  --panel:     var(--srf-raised);
+  --panel-2:   var(--srf-sunken);
+  --panel-3:   var(--srf-hover);
+  --text:      var(--txt-1);
+  --dim:       var(--txt-2);
+  --line:      var(--brd-subtle);
+  --line-2:    var(--brd-strong);
+  --accent:    var(--brand-600);
+  --accent-fg: var(--txt-on-brand);
+
+  --ok:         var(--pos-fg);  --ok-bg:      var(--pos-bg);
+  --warn:       var(--cau-fg);  --warn-bg:    var(--cau-bg);
+  --bad:        var(--cri-fg);  --bad-bg:     var(--cri-bg);
+  --info:       var(--inf-fg);  --info-bg:    var(--inf-bg);
+  --violet:     var(--vio-fg);  --violet-bg:  var(--vio-bg);
+  --magenta:    var(--mag-fg);  --magenta-bg: var(--mag-bg);
+  --gray:       var(--neu-fg);  --gray-bg:    var(--neu-bg);
+}

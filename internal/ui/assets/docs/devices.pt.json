@@ -1,0 +1,611 @@
+{
+  "area": "devices",
+  "title": "Devices: enrolment, identidade, topologia e health",
+  "summary": "Um dispositivo nesta farm é identificado por onde ele está plugado, não pelo nome que ele diz ter: seriais de OEM colidem, e este rack tem um par de clones (0123456789ABCDEF em usb:3-1.1 e usb:3-1.2) para provar isso. A identidade é observada, depois resolvida contra uma escada de quatro degraus — uid gravado pelo brand, fingerprint de hardware, serial-mais-slot, adopt — e então gravada de volta no aparelho, para que o degrau mais forte exista da próxima vez. Health é um terceiro relógio mantido estritamente separado dos leases: o watchdog escreve uma única tabela, não tem privilégio nenhum sobre farm.leases, e um dispositivo que cai para offline nunca é tirado de um job em execução. Leia os Gaps antes de depender de qualquer parte da maquinaria de enrolment ou de topologia. O degrau do fingerprint executa agora — ele chamava min(uuid), um agregado que o PostgreSQL não tem, e a migração 00005 o reescreveu para contar primeiro e buscar depois — mas o degrau do serial ainda não consegue retornar ambiguous, e nem o enrolment nem a descoberta de topologia rodam em lugar algum além do papel de nó farmd, no Linux.",
+  "sections": [
+    {
+      "heading": "A regra que tudo nesta página obedece",
+      "body": "Um lease termina quando o job diz que terminou, quando um prazo que o usuário escreveu se esgota, ou quando um humano o toma de volta. Nada nesta página pode terminar um lease. Isso é garantido de três formas.\n\n**Por imports.** `internal/adbwire`, `internal/enroll`, `internal/topo` e `internal/watchdog` não importam `internal/lease` — verificado por grep nos quatro pacotes. Não existe, em nenhum deles, função em escopo capaz de terminar, encurtar ou sequer ler um lease. Uma mudança que precise do valor de um lease dentro de um desses pacotes é prova de que a mudança pertence a outro lugar.\n\n**Por grants.** `migrations/00002_lease.sql:110` executa `REVOKE ALL ON farm.leases FROM farm_watchdog`. Conferido contra o servidor em execução, abaixo. (Quanto esse revoke vale em tempo de execução é um gap — veja os Gaps.)\n\n**Por vocabulário.** `farm.leases.release_reason` tem uma constraint CHECK que lista sete valores — `completed`, `failed`, `job_cancelled`, `max_runtime`, `operator_revoked`, `holder_expired`, `device_retired` (`migrations/00001_core.sql:324`). Nenhum deles é um valor de conectividade, então \"o socket caiu\" levanta check_violation em vez de destruir trabalho em silêncio. Essa é a resposta direta ao issue DeviceFarmer/STF #663, onde um ECONNRESET de ~90 minutos no socket de tracking liberou um dispositivo no meio de uma execução.\n\nO custo da regra está dito com todas as letras em `internal/adbwire/doc.go`: quando a conexão do tracker cai, **snapshot nenhum é emitido**. O pacote não sintetiza uma lista vazia de dispositivos e não marca nada como ausente. Perder o socket para um servidor ADB é evidência sobre o socket, não sobre os aparelhos que estão atrás dele.",
+      "bullets": [
+        "Uma falha de transporte em `adbwire` tem exatamente dois efeitos permitidos: um erro tipado devolvido a quem chamou, e um contador incrementado (`internal/adbwire/doc.go:22-27`).",
+        "`topo` marca um slot como `maintenance` quando a porta dele sai da árvore USB; ele não pode terminar o lease de um dispositivo que esteja nesse slot (`internal/topo/discover.go:28-32`).",
+        "`enroll` se recusa a limpar o ponteiro de slot da linha de outro dispositivo para abrir espaço para um recém-chegado — essa linha pode estar segurando um lease vivo neste exato segundo (`internal/enroll/enroll.go:772-781`).",
+        "O `healthFor` do watchdog mapeia `offline` para o health `offline` (`internal/watchdog/watchdog.go:876-877`). Isso é uma afirmação sobre o fio, e o comentário da própria função diz que isso nunca pode ser lido como motivo para tirar um dispositivo de quem o tem."
+      ],
+      "examples": [
+        {
+          "label": "O papel do watchdog não pode tocar em um lease — conferido no servidor em execução",
+          "lang": "sql",
+          "code": "SELECT c.relname AS table_name,\n       has_table_privilege('farm_watchdog', c.oid, 'SELECT') AS sel,\n       has_table_privilege('farm_watchdog', c.oid, 'INSERT') AS ins,\n       has_table_privilege('farm_watchdog', c.oid, 'UPDATE') AS upd,\n       has_table_privilege('farm_watchdog', c.oid, 'DELETE') AS del\n  FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace\n WHERE n.nspname = 'farm'\n   AND c.relname IN ('leases','device_runtime','devices','slots','hosts','jobs')\n ORDER BY 1;",
+          "output": "   table_name   | sel | ins | upd | del \n----------------+-----+-----+-----+-----\n device_runtime | t   | t   | t   | f\n devices        | t   | f   | f   | f\n hosts          | t   | f   | f   | f\n jobs           | f   | f   | f   | f\n leases         | f   | f   | f   | f\n slots          | t   | f   | f   | f",
+          "note": "O plano de health pode escrever exatamente uma tabela e não consegue nem fazer SELECT em um lease. Isso é uma afirmação sobre o PAPEL, não sobre o processo: veja o gap de enforcement em tempo de execução, abaixo."
+        }
+      ],
+      "source": "internal/adbwire/doc.go, internal/watchdog/watchdog.go:1-60, internal/enroll/enroll.go:30-45, internal/topo/discover.go:1-40, migrations/00002_lease.sql:72-117, migrations/00001_core.sql:316-326"
+    },
+    {
+      "heading": "Um serial ADB é evidência, não identificador",
+      "body": "OEMs baratas despacham lotes de aparelhos com o mesmo serial gravado de fábrica. O próprio README do STF documenta um dispositivo que sai de fábrica como `0123456789ABCDEF`, e este rack tem dois deles.\n\nA consequência não é cosmética. Toda ação de recovery neste sistema — reconectar, detach/attach, reset USB, ciclo de energia da porta, reboot — resolve um alvo antes de agir. Se resolvesse por serial, poderia cair no clone que está há quatro horas dentro de uma execução de seis horas de outra pessoa e matá-la, enquanto o aparelho quebrado ao lado continua quebrado. Por isso **toda chamada endereçada nesta base de código recebe um devpath**, a posição na árvore USB, e o serial é registrado como observação e usado apenas como um dos componentes de um digest.\n\nEndereçamento por serial existe em exatamente uma função, `adbwire.Client.UnsafeBySerial` (`client.go:407-419`), e carrega esse nome de propósito. Ela não tem chamadores em código de produção — só em `client_test.go`, onde o teste afirma que um serial clonado volta como `ErrAmbiguousTarget`. `doc.go:45-49` limita o uso dela a ferramental interativo e ao enrolment inicial de um dispositivo cujo devpath ainda não é conhecido, e proíbe que qualquer caminho de recovery ou de health a chame.\n\nO schema registra a colisão em vez de escondê-la. `farm.devices.serial_ambiguous` é setado de dentro de `farm.resolve_device` em dois lugares: o degrau 3 o seta no instante em que enxerga mais de uma linha carregando o serial (`00004_operate.sql:307`), e o degrau 4 reconfere *depois* de uma adoção (`:352`), porque no momento em que o segundo clone é resolvido pela primeira vez a contagem ainda é um e nenhum dos dois dispositivos jamais seria marcado.",
+      "bullets": [
+        "`farm.slots.adb_devpath` é `GENERATED ALWAYS AS ('usb:' || usb_path) STORED` (`migrations/00001_core.sql:100`) — a chave de junção entre o schema e o que o servidor ADB reporta.",
+        "`adbwire.Client.Devices` usa `host:devices-l` e nunca cai para a forma curta, porque a forma curta omite o devpath (`client.go:246-261`).",
+        "`adbwire.Snapshot.AmbiguousSerials()` ordena o resultado (`device.go:184-186`): o valor termina nos logs do operador, e uma ordem instável faria duas observações idênticas parecerem duas observações diferentes.",
+        "Um dispositivo que o servidor ADB lista sem devpath — um emulador, um alvo de rede — não pode ser endereçado por posição, e `Device.Target()` recusa em vez de cair para o serial (`device.go:113-130`). Ele não tem lugar em um rack e não pode ter a energia ciclada."
+      ],
+      "examples": [
+        {
+          "label": "Encontre o par de clones",
+          "lang": "sql",
+          "code": "SELECT d.farm_uid, d.model, s.adb_devpath, s.rack_slot, d.serial_ambiguous\n  FROM farm.devices d\n  JOIN farm.slots s ON s.id = d.current_slot_id\n WHERE d.adb_serial IN (SELECT adb_serial FROM farm.devices\n                         GROUP BY adb_serial HAVING count(*) > 1)\n ORDER BY s.adb_devpath;",
+          "output": "              farm_uid               |  model   | adb_devpath |  rack_slot   | serial_ambiguous \n-------------------------------------+----------+-------------+--------------+------------------\n df-970e1c5b7163543ded6ed5f3a05c0978 | Pixel 7  | usb:3-1.1   | R1-U04-H1-P1 | t\n df-970e195b71634f24ed6ed8f3a05c0e91 | Pixel 6a | usb:3-1.2   | R1-U04-H1-P2 | t",
+          "note": "Dois aparelhos diferentes — um Pixel 7 e um Pixel 6a — reportando um único serial. Linhas separadas, uids separados, posições separadas no rack. Nesta demonstração a flag foi semeada, não observada; veja os Gaps."
+        },
+        {
+          "label": "O que o servidor ADB de fato diz (protocolo host cru, sem o binário adb)",
+          "lang": "text",
+          "code": "# 4-hex-digit length prefix, then the service string:\n#   000ehost:devices-l\n# reply: OKAY, 4-hex length, payload\n# Driven from a PowerShell TcpClient against 127.0.0.1:50136.",
+          "output": "SENT   : 000ehost:devices-l\nSTATUS : OKAY\nLENGTH : 0aef (2799 bytes)\nPAYLOAD:\n0123456789ABCDEF       device usb:3-1.1 product:panther model:Pixel_7 device:panther transport_id:1\n0123456789ABCDEF       device usb:3-1.2 product:bluejay model:Pixel_6a device:bluejay transport_id:2\nR534TOLGRWJSLN         device usb:3-1.3 product:r0qxxx model:Galaxy_S22 device:r0q transport_id:3\n334TONEXG3YVQ          device usb:3-1.4 product:sunfish model:Pixel_4a device:sunfish transport_id:4\n...",
+          "note": "Duas linhas de listagem, um serial. O campo zero é inútil como chave; `usb:3-1.1` e `usb:3-1.2` são as únicas coisas que distinguem esses dois. Os valores de estado nesta listagem se mexem — o simulador leva dispositivos para offline e de volta — então uma nova execução vai diferir depois das duas primeiras linhas."
+        },
+        {
+          "label": "Os dois clones seguem endereçáveis separadamente — mesmo servidor ADB, devpaths diferentes",
+          "lang": "bash",
+          "code": "export FARM_API_URL=http://127.0.0.1:8420\nfor u in df-970e1c5b7163543ded6ed5f3a05c0978 df-970e195b71634f24ed6ed8f3a05c0e91; do\n  ./bin/farmd.exe ctl device exec \"$u\" \\\n    --reason \"clone pair addressability check\" --yes -o json \\\n    -- getprop ro.build.version.release\ndone",
+          "output": "About to run a shell command on 1 device at R1-U04-H1-P1.\n...\nproceeding (--yes)\n{\n  \"device_id\": \"a6adf5c9-ea2e-4105-a3c4-a8b1104a6259\",\n  \"adb_devpath\": \"usb:3-1.1\",\n  \"adb_endpoint\": \"127.0.0.1:50136\",\n  \"command\": \"getprop ro.build.version.release\",\n  \"exit_code\": 0, \"output\": \"14\\n\", \"exited\": true,\n  \"truncated\": false, \"duration_ms\": 0\n}\n\nAbout to run a shell command on 1 device at R1-U04-H1-P2.\n...\n{\n  \"device_id\": \"de141b14-f99c-44c4-89b1-eb69e1a855f5\",\n  \"adb_devpath\": \"usb:3-1.2\",\n  ... same endpoint, exit_code 0, output \"14\\n\"\n}",
+          "note": "Um endpoint, dois ids de dispositivo, dois devpaths, dois comandos independentes. Se a API resolvesse por serial, não haveria como dizer a qual dos dois você se referia. `--yes` pula a confirmação; o preâmbulo é impresso de todo jeito e nomeia o rack slot antes de qualquer coisa rodar."
+        },
+        {
+          "label": "O que o endereçamento por serial faz em vez disso",
+          "lang": "text",
+          "code": "# host-serial:<target>:<cmd> — the target-name field, matched against\n# serial OR devpath, exactly as adb's atransport::MatchesTarget does\nSENT   : 0026host-serial:0123456789ABCDEF:get-state",
+          "output": "STATUS : FAIL\nLENGTH : 0014 (20 bytes)\nPAYLOAD:\nmore than one device",
+          "note": "A recusa é o bom desfecho. O desfecho perigoso é um build de servidor que escolhe um dos dois, e é por isso que nada nos caminhos de recovery ou de health tem permissão para endereçar por serial."
+        },
+        {
+          "label": "O que o validador de devpath aceita",
+          "lang": "text",
+          "code": "// internal/adbwire/device.go:343-374, run as the real ValidateDevpath\ndevpathRe    = ^usb:[0-9A-Za-z][0-9A-Za-z._-]*$\nmaxDevpathLen = 128",
+          "output": "\"usb:3-1.4.2\"            true\n\"usb:3-1.1\"              true\n\"usb:20-3\"               true      <- Darwin location form\n\"usb:3-1.4:reboot\"       false     <- a colon would terminate the service field early\n\"usb:3-1.4 usb:3-1.5\"    false     <- a space would too\n\"usb:3-1.4\\nhost:kill\"   false     <- a newline\n\"0123456789ABCDEF\"       false     <- a serial is not a position\n\"emulator-5554\"          false\n\"\"                       false",
+          "note": "O padrão é uma fronteira de segurança, não higiene de formatação. Um devpath é interpolado em uma string de serviço delimitada por dois-pontos, e a requisição do outro lado de uma troca de alvo pode ser um reboot apontado para um aparelho que está há três horas dentro da execução de outra pessoa. Um único predicado, `isDevpath`, sustenta tanto o parser da listagem quanto `ValidateDevpath`, de modo que o que este pacote registra e o que ele endereça não podem divergir."
+        }
+      ],
+      "source": "internal/adbwire/doc.go:36-49, internal/adbwire/client.go:246-261, 407-419, internal/adbwire/device.go:85-190, 334-374, migrations/00001_core.sql:95-101, migrations/00004_operate.sql:296-310, 344-357, internal/demo/seed.go:31-38, 633, test/fakeadb/doc.go:24-33"
+    },
+    {
+      "heading": "A escada de resolução: brand → fingerprint → serial E slot → adopt",
+      "body": "A decisão \"que dispositivo é este?\" mora em exatamente um lugar: `farm.resolve_device`, `migrations/00004_operate.sql:245`. É SQL e não Go de propósito — uma segunda cópia da escada em Go divergiria da que está no banco, e as duas discordariam sobre qual aparelho é este. `internal/enroll` leva evidência para dentro e traz uma resposta para fora, e nada mais (`enroll.go:720-753`).\n\nA primeira coisa que a função faz é procurar o slot de `(host_id, usb_path)` e **RAISE `no_data_found` se não houver nenhum** (`:266-270`). Adoção precisa de uma posição; registrar posições é trabalho da topologia, não do enrolment. Por isso `internal/enroll` lê a lista de slots ele mesmo uma vez por ciclo (`enroll.go:466-489`), em vez de deixar essa exceção abortar a transação que estava registrando o avistamento.\n\nDepois, quatro degraus, a evidência mais forte primeiro.",
+      "bullets": [
+        "**Degrau 1 — uid da farm gravado pelo brand.** Nós escrevemos, então é nosso. Um dispositivo que carrega um brand é sempre resolvível, tenha ele dito o que for ou deixado de dizer (`identity.go:204-218`).",
+        "**Degrau 2 — fingerprint de hardware.** Um digest sobre as propriedades que um factory reset não toca. Se exatamente um dispositivo casa, é esse o dispositivo; mais de um e a resposta é `ambiguous` sem nomear dispositivo nenhum. **Este degrau levanta SQLSTATE 42883 no PostgreSQL 17 — veja os Gaps. Ele é o primeiro degrau que um aparelho recém-saído da caixa alcança.**",
+        "**Degrau 3 — serial E o slot em que ele foi visto pela última vez.** Um serial sozinho não identifica nada. Os dois precisam concordar. Se o serial é carregado por mais de uma linha, `serial_ambiguous` é setado em todas elas e nenhum dispositivo é nomeado.",
+        "**Degrau 4 — adopt.** Cunha `df-` + 16 bytes aleatórios em hex, insere em `farm.devices`, cria a linha de `farm.device_runtime` (que nasce com health `unknown`), e então reconfere se há uma colisão de serial que só ficou visível depois do insert.",
+        "Qualquer que seja o degrau que responda, a ocupação é registrada: toda tenancy vencida é fechada (`device moved`, `slot reoccupied`) e a atual é aberta em `farm.slot_occupancy`, que carrega índices parciais únicos forçando um dispositivo vivo por slot e um slot vivo por dispositivo (`00004_operate.sql:90-92`)."
+      ],
+      "examples": [
+        {
+          "label": "Degrau 1 — o dispositivo com brand (revertido, nada mudou)",
+          "lang": "sql",
+          "code": "BEGIN;\nSELECT * FROM farm.resolve_device(\n  'h01', '3-1.1', 'df-970e1c5b7163543ded6ed5f3a05c0978', NULL,\n  '0123456789ABCDEF', 'default', '{}'::jsonb);\nROLLBACK;",
+          "output": "              device_id               | resolution  | slot_id \n--------------------------------------+-------------+---------\n a6adf5c9-ea2e-4105-a3c4-a8b1104a6259 | branded_uid |       1"
+        },
+        {
+          "label": "Degrau 3 — um serial único no slot em que ele foi visto pela última vez",
+          "lang": "sql",
+          "code": "BEGIN;\nSELECT * FROM farm.resolve_device(\n  'h01', '3-1.3', NULL, NULL, 'R534TOLGRWJSLN', 'default', '{}'::jsonb);\nROLLBACK;",
+          "output": "              device_id               |   resolution    | slot_id \n--------------------------------------+-----------------+---------\n dfe76543-270a-42a8-b2d9-44b681277755 | serial_and_slot |       3"
+        },
+        {
+          "label": "Degrau 3 em um serial CLONE — este é o caso que precisa ser entendido",
+          "lang": "sql",
+          "code": "BEGIN;\n-- a spare position, registered the way topology would register it\nSELECT farm.register_slot('h01','3-1.9','3-1',9,\n         'StarTech ST7300USBM 7-port',7,true,'R1-U04-H1-P9') AS new_slot_id;\n-- an unbranded, un-fingerprinted phone carrying the clone serial turns up there\nSELECT * FROM farm.resolve_device('h01','3-1.9', NULL, NULL,\n         '0123456789ABCDEF', 'default',\n         '{\"manufacturer\":\"Google\",\"model\":\"Pixel 7\"}'::jsonb);\nSELECT count(*) AS rows_with_clone_serial\n  FROM farm.devices WHERE adb_serial = '0123456789ABCDEF';\nROLLBACK;",
+          "output": " new_slot_id \n-------------\n         119\n\n              device_id               | resolution  | slot_id \n--------------------------------------+-------------+---------\n 7b9e3d4e-0232-4d4c-9f2f-1310b438dd74 | adopted_new |     119\n\n rows_with_clone_serial \n------------------------\n                      3",
+          "note": "O veredito `ambiguous` calculado no degrau 3 é DESCARTADO: o degrau 4 testa apenas `IF v_dev IS NULL`, que continua verdadeiro. Uma terceira linha agora carrega esse serial. Faça o brand dos seus dispositivos; os degraus de fingerprint e de serial são o plano B, não o plano. Repare no id do slot: sequências de identidade não são transacionais, então um rollback ainda consome o número e a sua execução vai imprimir outro."
+        },
+        {
+          "label": "O mesmo serial clonado quando o slot já está ocupado",
+          "lang": "sql",
+          "code": "BEGIN;\nSELECT * FROM farm.resolve_device('h01','3-1.1', NULL, NULL,\n         '0123456789ABCDEF', 'default', '{}'::jsonb);\nROLLBACK;",
+          "output": "ERROR:  23505: duplicate key value violates unique constraint \"devices_one_per_slot\"\nDETAIL:  Key (current_slot_id)=(1) already exists.\nCONTEXT: PL/pgSQL function resolve_device(...) line 62 at SQL statement",
+          "note": "`enroll.classifyResolveError` mapeia 23505 para a resolução `conflict`, detalhe `slot_occupied_by_another_device`, e loga \"enrollment will not move that row, a human must re-slot or retire it\" (enroll.go:771-782). Ele não vai limpar o ponteiro, porque o dispositivo que está saindo pode estar segurando um lease vivo."
+        },
+        {
+          "label": "Nenhum slot registrado naquela posição",
+          "lang": "sql",
+          "code": "SELECT * FROM farm.resolve_device('h01','9-9.9', NULL, NULL,\n         'ANYSERIAL', 'default', '{}'::jsonb);",
+          "output": "ERROR:  P0002: no slot registered at h01/9-9.9 — run topology discovery first\nCONTEXT: PL/pgSQL function resolve_device(...) line 16 at RAISE",
+          "note": "O enrolment nunca deixa isso disparar no caminho normal: ele lê `farm.slots` primeiro e registra o avistamento com `resolution = 'pending'` e `detail.reason = 'no_slot_registered'` em vez disso (enroll.go:587-594). Se disparar mesmo assim — o slot sumiu no meio do ciclo — classifyResolveError mapeia P0002 para o mesmo desfecho."
+        }
+      ],
+      "source": "migrations/00004_operate.sql:245-372, internal/enroll/enroll.go:466-489 (slots), 576-670 (record), 720-812 (resolve, classifyResolveError), internal/enroll/identity.go:193-218 (Resolvable)"
+    },
+    {
+      "heading": "O fingerprint de hardware: o que ele coloca no hash e o que ele deliberadamente deixa de fora",
+      "body": "O trabalho inteiro do fingerprint é reconhecer um aparelho que voltou **limpo**. Um factory reset apaga `/data`, que é onde o brand mora, onde `Settings.Secure.android_id` mora, e onde mora qualquer coisa que um app pudesse ter escrito. Por isso o digest é construído apenas a partir de dados de partição somente-leitura e do bootloader.\n\nCinco componentes, em ordem fixa, cada um prefixado pelo comprimento (`%d:%s`) para que `(\"ab\",\"c\")` e `(\"a\",\"bc\")` não possam gerar o mesmo hash:\n\n`manufacturer` · `model` · `device` (codinome da placa) · `hardware` (SoC/plataforma) · `serial` (o primeiro não vazio entre `ro.boot.serialno`, `ro.serialno` e o serial do ADB).\n\n**As propriedades de build ficam de fora de propósito.** `ro.build.fingerprint` e `ro.build.version.*` também sobrevivem a um factory reset, mas não sobrevivem a um OTA. Uma atualização em toda a frota mudaria o fingerprint de todos os dispositivos na mesma noite: a escada cairia para serial-e-slot no rack inteiro de uma vez, e qualquer aparelho que também tivesse sido recabeado seria adotado como novo. Um wipe perde o brand de um dispositivo; um OTA que zerasse todos os fingerprints perderia o da frota inteira.\n\n**O serial é obrigatório, e pelo menos três dos cinco componentes precisam estar presentes** (`fingerprintMinComponents = 3`). Sem serial, toda unidade de um mesmo modelo gera hash idêntico e `resolve_device` reporta `ambiguous` para o rack inteiro. Abaixo de três componentes o digest deixa de distinguir unidades e passa a agrupá-las, o que é pior do que não ter digest nenhum. Abaixo desse mínimo a função retorna `nil`, o que não é um erro — a resolução simplesmente desce um degrau na escada.\n\nO digest é prefixado com `device-farmer/hwfp/1`. Quando o conjunto de componentes for revisado um dia, o incremento de versão torna os digests novos visivelmente diferentes, em vez de colidirem em silêncio com os antigos.",
+      "examples": [
+        {
+          "label": "Saída real de HardwareFingerprint",
+          "lang": "text",
+          "code": "// Run as the real internal/enroll.HardwareFingerprint via\n//   go test -overlay <scratch>/overlay.json -run TestDocsDump ./internal/enroll/\n// which maps a scratchpad test file into the package without writing to the tree.\n// sha256 input, length-prefixed:\n//   20:device-farmer/hwfp/1 12:manufacturer 6:Google 5:model 7:Pixel 7\n//   6:device 7:panther 8:hardware 7:panther 6:serial 16:0123456789ABCDEF",
+          "output": "3-1.1 Pixel 7                        9866b639890cbf7fd32aa502053c2ae333da4db5a012d0079a5ae289994668f1  [manufacturer model device hardware serial]\n3-1.2 Pixel 6a                       c6d5aa8e0e382da16699dbd0437b9cbaa0a6c0ef4b1a1447b21f1d81e50690e4  [manufacturer model device hardware serial]\nmodel + serial only (2 components)   nil  (below the bar)\nno serial at all                     nil  (below the bar)\ntwo identical units, same serial     9866b639890cbf7fd32aa502053c2ae333da4db5a012d0079a5ae289994668f1  [manufacturer model device hardware serial]",
+          "note": "O par de clones gera fingerprints SEPARADOS porque o modelo e a placa diferem — e é por isso que um fingerprint é evidência mais forte que um serial. A última linha é o limite honesto: duas unidades genuinamente idênticas carregando o mesmo serial produzem o mesmo digest, `resolve_device` responde `ambiguous`, e nenhum dispositivo é nomeado. Essa é a resposta correta, não um bug."
+        }
+      ],
+      "source": "internal/enroll/identity.go:453-558 (HardwareFingerprint, fingerprintVersion, fingerprintMinComponents, writeField), internal/enroll/identity.go:30-46 (property keys)"
+    },
+    {
+      "heading": "Branding: onde a farm escreve o próprio nome no dispositivo",
+      "body": "O brand é o degrau mais forte porque fomos nós que o escrevemos. Ele mora em **`/data/local/tmp/.farm/uid`** — o único diretório em que um shell ADB consegue escrever num aparelho de fábrica, sem root. Ele está dentro de `/data`, então um factory reset o apaga, que é exatamente o caso que o fingerprint de hardware existe para cobrir.\n\nO uid é cunhado por `farm.resolve_device` (`'df-' || encode(gen_random_bytes(16),'hex')`) e lido de volta de `farm.devices.farm_uid` antes de ser escrito no aparelho. `internal/enroll` nunca inventa um: um uid que este processo tivesse inventado nomearia uma linha que não existe. O formato é uma constraint CHECK em `farm.devices.farm_uid` (`^df-[0-9a-f]{32}$`, `00001_core.sql:135`) e a mesma regex em Go (`brand.go:38`) — conferida antes de o valor entrar em um comando de shell, o que de quebra o torna inerte para o shell.\n\nO branding é idempotente e **nunca sobrescreve um uid diferente**. Dois uids de farm em um mesmo dispositivo significam que duas linhas de `farm.devices` acreditam ser este aparelho; sobrescrever uma delas fundiria o histórico de dois dispositivos — scores de falha, quarantines, registros de lease — em uma única linha, sem nenhuma forma posterior de dizer qual medição pertencia a qual aparelho. Isso é recusado, logado em ERROR e escrito em `farm.events` como `identity_conflict`.",
+      "bullets": [
+        "A escrita é atômica: `uid.new` e então `mv -f`. Um aparelho que perde energia no meio do caminho precisa terminar com o brand antigo ou com o novo, nunca com meio uid — um brand truncado não casa com nada e manda um aparelho conhecido de volta para baixo na escada.",
+        "É feito `sync`, com fallbacks, porque o propósito inteiro do brand é sobreviver aos reboots abruptos que uma escada de recovery provoca.",
+        "A escrita **reconfere no próprio dispositivo** o que quem chamou já havia conferido um round trip antes, e recusa ali mesmo com exit 17. Sem essa linha, a única promessa que este pacote faz repousaria sobre um `cat` ter dado certo um segundo antes.",
+        "A escrita é verificada relendo o arquivo por uma conexão nova. Uma escrita que ninguém releu é uma escrita que apenas acreditamos ter acontecido, e um dispositivo sem brand que julgamos ter brand acaba sendo adotado duas vezes.",
+        "Um arquivo de brand cujo conteúdo não é um uid de farm é registrado como `malformed_uid` no detalhe da observação e **nunca serve de base para ação** (`enroll.go:574`): alguma coisa que não é este sistema escreveu esse arquivo, e o dispositivo não receberá brand enquanto ele estiver ali.",
+        "Um arquivo de brand vazio é lido como \"sem brand\" de propósito, para que uma escrita que perdeu energia possa ser substituída em vez de bloquear aquele dispositivo para sempre. O exit 44 significa \"não existe arquivo\", que é deliberadamente distinto de \"o arquivo não pôde ser lido\" — `cat 2>/dev/null` dá a mesma resposta para os dois casos."
+      ],
+      "examples": [
+        {
+          "label": "Os três comandos, exatamente como o código os monta",
+          "lang": "bash",
+          "code": "# Printed by running the real probeCommand, brandReadCmd and brandWriteCmd\n# under `go test -overlay` (no file was added to the repository).\n\n# PROBE — brand and eleven properties in ONE round trip. The brand is read\n# first and printed first because it is the strongest evidence we will have.\nprintf '%s=%s\\n' farm_uid \"$(cat /data/local/tmp/.farm/uid 2>/dev/null)\"; for k in ro.product.manufacturer ro.product.model ro.product.name ro.product.device ro.build.version.release ro.build.version.sdk ro.product.cpu.abilist ro.build.fingerprint ro.hardware ro.boot.serialno ro.serialno; do printf '%s=%s\\n' \"$k\" \"$(getprop \"$k\")\"; done\n\n# BRAND READ — exit 44 means \"there is no file\".\nif [ -e /data/local/tmp/.farm/uid ]; then cat /data/local/tmp/.farm/uid; else exit 44; fi\n\n# BRAND WRITE — exit 17 means the device found a different brand in place.\nif [ -s /data/local/tmp/.farm/uid ] && [ \"$(cat /data/local/tmp/.farm/uid 2>/dev/null)\" != 'df-970e1c5b7163543ded6ed5f3a05c0978' ]; then exit 17; fi; mkdir -p /data/local/tmp/.farm && printf '%s' 'df-970e1c5b7163543ded6ed5f3a05c0978' > /data/local/tmp/.farm/uid.new && chmod 600 /data/local/tmp/.farm/uid.new && mv -f /data/local/tmp/.farm/uid.new /data/local/tmp/.farm/uid && { sync /data/local/tmp/.farm/uid 2>/dev/null || sync 2>/dev/null || true; }",
+          "output": "(the three strings above are the verbatim output)",
+          "note": "Um round trip em vez de doze não é micro-otimização: um host sonda todos os dispositivos conectados a cada ciclo, cada chamada ADB é uma conexão nova com negociação de transporte, e alguns desses dispositivos estão no meio de um job."
+        },
+        {
+          "label": "Lendo o brand de um dispositivo na mão",
+          "lang": "bash",
+          "code": "# PowerShell. Do NOT run this from Git Bash on Windows: MSYS path translation\n# rewrites /data/local/tmp/... into C:/Program Files/Git/data/local/tmp/...\n# before the CLI ever sees it (verified — the mangled path comes back in the\n# echoed \"command\" field). Prefix with MSYS2_ARG_CONV_EXCL='*' if you must.\n$env:FARM_API_URL='http://127.0.0.1:8420'\n& .\\bin/farmd.exe ctl device exec df-970e195b71634f24ed6ed8f3a05c0e91 `\n    --reason \"checking which farm this handset belongs to\" --yes -o json `\n    -- cat /data/local/tmp/.farm/uid",
+          "output": "{\n  \"device_id\": \"de141b14-f99c-44c4-89b1-eb69e1a855f5\",\n  \"adb_devpath\": \"usb:3-1.2\",\n  \"adb_endpoint\": \"127.0.0.1:50136\",\n  \"command\": \"cat /data/local/tmp/.farm/uid\",\n  \"exit_code\": 0,\n  \"output\": \"\\n\",\n  \"exited\": true,\n  \"truncated\": false,\n  \"duration_ms\": 0\n}",
+          "note": "Os dispositivos simulados respondem vazio: o servidor ADB falso tem script para cinco comandos específicos (internal/demo/demo.go:809-816) e devolve um frame shell v2 vazio com exit 0 para qualquer outra coisa. Em hardware real isto imprime o uid. O que o exemplo demonstra é o caminho auditado e endereçado por devpath que ele percorre — e que um aparelho sem brand é indistinguível disto."
+        }
+      ],
+      "source": "internal/enroll/brand.go:16-130 (BrandDir, BrandPath, uidRe, exit codes, brandReadCmd, brandWriteCmd, ConflictError), internal/enroll/identity.go:88-121 (buildProbeCommand), internal/enroll/enroll.go:890-940 (brandDevice), migrations/00004_operate.sql:314, migrations/00001_core.sql:135"
+    },
+    {
+      "heading": "Observe antes de concluir: farm.identity_observations",
+      "body": "Todo ciclo insere o avistamento **primeiro, em um statement próprio**, antes de `farm.resolve_device` ser chamada (`enroll.go:606` chama `observe`, `:620` chama `resolve`). Essa ordem é a razão inteira de a tabela existir: uma falha na resolução — uma posição desconhecida, um slot cujo ocupante anterior ainda está registrado nele, um banco que rejeita a chamada — ainda assim deixa para trás um registro durável do que foi fisicamente visto. Semanas depois, esse registro é a única coisa capaz de explicar por que um dispositivo foi adotado, ou por que não foi.\n\nA linha carrega o que o servidor ADB disse (`usb_path`, `adb_devpath`, `transport_id`, `adb_serial`), o que o dispositivo disse sobre si mesmo (`farm_uid`, `hw_fingerprint`, `manufacturer`, `model`, `product`, `device_codename`, `android_release`, `sdk_int`, `abis`, `build_fingerprint`), o `host_epoch` em que o transport id foi cunhado, e uma `resolution` que começa em `pending`. `observed_at` é o default `now()` da coluna — o INSERT nunca passa um timestamp, então nenhuma leitura do relógio do processo de enrolment é jamais gravada.\n\nA conclusão é anexada depois, com `detail = detail || $jsonb` (`enroll.go:821-825`). O merge importa: a evidência da própria observação precisa sobreviver à conclusão.",
+      "bullets": [
+        "CHECK de `resolution`: `pending`, `branded_uid`, `hw_fingerprint`, `serial_and_slot`, `adopted_new`, `ambiguous`, `conflict`, `unreadable` (`00004_operate.sql:45-48`).",
+        "`unreadable` cobre um dispositivo que não respondeu nada aproveitável: `unauthorized`, `offline`, `probe_timeout`, `probe_truncated`, `probe_noisy`, `detached`, `probe_failed`, `identity_incomplete`.",
+        "`cancelled` deliberadamente NÃO é registrado (`enroll.go:545-547`). Uma sondagem que este processo abandonou ao sair é um fato sobre um shutdown; colocá-la no registro seria juntar um deploy como prova contra um aparelho.",
+        "Uma resposta de sondagem parcial ou longa demais é registrada, mas nunca serve de base para resolução. Metade de uma lista de propriedades é indistinguível da lista de propriedades de outro dispositivo, e adotar em cima dela cunha um fantasma.",
+        "Toda string fornecida pelo dispositivo é limitada e tornada armazenável antes de chegar perto do banco (`identity.go:56-75`): o PostgreSQL rejeita byte NUL e UTF-8 inválido (22021 em text, 22P05 em jsonb), e um único byte ruim faria o INSERT inteiro falhar — perdendo o *avistamento*, em todo ciclo, para sempre, sem nada dizendo por quê.",
+        "Só dois desfechos ganham uma linha em `farm.events`: `device_adopted` (`enroll.go:656`) e `identity_conflict` (`:930`). Um ciclo que reconhece quarenta dispositivos conhecidos escreve quarenta linhas de observação e evento nenhum, porque uma linha do tempo com uma entrada por dispositivo por ciclo é uma linha do tempo que ninguém lê.",
+        "`ident_obs_conflict` é um índice parcial em `(observed_at DESC) WHERE resolution IN ('ambiguous','conflict','unreadable')` — a consulta que o operador de fato roda."
+      ],
+      "examples": [
+        {
+          "label": "O que deu errado, do mais recente para o mais antigo",
+          "lang": "sql",
+          "code": "SELECT observed_at, host_id, usb_path, resolution,\n       detail->>'reason'     AS reason,\n       detail->>'unreadable' AS unreadable,\n       adb_serial\n  FROM farm.identity_observations\n WHERE resolution IN ('ambiguous','conflict','unreadable','pending')\n ORDER BY observed_at DESC\n LIMIT 20;",
+          "output": " observed_at | host_id | usb_path | resolution | reason | unreadable | adb_serial \n-------------+---------+----------+------------+--------+------------+------------\n(0 rows)",
+          "note": "A tabela inteira está vazia neste sistema (0 linhas), e o motivo importa: o laço de enrolment só roda sob o papel `farmd node`, que a demonstração não inicia. Tudo o que está descrito nesta seção e nas três anteriores foi verificado chamando o SQL diretamente e lendo o código, não vendo o laço rodar. Veja os Gaps."
+        },
+        {
+          "label": "Todos os avistamentos de um mesmo dispositivo",
+          "lang": "sql",
+          "code": "SELECT observed_at, usb_path, resolution, farm_uid,\n       encode(hw_fingerprint,'hex') AS hw_fp,\n       detail->>'brand' AS brand\n  FROM farm.identity_observations\n WHERE device_id = (SELECT id FROM farm.devices\n                     WHERE farm_uid = 'df-970e1c5b7163543ded6ed5f3a05c0978')\n ORDER BY observed_at DESC LIMIT 20;",
+          "output": "(0 rows) — same reason as above",
+          "note": "`ident_obs_device` indexa (device_id, observed_at DESC) exatamente para esta consulta."
+        }
+      ],
+      "source": "migrations/00004_operate.sql:24-56, internal/enroll/enroll.go:538-672 (record), 675-712 (observe), 817-843 (setResolution), internal/enroll/identity.go:56-75 (storability bounds)"
+    },
+    {
+      "heading": "Como a topologia USB vira slots, hubs, controladores e power domains",
+      "body": "Um **slot é uma posição**: barramento, hub, porta. É o que um humano consegue alcançar a pé, é o que um interruptor de energia consegue cortar, e é o que sobrevive ao dispositivo nele ser desplugado, trocado, reflashado ou renomeado. Dispositivos entram e saem dos slots.\n\nA descoberta lê a árvore USB do Linux a partir de `/sys/bus/usb/devices` através de um `fs.FS`, e é por isso que o parser e a aritmética dos rótulos são testáveis em qualquer máquina enquanto a fonte real se recusa a rodar em qualquer coisa que não seja Linux. `topo.Sysfs` falha explicitamente fora do Linux em vez de retornar uma árvore vazia, porque **uma árvore vazia é a resposta perigosa**: a descoberta concluiria que todos os slots do host sumiram.\n\nDois detalhes do sysfs governam o parsing e são fáceis de errar. As entradas sob `/sys/bus/usb/devices` são links simbólicos para dentro de `/sys/devices`, então nada aqui filtra por `IsDir` e nada usa `fs.WalkDir` (que não segue links simbólicos e veria uma árvore vazia num host real). E o diretório de um root hub se chama `usb3` enquanto ele se endereça como `3-0`, com um dispositivo na primeira porta raiz sendo `3-1`, não `3-0.1`.\n\nO que vira slot é deliberadamente conservador. Um hub entra na farm quando está carregando pelo menos um dispositivo Android — reconhecido pela tripla de interface USB `ff/42/01` (ADB) ou `ff/42/03` (fastboot), que é o que o próprio código de host do adb casa e que não depende de uma tabela de vendor id. Um hub cheio de dongles na mesa de alguém não vira quatorze slots só porque calhou de dividir a mesma máquina.",
+      "bullets": [
+        "Toda porta de um hub adotado vira um slot, ocupada ou não: a tomada vazia ao lado de sete cheias é onde o oitavo aparelho vai, e o slot precisa existir antes do dispositivo.",
+        "Uma porta que carrega outro hub é pulada. Registrá-la criaria um slot cujo `usb_path` é o `usb_path` de um hub, e uma ação de recovery mirando esse \"dispositivo\" estaria mirando um hub.",
+        "Root hubs ficam de fora por padrão. Mesmo com `IncludeRootHubs`, apenas as portas que estão segurando um dispositivo Android viram slots — as outras portas de um root hub são o teclado, a NIC e o BMC da própria máquina, e transformar isso em posições escalonáveis é como um operador acaba ciclando a energia do disco de boot do host para recuperar um aparelho.",
+        "Hubs abaixo de `MinPorts` (padrão `DefaultMinHubPorts = 3`) são ignorados: o hub de duas portas dentro de um monitor, o que fica dentro de um teclado.",
+        "O registro é por hub, cada um em sua própria transação (`registerHub`, `discover.go:637-682`). O hub é a unidade natural — seu controlador, seu power domain e suas portas são uma afirmação consistente sobre uma peça de hardware — de modo que uma falha no meio do caminho deixa hubs inteiros registrados em vez de meio hub.",
+        "`registerHub` só retorna uma contagem diferente de zero depois que `tx.Commit` tem sucesso. Reportar como escritas linhas que sofreram rollback coloca no relatório e em `farm_topo_slots_registered_total` um número que nada no banco sustenta, e é assim que um operador conclui que um rack foi registrado e para de olhar.",
+        "`linkHubs` seta `farm.hubs.parent_hub_id` depois, porque `register_slot` trata um hub por vez e ainda não tem como saber que o hub a montante existe. A correlação de raio de impacto lê essa árvore: um hub de cinco portas encadeado em outro falha como uma unidade junto com o pai."
+      ],
+      "examples": [
+        {
+          "label": "register_slot constrói a cadeia inteira a partir de uma posição observada",
+          "lang": "sql",
+          "code": "BEGIN;\n-- a cheap 4-port hub with NO per-port VBUS switching\nSELECT farm.register_slot('h01','5-4.3','5-4',3,'Cheap 4-port hub',4,false,'R1-U04-H9-P3') AS slot_id;\n\nSELECT c.root_bus, hb.usb_path AS hub, hb.port_count, hb.vbus_switchable,\n       pd.kind AS power_kind, pd.control, pd.control_addr,\n       s.usb_path, s.adb_devpath, s.topo_path::text, s.rack_slot\n  FROM farm.slots s\n  JOIN farm.hubs hb          ON hb.id = s.hub_id\n  JOIN farm.controllers c    ON c.id  = hb.controller_id\n  JOIN farm.power_domains pd ON pd.id = s.power_domain_id\n WHERE s.host_id='h01' AND s.usb_path='5-4.3';\nROLLBACK;",
+          "output": " slot_id \n---------\n     120\n\n root_bus | hub | port_count | vbus_switchable | power_kind | control | control_addr | usb_path | adb_devpath | topo_path |  rack_slot   \n----------+-----+------------+-----------------+------------+---------+--------------+----------+-------------+-----------+--------------\n        5 | 5-4 |          4 | f               | ganged     | none    | 5-4          | 5-4.3    | usb:5-4.3   | h01.5_4.3 | R1-U04-H9-P3",
+          "note": "Uma única chamada criou o controlador (barramento 5), o hub, um power domain GANGED e o slot — com `adb_devpath` gerado e `topo_path` como ltree para consultas por prefixo. Revertida; o rack em produção fica intocado. Os ids avançam de todo jeito, então a sua execução imprime um slot_id maior."
+        },
+        {
+          "label": "Os hubs do rack em produção e seus power domains",
+          "lang": "sql",
+          "code": "SELECT hb.host_id, hb.usb_path AS hub, hb.model, hb.port_count,\n       hb.vbus_switchable, pd.kind AS power_kind, pd.control, count(s.id) AS slots\n  FROM farm.hubs hb\n  LEFT JOIN farm.slots s          ON s.hub_id = hb.id\n  LEFT JOIN farm.power_domains pd ON pd.id = s.power_domain_id\n GROUP BY 1,2,3,4,5,6,7 ORDER BY 1,2;",
+          "output": " host_id | hub |            model             | port_count | vbus_switchable | power_kind | control  | slots \n---------+-----+------------------------------+------------+-----------------+------------+----------+-------\n h01     | 3-1 | StarTech ST7300USBM 7-port   |          7 | t               | per_port   | uhubctl  |     7\n h01     | 3-2 | Plugable USB3-HUB7BC         |          7 | t               | per_port   | uhubctl  |     7\n h01     | 4-1 | Anker A7515 7-port           |          7 | t               | ganged     | smarthub |     7\n h01     | 4-2 | AmazonBasics HU3770V1 7-port |          7 | f               | none       | none     |     7\n h02     | 3-1 | StarTech ST7300USBM 7-port   |          7 | t               | per_port   | uhubctl  |     7\n h02     | 3-2 | Plugable USB3-HUB7BC         |          7 | t               | per_port   | uhubctl  |     7\n h02     | 4-1 | Anker A7515 7-port           |          7 | t               | ganged     | smarthub |     7\n h02     | 4-2 | AmazonBasics HU3770V1 7-port |          7 | f               | none       | none     |     7",
+          "note": "O hub 4-1 reporta VBUS chaveável, mas o domínio dele é `ganged` em um `smarthub`: um interruptor externo tem autoridade sobre o sysfs, e `reconcilePower` deliberadamente não mexe num domínio desses. Este layout foi semeado pela demonstração, não descoberto — a descoberta nunca rodou aqui."
+        }
+      ],
+      "source": "internal/topo/discover.go:1-40 (package comment), 56-120 (defaults, HubFilter), 470-540 (hub selection), 528-570 (planHub), 637-682 (registerHub), 742-780 (linkHubs), internal/topo/sysfs.go:28-53, 90-110, 200-232, migrations/00004_operate.sql:376-437 (register_slot), migrations/00001_core.sql:53-121"
+    },
+    {
+      "heading": "Por que um hub sem chaveamento por porta recebe UM único domínio ganged",
+      "body": "`farm.power_domains` modela **o que um único interruptor de fato controla**. Em um hub sem chaveamento de VBUS por porta, todas as portas dividem um domínio, então \"cicle a energia deste dispositivo\" é na verdade \"cicle a energia destes sete dispositivos\" — seis dos quais podem estar no meio de uma execução, segurando leases vivos.\n\nPor isso `farm.register_slot` cria exatamente um domínio por caminho de hub e define o tipo dele a partir da capacidade de chaveamento do hub: `per_port`/`uhubctl` quando o hardware prova que consegue chavear uma porta, `ganged`/`none` caso contrário (`00004_operate.sql:411-423`). O comentário na migração é direto sobre por que isso mora em SQL e não em Go: é o que impede a escada de recovery de ciclar a energia de sete dispositivos para consertar um.\n\n**É preciso evidência positiva para afirmar per-port; a ausência de evidência nunca é lida como capacidade.** O `hubPower` em `sysfs.go` lê os bits 1..0 de `wHubCharacteristics` (00 ganged, 01 individual, 1x nenhum) quando o kernel os expõe e, caso contrário, conta os atributos `disable` por porta — exigindo que o atributo esteja presente *e gravável* em **todas** as portas (`writableAttr`, `sysfs.go:484-490`), porque um `disable` somente-leitura é uma leitura de status, não um controle. Qualquer coisa ambígua — algumas portas controláveis, outras não, nenhum atributo, um diretório de interface que não pôde ser listado — resolve para `unknown`, que quem chama trata como não chaveável.\n\nErrar para o lado de ganged custa um raio de impacto mais largo em uma tentativa de recovery, e uma recusa. Errar para o outro lado custa a execução de seis horas de alguém.\n\n`reconcilePower` existe porque `register_slot` cria um domínio na primeira vez que o vê e nunca mais volta nele — correto para uma função de schema, errado para um rack onde alguém trocou um hub chaveável por um barato na mesma tomada. **O rebaixamento para `ganged` é a direção que sustenta tudo.** A promoção só acontece diante de evidência positiva, e os dois UPDATEs ficam restritos exatamente às formas `('ganged','none')` / `('per_port','uhubctl')` que o próprio `register_slot` escreve, de modo que um domínio que um operador apontou para uma PDU ou para um smart hub fica intocado.",
+      "examples": [
+        {
+          "label": "Todas as portas de um hub não chaveável dividem um domínio",
+          "lang": "sql",
+          "code": "BEGIN;\nSELECT p AS port,\n       farm.register_slot('h01','5-4.'||p,'5-4',p,'Cheap 4-port hub',4,false,'R1-U04-H9-P'||p)\n  FROM generate_series(1,4) p;\n\nSELECT s.usb_path, s.power_domain_id, pd.kind, pd.control,\n       count(*) OVER (PARTITION BY s.power_domain_id) AS slots_sharing_this_domain\n  FROM farm.slots s JOIN farm.power_domains pd ON pd.id = s.power_domain_id\n WHERE s.host_id='h01' AND s.usb_path LIKE '5-4.%' ORDER BY s.usb_path;\nROLLBACK;",
+          "output": " usb_path | power_domain_id |  kind  | control | slots_sharing_this_domain \n----------+-----------------+--------+---------+---------------------------\n 5-4.1    |              14 | ganged | none    |                         4\n 5-4.2    |              14 | ganged | none    |                         4\n 5-4.3    |              14 | ganged | none    |                         4\n 5-4.4    |              14 | ganged | none    |                         4",
+          "note": "Um domínio, quatro slots. A escada lê esse número antes de agir."
+        },
+        {
+          "label": "A recusa, ao vivo",
+          "lang": "bash",
+          "code": "# slot 22 is R1-U04-H4-P1 on hub 4-2 (AmazonBasics, vbus_switchable = false)\ncurl -s -X POST http://127.0.0.1:8420/api/v1/slots/22/power \\\n  -H 'content-type: application/json' \\\n  -d '{\"reason\":\"show the refusal path\"}'",
+          "output": "{\"error\":{\"code\":\"conflict\",\n \"message\":\"this slot has no controllable power domain, so its port power cannot be cycled from here\",\n \"detail\":{\"blast_radius\":\"power_domain\",\"host_id\":\"h01\",\"hub_id\":4,\n   \"live_leases\":1,\"power_control\":\"none\",\"power_domain_id\":4,\n   \"power_kind\":\"none\",\"rack_slot\":\"R1-U04-H4-P1\",\n   \"requires_policy\":\"allow_port_power_cycle\",\"slot_id\":22,\n   \"slot_state\":\"active\",\"slots_in_domain\":7,\"tier\":4,\n   \"tier_name\":\"port_power\",\"usb_path\":\"4-2.1\",\"vbus_switchable\":false}}}",
+          "note": "`slots_in_domain: 7` é a consequência do ganged dita a quem chamou, e é estrutural. `live_leases` reflete o estado de alocação e muda entre chamadas. A recusa é escrita em `farm.recovery_attempts.refusal` em vez de ficar como um buraco na linha do tempo: \"não aconteceu nada aqui\" e \"nós nos recusamos a agir, e eis o porquê\" não podem parecer a mesma coisa às 3 da manhã. Não dispare isto contra um slot do hub 4-1 a não ser que você queira mesmo — aquele domínio é ganged sobre sete dispositivos vivos."
+        },
+        {
+          "label": "Recusas registradas neste sistema, e por quem",
+          "lang": "sql",
+          "code": "SELECT count(*) FILTER (WHERE refusal LIKE 'tier % has blast radius%')          AS from_recovery_ladder,\n       count(*) FILTER (WHERE refusal LIKE 'this slot has no controllable%'\n                          OR  refusal LIKE 'tier % (%) refused:%')                AS from_api_slot_power,\n       count(*) FILTER (WHERE refusal LIKE 'the live lease on this device carries%'\n                          OR  refusal LIKE 'this hub has no switchable VBUS%'\n                          OR  refusal LIKE 'the power domain is ganged%'\n                          OR  refusal LIKE 'quarantine stops scheduling%')        AS from_demo_simulator,\n       count(*) AS total\n  FROM farm.recovery_attempts WHERE refusal IS NOT NULL;",
+          "output": " from_recovery_ladder | from_api_slot_power | from_demo_simulator | total \n----------------------+---------------------+---------------------+-------\n                    0 |                  11 |                  37 |    48",
+          "note": "Três processos diferentes escrevem em farm.recovery_attempts, e nesta demonstração a escada de verdade não recusou nada. As 11 linhas da API incluem os dois curls acima. Os textos que você vê ali — disruption_policy=\"no_disruption\" proibindo um ciclo de tier 4, \"the power domain is ganged and 1 live lease(s) share it\" — são a narrativa da demonstração (internal/demo/demo.go:1938, 1999-2005), não internal/recovery/ladder.go, cujas recusas próprias começam com \"tier N (name) has blast radius …\" (ladder.go:920). Cada uma delas continua sendo a mesma forma de decisão: um dispositivo segue quebrado porque o trabalho de outra pessoa vale mais do que consertá-lo."
+        }
+      ],
+      "source": "migrations/00004_operate.sql:411-423, internal/topo/sysfs.go:56-92 (PowerSwitching), 394-490 (hubPower, countPortControls, writableAttr), internal/topo/discover.go:686-740 (reconcilePower), internal/api/ops.go:640-745, internal/recovery/ladder.go:824-925, internal/demo/demo.go:1990-2010, 2077"
+    },
+    {
+      "heading": "rack_slot: a string que um humano segue a pé às 03:00",
+      "body": "Um `rack_slot` é o que o operador lê quando um alerta diz que um dispositivo está inalcançável. `R2-U14-H3-P5` o manda para um rack, uma prateleira, um hub e uma tomada. `30501029-78dd-4fd9` o manda para uma planilha, e depois para o dispositivo errado.\n\nQuatro campos e nada mais: `R<rack>` de `farm.hosts.rack_id`, `U<unit>` de `farm.hosts.rack_unit` (preenchido com zero até dois dígitos, para que os rótulos ordenem do jeito que as prateleiras se empilham), `H<token>` para o hub, `P<port>` para a tomada. Um host sem coordenadas de rack cai de volta para o próprio host id, porque um rótulo sem lugar não leva ninguém a pé a lugar nenhum.\n\n**O token do hub é uma função pura do caminho USB**, não um ordinal de enumeração. A escolha óbvia — \"este é o terceiro hub que eu encontrei\" — é errada de um jeito que fica invisível até doer. A ordem de enumeração do sysfs reflete qual hub respondeu primeiro durante o boot, a ordem de carga dos módulos e o que já estava plugado quando o kernel subiu; reinicie o host e o terceiro hub vira o primeiro. Um índice ordenado só é estável enquanto o conjunto de hubs não muda; encaixar mais um hub em uma porta raiz anterior renumera tudo o que vem depois dele.\n\nE a falha é silenciosamente destrutiva. O braço de conflito de `farm.register_slot` é `rack_slot = COALESCE(EXCLUDED.rack_slot, farm.slots.rack_slot)`, e a descoberta sempre passa um rótulo calculado — então um ordinal deslocado não produz um rótulo ruim, ele **reescreve todos os rótulos do host em uma única passada, enquanto um operador caminha até o rack segurando uma impressão dos antigos.**\n\nPor isso `HubOrdinal(\"3-1.4\")` é `3.1.4`: o número do barramento mais a cadeia de tomadas físicas por onde o cabo de fato passa. Essa string muda quando, e somente quando, um humano move um cabo — que é exatamente quando o rótulo *deve* mudar.",
+      "bullets": [
+        "A única parte não física de um caminho USB é o número do barramento, que o kernel atribui na ordem de registro dos controladores. Um upgrade de kernel ou uma mudança na ordem de carga dos módulos pode movê-lo. É para isso que serve `Overrides.HubTokens` — fixe `\"3-1.4\" -> \"3\"` e obtenha o clássico `R2-U14-H3-P5`. (Hoje isso não tem superfície de configuração; veja os Gaps.)",
+        "`Overrides.SlotLabels` contorna o esquema por completo, para o rack em que alguém já colou números em todas as tomadas.",
+        "Três checagens de colisão, todas antes de qualquer coisa ser escrita: `NewLabeler` rejeita dois overrides reivindicando um mesmo token; `Labeler.Check` pega um override colidindo com um token *derivado*; `checkPlannedLabels` pega dois rótulos de slot já prontos sendo iguais. `farm.slots` não tem índice único em `rack_slot` — verificado contra o catálogo em produção — então, sem essas checagens, a segunda escrita simplesmente dá certo e duas tomadas atendem por um mesmo rótulo.",
+        "As mensagens de erro são emitidas a partir de mapas ordenados, então uma configuração com duas entradas ruins sempre reporta a mesma primeiro. Uma mensagem de erro que muda entre execuções da mesma configuração é uma mensagem em que os operadores param de acreditar."
+      ],
+      "examples": [
+        {
+          "label": "O que o labeler produz, e o que ele recusa",
+          "lang": "text",
+          "code": "// Run as the real internal/topo Labeler under `go test -overlay`.\nl1 := NewLabeler(\"h01\", \"r1\", 4, Overrides{});           l1.Slot(\"3-1\",   \"3-1.1\",   1)\n                                                          l1.Slot(\"3-1.4\", \"3-1.4.5\", 5)\nl2 := NewLabeler(\"h02\", \"DC1-A7\", 10, Overrides{});      l2.Slot(\"4-2\",   \"4-2.3\",   3)\nl3 := NewLabeler(\"h09\", \"\", 0, Overrides{});             l3.Slot(\"3-1\",   \"3-1.2\",   2)\nl4 := NewLabeler(\"h01\",\"R1\",4, Overrides{HubTokens:{\"3-1.4\":\"3\"}}); l4.Slot(\"3-1.4\",\"3-1.4.5\",5)",
+          "output": "R1-U04-H3.1-P1\nR1-U04-H3.1.4-P5\nDC1-A7-U10-H4.2-P3\nh09-H3.1-P2\nR1-U04-H3-P5\nHubOrdinal(\"3-1.4\") = 3.1.4   HubOrdinal(\"3-0\") = 3.0\n\ntwo overrides claiming one token ->\n  topo: hub token \"9\" is claimed by both 3-1 and 3-2; one label pointing at two\n  hubs sends an operator to the wrong rack position\noverride colliding with a derived token ->\n  topo: hubs 3-1 and 3-1.4 both label as H3.1 on host h01; fix the override map\n  before these labels are written\nno collision -> <nil>",
+          "note": "`DC1-A7` mantém o nome — um rack id que já é um nome não recebe o prefixo \"R\", porque \"RDC1-A7\" parece um erro de digitação onde \"DC1-A7\" parece um rack. Ids numéricos são normalizados: `r1`, `R1` e `1` todos renderizam `R1`."
+        },
+        {
+          "label": "Os rótulos do rack em produção são semeados, não derivados",
+          "lang": "sql",
+          "code": "SELECT s.rack_slot, s.usb_path, hb.usb_path AS hub\n  FROM farm.slots s JOIN farm.hubs hb ON hb.id = s.hub_id\n WHERE s.host_id = 'h01' AND s.port_number = 1 ORDER BY hb.usb_path;",
+          "output": " rack_slot    | usb_path | hub \n--------------+----------+-----\n R1-U04-H1-P1 | 3-1.1    | 3-1\n R1-U04-H2-P1 | 3-2.1    | 3-2\n R1-U04-H3-P1 | 4-1.1    | 4-1\n R1-U04-H4-P1 | 4-2.1    | 4-2",
+          "note": "`H1..H4`, não `H3.1`/`H3.2`/`H4.1`/`H4.2`. A demonstração escreve os rótulos diretamente (internal/demo/seed.go:551, formato `R%s-U%02d-H%d-P%d`) usando exatamente o ordinal de enumeração que o labeler se recusa a usar. Um host de verdade rodando `farmd node` sem mapa de override produz a forma pontilhada — então não espere que um rack descoberto se pareça com este."
+        }
+      ],
+      "source": "internal/topo/rackslot.go (whole file), internal/topo/discover.go:574-585 (checkPlannedLabels), migrations/00004_operate.sql:430-433, internal/demo/seed.go:551, 745"
+    },
+    {
+      "heading": "Ciclo de vida do slot: marcado, nunca apagado",
+      "body": "**Nada em `topo` remove um slot porque um dispositivo parou de responder.** Um aparelho que sobe em fastboot, some do barramento ou está com a depuração USB desligada continua na tomada dele, e o slot dele continua existindo. A única coisa que aposenta um slot é a *própria porta* deixar de ser reportada pelo kernel — o hub foi desplugado ou trocado.\n\nMesmo então o slot é marcado como `maintenance`, nunca apagado. `farm.leases`, `farm.recovery_attempts`, `farm.quarantines` e `farm.slot_occupancy` referenciam slots por id, e um id de slot em uma linha de lease de seis meses atrás precisa continuar resolvendo para uma posição sobre a qual se possa avisar um humano. `maintenance` também é exatamente a semântica certa: `farm.lease_acquire` exige `s.state = 'active'` tanto na escolha do candidato quanto na reconferência sob o lock (`00002_lease.sql:273`, `:265`), então um slot aposentado deixa de ser escalonado e não faz mais nada. **Ele não pode terminar o lease de um dispositivo que esteja num slot desses** — um hub ser desplugado não é motivo para tirar o dispositivo de um job em execução.\n\nA reconciliação de remoção é protegida de três formas, e vem desligada por padrão.",
+      "bullets": [
+        "**Desligada por padrão.** `RetireVanished` é false, porque a primeira coisa que um deploy novo faz é escanear um host cujos slots foram semeados na mão, e a segunda coisa que ele não deve fazer é aposentar todos eles.",
+        "**Nunca em uma varredura parcial.** Se qualquer entrada do sysfs falhou na leitura, ou se um dispositivo referenciou um pai que a varredura não reportou, a árvore é `Partial` e a reconciliação é pulada com a observação: uma porta ausente não é evidência de que a porta acabou.",
+        "**Limitada.** Uma passada pode aposentar no máximo `MaxRetireFraction` (padrão 0.25) dos slots ativos de um host. O limite é uma afirmação sobre evidência, não sobre hardware: hubs falham um de cada vez, e uma passada que afirma que um quarto de um host desapareceu de uma vez é muito mais provavelmente um soluço do udev, um contêiner que perdeu o bind mount de `/sys`, ou uma varredura contra a máquina errada. Agir sobre isso tornaria todos os dispositivos daquele host não escalonáveis — uma queda da farm causada por uma leitura ruim. Um único slot desaparecido sempre passa (`len(vanished) > 1` condiciona a checagem), porque tirar um único hub morto de um host pequeno excede qualquer fração e esse caso é obviamente benigno.",
+        "Uma varredura que encontra **zero** portas vivas em um host que tem slots ativos é recusada de saída. Isso não é um host que perdeu o hardware; é uma varredura que não funcionou.",
+        "`restore` reativa **apenas** slots cuja linha mais recente em `farm.audit_log` é o próprio ator da descoberta com a ação `slot.maintenance`. Um humano que colocou um slot em maintenance (\"esta porta está instável, deixe-a de fora até eu trocar o cabo\") tem a última palavra, e um timer que acorda e desfaz a decisão dele pelas costas é exatamente a classe de automação que este sistema se recusa a abrigar.",
+        "Rodar a descoberta duas vezes contra um hardware que não mudou não escreve nada na segunda vez. Isso é uma propriedade de correção, não uma otimização: a descoberta roda em um timer, e o operador precisa conseguir distinguir uma mudança real de topologia de ruído de rotina apenas olhando `farm.events`."
+      ],
+      "examples": [
+        {
+          "label": "O que uma aposentadoria deixa para trás",
+          "lang": "sql",
+          "code": "SELECT e.at, e.kind, e.slot_id, e.actor, e.detail->>'usb_path' AS usb_path,\n       e.detail->>'rack_slot' AS rack_slot, e.detail->>'source' AS source\n  FROM farm.events e\n WHERE e.kind IN ('slot_vanished','slot_returned','power_domain_corrected')\n ORDER BY e.at DESC LIMIT 20;",
+          "output": "(0 rows)",
+          "note": "Vazio aqui porque a descoberta de topologia nunca roda na demonstração (só Linux, só farmd node). O formato do sujeito de auditoria é `slot:<id>` (discover.go:927), igual ao da própria API, de modo que um humano que reative um slot mais tarde cai no mesmo sujeito e `restore` consegue ver que a última palavra foi dele."
+        },
+        {
+          "label": "O estado do slot como o alocador o vê",
+          "lang": "sql",
+          "code": "SELECT s.state, count(*) FROM farm.slots s GROUP BY 1;",
+          "output": " state  | count \n--------+-------\n active |    56"
+        }
+      ],
+      "source": "internal/topo/discover.go:1-40, 380-400 (guards), 790-860 (reconcileRemovals, refuseMassRemoval), 900-930 (retire), 953-1010 (restore), migrations/00002_lease.sql:263-302, migrations/00001_core.sql:108-116"
+    },
+    {
+      "heading": "A máquina de estados do dispositivo",
+      "body": "Dois vocabulários, mantidos separados de propósito.\n\n**`farm.device_runtime.adb_state`** é o que o fio diz, literalmente como veio do servidor ADB, normalizado em um conjunto fechado. `adbwire.ParseConnState` é total sobre esse conjunto — incluindo os três valores que o servidor nunca emite — então um valor lido de volta da coluna faz parse para ele mesmo. Omitir `absent` do braço de correspondência exata o reescreveria em silêncio para `unknown` na volta, transformando \"nunca vimos este dispositivo\" em \"não sabemos dizer\", que são alarmes diferentes. O servidor também não se limita a palavras isoladas: um problema de permissão chega como uma frase inteira terminando em uma URL entre colchetes, então o parsing casa por prefixos e por substrings.\n\n**`farm.device_runtime.health`** é o veredito que o alocador lê. `absent` é nosso, não do servidor: significa que o dispositivo não estava em uma listagem real, de forma alguma.\n\nO predicado do alocador é estreito e aparece duas vezes em `farm.lease_acquire` — uma para escolher um candidato (`00002_lease.sql:268-277`), outra para reconferir sob o lock (`:257-266`), porque `ORDER BY` materializa a ordenação antes do lock e a linha que travamos pode já não qualificar: `admin_state = 'enabled'` AND `current_lease_id IS NULL` AND `adb_state = 'device'` AND `health = 'healthy'` AND `s.state = 'active'` AND `s.rearm_at <= now()`.",
+      "table": {
+        "columns": [
+          "adb_state",
+          "health",
+          "por que essa distinção existe"
+        ],
+        "rows": [
+          [
+            "device",
+            "healthy",
+            "o único par alocável"
+          ],
+          [
+            "offline",
+            "offline",
+            "o servidor ADB não consegue falar com ele — uma afirmação sobre o fio, nunca um motivo para retomar o dispositivo"
+          ],
+          [
+            "unauthorized",
+            "unauthorized",
+            "o diálogo RSA ainda está na tela; o estado mais comum em um rack recém-montado"
+          ],
+          [
+            "authorizing, connecting",
+            "booting",
+            "em transição, não quebrado"
+          ],
+          [
+            "absent, detached",
+            "missing",
+            "chegou um snapshot REAL que não continha o dispositivo"
+          ],
+          [
+            "bootloader, recovery, sideload, rescue",
+            "recovering",
+            "vivo e endereçável, apenas incapaz de rodar um teste — a resposta do operador difere de offline: um é um cabo, o outro é um modo"
+          ],
+          [
+            "no_permissions",
+            "degraded",
+            "regras de udev no host, não um defeito do dispositivo"
+          ],
+          [
+            "host, unknown, qualquer coisa não reconhecida",
+            "unknown",
+            "a ausência de histórico, não um histórico de instabilidade"
+          ],
+          [
+            "(qualquer)",
+            "quarantined",
+            "um veredito humano. Nenhuma sondagem o derruba."
+          ],
+          [
+            "(qualquer)",
+            "retired",
+            "um fato administrativo. Nenhuma sondagem o derruba."
+          ]
+        ]
+      },
+      "bullets": [
+        "A linha de runtime de um dispositivo novo é criada com health `unknown`, nunca `healthy` — tanto por `farm.resolve_device` (que insere sem valor de health, pegando o default da coluna) quanto pelo `ensure` do watchdog (`watchdog.go:739-754`). `unknown` significa precisamente \"ninguém olhou ainda\"; começar em `healthy` deixaria o alocador entregar um dispositivo com base em uma suposição.",
+        "`unknown` ganha uma exceção no damper (`watchdog.go:660`): uma única olhada boa basta para sair dele, porque a histerese existe para amortecer oscilação e ali não há nada contra o que oscilar. O token de flap continua sendo cobrado.",
+        "`suppress_until` congela o health enquanto um reset induzido está em curso (`watchdog.go:653`). *Espera-se* que o transporte caia, então uma queda não prova nada. Quem o define é a escada de recovery (`ladder.go:1070`), que também vira o health para `recovering` durante a janela de acomodação.",
+        "A escada não volta a subir enquanto `updated_at > suppress_until` não for verdade (`ladder.go:516-517`) — esperar apenas a janela expirar gastaria o próximo degrau em cima do valor congelado. Exigir uma escrita depois da janela é o que faz a janela de acomodação de fato acomodar alguma coisa.",
+        "Na demonstração essas regras valem só pela metade: um segundo reconciliador escreve a mesma tabela com lógica diferente e sem checar `suppress_until`. Veja os Gaps."
+      ],
+      "examples": [
+        {
+          "label": "Censo de health, ao vivo",
+          "lang": "sql",
+          "code": "SELECT r.health, count(*) FROM farm.device_runtime r GROUP BY 1 ORDER BY 2 DESC;",
+          "output": "   health    | count \n-------------+-------\n healthy     |    47\n quarantined |     7\n offline     |     1\n degraded    |     1",
+          "note": "Uma amostra, não um fato: o simulador mexe nos dispositivos continuamente e essas contagens diferem de minuto a minuto. O que é estável neste sistema é o formato — um hub inteiro de dispositivos em quarantine juntos no h02, e um ou dois flappers no hub 3-1 do h01."
+        },
+        {
+          "label": "O mesmo censo como métrica exportada",
+          "lang": "bash",
+          "code": "curl -s http://127.0.0.1:8420/metrics | grep '^farm_device_health' | head -12",
+          "output": "farm_device_health{host=\"h01\",hub=\"3-1\",state=\"booting\"} 0\nfarm_device_health{host=\"h01\",hub=\"3-1\",state=\"degraded\"} 1\nfarm_device_health{host=\"h01\",hub=\"3-1\",state=\"healthy\"} 5\nfarm_device_health{host=\"h01\",hub=\"3-1\",state=\"missing\"} 0\nfarm_device_health{host=\"h01\",hub=\"3-1\",state=\"offline\"} 1\nfarm_device_health{host=\"h01\",hub=\"3-1\",state=\"quarantined\"} 0\n...",
+          "note": "Rotulado por host e por hub, não por dispositivo, e preenchido com zero em todos os estados, de modo que uma falha de hub se lê como um único despenhadeiro correlacionado em vez de sete alertas de dispositivo. Esta é a métrica de health que de fato está exposta — as métricas farm_watchdog_* que estão no código-fonte do watchdog não estão registradas em lugar nenhum; veja os Gaps."
+        }
+      ],
+      "source": "internal/adbwire/device.go:14-82 (ConnState, ParseConnState), internal/watchdog/watchdog.go:613-700 (write), 739-754 (ensure), 865-896 (healthFor), migrations/00001_core.sql:185-221, migrations/00002_lease.sql:263-302, internal/recovery/ladder.go:485-520, 1060-1080, internal/obs/metrics.go:376-384"
+    },
+    {
+      "heading": "O damper de flap, e por que ele é assimétrico",
+      "body": "Um dispositivo USB em um cabo ruim pode enumerar e cair a cada poucos segundos. Refletir isso fielmente produz uma coluna de health que oscila healthy ↔ degraded, um alocador que entrega o dispositivo entre os piscos, e um alerta sobre o qual ninguém consegue agir.\n\n`farm.device_runtime.flap_credits` é um balde de tokens (default do schema 10.0, teto `DefaultFlapCap = 10.0`, recarga `DefaultFlapRefill = 1.0` token/minuto), **recarregado contra o `now()` do servidor a partir do `flap_updated_at` registrado na própria linha**. Nenhum relógio do pod do watchdog é consultado e nenhum é enviado: um watchdog com o relógio desalinhado não pode ser capaz de entregar a um dispositivo um balde cheio de tokens que ele não ganhou. A decisão inteira — recarga, histerese, transição, cobrança do crédito — é um único statement.\n\nA assimetria é o mecanismo:\n\n**Descer é de graça**, mas com debounce por `consec_bad` (`DefaultMinBad = 2`). Segurança primeiro: um dispositivo que está falhando precisa sair do conjunto escalonável sem demora, e nunca ficar à mercê de um balde vazio.\n\n**Voltar a subir custa um token**, além de uma histerese de `consec_good` (`DefaultMinGood = 3`, maior que MinBad de propósito — declarar healthy é uma promessa feita ao alocador). Um dispositivo que fica quicando esvazia o balde e então **fica fora do pool** até ter ficado quieto tempo suficiente para recarregar.\n\nA direção cara é a que colocaria um dispositivo ruim de volta na frente de um tenant.\n\nO laço é um reconciliador, não um manipulador de eventos. O servidor ADB só fala quando alguma coisa muda, então um laço puramente disparado por borda não escreve nada para um rack quieto — e uma linha alterada por baixo dele (a escada marcando um dispositivo como `recovering`, um operador fechando uma quarantine) nunca convergiria. A cada `Resync` (`DefaultResync = 60s`) a última observação **real** é aplicada de novo. Se nada jamais foi observado em um host, nada é aplicado: inventar uma listagem vazia é exatamente o erro que `adbwire` se recusa a cometer quando um socket cai.",
+      "examples": [
+        {
+          "label": "Dispositivos que o servidor ADB alcança agora mesmo e que ainda assim não são escalonáveis",
+          "lang": "sql",
+          "code": "SELECT s.rack_slot, r.adb_state, r.health, r.consec_good,\n       round(r.flap_credits,2) AS credits, r.ladder_tier,\n       r.suppress_until IS NOT NULL AS suppressed\n  FROM farm.device_runtime r JOIN farm.slots s ON s.id = r.slot_id\n WHERE r.adb_state = 'device' AND r.health <> 'healthy'\n ORDER BY s.rack_slot;",
+          "output": "  rack_slot   | adb_state |   health    | consec_good | credits | ladder_tier | suppressed \n--------------+-----------+-------------+-------------+---------+-------------+------------\n R1-U04-H1-P7 | device    | degraded    |           1 |    0.10 |           0 | f\n R1-U10-H4-P6 | device    | quarantined |          94 |   10.00 |           0 | f\n R1-U10-H4-P7 | device    | quarantined |          94 |   10.00 |           0 | f",
+          "note": "Dois motivos diferentes, os dois corretos. O P7 no hub 3-1 é alcançável por ADB mas tem 0.10 crédito — o damper está segurando ele de fora até o balde recarregar acima de 1. Os dois no hub 4-2 do h02 têm o balde CHEIO e 94 olhadas boas consecutivas e mesmo assim seguem segurados: eles estão sob uma quarantine aberta com escopo de hub (farm.quarantines id 5), e quarantine é um veredito humano que nenhuma sondagem derruba. Esta é a consulta mais útil desta página — ela separa \"o damper está fazendo o trabalho dele\" de \"um humano precisa fechar alguma coisa\"."
+        },
+        {
+          "label": "Observando um flapper",
+          "lang": "sql",
+          "code": "SELECT s.rack_slot, r.adb_state, r.health, r.consec_bad, r.consec_good,\n       round(r.flap_credits,2) AS credits, now() - r.health_since AS held_for\n  FROM farm.device_runtime r JOIN farm.slots s ON s.id = r.slot_id\n WHERE s.rack_slot IN ('R1-U04-H1-P6','R1-U04-H1-P7') ORDER BY 1;",
+          "output": "-- t = 0\n  rack_slot   | adb_state |  health  | consec_bad | consec_good | credits |    held_for    \n--------------+-----------+----------+------------+-------------+---------+----------------\n R1-U04-H1-P6 | device    | degraded |          0 |           1 |    0.07 | 00:00:00.55681\n R1-U04-H1-P7 | device    | degraded |          0 |           1 |    0.10 | 00:00:00.55933\n\n-- t = 20s\n R1-U04-H1-P6 | offline   | offline  |          1 |           0 |    0.00 | 00:00:01.652997\n R1-U04-H1-P7 | device    | degraded |          0 |           1 |    0.10 | 00:00:02.679632",
+          "note": "Os dois estão quicando; nenhum dos dois volta a subir para healthy, porque os créditos estão < 1. Nesta demonstração as linhas que você vê foram escritas pelo simulador da demonstração, não por internal/watchdog — o watchdog real nunca emite `degraded` para adb_state='device'. Calibre os limiares contra o laço real, não contra isto. Não existe métrica exportada para o damping: farm_watchdog_flap_damped_total existe no código-fonte, mas não está registrada."
+        }
+      ],
+      "source": "internal/watchdog/watchdog.go:43-60 (package comment), 78-113 (defaults), 389-437 (watchHost/resync), 613-700 (write), 739-754 (ensure), migrations/00001_core.sql:198-210, internal/demo/demo.go:596-655"
+    },
+    {
+      "heading": "No que o watchdog pode e no que não pode tocar",
+      "body": "**Pode escrever:** `farm.device_runtime` (a tabela dele) e a linha dele em `farm.component_heartbeat`, via `farm.component_beat`.\n\n**Pode ler:** `farm.devices`, `farm.slots`, `farm.hosts` — o suficiente para saber em que posição um dispositivo está e qual é o rótulo de rack dele.\n\n**Não pode tocar, de jeito nenhum:** `farm.leases`, `farm.jobs`, `farm.devices` (escritas).\n\nTrês recusas específicas que vale conhecer:\n\n**Ele não vai setar `farm.devices.serial_ambiguous`.** Ele detecta a colisão (`AmbiguousSerials`) e loga um aviso, mas `farm.devices` não é a tabela dele, e alargar o grant para setar um único booleano colocaria o plano de health dentro da tabela de identidade (`watchdog.go:516-528`). Quem seta a flag é `farm.resolve_device` — o que significa que, numa farm em que o enrolment não está rodando, ninguém a seta.\n\n**Ele não vai incrementar `farm.hosts.host_epoch`.** Ele apenas *copia* o epoch que capturou quando o worker subiu, ao lado de cada `transport_id` que registra. Incrementar é trabalho do agente de nó. Como o adb reaproveita inteiros pequenos de transporte depois de um restart, `(host_epoch, transport_id)` é o único par estável (`00001_core.sql:40-43`) — e um worker que ainda carimba o epoch anterior está registrando um par que nomeia um transporte que ninguém tem. É por isso que um epoch alterado reinicia o leitor daquele host.\n\n**O heartbeat dele nunca pode ser adicionado a `FARM_REAPER_COMPONENTS`.** `farm.reaper_arm` *soma* o tempo de indisponibilidade de um componente nomeado ao prazo de todo lease vivo. Deixar que uma queda do watchdog mexesse nos relógios dos leases fundiria o plano de health com a vivacidade do lease — exatamente a fusão que este sistema existe para impedir (`watchdog.go:80-87`).\n\nParar o watchdog congela o health no último valor observado. Nada é marcado como missing, nenhum lease é tocado: uma queda do watchdog não custa um dispositivo a ninguém. O risco simétrico é real e está dito no próprio comentário da escada de recovery (`ladder.go:500-502`) — sem watchdog rodando não há confirmação e a escada empaca; uma escada empacada deixa dispositivos quebrados quebrados, mas uma escada dirigida por um plano de health *morto* cicla a energia de um rack que está funcionando.",
+      "bullets": [
+        "Um dispositivo que o servidor ADB enxerga e cujo devpath não casa com nenhum slot ocupado é contado e logado em DEBUG (`watchdog.go:530-544`). Isso é uma lacuna de provisionamento, não um problema de health, e fazer o enrolment dele é trabalho de outra pessoa.",
+        "As escritas são puladas quando o estado não mudou, usando um cache por devpath — mas o banco continua sendo a verdade: uma escrita que toca zero linhas limpa a entrada do cache, e o resync limpa o cache inteiro.",
+        "`last_seen_at` é atualizado para todo dispositivo presente em um único statement (`touch`, `watchdog.go:755`), separado das transições de health. Frescor é um fato, não um veredito.",
+        "Uma escrita que falha descarta a entrada de cache daquele devpath para que o próximo snapshot tente de novo, em vez de o laço acreditar em uma escrita que nunca chegou."
+      ],
+      "examples": [
+        {
+          "label": "O plano de health está vivo?",
+          "lang": "sql",
+          "code": "SELECT component, beat_at, now() - beat_at AS age\n  FROM farm.component_heartbeat ORDER BY component;",
+          "output": "  component   |            beat_at            |       age       \n--------------+-------------------------------+-----------------\n api          | 2026-09-04 10:50:33.827962-03 | 00:00:04.486307\n demo         | 2026-09-04 10:50:33.730888-03 | 00:00:04.583381\n jobrunner    | 2026-09-04 10:50:36.529270-03 | 00:00:01.784999\n reaper       | 2026-09-04 10:50:33.827451-03 | 00:00:04.486818\n recovery     | 2026-09-04 10:50:33.723162-03 | 00:00:04.591107\n scheduler    | 2026-09-04 10:50:36.360985-03 | 00:00:01.953284\n watchdog:h01 | 2026-09-04 10:50:33.726890-03 | 00:00:04.587379\n watchdog:h02 | 2026-09-04 10:50:33.727414-03 | 00:00:04.586855",
+          "note": "Uma chave de heartbeat por host, nunca uma chave \"watchdog\" compartilhada: uma chave compartilhada deixaria o beat de um host saudável esconder um host morto. A chave por host é composta pelo binário (cmd/farmd/roles.go:235, :258); o DefaultComponent do próprio internal/watchdog é a string pura \"watchdog\". Repare no que está ausente: nenhuma linha de `enroll` e nenhuma de `node`, porque esses papéis não estão rodando aqui."
+        }
+      ],
+      "source": "internal/watchdog/watchdog.go:1-60, 78-92 (DefaultComponent), 271-298 (beat), 349-388 (reconcileWorkers/epoch), 504-544 (ambiguous serials, unmapped), 755-770 (touch), internal/recovery/ladder.go:499-502, migrations/00002_lease.sql:107-110, migrations/00001_core.sql:38-43, cmd/farmd/roles.go:225-268"
+    },
+    {
+      "heading": "O protocolo host do ADB, falado nativamente",
+      "body": "`internal/adbwire` é um cliente do protocolo host do **servidor** ADB, sobre TCP. Ele nunca chama o binário `adb` por shell, e os motivos são operacionais, não estéticos.\n\nChamar por shell significa: nada de erros tipados, então \"o servidor recusou este verbo\" e \"o socket morreu\" chegam como o mesmo exit diferente de zero e são tratados igual; nenhuma forma de limitar uma chamada isolada independentemente de um processo; um subprocesso por sondagem em quarenta dispositivos de um host; saída deformada pelo que a versão local do cliente resolver imprimir; e — o que realmente importa — nenhuma forma de garantir que uma string de alvo é um devpath e não um serial, porque você está entregando texto ao parser de argumentos de outra pessoa.\n\nO enquadramento é pequeno: um prefixo de comprimento de 4 dígitos hexadecimais seguido da string de serviço, e uma resposta `OKAY` ou `FAIL` mais uma mensagem prefixada por comprimento.\n\nO endereçamento é `host-usb:<devpath>:<cmd>` (padrão) ou `host-serial:<devpath>:<cmd>`. Os dois carregam um devpath e nunca um serial; eles diferem apenas em qual dos dois parsers do servidor faz a resolução, e builds diferentes de servidor divergem sobre qual deles roteia a correspondência por devpath, então a escolha é configuração, não semântica.",
+      "bullets": [
+        "Um `Client` não guarda conexão. Toda chamada abre a sua, porque o protocolo host fecha a conexão depois de um único serviço host e porque um socket compartilhado deixaria um dispositivo lento travar todas as sondagens de health daquele host.",
+        "**Verbos de controle** (`reconnect`, `reconnect-offline`, `detach`, `attach`) são endereçados por posição. Um `*ProtocolError` significa que o servidor recusou — um servidor mais antigo pode não implementar o verbo, o que é uma recusa, não um defeito — e um `*TransportError` significa que o socket falhou. Uma escada de recovery precisa dessa distinção: recusa significa \"tente o próximo degrau\", falha de transporte significa \"o próprio host está inalcançável e nenhum degrau vai ajudar\".",
+        "O parser da listagem percorre a cauda **de trás para frente** sobre os tokens que reconhece, porque o campo de estado não é um único token: um host sem as regras de udev reporta uma frase inteira, com espaços e uma URL. Quebrar por espaço em branco e pegar o campo 1 rotula errado exatamente os dispositivos que o operador mais precisa ver.",
+        "`(no serial number)` são três palavras separadas por espaço em um formato separado por espaço. Pegar ingenuamente o campo 0 registra `(no` como serial e desloca em duas posições todas as colunas seguintes. O parser trata esse caso à parte e armazena um serial **vazio** — o que também mantém aquele dispositivo fora de `AmbiguousSerials`, onde um literal compartilhado fabricaria uma colisão entre todos os dispositivos unauthorized do host.",
+        "Um `key:value` não modelado não pode interromper a caminhada de trás para frente, porque o devpath fica à esquerda da cauda: um servidor que acrescentasse um campo entre eles deixaria `Devpath` vazio e tornaria o dispositivo não endereçável por todo o tempo em que aquele campo existisse.",
+        "`host:host-features` é exposto; o `host:features` puro deliberadamente não é, porque ele resolve para qualquer dispositivo que o servidor tiver vontade de escolher.",
+        "O shell usa `shell,v2,raw:` — a v2 multiplexa stdout e stderr e carrega um status de saída de verdade; `raw` suprime o pty, para que a saída não seja deformada pela tradução de fim de linha. `ShellResult.Exited` distingue \"saiu com 0\" de \"nunca nos disse\"; `Truncated` registra que o teto de saída foi atingido, o que não é falha, porque um comando tagarela não deve parecer um dispositivo quebrado.",
+        "`MaxShellPacket` (1 MiB) limita um frame. O campo de comprimento é um uint32, então um fluxo dessincronizado pediria quatro gigabytes com base em quatro bytes de lixo.",
+        "O tracker reconecta com backoff **com jitter**. Cada host da farm roda um leitor, e um restart do servidor adb atinge todos eles de uma vez; sem jitter eles reconectariam em uníssono e continuariam assim. O canal de snapshot dele tem profundidade um, com a entrada velha descartada, porque todo snapshot é estado completo e o mais novo supera estritamente um que não foi consumido — bloquear deixaria um consumidor lento travar o socket e transformaria um atraso de contabilidade em uma aparente queda do host."
+      ],
+      "examples": [
+        {
+          "label": "host:version — a prova mais barata de que o servidor está vivo",
+          "lang": "text",
+          "code": "# write:  4 hex digits of length, then the service string\n000chost:version",
+          "output": "STATUS : OKAY\nLENGTH : 0004 (4 bytes)\nPAYLOAD:\n0029",
+          "note": "Interpretado em base 16 — 0x29 = 41. Um servidor que formatasse em decimal seria lido errado em silêncio."
+        },
+        {
+          "label": "get-state endereçado por posição",
+          "lang": "text",
+          "code": "001chost-usb:usb:3-1.1:get-state",
+          "output": "STATUS : OKAY\nLENGTH : 0006 (6 bytes)\nPAYLOAD:\ndevice"
+        }
+      ],
+      "source": "internal/adbwire/doc.go, internal/adbwire/client.go:31-49 (TargetPrefix), 190-240 (Control), 246-262 (Devices), 264-300 (features), 640-690 (Backoff), 689-730 (Tracker), internal/adbwire/device.go:200-333 (parser), 334-374 (devpath validation), 416-543 (shell v2)"
+    },
+    {
+      "heading": "O protocolo sync: transferência de arquivos, nativamente",
+      "body": "`sync:` é um serviço comum do lado do dispositivo — iniciado sobre um transporte exatamente como `shell,v2,raw:` — mas tudo depois do `OKAY` que o responde fala um **enquadramento diferente**. Ali não existe prefixo de comprimento de 4 dígitos hexadecimais: uma mensagem é um id ASCII de 4 bytes seguido de um uint32 little-endian e, nas formas id/comprimento, dessa quantidade de bytes de payload.\n\nNada em `sync.go` pode tocar em `conn.writeMessage`, `conn.readMessage` ou `conn.readStatus`. Misturar os dois enquadramentos é a maneira clássica de dessincronizar este fluxo, e um fluxo dessincronizado não falha alto: ele lê quatro bytes arbitrários como comprimento e pede essa quantidade.\n\nTrês propriedades sustentam tudo.\n\n**As transferências são em fluxo.** Um único buffer fixo de preparo de `SyncDataMax` (64 KiB) carrega todos os chunks nos dois sentidos, então um artifact de 200 MB custa 64 KiB de heap e não 200 MB — o que, em vinte e oito dispositivos dentro de um mesmo processo, é a diferença entre 1,8 MB e 5,6 GB.\n\n**Um comprimento vindo da outra ponta é conferido antes de ser usado, e nunca é usado para dimensionar nada.** Um par que diz que um chunk DATA tem 0xFFFFFFFF bytes não está pedindo quatro gigabytes de memória; ele está falhando em falar o protocolo, e a sessão é marcada como quebrada.\n\n**Toda transferência é limitada pelo context que lhe foi entregue, não pelo context com que a sessão foi aberta.** Uma sessão dura o tempo do trabalho que a usa; uma transferência dura o tempo do orçamento que alguém escreveu para aquele passo. Um dispositivo que para de responder *sem fechar nada* — sem erro, sem EOF, sem reset — é exatamente onde os dois divergem, e uma transferência limitada apenas pela sessão manteria um passo aberto por todo o tempo restante do trabalho. Quando é o prazo de quem chamou que encerra uma transferência, o resultado é um `*CanceledError` — quem chamou recebendo o que pediu — nunca um `*TransportError` culpando o fio.",
+      "bullets": [
+        "As requisições são estritamente sequenciais: o protocolo não tem ids de requisição, então duas transferências intercaladas em uma mesma sessão leriam as respostas uma da outra. Isso não é deixado para quem chama lembrar — uma segunda requisição enquanto outra está em curso é recusada como `UsageError`.",
+        "`Close` é seguro a partir de outra goroutine a qualquer momento; é assim que uma transferência bloqueada é interrompida. O `QUIT` de cortesia dele é **pulado** enquanto uma transferência está em curso, porque oito bytes caindo no meio de um chunk DATA corromperiam o arquivo que está sendo escrito. Ele também tem um limite fixo de 2s em vez do context de quem chama, porque `Close` é adiado em caminhos que já não têm context algum e precisa retornar.",
+        "`Push` confere o context **a cada chunk**, não só no socket: um push cancelado para no próximo limite de chunk em vez de levar um artifact de vários gigabytes até o fim para quem já deixou de se importar, e uma fonte que fica respondendo `(0, nil)` — legal para um `io.Reader`, e a forma que um pipe travado assume — não consegue girar para sempre sem tocar o socket em que o prazo vive.",
+        "O cabeçalho do chunk é escrito a partir do mesmo buffer do payload, então um chunk é uma escrita. Duas escritas por chunk colocariam um segmento de 4 bytes na frente de cada 64 KiB de uma transferência de vários gigabytes.",
+        "`Pull` verifica se houve escrita curta mesmo quando `Write` retorna nil. O destino é fornecido por quem chama — no runner ele alimenta um armazenamento endereçado por conteúdo — e um escritor que consumisse em silêncio menos do que recebeu colocaria um arquivo no fio, um arquivo diferente no armazenamento, e um digest válido dos bytes errados na linha do passo. Nada rio abaixo conseguiria perceber.",
+        "Uma fonte que morre no meio de um push é reportada como ela mesma, não fantasiada de falha de transporte ou de recusa. O dispositivo está bem e o socket está bem; a sessão está encerrada de todo jeito, porque o daemon está no meio de um arquivo e nunca vai ser informado de como o arquivo termina.",
+        "`SEND` junta caminho e modo com uma vírgula e o daemon quebra na **última** delas, então um caminho remoto contendo vírgulas é legal e não precisa de escape. O modo vai em **decimal**: o daemon o interpreta com uma conversão que detecta a base, então `0755` seria lido como octal enquanto `493` é lido como decimal — o mesmo número.",
+        "Os bits `st_mode` do POSIX são traduzidos explicitamente, não confundidos com o `fs.FileMode` do Go (que é uma codificação própria, e confundir os dois transforma em silêncio um diretório em um arquivo com permissões peculiares).",
+        "`LSTAT_V1` **não tem FAIL para um caminho inexistente** — o daemon responde a um lstat que falhou com uma resposta zerada. `FileInfo.Exists` é inferido de um modo igual a zero e de mais nada, que é o que torna `Stat` utilizável como checagem de existência.",
+        "`FileInfo.Size` vem de um uint32, então um arquivo de 4 GiB ou mais é reportado módulo 2^32. Quem precisa ser exato sobre um arquivo desses deve lê-lo em vez de dar stat nele."
+      ],
+      "source": "internal/adbwire/sync.go:15-101 (framing rationale, constants), 104-183 (POSIX mode translation), 188-226 (FileInfo), 228-315 (SyncConn, Close), 318-500 (Push, Pull), 502-570 (Stat)"
+    },
+    {
+      "heading": "Receitas do operador",
+      "body": "Tudo abaixo foi executado contra o sistema em produção em `http://127.0.0.1:8420` / `postgres://farm@127.0.0.1:55432/device_farmer`. As contagens e o estado dos leases se mexem; a estrutura não.",
+      "examples": [
+        {
+          "label": "Um dispositivo, tudo sobre ele",
+          "lang": "bash",
+          "code": "export FARM_API_URL=http://127.0.0.1:8420\n./bin/farmd.exe ctl device df-970e1c5b7163543ded6ed5f3a05c0978",
+          "output": "rack slot:              R1-U04-H1-P1\nfarm uid:               df-970e1c5b7163543ded6ed5f3a05c0978\ndevice id:              a6adf5c9-ea2e-4105-a3c4-a8b1104a6259\npool:                   default\nadmin state:            enabled\n\nmodel:                  Google Pixel 7\nandroid:                15 (api 35)\nadb serial:             0123456789ABCDEF  (AMBIGUOUS: another device reports this same serial — evidence only, never an address)\n\nhost:                   h01\nhost admin state:       enabled\nadb endpoint:           127.0.0.1:50136\nadb devpath:            usb:3-1.1\nusb path:               3-1.1\nhub:                    1 (3-1)\nslot state:             active\n\nhealth:                 healthy\nhealth since:           2026-09-04 09:33:44\nadb state:              device\nbattery:                44% 34.7C\nconsecutive bad probes: 0\nnext recovery rung:     0\nfailure score:          0.00\nlast seen:              6s ago\nfence floor:            2282\n\nlease:                  none — this device holds no live lease\n\nhub 3-1 on h01: 2 of 7 devices unhealthy — a correlated fault. Suspect the hub, its cable or its power domain before this phone.",
+          "note": "A ambiguidade é jogada na cara do operador, e a faixa de correlação aponta para o hub antes de apontar para o aparelho. `fence floor` e `last seen` se mexem a cada segundo."
+        },
+        {
+          "label": "Um dispositivo que segura um lease vivo se recusa a ser cutucado",
+          "lang": "bash",
+          "code": "./bin/farmd.exe ctl device exec <uid-of-a-leased-device> \\\n  --reason \"why you are doing this\" --yes \\\n  -- getprop ro.product.model",
+          "output": "Device R1-U04-H2-P6 holds a live lease. Without --force the API will refuse this.\n\nrack slot:   R1-U04-H2-P6\nadb devpath: usb:3-2.6\ncommand:     getprop ro.product.model\n\nlive lease:  dc010625-4af6-4760-8575-f361c7de60ff\njob:         f24a491f-9eeb-47a6-9cbb-3936981ae4da\ntenant:      acme\nprotected:   no\n\nproceeding (--yes)\nctl: POST /api/v1/devices/.../exec: 409 conflict: this device holds a live lease;\nrunning a command on it can corrupt that job's run. Retry with \"force\": true and a\nreason if you mean to do it anyway. (request de582db5f722d9f2)",
+          "note": "Código de saída 3. Uma recusa é uma resposta, não uma quebra — e repare no que ela NÃO fez: o lease continua lá. Encontre um alvo com: SELECT d.farm_uid FROM farm.leases l JOIN farm.devices d ON d.id=l.device_id WHERE l.state IN ('held','suspect') LIMIT 1;"
+        },
+        {
+          "label": "A árvore física em JSON",
+          "lang": "bash",
+          "code": "curl -s http://127.0.0.1:8420/api/v1/topology | head -c 800",
+          "output": "{\"hosts\":[{\"id\":\"h01\",\"rack_id\":\"r1\",\"rack_unit\":4,\"host_epoch\":3,\n\"adb_endpoint\":\"127.0.0.1:50136\",\"admin_state\":\"enabled\",\n\"kernel_release\":\"6.8.0-45-generic\",\"agent_version\":\"farmd-node/0.1.0\",\n\"last_seen_at\":\"2026-09-04T10:30:33.815233-03:00\",\n\"hubs\":[{\"hub_id\":1,\"usb_path\":\"3-1\",\"model\":\"StarTech ST7300USBM 7-port\",\n\"port_count\":7,\"vbus_switchable\":true,\"devices\":7,\"healthy\":5,\"unhealthy\":2,\n\"worst_since\":\"2026-09-04T10:55:00.820569-03:00\",\"correlated\":true,\n\"slots\":[{\"slot_id\":1,\"port_number\":1,\"usb_path\":\"3-1.1\",\n\"adb_devpath\":\"usb:3-1.1\",\"rack_slot\":\"R1-U04-H1-P1\",\"state\":\"active\",\n\"rearm_at\":\"...\",\"power_domain_id\":1,\"power_kind\":\"per_port\",\n\"power_control\":\"uhubctl\",\"device_id\":\"a6adf5c9-...\",\"farm_uid\":\"df-970e1c5b...\"",
+          "note": "`correlated: true` no hub 3-1 é o sinal de dois-doentes-em-sete que transforma um hub morto em um alerta em vez de doze."
+        },
+        {
+          "label": "Qual slot levaria quantos dispositivos junto com ele",
+          "lang": "sql",
+          "code": "SELECT s.rack_slot, s.usb_path, pd.kind AS power_kind, pd.control,\n       count(*) OVER (PARTITION BY s.power_domain_id) AS blast_radius\n  FROM farm.slots s\n  LEFT JOIN farm.power_domains pd ON pd.id = s.power_domain_id\n WHERE s.host_id = 'h01'\n ORDER BY blast_radius DESC, s.rack_slot LIMIT 8;",
+          "output": " rack_slot    | usb_path | power_kind | control | blast_radius \n--------------+----------+------------+---------+--------------\n R1-U04-H1-P1 | 3-1.1    | per_port   | uhubctl |            7\n R1-U04-H1-P2 | 3-1.2    | per_port   | uhubctl |            7\n R1-U04-H1-P3 | 3-1.3    | per_port   | uhubctl |            7\n ...",
+          "note": "Todo hub aqui é um domínio de sete, seja chaveável ou não — a demonstração semeia um domínio por hub. Em um hub per_port a escada ainda consegue cortar uma porta; em um ganged ela não consegue, e o número é o que ela vai perturbar."
+        },
+        {
+          "label": "Todo dispositivo que divide um serial com outro",
+          "lang": "sql",
+          "code": "SELECT d.adb_serial, count(*) AS n,\n       array_agg(s.adb_devpath ORDER BY s.adb_devpath) AS positions\n  FROM farm.devices d JOIN farm.slots s ON s.id = d.current_slot_id\n GROUP BY d.adb_serial HAVING count(*) > 1;",
+          "output": "    adb_serial    | n |        positions        \n------------------+---+-------------------------\n 0123456789ABCDEF | 2 | {usb:3-1.1,usb:3-1.2}",
+          "note": "Rode isto depois de cada lote de hardware novo. Não confie em farm.devices.serial_ambiguous no lugar disto — essa flag só é escrita de dentro de farm.resolve_device, então em uma farm em que o enrolment não está rodando ela nunca é setada por observação."
+        }
+      ],
+      "source": "internal/ctl, internal/api/router.go:71-82, internal/api/ops.go"
+    },
+    {
+      "heading": "Gaps fechados desde que esta página foi escrita",
+      "body": "A lista de gaps abaixo foi escrita contra uma árvore anterior, e parte dela já foi corrigida desde então. Essas entradas ficam registradas aqui em vez de apagadas: quem lembra de um gap precisa conseguir distinguir **corrigido** de **nunca existiu**, e a mudança que fechou um gap costuma ser a descrição verdadeira mais curta do que o comportamento é hoje.\n\nA regra desta tabela é a regra da própria lista de gaps. Uma entrada só se muda para cá depois que o código foi lido e a afirmação conferida contra ele, nunca porque uma mensagem de commit disse que sim — que é exatamente como a lista ficou desatualizada em primeiro lugar. Tudo o que continua aberto está em **O que não está construído aqui**, logo abaixo.",
+      "table": {
+        "columns": [
+          "o que estava errado",
+          "o que fechou o gap"
+        ],
+        "rows": [
+          [
+            "`internal/enroll` e `internal/topo` ainda têm zero arquivos de teste. `internal/watchdog` agora tem um (`battery_test.go`, cobrindo o leitor de bateria e temperatura contra o servidor ADB falso), então o pacote com o único `UPDATE` em `farm.device_runtime` já não está inteiramente sem testes — mas o caminho de reconciliação dele, o que decide o que o `health` se torna, continua sem. O lado Go da escada de identidade, o parser da árvore USB, a proteção contra remoção em massa, as checagens de colisão de rótulo de rack e o damper de flap não são exercitados por `go test ./...`. Cada um dos dois defeitos de SQL acima teria sido pego por um único teste. Trate o comportamento nesses pacotes como documentado-mas-não-verificado, a menos que você o tenha visto rodar.",
+            "24 testes em `internal/enroll` (`Probe`, `HardwareFingerprint`, `parseProps`, `Brander.Read/Brand/Rebrand` contra `test/fakeadb`, incluindo o par de clones, e `EnrollOnce` contra um banco descartável) e 18 em `internal/topo` (`FromFS(fstest.MapFS)`, o plano de hubs, o labeller e uma passada em dry-run)."
+          ],
+          [
+            "Overrides, RetireVanished, IncludeRootHubs, AdoptEmpty, MinPorts, DryRun e MaxRetireFraction do topo.Config não estão ligados a nenhum campo de configuração nem a nenhuma flag. cmd/farmd/roles.go:553-559 o constrói apenas com Pool, HostID, Source, Actor e Logger. A reconciliação de remoção está DESLIGADA em todo deployment publicado: um hub que você desplugar deixa os slots dele `active` para sempre, e eles simplesmente nunca têm um dispositivo dentro. Não há forma suportada de fornecer um mapa de override HubTokens ou SlotLabels — o rótulo que o operador lê no rack não pode ser corrigido sem editar Go e recompilar, e num host com mais de um hub por barramento os rótulos derivados são pontilhados (H3.1, H3.2) em vez dos H1..H4 que a demonstração mostra. Também não existe superfície de dry-run para conferir o que uma primeira passada de descoberta criaria antes de ela escrever.",
+            "Todos os treze campos chegam a `topo.Config` a partir do ambiente: `FARM_TOPO_OVERRIDES` (um JSON com o mapa de nomes), `FARM_TOPO_RETIRE_VANISHED`, `FARM_TOPO_MAX_RETIRE_FRACTION`, `FARM_TOPO_DRY_RUN`, `FARM_TOPO_MIN_PORTS`, `FARM_TOPO_ADOPT_EMPTY`, `FARM_TOPO_INCLUDE_ROOT_HUBS`, `FARM_TOPO_INCLUDE`, `FARM_TOPO_EXCLUDE`, `FARM_TOPO_INTERVAL`, `FARM_TOPO_CALL_TIMEOUT` e `FARM_SYSFS_ROOT`, cada um validado e impresso por `Summary()`. `FARM_NODE_TOKEN` saiu de um `os.Getenv` cru na mesma mudança."
+          ],
+          [
+            "Não existe superfície de operador para registrar um slot, mudar um dispositivo de slot ou refazer o brand de um. Os endpoints físicos da API são GET /api/v1/topology, POST /api/v1/slots/{id}/power, POST /api/v1/devices/{id}/exec e POST /api/v1/hosts/{id}/drain|undrain (internal/api/router.go:73-82). farm.register_slot é só SQL; enroll.Brander.Rebrand (brand.go:264) não tem chamador nenhum em lugar algum; adbwire.Client.UnsafeBySerial não tem nenhum fora do teste dele. Fazer o bootstrap de um rack num host que não consegue rodar a descoberta, ou corrigir um dispositivo cuja linha está comprovadamente errada, significa SQL escrito na mão contra farm.register_slot e farm.devices. O erro de conflito de brand diz ao operador \"one of those two device rows is wrong and a human must retire it\" (brand.go:127-129) e não lhe dá comando nenhum com que fazer isso.",
+            "`internal/api/slots.go` serve `GET/POST /api/v1/slots`, `POST /slots/{id}/label`, `POST /devices/{id}/reslot` e `/rebrand`, sobre `farm.reslot_device` e `farm.relabel_slot` (`migrations/00017_reslot.sql`), com uma checagem de ocupação e uma linha de auditoria; `ctl slot list|register|label|reslot|rebrand` os aciona. Todo verbo recusa enquanto o dispositivo segura um lease vivo — nada aqui pode terminar um lease."
+          ],
+          [
+            "O firewall de papéis do SQL está definido, mas não é assumido em tempo de execução. openPool (cmd/farmd/roles.go:54-75) conecta com o que quer que DATABASE_URL diga, e nenhum processo Go emite SET ROLE. O único SET ROLE do sistema está dentro de farm.lease_reclaim (migrations/00002_lease.sql:563), que retira o privilégio do reaper sobre device_runtime pela duração daquela função. `REVOKE ALL ON farm.leases FROM farm_watchdog` só vale se você der a cada papel o próprio papel de login e o próprio DSN — e hoje você não consegue fazer isso sem DDL extra, porque farm_reaper, farm_scheduler e farm_watchdog são todos criados NOLOGIN (verificado: rolcanlogin = f para os três). A demonstração em execução conecta como `farm`, que é superusuário (rolsuper = t), então o processo do watchdog ali poderia escrever um lease se o código dele tentasse. A proteção que de fato está em vigor é a barreira de imports do Go, que é real, mas é uma propriedade de tempo de compilação deste build, não uma garantia do banco.",
+            "Veja a página de lease: `FARM_DB_ROLE` assume o papel em toda conexão do pool, e `test/assertions_v15.sql` prova que o reaper não consegue ler `farm.device_runtime` e que o watchdog não consegue ler `farm.leases`."
+          ],
+          [
+            "Na demonstração, farm.device_runtime é escrita por DOIS reconciliadores com regras diferentes: internal/watchdog (o real, um worker por host, com heartbeats presentes) e o laço simulador da própria demonstração (internal/demo/demo.go:596-700), que tem o próprio CASE de damper, emite `degraded` sempre que adb_state='device' e credits<1 e — ao contrário do watchdog real — não consulta suppress_until de forma alguma. internal/watchdog.healthFor mapeia `device` para `healthy` e só chega a produzir `degraded` para `no_permissions`, então toda linha `degraded` visível neste sistema veio do simulador, não do laço real. Calibrar limiares de flap ou escrever alertas contra o que esta demonstração mostra significa calibrar contra o simulador. O desprezo do simulador por suppress_until também significa que o comportamento de congelamento durante um reset induzido, descrito acima, não é o que você está vendo aqui.",
+            "Um damper, em um lugar. `internal/watchdog/damper.go` é dono do balde de tokens e `watchdog.DamperSQL` é o único statement que tanto o watchdog quanto o simulador rodam, de modo que a demonstração já não consegue mostrar uma histerese que o produto não tem. O simulador também respeita `suppress_until` agora."
+          ],
+          [
+            "O cliente de sync implementa apenas SEND, RECV, LSTAT_V1 e QUIT. Não há LIST/enumeração de diretório, não há mkdir, não há STAT_V2, e FileInfo.Size é truncado de um uint32. Um push para um caminho cujo diretório pai não existe falha no daemon; nada o cria. Um arquivo de 4 GiB ou mais dá stat como o tamanho módulo 2^32, então uma checagem de existência-mais-tamanho em um artifact grande compara em silêncio o número errado — leia o arquivo em vez de dar stat nele. Não há como enumerar um diretório remoto.",
+            "`internal/adbwire/sync_list.go` fala `LIST`/`DENT` nativamente (`SyncConn.List`), e `Client.MkdirAll` cria o pai de um push com um caminho validado. `test/fakeadb` responde a `LIST`. Nada chama o `adb` por shell."
+          ],
+          [
+            "O degrau de fingerprint de hardware de `farm.resolve_device` não conseguia executar. Ele chamava `min(d.id)` numa coluna uuid e o PostgreSQL não tem agregado `min(uuid)`, então o degrau 2 levantava SQLSTATE 42883 exatamente na colisão que ele existe para julgar — e `enroll.classifyResolveError` registrava o avistamento como `pending` para sempre.",
+            "`migrations/00005_correctness.sql:68-78` conta primeiro e busca depois: `count(*) = 1` identifica uma linha sem precisar de agregado, e `count(*) > 1` registra `ambiguous` em vez de tirar na moeda entre dois dispositivos. `test/assertions_v5.sql` V1 prova que o degrau executa."
+          ],
+          [
+            "`farm.v_fleet` juntava quarantines por `q.device_id = d.id`, então um dispositivo coberto por uma quarantine com escopo de hub ou de host — justamente o tipo que a lógica de correlação de fato abre — lia `health='quarantined'` com `quarantine_id` e `quarantine_reason` ambos NULL.",
+            "`migrations/00005_correctness.sql:446` reconstrói a view para escolher a quarantine aberta MAIS ESTREITA que cobre o dispositivo, entre os escopos de device, slot, power_domain, hub e host, e acrescenta uma coluna `quarantine_scope` para que a linha diga qual delas casou."
+          ],
+          [
+            "`farm.resolve_device` nunca consegue dar RETURN em 'ambiguous' a partir do degrau do serial. O degrau 3 atribui `v_res := 'ambiguous'` num serial duplicado (`migrations/00005_correctness.sql:89-92`) mas deixa `v_dev` NULL, e o degrau 4 testa apenas `IF v_dev IS NULL`, então ele cai direto na adoção e sobrescreve o veredito com 'adopted_new'. A reescrita em 00005 corrigiu o degrau do fingerprint e acrescentou a escrita de `serial_ambiguous`; ela não mudou este fluxo de controle.",
+            "`migrations/00011_resolve_ambiguous.sql` carrega a ambiguidade em uma variável própria, de modo que um degrau posterior que identifique positivamente o dispositivo ainda vence e reporta o próprio nome, enquanto uma adoção que vem depois de um degrau indeciso reporta `ambiguous` e mesmo assim retorna o device_id. O índice parcial `ident_obs_conflict` finalmente casa com o caso para o qual foi construído. `test/assertions_v11.sql`."
+          ],
+          [
+            "Os coletores Prometheus de nenhum pacote estão registrados — nem os do adbwire. `cmd/farmd/roles.go:86` chama `obs.RegisterAll(reg, log)` sem grupos variádicos, e a assinatura é `RegisterAll(r, log, groups ...[]prometheus.Collector)` — então o registry recebe os nove coletores do próprio internal/obs e nada mais. Dez pacotes definem `Collectors()` (adbwire, enroll, janitor, jobrunner, node, reaper, recovery, scheduler, topo, watchdog) e a árvore inteira tem exatamente UM ponto de chamada: `internal/api/server.go:369`, para o adbwire — e essa linha fica dentro de `if ownRegistry`, um ramo que o `farmd` nunca toma, porque `runAPI` fornece o próprio registry em `roles.go:138`. Então, no binário publicado, os coletores de nenhum pacote chegam a `/metrics`, incluindo os do adbwire.",
+            "Os dez grupos são passados a `obs.RegisterAll`, e a colisão de descritores por trás disso — `farm_recovery_attempts_total` declarado duas vezes com conjuntos de rótulos diferentes — foi resolvida em vez de contornada, de modo que `recovery.Collectors()` registra em vez de fazer o `farmd` falhar ao iniciar."
+          ],
+          [
+            "O agente de nó liga Enroll a enroll.EnrollOnce (cmd/farmd/roles.go:590-593), que roda uma passada e retorna, mas node.Agent.enrollLoop (internal/node/agent.go:735-776) espera uma função que rode até o context dela terminar e trata todo retorno como um restart anormal.",
+            "`Enroll: enr.Run`. `EnrollOnce` retorna normalmente depois de uma passada, o que o laço lia como falha: ele logava WARN e dobrava o backoff, então o enrolment rodava em uma agenda que decaía exponencialmente enquanto reclamava que algo estava errado, e um aparelho plugado às 02:00 esperava o pior caso de atraso."
+          ]
+        ]
+      },
+      "source": "migrations/00005_correctness.sql, test/assertions_v5.sql"
+    }
+  ],
+  "gaps": [
+    {
+      "what": "Nem a descoberta de topologia nem o enrolment rodam em qualquer lugar além do papel `farmd node`, e topo.Sysfs se recusa a rodar fora do Linux (sysfs.go:211-215).",
+      "consequence": "A demonstração em execução (cmd/farmd/roles.go:311-362) inicia demo, api, scheduler, reaper, recovery, jobrunner e um watchdog por host — não inicia enroll, nem topo. farm.identity_observations e farm.slot_occupancy estão as duas VAZIAS no sistema em execução (verificado: 0 linhas cada), todos os 56 dispositivos têm hw_fingerprint IS NULL, e farm.component_heartbeat não tem linha de `enroll` nem de `node`. Tudo o que está nas seções de enrolment e de topologia acima foi verificado chamando as funções SQL diretamente, rodando as funções Go isoladamente e lendo o código; os laços em si nunca rodaram aqui. Nada neste repositório consegue fazer o enrolment de um dispositivo ou registrar um slot em um host Windows ou macOS.",
+      "status": "linux_only"
+    },
+    {
+      "what": "farm.recovery_attempts na demonstração tem três escritores — internal/recovery/ladder.go (742, 950, 1054), internal/api/ops.go (692, 738) e internal/demo/demo.go (2077) — e a escada de recovery de verdade não recusou nada neste sistema.",
+      "consequence": "Verificado atribuindo todas as 48 linhas de recusa pelo texto delas: 37 escritas pelo simulador da demonstração, 11 pelo handler de energia de slot da API (2 delas vindas desta verificação), 0 por internal/recovery/ladder.go, cujas recusas começam com \"tier N (name) has blast radius …\" (ladder.go:920). Um operador que leia o censo de recusas, a UI ou `sum by (outcome) (farm_recovery_attempts_total)` nesta demonstração está lendo uma narrativa roteirizada, não a lógica de raio de impacto da escada. O caminho de recusa da própria escada não é exercitado aqui e não é testado (veja o gap de zero arquivos de teste).",
+      "status": "partial"
+    },
+    {
+      "what": "Snapshot.AmbiguousSerials é detectado e logado pelo watchdog (watchdog.go:522-525) e pelo enroller, mas farm.devices.serial_ambiguous só é escrito de dentro de farm.resolve_device — no degrau 3, quando a contagem do serial passa de um (00004_operate.sql:307), e de novo depois de uma adoção (:352).",
+      "consequence": "Em uma farm em que o enrolment não está rodando — o que inclui esta demonstração — um par de clones que apareça agora produz uma linha de log e um gauge não registrado, e flag durável nenhuma em qualquer uma das duas linhas. A flag nas duas linhas de clone vivas aqui foi semeada por internal/demo/seed.go, não observada. Use a consulta GROUP BY … HAVING count(*) > 1 das Receitas do operador em vez de confiar na coluna.",
+      "status": "partial"
+    },
+    {
+      "what": "Na demonstração, os sete dispositivos que leem `health='quarantined'` estão cobertos por uma linha de quarantine com escopo de HUB (scope 'hub', host h02), não por linhas por dispositivo. `farm.quarantines.device_id` é NULL em todas as linhas da tabela, porque nada na árvore abre uma quarantine com escopo de dispositivo, exceto o degrau de esgotamento da própria escada, que nunca disparou aqui.",
+      "consequence": "Uma consulta que junte `farm.quarantines` por `device_id` para explicar um dispositivo em quarantine não encontra nada e parece um bug de dados. `farm.v_fleet` já não tem esse problema — ela resolve escopo de hub e de host e reporta `quarantine_scope` (veja a tabela acima) — mas um join escrito na mão contra a tabela base ainda tem. Procure a linha por `hub_id` ou por `host_id`, e note que nesta demonstração quem as abre e fecha é o simulador, não a escada de recovery.",
+      "status": "partial"
+    },
+    {
+      "what": "Exemplos de verificação que sofreram rollback ainda consomem valores de sequências de identidade, e o psql em um host não anglófono imprime rodapés de contagem de linhas localizados.",
+      "consequence": "Reexecutar os exemplos de register_slot e de adoção desta página imprime ids de slot e de power_domain maiores que os das saídas mostradas, e imprime \"(N linhas)\" em vez de \"(N rows)\" em um servidor pt-BR. Nenhum dos dois é um defeito; não leia um id diferente como uma discrepância. No Windows, evite também rodar `ctl device exec … -- cat /absolute/path` a partir do Git Bash: a tradução de caminhos do MSYS reescreve o argumento antes de a CLI vê-lo.",
+      "status": "partial"
+    }
+  ],
+  "verified": "NENHUM ARQUIVO DO REPOSITÓRIO FOI MODIFICADO. `git status --porcelain` no fim é byte a byte idêntico ao do início (4 modificações preexistentes de UI/api mais internal/api/capabilities.go, nenhuma delas minha). Onde precisei rodar código não exportado, usei `go test -overlay <scratchpad>/overlay.json`, que mapeia arquivos de teste do scratchpad para dentro de um pacote sem escrever na árvore.\n\nLidos por inteiro: internal/enroll/{enroll,identity,brand}.go, internal/topo/{discover,sysfs,rackslot}.go, internal/watchdog/watchdog.go, internal/adbwire/{doc,client,device,sync}.go, migrations/00004_operate.sql; mais leituras dirigidas de migrations/00001_core.sql e 00002_lease.sql, internal/recovery/ladder.go, internal/api/{router,server,ops}.go, internal/node/agent.go, internal/demo/{demo,seed}.go, internal/obs/{doc,metrics}.go, cmd/farmd/roles.go, test/fakeadb/doc.go, docker-compose.yml.\n\nExecutado contra o sistema em produção (API 127.0.0.1:8420, Postgres 127.0.0.1:55432, PostgreSQL 17.10 on x86_64-windows) — 43 exemplos:\n- SQL: par de clones 0123456789ABCDEF em usb:3-1.1 (Pixel 7) / usb:3-1.2 (Pixel 6a), os dois com serial_ambiguous=t; hosts, hubs, controladores, power domains, slots, ids de slot por hub, censo de health de device_runtime, censo de recusas de recovery_attempts mais uma consulta de atribuição por escritor, component_heartbeat, quarantines (\\d e conteúdo completo), leases; contados identity_observations=0, slot_occupancy=0, devices_with_fingerprint=0, devices=56, slots=56 todos ativos, hubs=8, quarantines=5 (1 aberta).\n- has_table_privilege('farm_watchdog', ...) em leases/jobs/devices/slots/hosts/device_runtime; pg_roles para rolsuper e rolcanlogin; pg_indexes em farm.slots (nenhum índice único em rack_slot); pg_constraint em farm.events.\n- farm.resolve_device em transações revertidas com \\set VERBOSITY verbose: branded_uid; serial_and_slot; serial clonado em uma posição recém-criada por register_slot -> adopted_new mais uma terceira linha carregando esse serial; serial clonado em um slot ocupado -> 23505 devices_one_per_slot na linha 62 da função; posição não registrada -> P0002; degrau do fingerprint -> 42883 \"function min(uuid) does not exist\" na linha 30 da função (confirmado com to_regprocedure('min(uuid)') = NULL, min(bigint) presente).\n- farm.register_slot em transações revertidas: construiu o controlador do barramento 5 + hub 5-4 + domínio ganged/none + slot com adb_devpath gerado e topo_path em ltree; as quatro portas de um hub não chaveável caíram todas em um mesmo power_domain_id.\n- Protocolo host do ADB cru sobre TCP contra o servidor falso em 127.0.0.1:50136 (TcpClient do PowerShell, sem binário adb): host:version -> OKAY 0029; host:devices-l -> OKAY 0aef/2799 bytes mostrando as duas linhas dos clones; host-usb:usb:3-1.1:get-state -> OKAY \"device\"; host-serial:0123456789ABCDEF:get-state -> FAIL \"more than one device\".\n- CLI: `ctl device <uid>` em um clone (aviso de ambiguidade + faixa de correlação do hub); `ctl device exec` nos DOIS clones com --reason/--yes -o json retornando ids de dispositivo distintos em usb:3-1.1 e usb:3-1.2; `ctl device exec` em um dispositivo com lease vivo -> 409 com código de saída 3 e o lease intacto; `ctl device exec … -- cat /data/local/tmp/.farm/uid` rodado tanto no Git Bash (caminho deformado — exemplo corrigido) quanto no PowerShell (limpo).\n- API: GET /healthz, GET /metrics (enumeradas todas as 17 famílias de métricas), GET /api/v1/topology; POST /api/v1/slots/22/power duas vezes -> 409 \"this slot has no controllable power domain\", slots_in_domain 7. Eu NÃO disparei o endpoint de energia contra o hub 4-1, o que teria pedido um ciclo de verdade em 7 dispositivos.\n- Amostrei o damper de flap duas vezes, com 20s de intervalo, em R1-U04-H1-P6/P7: os dois segurados abaixo de healthy, com flap_credits 0.00-0.10.\n- `go test ./internal/{adbwire,enroll,topo,watchdog}` — adbwire ok, os outros três \"no test files\"; contei os arquivos de teste em todos os 20 pacotes internal.\n- Rodei o enroll.HardwareFingerprint REAL (cinco casos, incluindo a colisão de unidades idênticas), as strings reais de probeCommand/brandReadCmd/brandWriteCmd, os reais topo.NewLabeler/Slot/HubOrdinal/Check (incluindo os dois erros de colisão) e o real adbwire.ValidateDevpath (nove entradas), tudo via go test -overlay.\n\nCHECAGEM DE INVARIANTE: li todas as seções especificamente atrás de qualquer caminho que vá de um evento de conectividade ao fim de um lease. Não existe nenhum, e nenhuma formulação sugere que exista. Em todo lugar em que a página nomeia um valor de health, ela diz o que aquele valor interrompe (a alocação, o próximo degrau) e no que ele não toca (um lease vivo): a linha `offline` da tabela da máquina de estados, o parágrafo de aposentadoria de slot do topo, a recusa de conflito de slot do enroll, as três recusas do watchdog e o parágrafo do socket caído do adbwire. Reforcei dois pontos em vez de deixá-los ambíguos — a constraint de release_reason agora é citada por inteiro a partir de migrations/00001_core.sql:324, para que quem lê veja que não há valor de conectividade a escrever, e o gap de quarantine agora afirma explicitamente que uma quarantine de hub interrompe o escalonamento e não toca nos leases dos dispositivos daquele hub.\n\nPASSADA DE REVERIFICAÇÃO DOS GAPS. A lista de gaps desta página foi reconferida contra a árvore, linha a linha, depois das migrações 00005, 00006 e 00007 e das mudanças em Go que vieram com elas. Toda entrada movida para \"Gaps fechados desde que esta página foi escrita\" foi confirmada lendo o código que a fechou, não confiando em uma mensagem de commit. Três afirmações se mostraram desatualizadas na direção oposta e foram reabertas: reaper.Collectors(), jobrunner.Collectors() e os coletores de recovery/node seguem todos não registrados, porque cmd/farmd/roles.go:86 chama obs.RegisterAll(reg, log) sem grupos variádicos e o único ponto de chamada de Collectors() na árvore fica em um ramo que o farmd nunca toma. Uma afirmação estava simplesmente errada quando foi escrita — farm.slots.power_domain_id existe desde migrations/00001_core.sql:91 — e foi corrigida no lugar. Duas afirmações sobre cobertura de testes foram estreitadas em vez de fechadas: internal/lease e internal/api estão cobertos agora; internal/reaper, internal/scheduler, internal/runner e internal/jobrunner ainda têm zero arquivos de teste. Apenas os seis arquivos JSON de área foram editados por esta passada; nenhum código Go, SQL ou de UI foi tocado."
+}

@@ -332,10 +332,50 @@ function renderFleet() {
 
   refreshFilterOptions(all || []);
 
+  /* Cards or table, decided and painted on the switch BEFORE anything below
+   * can return early. The loading and the failed states own the whole of
+   * #fleet-body, and they are the states the page spends its first seconds in
+   * — a switch wired only on the happy path is a switch that does nothing
+   * until the first response lands, and nothing at all on a farm whose fleet
+   * endpoint is refusing. */
+  const mode = fleetMode(all);
+  syncFleetModeControl(mode);
+
   const problem = panelState('fleet', all, emptyState(
     'No devices match.',
     'This grid shows every device in farm.v_fleet grouped by host and then by hub — rack slot, model, health, lease and battery. Clear the filters, or check that the watchdog has registered devices.'));
   if (problem) { body.replaceChildren(problem); alerts.replaceChildren(); return; }
+
+  /* Both panes always exist; exactly one is visible, and only the visible one
+   * is ever filled — a hidden table of five hundred rows is five hundred rows
+   * of work nobody asked for, on a view that repaints under a live event
+   * stream. */
+  const boxes = fleetModeBoxes(body);
+  boxes.cards.hidden = mode !== 'cards';
+  boxes.table.hidden = mode !== 'table';
+
+  if (mode === 'table') {
+    boxes.cards.replaceChildren();
+    boxes.table.replaceChildren(rows.length
+      ? fleetTable(rows)
+      : emptyState(t('fleet.empty'), t('fleet.emptyDetail')));
+    /* The in-context hub-correlation box below is not drawn here, and it is
+     * worth being exact about what that costs. The box belongs beside the hub
+     * it accuses, and a table sorted by battery has no hub to stand beside.
+     * The correlation the SERVER found still reaches the reader: it comes off
+     * the alert stream with the hub id on it and fills the banner region at
+     * the top of the page, which is above this table too.
+     *
+     * What is not reproduced is the client-side fallback below — the ratio
+     * test that fires when the server did not flag the hub itself. In table
+     * mode that hub is visible only as several unhealthy rows sharing a hub
+     * path, which is a thing an operator can sort by and not a thing the page
+     * says out loud. That is a real gap and it is written down here rather
+     * than papered over. */
+    alerts.replaceChildren();
+    return;
+  }
+  boxes.table.replaceChildren();
 
   // Group by host, then by hub: the physical failure unit, in the order a
   // human walks the room.
@@ -455,7 +495,7 @@ function renderFleet() {
       'The fleet has ' + (all ? all.length : 0) + ' devices. Clear the filters to see them.'));
   }
 
-  body.replaceChildren(frag);
+  boxes.cards.replaceChildren(frag);
 
   // Alerts inside the view are rendered content; the announcement goes to the
   // aria-live banner region once per new correlation, not on every repaint.
@@ -700,6 +740,376 @@ function deviceTile(d) {
       pct === null
         ? el('span', { class: 'batt', title: t('fleet.tile.noBattery') }, '—')
         : batteryEl(d.battery)));
+}
+
+/* ------------------------------------------------------------------ *
+ * THE FLEET AS A TABLE
+ *
+ * A card grid is a map of a rack you can walk. Forty tiles is a wall of
+ * handsets an operator can point at, and where a tile sits on screen is where
+ * a phone sits in the room. Past a certain size that stops being true: the
+ * grid wraps into a shape with no relation to the room, and the map becomes a
+ * wall. A table does not pretend to be a map. It has one row per device, it
+ * sorts, and it is what a business reads.
+ *
+ * Neither mode is the real one. The grid is how you find a device you can see;
+ * the table is how you find a device among five hundred you cannot.
+ * ------------------------------------------------------------------ */
+
+const FLEET_MODES = ['cards', 'table'];
+
+/* Where the grid stops being a map. Forty is roughly where a comfortable-
+ * density grid stops fitting on one screen — and it is only a DEFAULT: the
+ * moment a reader picks a mode, their choice is what fleetMode returns, at
+ * every size, forever. */
+const FLEET_TABLE_ABOVE = 40;
+
+/* The choice lives in localStorage, per browser, for the same reason the
+ * language and the density do (see i18n.js): it is a reading preference and
+ * not a property of the farm. Two operators sharing one control plane can want
+ * different modes and neither may change the other's.
+ *
+ * It is deliberately NOT in the URL hash either, which is the same argument
+ * one step further out: buildHash() makes a link somebody pastes into a
+ * ticket, and a pasted link that silently re-modes a colleague's dashboard is
+ * exactly the thing storing this per browser is meant to prevent. The hash
+ * carries what the OTHER reader needs — the filters and the search — and
+ * nothing about how this one likes to read. */
+const FLEET_MODE_KEY = 'device-farmer.fleetMode';
+
+/* null means "never chosen", which is not the same as either mode: it is what
+ * lets the size rule below decide, and what a stored choice replaces. */
+let fleetModeChoice = readFleetMode();
+
+function readFleetMode() {
+  try {
+    const saved = localStorage.getItem(FLEET_MODE_KEY);
+    if (FLEET_MODES.includes(saved)) return saved;
+  } catch (_) { /* private mode: no stored choice, so size decides */ }
+  return null;
+}
+
+/* The size rule's answer, once something has been able to measure the farm.
+ * null until then. */
+let fleetModeDefault = null;
+
+/* fleetIsFiltered: is the fleet the page is holding the whole farm, or a slice
+ * of it? The host, hub, health, pool and search filters are all applied by the
+ * SERVER — state.data.fleet is its answer, not the farm — so none of them may
+ * be in effect when the size rule measures. */
+function fleetIsFiltered() {
+  const f = state.filters;
+  return !!(state.q.trim() || f.host || f.hub || f.health || f.pool || f.lease);
+}
+
+/* fleetMode answers with the mode to draw: a stored choice if the reader has
+ * made one, and otherwise the size rule.
+ *
+ * The size is re-measured only from an UNFILTERED answer, and this is the
+ * whole reason the function is shaped this way. Measuring whatever the server
+ * last returned meant that narrowing the health filter to the seven
+ * quarantined devices threw an operator out of the table and into the card
+ * grid, and clearing the filter threw them back. A default that moves while
+ * somebody is working is not a default.
+ *
+ * `fleet` is null until the first response, which is why it is passed whole
+ * rather than as a length: an empty farm is a farm with no devices in it, and
+ * a farm nobody has heard from yet is not. */
+function fleetMode(fleet) {
+  if (fleetModeChoice) return fleetModeChoice;
+  if (Array.isArray(fleet) && !fleetIsFiltered()) {
+    fleetModeDefault = fleet.length > FLEET_TABLE_ABOVE ? 'table' : 'cards';
+  }
+  return fleetModeDefault || 'cards';
+}
+
+function setFleetMode(next) {
+  if (!FLEET_MODES.includes(next) || next === fleetModeChoice) return;
+  fleetModeChoice = next;
+  try { localStorage.setItem(FLEET_MODE_KEY, next); } catch (_) { /* not fatal */ }
+  render();
+}
+
+/* fleetModeBoxes returns the two containers, making them if they are not there.
+ *
+ * They are rebuilt rather than assumed because renderFleet empties #fleet-body
+ * outright whenever the API has not answered yet or answered with nothing —
+ * the loading and error states own the whole box, and the modes come back
+ * under them on the next good render. */
+function fleetModeBoxes(body) {
+  let cards = $('#fleet-cards', body);
+  let tbl = $('#fleet-table', body);
+  if (!cards || !tbl) {
+    cards = el('div', { id: 'fleet-cards', class: 'fleet-pane' });
+    tbl = el('div', { id: 'fleet-table', class: 'fleet-pane' });
+    body.replaceChildren(cards, tbl);
+  }
+  return { cards: cards, table: tbl };
+}
+
+/* syncFleetModeControl paints the toolbar's two-state switch, and wires it
+ * once. The listener sits on the group rather than on the buttons so that it
+ * survives every repaint of the view below it. */
+function syncFleetModeControl(mode) {
+  const group = $('#fleet-mode');
+  if (!group) return;
+  if (!group.dataset.wired) {
+    group.dataset.wired = '1';
+    group.addEventListener('click', (ev) => {
+      const btn = ev.target.closest('button[data-mode]');
+      if (btn) setFleetMode(btn.dataset.mode);
+    });
+  }
+  for (const btn of $$('button[data-mode]', group)) {
+    btn.setAttribute('aria-pressed', btn.dataset.mode === mode ? 'true' : 'false');
+  }
+}
+
+/* ---------------------------- sorting ---------------------------- */
+
+/* Which column the table is ordered by, and which way. It is not stored: the
+ * mode is how somebody reads, a sort is what they are looking for right now,
+ * and a sort that outlived the question it answered is a table that opens in
+ * an order nobody asked for. */
+let fleetSort = { key: 'slot', dir: 'asc' };
+
+function setFleetSort(key) {
+  fleetSort = fleetSort.key === key
+    ? { key: key, dir: fleetSort.dir === 'asc' ? 'desc' : 'asc' }
+    : { key: key, dir: 'asc' };
+  render();
+}
+
+/* HEALTH_RANK orders the Condition column and does nothing else.
+ *
+ * Ascending is calmest first, so one click puts the devices that are fine at
+ * the top and a second click puts the ones somebody has to walk to. This is a
+ * reading order and not a severity the server would recognise: there is no
+ * rank column in farm.v_fleet, and this number is never sent anywhere. The
+ * only judgement in it is that the two states which mean somebody DECIDED a
+ * handset is out of service — parked and retired — sit next to healthy rather
+ * than among the faults, which is the same call NOT_A_FAULT makes in app.js. */
+const HEALTH_RANK = {
+  healthy: 0, parked: 1, retired: 2, booting: 3, recovering: 4,
+  degraded: 5, unauthorized: 6, quarantined: 7, missing: 8, offline: 9, unknown: 10
+};
+
+function healthRank(h) {
+  const r = HEALTH_RANK[h || 'unknown'];
+  // A health value this page has never heard of sorts after every one it has.
+  return r === undefined ? 99 : r;
+}
+
+/* free < held < protected < suspect, and then the same four again for a device
+ * that is administratively out. Suspect goes last of the four because it is
+ * the one an operator is hunting for: the control plane has not heard from the
+ * holder, and — the axiom the Leases view states — the lease is not over.
+ *
+ * The +4 puts every device a scheduler could still be given above every device
+ * it could not, which is the question this column is asked. A drained device
+ * holds no lease and is not free either. */
+function availRank(d) {
+  const out = drainedState(d) ? 4 : 0;
+  const st = d.leaseState;
+  if (!st || st === 'released' || st === 'expired') return out;
+  if (st === 'suspect') return out + 3;
+  return out + (d.protected ? 2 : 1);
+}
+
+function deviceModelName(d) {
+  return [d.manufacturer, d.model].filter(Boolean).join(' ');
+}
+
+/* The five columns whose order is a comparison between two rows. */
+const FLEET_SORTS = {
+  slot: (a, b) => cmp(a.rackSlot || a.usbPath, b.rackSlot || b.usbPath),
+  model: (a, b) => cmp(deviceModelName(a), deviceModelName(b)) || cmp(a.android, b.android),
+  where: (a, b) => cmp(a.host, b.host) || cmp(a.hubPath, b.hubPath) ||
+    cmp(a.rackSlot || a.usbPath, b.rackSlot || b.usbPath),
+  condition: (a, b) => healthRank(a.health) - healthRank(b.health) || cmp(a.health, b.health),
+  availability: (a, b) => availRank(a) - availRank(b)
+};
+
+/* And the two whose order is a number the row either has or does not.
+ *
+ * They are separated because both problems live here. A comparison sort asks
+ * each row for its value about log2(n) times, so Date.parse on five hundred
+ * rows was twenty thousand parses per repaint on the one view that repaints
+ * under a live event stream; computing the value once per row per render
+ * removes all of it. And a value the API did not fill is not a small number
+ * and not a large one, so it is null rather than NaN or zero — see fleetSorted
+ * for what that buys. */
+const FLEET_NUMBERS = {
+  battery: (d) => {
+    if (d.battery === null || d.battery === undefined) return null;
+    const n = Number(d.battery);
+    return Number.isNaN(n) ? null : n;
+  },
+  lastSeen: (d) => {
+    const at = parseTime(d.lastSeen);
+    return at ? at.getTime() : null;
+  }
+};
+
+function fleetSorted(rows) {
+  const dir = fleetSort.dir === 'desc' ? -1 : 1;
+  const value = FLEET_NUMBERS[fleetSort.key];
+
+  // slice(): fleetRows() hands back an array the render pipeline still owns.
+  if (value) {
+    const v = new Map(rows.map((d) => [d, value(d)]));
+    return rows.slice().sort((a, b) => {
+      const va = v.get(a), vb = v.get(b);
+      /* A row with nothing to compare sinks to the bottom in BOTH directions.
+       * "—" is not an answer to "which battery is lowest", and reversing the
+       * order must not promote it to one. */
+      if (va === null || vb === null) return va === vb ? 0 : va === null ? 1 : -1;
+      return dir * (va - vb);
+    });
+  }
+
+  const by = FLEET_SORTS[fleetSort.key] || FLEET_SORTS.slot;
+  return rows.slice().sort((a, b) => dir * by(a, b));
+}
+
+/* ----------------------------- the table ----------------------------- */
+
+/* fleetTable takes rows and returns one node. It re-filters nothing —
+ * fleetRows() has already applied every filter and the header search — and it
+ * holds no reference to anything outside itself, so the caller decides where
+ * it goes and when it is replaced. */
+function fleetTable(rows) {
+  const cols = [
+    { label: t('fleet.col.slot'), sort: 'slot', cls: 'f-slot', cell: slotCell },
+    { label: t('fleet.col.model'), sort: 'model', cls: 'f-model', cell: modelCell },
+    { label: t('fleet.col.where'), sort: 'where', cls: 'f-where', cell: whereCell },
+    { label: t('fleet.col.condition'), sort: 'condition', cls: 'f-cond', cell: conditionCell },
+    { label: t('fleet.col.availability'), sort: 'availability', cls: 'f-avail', cell: availabilityCell },
+    { label: t('fleet.col.battery'), sort: 'battery', cls: 'f-batt', cell: (d) => batteryEl(d.battery) },
+    { label: t('fleet.col.lastSeen'), sort: 'lastSeen', cls: 'f-seen', cell: (d) => timeCell(d.lastSeen) }
+  ];
+
+  /* .tscroll is not optional and never has been: html and body clip sideways
+   * overflow, so a wide thing without its own scroller is a wide thing nobody
+   * can reach. The seven columns above are chosen to fit a 1280px laptop
+   * without using it — see fleet.css, which relaxes the 900px floor that the
+   * global table rule sets for the denser views. */
+  return el('div', { class: 'tscroll fleet-tbl' },
+    table(cols, fleetSorted(rows), {
+      onRowClick: (d) => openDevice(d),
+      sortKey: fleetSort.key,
+      sortDir: fleetSort.dir,
+      onSort: setFleetSort
+    }));
+}
+
+/* The first cell is the row's keyboard control, and the only one: a table of
+ * five hundred devices with seven tab stops per row is a table nobody reaches
+ * the bottom of. Its accessible name is the device, not the word in the cell,
+ * so what a screen reader announces is what a sighted reader clicks. */
+function slotCell(d) {
+  const label = d.rackSlot || (d.usbPath ? 'usb ' + d.usbPath : null);
+  return el('button', {
+    type: 'button',
+    class: 'rowlink',
+    'aria-label': t('fleet.openDevice', { device: fleetRowName(d) }),
+    onclick: () => openDevice(d)
+  }, label
+    ? el('span', { class: 'mono' }, label)
+    : el('span', { class: 'unslotted', title: t('fleet.unslottedWhy') }, t('fleet.unslotted')));
+}
+
+/* The name a screen reader hears in place of a row of cells. Position first,
+ * because the position is what an operator walks to. Nothing here is
+ * translated: it is a rack slot, a manufacturer and a model, all of them
+ * server data. */
+function fleetRowName(d) {
+  return [d.rackSlot || (d.usbPath ? 'usb ' + d.usbPath : null) || shortId(d.id), deviceModelName(d)]
+    .filter(Boolean).join(' — ');
+}
+
+/* The model, and the one identity fact that changes how a device must be
+ * addressed: an ADB serial that is not unique in this farm. That belongs here
+ * rather than under Condition, because nothing about the handset is wrong —
+ * two of them answer to the same name, and a command sent by serial could
+ * reach either one. */
+function modelCell(d) {
+  const name = deviceModelName(d);
+  return el('span', { class: 'chips' },
+    el('span', {
+      class: 'trunc',
+      title: [name, d.android ? 'Android ' + d.android : null, d.serial || null].filter(Boolean).join('  ')
+    }, name || t('fleet.unknownModel'),
+      d.android ? el('span', { class: 'dim' }, ' · ' + d.android) : null),
+    d.serialAmbiguous
+      ? el('span', { class: 'chip chip-degraded', title: t('fleet.dupSerialWhy') },
+        el('span', { 'aria-hidden': 'true' }, '⚠'), t('fleet.dupSerial'))
+      : null);
+}
+
+/* Host and hub in one column. They are one answer — which machine, which port
+ * tree — and the pair is what the correlated-failure story is told in.
+ *
+ * The separator is its own element: inside an inline-flex box a leading space
+ * in a text node sits at the start of a line box and is dropped, so
+ * "h01 · 3-1" rendered as "h01· 3-1" when it was glued to the hub path. */
+function whereCell(d) {
+  return el('span', { class: 'f-where-in' },
+    el('span', { class: 'mono trunc', title: String(d.host || '') }, d.host || t('fleet.noHost')),
+    el('span', { class: 'dim', 'aria-hidden': 'true' }, '·'),
+    el('span', { class: 'dim mono' }, d.hubPath || t('fleet.noHub')));
+}
+
+/* Condition: the health the watchdog decided, plus an open quarantine record
+ * when the health value does not already say so. A device can carry a
+ * quarantine that its current health has moved on from, and a quarantine is a
+ * standing decision about a handset — losing it on the mode that a large farm
+ * opens in would be losing it. */
+function conditionCell(d) {
+  return el('span', { class: 'chips' },
+    healthChip(d.health),
+    d.quarantineID && d.health !== 'quarantined'
+      ? el('span', { class: 'chip chip-quarantined', title: d.quarantineReason || t('fleet.openQuarantine') },
+        el('span', { 'aria-hidden': 'true' }, '■'), 'quarantined')
+      : null);
+}
+
+/* Availability, which is the whole question of whether a job can have this
+ * device: the lease, and the administrative state of the device itself. A
+ * drained device holds no lease and is still not available, so a table that
+ * showed only the lease would call it free.
+ *
+ * leaseChips() also returns a "plain" chip beside a held lease, meaning the
+ * reaper may reclaim it after TTL plus grace. That is the DEFAULT, and on a
+ * table of five hundred rows it is a word on every held row that tells an
+ * operator nothing they had not already assumed. The exception — protected —
+ * still comes through, because that one is a decision somebody made. */
+function availabilityCell(d) {
+  const out = drainedState(d);
+  return el('span', { class: 'chips' },
+    leaseChips(d).filter((c) => !c.classList.contains('chip-plain')),
+    out
+      ? el('span', { class: 'chip chip-drain', title: out.why },
+        el('span', { 'aria-hidden': 'true' }, '⏸'), out.state)
+      : null);
+}
+
+/* drainedState: is somebody holding this device out of the pool, and at which
+ * level? The device's own admin_state first, then the host's — a drained host
+ * takes every device on it out with it.
+ *
+ * The card grid says the host half in the host header, above the tiles. A
+ * table has no host header, so without this a whole drained host would read as
+ * twenty-eight free devices in the mode a large farm opens in. The value
+ * printed is the column's, untranslated, because it is what admin_state says. */
+function drainedState(d) {
+  if (d.adminState && d.adminState !== 'enabled') {
+    return { state: d.adminState, why: 'device admin_state' };
+  }
+  if (d.hostAdminState && d.hostAdminState !== 'enabled') {
+    return { state: d.hostAdminState, why: 'host_admin_state — the host this device is on is out of the pool' };
+  }
+  return null;
 }
 
 function refreshFilterOptions(rows) {

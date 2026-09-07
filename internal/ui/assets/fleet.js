@@ -314,7 +314,9 @@ function renderFleetSummary(all, rows) {
   const words = [];
   if (!served && !screened && !capped && c.unhealthy === 0) words.push(t('fleet.sum.allClear'));
   if (capped) words.push(t('fleet.sum.truncated'));
-  else words.push(served ? t('fleet.sum.filtered', { served: String(c.total) }) : t('fleet.sum.wholeFarm'));
+  else if (!served) words.push(t('fleet.sum.wholeFarm'));
+  else if (c.total === 1) words.push(t('fleet.sum.filteredOne'));
+  else words.push(t('fleet.sum.filtered', { served: String(c.total) }));
   if (screened) words.push(t('fleet.sum.onScreen', { shown: String(rows.length) }));
 
   note.className = 'sum-note' + (capped ? ' capped' : '');

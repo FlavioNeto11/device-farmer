@@ -429,6 +429,11 @@ const STRINGS = {
     'fleet.sum.allClear': 'Nothing needs attention right now.',
     'fleet.sum.wholeFarm': 'These five numbers are the whole farm, as the server counted it.',
     'fleet.sum.filtered': 'A filter is on: these five numbers count the {served} devices the server returned for it, not the whole farm.',
+    /* One is its own sentence in both languages. "the 1 devices" is the kind
+       of seam that tells a reader the screen was assembled rather than
+       written, and this line is the caveat that stops them trusting a
+       filtered number as a farm-wide one. */
+    'fleet.sum.filteredOne': 'A filter is on: these five numbers count the one device the server returned for it, not the whole farm.',
     'fleet.sum.onScreen': 'The grid below is showing {shown} of them.',
     'fleet.sum.truncated': 'The server capped this response, so these five numbers count only the rows that came back — not the farm.',
 
@@ -1113,6 +1118,7 @@ const STRINGS = {
     'fleet.sum.allClear': 'Nada precisa de atenção agora.',
     'fleet.sum.wholeFarm': 'Estes cinco números são a fazenda inteira, como o servidor contou.',
     'fleet.sum.filtered': 'Há um filtro ligado: estes cinco números contam os {served} dispositivos que o servidor devolveu para ele, não a fazenda inteira.',
+    'fleet.sum.filteredOne': 'Há um filtro ligado: estes cinco números contam o único dispositivo que o servidor devolveu para ele, não a fazenda inteira.',
     'fleet.sum.onScreen': 'A grade abaixo está mostrando {shown} deles.',
     'fleet.sum.truncated': 'O servidor limitou esta resposta, então estes cinco números contam só as linhas que voltaram — não a fazenda.',
 

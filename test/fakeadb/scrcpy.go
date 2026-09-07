@@ -199,6 +199,22 @@ type ScrcpyConfig struct {
 	// nowhere near the mistake.
 	VideoLoop bool
 
+	// VideoHold, when non-nil, holds each video handler between its prefix and
+	// its session header until it RECEIVES a value. One send releases one
+	// handler.
+	//
+	// A receive rather than a close, so that a device serving a second session
+	// holds again: the gate is per session, and a broadcast would open every
+	// future one along with the one under test.
+	//
+	// It exists for the tests of that gate. The window between a video socket
+	// claiming its role and settling into it is where a second connection is
+	// refused, and standing in that window on purpose is otherwise a race
+	// against the kernel. A session whose client goes away while held ends
+	// without a header, which is what a handset that never produced one looks
+	// like from here.
+	VideoHold <-chan struct{}
+
 	// ServerLog is written to the spawn's stdout as one shell v2 packet, the
 	// way the server jar announces itself. Nothing parses it.
 	ServerLog string
@@ -484,6 +500,28 @@ func (d *scrcpyDevice) serveVideo(sess *StreamSession, gen int) error {
 
 	if len(cfg.VideoPrefix) > 0 {
 		if _, err := sess.Write(cfg.VideoPrefix); err != nil {
+			d.videoGaveUp(gen)
+			return nil
+		}
+	}
+
+	// The header is held back until VideoHold releases it, so a test can observe
+	// the window in which the video role is CLAIMED but not yet SETTLED. That
+	// window exists in a real session too — it is however long the handset takes
+	// to produce its first header — and it is where serveSocket refuses a second
+	// connection. There is no other way to stand in it on purpose.
+	//
+	// It is a channel and not a byte count because the previous version of this
+	// seam WAS a byte count: a prefix large enough that the kernel could not
+	// absorb it, against a receive buffer pinned small. That is a bet on three
+	// operating systems' socket buffering, and it lost on Linux — the platform
+	// this ships on — inside the image build, while passing on the developer's
+	// machine. A fixture whose determinism depends on SO_RCVBUF is not
+	// deterministic.
+	if cfg.VideoHold != nil {
+		select {
+		case <-cfg.VideoHold:
+		case <-sess.Done:
 			d.videoGaveUp(gen)
 			return nil
 		}

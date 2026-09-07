@@ -1,7 +1,6 @@
 package fakeadb
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/binary"
 	"errors"
@@ -172,30 +171,29 @@ func TestAControlSocketIsRefusedWhileTheVideoSocketIsUnsettled(t *testing.T) {
 
 	const (
 		devpath = "usb:6-2.1"
-		// A megabyte of prefix against a receive window pinned at eight
-		// kilobytes by streamWireThrottled, so the handler's single write of it
-		// CANNOT complete and the header behind it cannot go out. The ratio
-		// between the two numbers is the point, and the note on that helper is
-		// what happens when they are left to the kernel to choose.
-		prefix = 1 << 20
-		peek   = 4 << 10
-		rcvbuf = 8 << 10
+		// A short prefix, purely so that reading it proves the video role WAS
+		// claimed — the handler is running and writing. What holds the handler
+		// before its header is the channel below, NOT an unread backlog: an
+		// earlier version of this test used a megabyte of prefix against a
+		// pinned receive buffer and lost the bet on Linux, inside the image
+		// build, while passing here.
+		prefix = 64
 	)
+	hold := make(chan struct{})
 	s := Start(t, ScrcpyFixture(ScrcpyConfig{
 		Devpath:     devpath,
 		VideoPrefix: bytes.Repeat([]byte{0xab}, prefix),
+		VideoHold:   hold,
 	}))
 	scid, _ := s.ScrcpySCID(devpath)
 	service := "localabstract:scrcpy_" + scid
 	dev := s.scrcpyFor(devpath)
 
-	// Reading a little proves the video role WAS claimed — the handler is
-	// writing — while leaving the rest of the prefix in front of the header.
-	video := streamWireThrottled(t, s, devpath, service, rcvbuf)
-	mustRead(t, video, peek, "the front of the video prefix")
+	video := streamWire(t, s, devpath, service)
+	mustRead(t, video, prefix, "the video prefix")
 	if videoIsLive(dev) {
-		t.Fatalf("the video socket settled while %d bytes of prefix were still unread; the gate "+
-			"this test is about was already open and nothing below it proves anything", prefix-peek)
+		t.Fatalf("the video socket settled while its header was still held; the gate this test " +
+			"is about was already open and nothing below it proves anything")
 	}
 
 	second := streamWire(t, s, devpath, service)
@@ -211,11 +209,11 @@ func TestAControlSocketIsRefusedWhileTheVideoSocketIsUnsettled(t *testing.T) {
 			"this", reply)
 	}
 
-	// The refusal did not spend the control role. Drain the prefix, let the
-	// header out, and the NEXT connection is the control socket it was always
-	// going to be — otherwise one client's mistake would cost the session a
-	// socket nobody ever used.
-	mustRead(t, video, prefix-peek, "the rest of the video prefix")
+	// The refusal did not spend the control role. Release the header, and the
+	// NEXT connection is the control socket it was always going to be —
+	// otherwise one client's mistake would cost the session a socket nobody ever
+	// used.
+	hold <- struct{}{}
 	mustRead(t, video, wireVideoHeaderLen, "the session header")
 	waitFor(t, func() bool { return videoIsLive(dev) },
 		func() string { return "the video socket never settled after its header went out" })
@@ -484,14 +482,17 @@ func TestARespawnsGateIsNotOpenedByThePreviousSessionsVideoSocket(t *testing.T) 
 
 	const (
 		devpath = "usb:6-8.2"
-		prefix  = 1 << 20
-		peek    = 4 << 10
-		rcvbuf  = 8 << 10
+		prefix  = 64
 		frame   = "FRAME"
 	)
+	// Held rather than buried behind an unread backlog, for the reason on
+	// ScrcpyConfig.VideoHold: a receive buffer is not a synchronisation
+	// primitive, and betting on one failed on Linux while passing here.
+	hold := make(chan struct{})
 	s := Start(t, ScrcpyFixture(ScrcpyConfig{
 		Devpath:     devpath,
 		VideoPrefix: bytes.Repeat([]byte{0xab}, prefix),
+		VideoHold:   hold,
 		Packets:     []ScrcpyPacket{{PTS: 1, KeyFrame: true, Data: []byte(frame)}},
 	}))
 	service := "localabstract:scrcpy_" + testSCID
@@ -499,8 +500,8 @@ func TestARespawnsGateIsNotOpenedByThePreviousSessionsVideoSocket(t *testing.T) 
 
 	first := streamWire(t, s, devpath, spawnService(testSCID))
 	readShellPacket(t, first)
-	stale := streamWireThrottled(t, s, devpath, service, rcvbuf)
-	mustRead(t, stale, peek, "the front of the first session's video prefix")
+	stale := streamWire(t, s, devpath, service)
+	mustRead(t, stale, prefix, "the first session's video prefix")
 
 	// The respawn. From here the old handler belongs to a session that is over,
 	// and it does not know that.
@@ -511,7 +512,7 @@ func TestARespawnsGateIsNotOpenedByThePreviousSessionsVideoSocket(t *testing.T) 
 	// point where it would mark a video socket live. Reading its first PACKET is
 	// what proves it got there — the header write returning is not observable
 	// from out here, and a sleep would be a guess.
-	mustRead(t, stale, prefix-peek, "the rest of the first session's video prefix")
+	hold <- struct{}{}
 	mustRead(t, stale, wireVideoHeaderLen, "the first session's session header")
 	mustRead(t, stale, wirePacketHeaderLen, "the first session's packet header")
 	mustRead(t, stale, len(frame), "the first session's packet payload")
@@ -525,8 +526,8 @@ func TestARespawnsGateIsNotOpenedByThePreviousSessionsVideoSocket(t *testing.T) 
 
 	// And the consequence, on the wire: the new session's gate really does still
 	// hold, so a socket opened while its video socket is unsettled is refused.
-	fresh := streamWireThrottled(t, s, devpath, service, rcvbuf)
-	mustRead(t, fresh, peek, "the front of the new session's video prefix")
+	fresh := streamWire(t, s, devpath, service)
+	mustRead(t, fresh, prefix, "the new session's video prefix")
 	overlapping := streamWire(t, s, devpath, service)
 	if got := readAllWithin(t, overlapping, time.Second); len(got) != 0 {
 		t.Fatalf("the new session served %d bytes to a socket opened before its video socket had "+
@@ -768,52 +769,6 @@ func scrcpySockets(d *scrcpyDevice) int {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.sockets
-}
-
-// streamWireThrottled is streamWire with the CLIENT'S receive buffer pinned
-// small before a single byte of the service has been asked for.
-//
-// THE TESTS ABOVE NEED THE VIDEO HANDLER PARKED, AND WITHOUT THIS THAT IS A
-// QUESTION ABOUT SOCKET BUFFERS RATHER THAN ABOUT THE FIXTURE. They hold the
-// handler ahead of its session header by giving it a VideoPrefix far larger than
-// anything a client reads, and then rely on its write blocking. With the buffers
-// left to autotune, this loopback swallowed EIGHT MEGABYTES whole — reset
-// connection and all — about one run in ten: the header went out, the socket
-// really was live, and a test whose premise was "the header did not go out"
-// failed twenty seconds later on an assertion about something that had never
-// happened. Enlarging the prefix would only move the number being guessed at.
-//
-// SO_RCVBUF pinned here fixes the receive window at a few kilobytes and takes
-// autotuning out of it, so the server can have at most that window plus its own
-// send buffer outstanding — tens of kilobytes against a prefix of a megabyte.
-// "The handler is parked" stops being a race and becomes arithmetic.
-//
-// It has to be set BEFORE the service frame goes out, which is why this is a
-// whole dial rather than one line bolted onto streamWire: the server writes
-// nothing until it has the service string, so setting the buffer here is
-// provably ahead of the first byte the fixture sends.
-func streamWireThrottled(tb testing.TB, s *Server, devpath, service string, rcvbuf int) *wire {
-	tb.Helper()
-	c, err := net.Dial("tcp", s.Addr())
-	if err != nil {
-		tb.Fatalf("dial %s: %v", s.Addr(), err)
-	}
-	tb.Cleanup(func() { _ = c.Close() })
-	tc, ok := c.(*net.TCPConn)
-	if !ok {
-		tb.Fatalf("the fake is not on TCP (%T), so its receive buffer cannot be pinned and the "+
-			"tests that need a parked writer cannot know that they have one", c)
-	}
-	if err := tc.SetReadBuffer(rcvbuf); err != nil {
-		tb.Fatalf("pinning the receive buffer at %d bytes: %v", rcvbuf, err)
-	}
-	if err := c.SetDeadline(time.Now().Add(wireDeadline)); err != nil {
-		tb.Fatalf("set deadline: %v", err)
-	}
-	w := &wire{tb: tb, c: c, br: bufio.NewReader(c)}
-	w.okBare("host:transport:" + devpath)
-	w.okBare(service)
-	return w
 }
 
 // videoIsLive reports whether a scripted device's video socket has got its

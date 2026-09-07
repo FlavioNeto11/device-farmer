@@ -289,6 +289,88 @@ const (
 	EnvFenceControlKey  = "FARM_FENCE_CONTROL_KEY"
 )
 
+// The interactive-control path: a live screen in the dashboard, and a human's
+// finger on it.
+//
+// FARM_SCREEN_SERVER_SHA pins WHICH jar is pushed to the handset. The screen
+// is produced by a server process that runs ON the device, and this farm does
+// not build it — an operator uploads it once with POST /api/v1/artifacts and
+// the digest it was stored under goes here. Pinning rather than "whatever is
+// named scrcpy-server" is the whole point: the artifact store is writable by
+// operators, and an unpinned lookup makes "replace the jar" into "run my code
+// as shell on every phone in the rack". A digest that does not resolve refuses
+// the route; it never falls back.
+//
+// FARM_SCREEN_SERVER_VERSION is coupled to that jar and is NOT decoration. The
+// server refuses to start when the version it is told does not match the
+// version it was built as, which converts a jar/command-line mismatch from a
+// silent parse of garbage into a named error on the handset's stderr. There is
+// no default: a farm that pinned a digest and guessed a version would get the
+// silent failure the pin was supposed to prevent.
+//
+// Both unset means the feature is off, and the routes say so with the names of
+// these two variables. That is the only way to turn it off, and it is the
+// default.
+const (
+	EnvScreenServerSHA     = "FARM_SCREEN_SERVER_SHA"
+	EnvScreenServerVersion = "FARM_SCREEN_SERVER_VERSION"
+
+	// FARM_SCREEN_MAX_SIZE is the longest edge of the encoded video, in
+	// pixels. It bounds the encoder on the handset, not this process: a
+	// 1440x3120 panel encoded at full resolution is bytes nobody looking at a
+	// 400-pixel-wide panel in a browser can see, paid for in device battery
+	// and in host bandwidth shared with every other device on the hub.
+	EnvScreenMaxSize = "FARM_SCREEN_MAX_SIZE"
+
+	// FARM_SCREEN_SESSION_TTL bounds how long one screen session may stay
+	// open with nothing arriving for it.
+	//
+	// READ THIS BEFORE CHANGING IT. This is a bound on a SESSION, which is a
+	// socket and an encoder on a handset. It is NOT, and must never become, a
+	// bound on a lease. A session that times out stops bytes and frees the
+	// encoder; the lease it borrowed its fence from is untouched, and the
+	// device is not released, reclaimed or quarantined. Making this end a
+	// lease would be exactly the idle timer the founding invariant exists to
+	// forbid — see LEASE-01 in REQUIREMENTS.md and STF #663.
+	EnvScreenSessionTTL = "FARM_SCREEN_SESSION_TTL"
+
+	// FARM_SCREEN_MAX_SESSIONS caps concurrent sessions in one api process.
+	// Each one is three ADB transports, a hardware encoder on a phone, and a
+	// response this process cannot buffer. The cap exists so that a wall of
+	// open tabs degrades by refusing the next one with a reason, rather than
+	// by starving the request that renews every lease in the farm.
+	EnvScreenMaxSessions = "FARM_SCREEN_MAX_SESSIONS"
+)
+
+const (
+	// DefaultScreenMaxSize is 1024 because it is the largest value that keeps
+	// a 1080x2400 panel's long edge inside the level-3.1 macroblock budget
+	// every Android device since API 21 is required to decode, and because it
+	// is comfortably above what a dashboard panel displays.
+	DefaultScreenMaxSize = 1024
+
+	// DefaultScreenSessionTTL. Thirty minutes is long enough that an operator
+	// reading a crash on a device does not get cut off mid-thought, and short
+	// enough that a forgotten tab releases the phone's encoder the same
+	// working day. It ends a SESSION and nothing else; see EnvScreenSessionTTL.
+	DefaultScreenSessionTTL = 30 * time.Minute
+
+	// DefaultScreenMaxSessions. Four is a judgement, not a measurement: it is
+	// more than one operator needs and few enough that the failure mode is a
+	// refusal an operator can read rather than a process under memory
+	// pressure. Raise it with evidence from a real farm.
+	DefaultScreenMaxSessions = 4
+
+	// MinScreenMaxSize and MaxScreenMaxSize bound FARM_SCREEN_MAX_SIZE. The
+	// floor is two macroblocks on the short edge, below which an H.264 encoder
+	// has nothing to predict from and emits a stream no decoder will open. The
+	// ceiling is above the long edge of any panel this farm holds, so a value
+	// past it can only be a typo or a request to upscale — which spends a
+	// phone's battery inventing pixels.
+	MinScreenMaxSize = 32
+	MaxScreenMaxSize = 4096
+)
+
 // Mirrors of CHECK constraints in migrations/00001_core.sql. Duplicated on
 // purpose: the database is the authority, but a process that would inevitably
 // violate the authority should never finish booting.
@@ -820,6 +902,122 @@ func controlFenceClient(l loader) FenceClient {
 	return f
 }
 
+// Screen is the interactive-control configuration: the jar that produces a
+// live screen on a handset, and the bounds on a session that shows one.
+//
+// WHAT THIS TYPE IS NOT. Nothing here can end a lease. A session is three ADB
+// transports and an encoder on a phone; a lease is a row in farm.leases whose
+// release_reason is CHECK-constrained to seven values, none of which is about a
+// socket. Every bound below stops BYTES. If a future field here looks like it
+// should also release a device, that is the idle timer the founding invariant
+// forbids, and the right change is to delete the field.
+type Screen struct {
+	// ServerSHA is the sha256 of the jar in farm.artifacts, lowercase hex.
+	ServerSHA string
+
+	// ServerVersion is the version string the jar's server expects as its
+	// first argument, and which it refuses to start without matching.
+	ServerVersion string
+
+	// MaxSize is the longest edge of the encoded video, in pixels.
+	MaxSize int
+
+	// SessionTTL bounds an idle session. See EnvScreenSessionTTL for the
+	// paragraph about what it must never be used for.
+	SessionTTL time.Duration
+
+	// MaxSessions caps concurrent sessions in this process.
+	MaxSessions int
+}
+
+// Enabled reports whether this farm can serve a screen at all.
+//
+// It is deliberately an AND of the two values an operator must supply, with no
+// default for either. A farm that set a digest and inherited a version would
+// push a known jar and then tell it a version it was not built as — which the
+// server on the handset refuses, from a process that has already spent a push
+// and an ADB transport to get there. Requiring both makes that unreachable.
+func (s Screen) Enabled() bool { return s.ServerSHA != "" && s.ServerVersion != "" }
+
+// problems reports configuration that cannot work, at boot, all at once.
+func (s Screen) problems() []error {
+	var errs []error
+
+	// All-or-none, and the message names the variable that is MISSING rather
+	// than the one that is set: an operator who set one of a pair does not need
+	// to be told about the one they already got right.
+	switch {
+	case s.ServerSHA != "" && s.ServerVersion == "":
+		errs = append(errs, fmt.Errorf("%s is set and %s is empty; the jar's server refuses to "+
+			"start when the version it is told does not match the version it was built as, so a "+
+			"digest without a version is a push that cannot run", EnvScreenServerSHA, EnvScreenServerVersion))
+	case s.ServerVersion != "" && s.ServerSHA == "":
+		errs = append(errs, fmt.Errorf("%s is set and %s is empty; there is no default jar, and "+
+			"resolving one by name would make replacing an artifact into running code on every "+
+			"handset", EnvScreenServerVersion, EnvScreenServerSHA))
+	}
+
+	// The digest is checked HERE rather than at the first request, because the
+	// alternative is an operator discovering a typo in a 64-character hex
+	// string at the moment they need to look at a phone. ValidSHA256's shape
+	// is also a path-traversal gate in the blob backend; a value that reaches
+	// the store must already have been through it.
+	if s.ServerSHA != "" && !isSHA256(s.ServerSHA) {
+		errs = append(errs, fmt.Errorf("%s = %q is not 64 lowercase hex digits; it names no "+
+			"artifact and would be refused by the blob store's own path check",
+			EnvScreenServerSHA, s.ServerSHA))
+	}
+
+	if s.MaxSize < MinScreenMaxSize {
+		errs = append(errs, fmt.Errorf("%s = %d is below %d; below that the encoder on the handset "+
+			"has fewer macroblocks than a frame needs and produces nothing a decoder will open",
+			EnvScreenMaxSize, s.MaxSize, MinScreenMaxSize))
+	}
+	if s.MaxSize > MaxScreenMaxSize {
+		errs = append(errs, fmt.Errorf("%s = %d is above %d, which is larger than any panel this "+
+			"farm holds; the encoder would upscale and charge a phone's battery for pixels nobody "+
+			"can see", EnvScreenMaxSize, s.MaxSize, MaxScreenMaxSize))
+	}
+	if s.SessionTTL <= 0 {
+		errs = append(errs, fmt.Errorf("%s = %s is not positive; a session with no bound is a phone "+
+			"whose encoder nothing frees", EnvScreenSessionTTL, s.SessionTTL))
+	}
+	if s.MaxSessions < 1 {
+		errs = append(errs, fmt.Errorf("%s = %d admits no sessions at all; leave %s unset to turn "+
+			"the feature off instead, which says so in the refusal",
+			EnvScreenMaxSessions, s.MaxSessions, EnvScreenServerSHA))
+	}
+	return errs
+}
+
+// describe is the Summary line.
+func (s Screen) describe() string {
+	if !s.Enabled() {
+		return fmt.Sprintf("off (%s/%s unset); a live screen reports itself unavailable and names "+
+			"these two rather than pushing an unknown jar", EnvScreenServerSHA, EnvScreenServerVersion)
+	}
+	return fmt.Sprintf("server %s… v%s, video long edge %dpx, idle session cut at %s "+
+		"(cuts BYTES; no lease is ended, released or reclaimed), at most %d sessions in this process",
+		s.ServerSHA[:12], s.ServerVersion, s.MaxSize, s.SessionTTL, s.MaxSessions)
+}
+
+// isSHA256 is the shape artifacts.ValidSHA256 enforces, repeated here because
+// internal/config imports nothing from the rest of the tree and is not about to
+// start: a configuration package that depended on a storage package would make
+// every consumer of a knob depend on it too.
+func isSHA256(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
 // Config is the whole of farmd's environment-derived configuration.
 type Config struct {
 	// Component is the name written by farm.component_beat. It must match the
@@ -866,6 +1064,11 @@ type Config struct {
 	// variables rather than three. Unset, the control routes report themselves
 	// unavailable and name what is missing rather than dialling in the clear.
 	FenceControl FenceClient
+
+	// Screen is the interactive-control path: which jar produces a live screen
+	// and what bounds a session that shows one. Off unless an operator pins a
+	// jar; see Screen.Enabled.
+	Screen Screen
 
 	WatchdogInterval time.Duration
 	MigrationsTable  string
@@ -971,6 +1174,14 @@ func Load(component string, opts ...Option) (*Config, error) {
 			CAFile:   l.str(EnvFenceClientCA, ""),
 		},
 		FenceControl: controlFenceClient(l),
+
+		Screen: Screen{
+			ServerSHA:     l.str(EnvScreenServerSHA, ""),
+			ServerVersion: l.str(EnvScreenServerVersion, ""),
+			MaxSize:       l.num(EnvScreenMaxSize, DefaultScreenMaxSize),
+			SessionTTL:    l.dur(EnvScreenSessionTTL, DefaultScreenSessionTTL),
+			MaxSessions:   l.num(EnvScreenMaxSessions, DefaultScreenMaxSessions),
+		},
 
 		Battery: Battery{
 			TempRiseDCPerMin: l.num(EnvBatteryTempRise, DefaultBatteryTempRiseDCPerMin),
@@ -1637,6 +1848,9 @@ Fix by raising %s above %s + %s, or by lowering the proxy's self-fence timeout.`
 	errs = append(errs, c.FenceClient.problems()...)
 	errs = append(errs, c.FenceControl.problems()...)
 
+	// ---- interactive control -----------------------------------------
+	errs = append(errs, c.Screen.problems()...)
+
 	return errs
 }
 
@@ -1809,6 +2023,13 @@ func (c *Config) Summary() string {
 		c.Charge.MaxPct, c.Charge.MinPct, c.Charge.Interval)
 	fmt.Fprintf(&b, "shutdown grace   = %s (drains requests; releases nothing)\n", c.ShutdownGrace)
 	fmt.Fprintf(&b, "fence client     = %s\n", c.FenceClient.describe())
+	// The control client gets its own line rather than sharing the one above.
+	// They are two certificates presenting two classes from one process, and a
+	// summary that printed only the maintenance one would let a farm run with
+	// the screen path silently dialling nothing while the block above said the
+	// fence was configured.
+	fmt.Fprintf(&b, "fence control    = %s\n", c.FenceControl.describe())
+	fmt.Fprintf(&b, "screen           = %s\n", c.Screen.describe())
 	fmt.Fprintf(&b, "artifact gc      = grace %s; a blob younger than this is never swept, "+
 		"and nothing sweeps unless an operator asks\n", c.ArtifactGCGrace)
 	return b.String()

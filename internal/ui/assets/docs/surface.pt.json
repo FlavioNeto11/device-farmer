@@ -1,0 +1,727 @@
+{
+  "area": "surface",
+  "title": "A API, a CLI e os artifacts",
+  "summary": "Quarenta e uma rotas pendem de um único pattern mux do net/http; o role que cada uma exige é escolhido no registro, em internal/api/router.go, e não dentro do handler, de modo que nenhum endpoint consegue existir sem um nível. Todo corpo não-2xx é o mesmo envelope, e dois dos seus códigos carregam peso: 410 fenced significa que o lease acabou e o job precisa abortar; 503 transient significa que o banco não respondeu e o lease está intacto — confundir os dois é o STF #663. Essa autorização já pode ser ligada: cmd/farmd/roles.go chama api.AuthenticatorFor, que lê FARM_API_TOKENS e se recusa a subir um listener exposto sem credenciais em vez de subir aberto. O que ainda é só promessa é o fence — a API o incrementa em um revoke e os clientes cooperativos o respeitam, mas o proxy que o imporia no socket do ADB não está escrito, e a resposta do revoke diz o contrário com todas as letras.",
+  "sections": [
+    {
+      "heading": "Como uma requisição é formada, e o que volta",
+      "source": "internal/api/router.go, internal/api/errors.go, internal/api/server.go",
+      "body": "O caminho base é `/api/v1`. O roteamento é o pattern mux do próprio Go — o método faz parte do padrão, e as variáveis de caminho são lidas com `r.PathValue` — sem nenhum router de terceiros (`router.go:16-26`).\n\nTodo corpo não-2xx é `{\"error\":{\"code\",\"message\",\"detail?}}` e nada mais (`errors.go:26-33`). **`code` é o campo em que se ramifica, não o status**, porque duas das falhas mais importantes desta API dividem um status com condições que nada têm a ver com elas: 409 é ao mesmo tempo `no_capacity` (escalonamento comum) e `disruption_refused` (uma recusa que um humano precisa ler).\n\nToda resposta carrega `X-Request-Id` — devolvido literalmente se você enviar um, cunhado caso contrário — e `X-Content-Type-Options: nosniff`. Um 503 carrega ainda `Retry-After: 2` (`errors.go:163-168`).\n\nCorpos JSON rejeitam campos desconhecidos (`router.go:309-338`). Isso é deliberado: ignorar em silêncio um erro de digitação como `max_runtime_sec` produz um job **sem** tempo máximo de execução — a diferença entre um lease que termina no relógio que o usuário escreveu e um que corre até um humano perceber. Os corpos têm teto de 1 MiB (`server.go:65`); acima disso você recebe 413.\n\nNão existe 405. Um método errado escorrega para o catch-all `/api/v1/` e se lê como um 404 cuja mensagem nomeia o método que você usou. Um `/api/v1` pelado, sem barra final, recebe do mux um 307 para `/api/v1/`, que então dá 404.",
+      "bullets": [
+        "`X-Request-Id` aparece na linha de access log da mesma requisição e no texto de erro do ctl — cite-o em um ticket.",
+        "Panics são recuperados em um 500 com o envelope padrão; o stack vai para o log, nunca para o corpo (`router.go:145-168`).",
+        "Os labels de rota nas métricas usam o padrão que casou (`GET /api/v1/leases/{id}/renew`), então a cardinalidade é limitada pela tabela de rotas, e não pelos ids que os clientes enviam (`router.go:231-238`).",
+        "`instrument` envolve `recoverer`, e não o contrário, de modo que uma requisição que entra em panic ainda produz uma linha de access log, um 500 no contador e um gauge de in-flight equilibrado (`router.go:113-118`)."
+      ],
+      "examples": [
+        {
+          "label": "Envelope e headers padrão",
+          "lang": "bash",
+          "code": "curl -s -D - -o /dev/null 'http://127.0.0.1:8420/api/v1/fleet?limit=1'",
+          "output": "HTTP/1.1 200 OK\nContent-Type: application/json; charset=utf-8\nX-Content-Type-Options: nosniff\nX-Request-Id: 26480b79c13bf2c9\nDate: Fri, 04 Sep 2026 13:46:41 GMT\nTransfer-Encoding: chunked"
+        },
+        {
+          "label": "O seu próprio request id volta ecoado",
+          "lang": "bash",
+          "code": "curl -s -o /dev/null -D - -H 'X-Request-Id: my-own-trace-id' \\\n  'http://127.0.0.1:8420/api/v1/fleet?limit=1' | grep -i x-request-id",
+          "output": "X-Request-Id: my-own-trace-id"
+        },
+        {
+          "label": "Um método errado é um 404, não um 405",
+          "lang": "bash",
+          "code": "curl -s -w '\\nHTTP %{http_code}\\n' http://127.0.0.1:8420/api/v1/leases/acquire   # GET on a POST-only route",
+          "output": "{\"error\":{\"code\":\"not_found\",\"message\":\"no such API route: GET /api/v1/leases/acquire\"}}\nHTTP 404",
+          "note": "POST /api/v1/fleet dá a imagem espelhada: \"no such API route: POST /api/v1/fleet\", também 404. Nenhum header Allow é enviado em momento algum."
+        },
+        {
+          "label": "Campo desconhecido recusado, e não ignorado",
+          "lang": "bash",
+          "code": "curl -s -w '\\nHTTP %{http_code}\\n' -X POST http://127.0.0.1:8420/api/v1/leases/acquire \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"job_id\":\"00000000-0000-0000-0000-000000000000\",\"holder\":\"x\",\"max_runtime_sec\":60}'",
+          "output": "{\"error\":{\"code\":\"invalid_json\",\"message\":\"the request body is not valid JSON for this endpoint: json: unknown field \\\"max_runtime_sec\\\"\"}}\nHTTP 400"
+        },
+        {
+          "label": "Teto de tamanho do corpo",
+          "lang": "bash",
+          "code": "{ printf '{\"holder\":\"'; head -c 1200000 /dev/zero | tr '\\0' a; printf '\"}'; } > big.json\ncurl -s -w '\\nHTTP %{http_code}\\n' -X POST http://127.0.0.1:8420/api/v1/leases/acquire \\\n  -H 'Content-Type: application/json' --data-binary @big.json",
+          "output": "{\"error\":{\"code\":\"bad_request\",\"message\":\"request body exceeds 1048576 bytes\"}}\nHTTP 413"
+        }
+      ]
+    },
+    {
+      "heading": "Todas as rotas, com o role que cada uma exige",
+      "source": "internal/api/router.go:33-116 (authoritative), internal/api/artifacts.go:119-132 (contributed at build time via WithRoutes)",
+      "body": "Os roles são ordenados: `tenant` < `operator` < `admin` (`internal/api/auth.go:41-72`). Um role desconhecido pontua 0 e não satisfaz nada. Uma rota de operator é aquela que **pode tirar um device de um job em execução ou perturbar hardware que outra pessoa está usando**; cada uma escreve em `farm.audit_log` com o subject de quem chamou.\n\nO bloco de artifact não está em `router.go`. Ele é contribuído pelo pai através de `api.WithRoutes` (`cmd/farmd/roles.go:132-145`) porque o backend de blob é uma escolha de implantação. **Se o store não abrir, essas cinco rotas simplesmente deixam de existir, em silêncio**, e todo step de push/install falha no seu primeiro artifact — o binário registra um WARN na inicialização e segue em frente.\n\nOs status codes abaixo são o que eu obtive batendo em cada rota no sistema ao vivo, não o que o handler poderia teoricamente retornar.",
+      "table": {
+        "columns": [
+          "Método + caminho",
+          "Role",
+          "Para que serve",
+          "Códigos observados ao vivo"
+        ],
+        "rows": [
+          [
+            "GET /healthz",
+            "nenhum",
+            "Liveness. Deliberadamente não toca no Postgres — matar a API porque o banco soluçou alarga exatamente a lacuna de control plane que o reaper tem de reembolsar.",
+            "200"
+          ],
+          [
+            "GET /readyz",
+            "nenhum",
+            "Readiness: ping de 2 s no pool (`server.go:85`), mais as estatísticas do pool.",
+            "200 (503 `unavailable` quando o ping falha)"
+          ],
+          [
+            "GET /metrics",
+            "nenhum",
+            "Prometheus/OpenMetrics.",
+            "200"
+          ],
+          [
+            "GET /api/v1/capabilities",
+            "nenhum",
+            "O que esta implantação realmente consegue fazer, observado e não declarado.",
+            "200"
+          ],
+          [
+            "POST /api/v1/specs/validate",
+            "tenant",
+            "Confere um spec. 200 com `valid:false` para um spec ruim — mas 400 se o corpo não for sequer um objeto JSON.",
+            "200; 400 com corpo vazio ou que não seja um objeto"
+          ],
+          [
+            "GET /api/v1/specs/kinds",
+            "tenant",
+            "O vocabulário de steps, os operadores de assert, os limites.",
+            "200"
+          ],
+          [
+            "GET /api/v1/specs/resets",
+            "tenant",
+            "Expande um tier de reset nos comandos de shell exatos. `?profile=` obrigatório, `?tier=` opcional.",
+            "200; 400 sem `profile`; 404 profile desconhecido"
+          ],
+          [
+            "GET /api/v1/fleet",
+            "tenant",
+            "Todos os devices. `?host= &hub= &health= &pool= &q= &limit=` (1–5000, padrão 1000). **Não é tenant-scoped.**",
+            "200"
+          ],
+          [
+            "GET /api/v1/devices/{id}",
+            "tenant",
+            "Um device. `{id}` é um uuid **ou** um `farm_uid`, nunca um serial ADB.",
+            "200; 404"
+          ],
+          [
+            "POST /api/v1/devices/{id}/exec",
+            "**operator**",
+            "Um comando de shell em um devpath físico. Não toca em lease nenhum. Recusado numa farm que impõe o fence no socket do ADB (`FARM_FENCE_CLIENT_CERT` definido): um shell arbitrário não é um serviço que o fence proxy admita numa conexão que não carrega fence, então rode o comando como um job step sob um lease.",
+            "200; 400 comando vazio; 404 device desconhecido; 409 o device está sob lease; 501 `exec_not_admitted` numa farm com fence"
+          ],
+          [
+            "GET /api/v1/topology",
+            "tenant",
+            "Racks → hosts → hubs → slots → devices. `?host=`.",
+            "200"
+          ],
+          [
+            "GET /api/v1/hosts",
+            "tenant",
+            "Hosts com `live_leases` — o que um drain teria de esperar terminar.",
+            "200"
+          ],
+          [
+            "POST /api/v1/hosts/{id}/drain",
+            "**operator**",
+            "Interrompe o placement. Não libera nada.",
+            "200; 400 sem reason; 404 host desconhecido"
+          ],
+          [
+            "POST /api/v1/hosts/{id}/undrain",
+            "**operator**",
+            "Retoma o placement.",
+            "200"
+          ],
+          [
+            "POST /api/v1/slots/{id}/power",
+            "**operator**",
+            "Pede um power cycle de porta no tier 4. Decide e registra; quem chavearia o VBUS seria um host agent.",
+            "202 accepted; 409 `disruption_refused`; 409 `conflict` (nenhum power domain controlável); 400 id não inteiro; 404 slot desconhecido"
+          ],
+          [
+            "GET /api/v1/jobs",
+            "tenant",
+            "`?state= &pool= &queue= &tenant= &limit=` (1–2000, padrão 200).",
+            "200"
+          ],
+          [
+            "POST /api/v1/jobs",
+            "tenant",
+            "Registra uma linha de job. Nada é escalonado aqui.",
+            "201; 400 pool/queue/tenant desconhecido"
+          ],
+          [
+            "GET /api/v1/jobs/{id}",
+            "tenant",
+            "Um job mais o histórico de leases dele. Exatamente duas chaves, `job` e `leases`. **Nenhum resultado de step.**",
+            "200; 400 não-uuid; 404"
+          ],
+          [
+            "POST /api/v1/jobs/{id}/cancel",
+            "tenant",
+            "Encerra um job, liberando o lease vivo dele com reason `job_cancelled` na mesma transação.",
+            "200; 404; 409 já terminal"
+          ],
+          [
+            "GET /api/v1/leases",
+            "tenant",
+            "`?state=live|all|held|suspect|released|expired &device= &job= &host= &limit=` (1–2000, padrão 200). Devolve `holder_instance` — veja as lacunas.",
+            "200; 400 state inválido"
+          ],
+          [
+            "POST /api/v1/leases/acquire",
+            "tenant",
+            "Idempotente em `job_id`. Um re-attach devolve o MESMO fence.",
+            "200; 400; 404 job desconhecido; 409 `no_capacity`"
+          ],
+          [
+            "POST /api/v1/leases/{id}/renew",
+            "tenant",
+            "O caminho quente. Veja a próxima seção.",
+            "200; 400; **410 `fenced`**; **503 `transient`**"
+          ],
+          [
+            "POST /api/v1/leases/{id}/release",
+            "tenant",
+            "Fim normal de um job.",
+            "200 (inclusive o no-op idempotente); 400 `check_violation`; 400 sem reason"
+          ],
+          [
+            "POST /api/v1/leases/{id}/revoke",
+            "**operator**",
+            "Um humano toma um device de volta. Não exige fence.",
+            "200; 400 sem reason; 404; 409 já terminal"
+          ],
+          [
+            "GET /api/v1/recovery",
+            "tenant",
+            "A ladder, as tentativas recentes, as quarantines abertas. `?device= &host= &limit=` (1–1000, padrão 100).",
+            "200"
+          ],
+          [
+            "POST /api/v1/quarantines/{id}/close",
+            "**operator**",
+            "Fecha uma quarantine.",
+            "200; 404; 409 já fechada"
+          ],
+          [
+            "GET /api/v1/bulk",
+            "tenant",
+            "Bulk runs recentes. `?limit=` (1–500, padrão 50).",
+            "200"
+          ],
+          [
+            "POST /api/v1/bulk",
+            "**operator**",
+            "Um comando aplicado a um selector, com teto por hub.",
+            "**202**; 400 o selector não casou com nada; 400 sem comando"
+          ],
+          [
+            "GET /api/v1/bulk/{id}",
+            "tenant",
+            "Uma run e o desfecho de cada target.",
+            "200; 404"
+          ],
+          [
+            "GET /api/v1/events",
+            "tenant",
+            "`farm.events` ∪ `farm.audit_log`, mais recentes primeiro. Apenas `?limit=` (1–2000, padrão 200). **Não é tenant-scoped.**",
+            "200"
+          ],
+          [
+            "GET /api/v1/stream",
+            "tenant",
+            "Server-Sent Events. **Não é tenant-scoped, e não tem como ser.**",
+            "200"
+          ],
+          [
+            "POST /api/v1/artifacts",
+            "tenant",
+            "Upload em stream; metadados na query string.",
+            "201; 400 kind/name/sha inválido; 400 `digest_mismatch`; 413"
+          ],
+          [
+            "GET /api/v1/artifacts",
+            "tenant",
+            "`?kind= &package= &limit=` (1–2000, padrão 200).",
+            "200"
+          ],
+          [
+            "GET /api/v1/artifacts/{sha}",
+            "tenant",
+            "Metadados + tudo que o referencia + `deletable`.",
+            "200; 400 sha malformado; 404"
+          ],
+          [
+            "DELETE /api/v1/artifacts/{sha}",
+            "**operator**",
+            "Esquece um digest. `?reason=` vai parar no audit log.",
+            "200; 404; 409 ainda referenciado"
+          ],
+          [
+            "GET /api/v1/devices/{id}/artifacts",
+            "tenant",
+            "O ledger do device. `?state=all|pending|present|failed|removed &limit=`.",
+            "200; 400 state inválido"
+          ],
+          [
+            "ANY /api/v1/...",
+            "tenant",
+            "Catch-all: um erro de digitação recebe o envelope JSON, não o HTML do dashboard.",
+            "404 (307 para um `/api/v1` pelado)"
+          ],
+          [
+            "GET /",
+            "nenhum",
+            "O dashboard embutido.",
+            "200 (404 `ui_not_mounted` se compilado sem ele)"
+          ]
+        ]
+      }
+    },
+    {
+      "heading": "Os status codes que carregam significado",
+      "source": "internal/api/errors.go:180-305, internal/api/leases.go:322-416",
+      "body": "Quatro desfechos decidem se um holder aborta, tenta de novo ou não faz nada. Erre neles e você terá reconstruído o STF #663.\n\n**410 + `fenced`** — `farm.lease_renew` devolveu zero linhas (`leases.go:359-366`). Terminal. Exatamente três coisas o produzem: o lease foi liberado, foi reclaimed, ou outro `acquire` no mesmo `job_id` fez re-attach e substituiu o `holder_instance`. Nenhuma delas é um evento de rede. Aborte o job, feche todos os sockets ADB, não escreva mais nada. Tentar de novo é tentar dirigir um device que agora pertence a outro job.\n\n**503 + `transient`** — o banco não respondeu: falha de dial, statement timeout, failover, pool esgotado, SQLSTATE 40001/40P01/55P03/57P03/53300/53400 (`errors.go:286-305`). Isso não prova **nada** a respeito do lease. Nenhum prazo se moveu. Tente de novo com backoff e não aborte. `Retry-After: 2` é enviado.\n\n**409 + `no_capacity`** — não é um erro. Nenhum device saudável, habilitado e sem lease casou. Recoloque na queue.\n\n**400 + `check_violation`** — o Postgres recusou a escrita contra um CHECK. O caso canônico é um reason de release para o qual o schema não tem palavra. `farm.leases.release_reason` não tem vocabulário de conectividade, então um erro de socket não consegue encerrar um lease *nem mesmo se o holder pedir que ele encerre*. O corpo do 400 lista as sete palavras que teriam funcionado e nomeia a constraint que disparou.\n\nA separação é contada em apartado em `farm_lease_renew_failures_total{kind=fenced|transient}`. Nesta farm, neste momento, isso marca `fenced 562, transient 0`.\n\nMais um que você verá nos logs mas nunca como resposta: **499 `client_closed`**. Quem chamou desligou. É registrado para que uma renovação abandonada não seja contada como o 200 em que o gravador de status começa por otimismo — na rota de renovação, isso tornaria um holder cujo pod morreu indistinguível de um cujo lease foi renovado (`router.go:281-295`).",
+      "examples": [
+        {
+          "label": "410 fenced — fence errado",
+          "lang": "bash",
+          "code": "curl -s -w '\\nHTTP %{http_code}\\n' -X POST \\\n  http://127.0.0.1:8420/api/v1/leases/dc010625-4af6-4760-8575-f361c7de60ff/renew \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"fence\":1,\"holder_instance\":\"4aad9588-6682-4846-b588-8be386931fd5\"}'",
+          "output": "{\"error\":{\"code\":\"fenced\",\"message\":\"this lease is no longer yours: abort the job, close every ADB socket, and write nothing further to the device. Do not retry — the device now belongs to another job.\",\"detail\":{\"lease_id\":\"dc010625-4af6-4760-8575-f361c7de60ff\",\"presented_fence\":1,\"terminal\":true}}}\nHTTP 410",
+          "note": "Um holder_instance errado com o fence correto produz um 410 idêntico — verificado. Ambos são zero linhas vindas de farm.lease_renew, e nenhum dos dois diz qual das duas metades estava errada. Renovar sem fence nenhum é um 400, não um 410."
+        },
+        {
+          "label": "400 check_violation — a recusa que define o sistema",
+          "lang": "bash",
+          "code": "curl -s -w '\\nHTTP %{http_code}\\n' -X POST \\\n  http://127.0.0.1:8420/api/v1/leases/dc010625-4af6-4760-8575-f361c7de60ff/release \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"fence\":2329,\"reason\":\"device_offline\"}'",
+          "output": "{\"error\":{\"code\":\"check_violation\",\"message\":\"the release reason is not a permitted value. farm.leases.release_reason has no word for connectivity — a socket error, a probe timeout or a device going offline cannot end a lease — so the database refused the write and the lease is untouched.\",\"detail\":{\"constraint\":\"leases_release_reason_check\",\"database_message\":\"new row for relation \\\"leases\\\" violates check constraint \\\"leases_release_reason_check\\\"\",\"permitted_release_reasons\":[\"completed\",\"failed\",\"job_cancelled\",\"max_runtime\",\"operator_revoked\",\"holder_expired\",\"device_retired\"],\"rejected_reason\":\"device_offline\"}}}\nHTTP 400",
+          "note": "Você só chega a esta recusa em um lease VIVO e no fence certo. Apresente o fence errado e farm.lease_release não casa com nada, então você recebe o 200 idempotente com released:false antes que o CHECK chegue a ser avaliado."
+        },
+        {
+          "label": "O lease depois de dois 410 e dois 400",
+          "lang": "bash",
+          "code": "curl -s 'http://127.0.0.1:8420/api/v1/leases?state=all&job=f24a491f-9eeb-47a6-9cbb-3936981ae4da'",
+          "output": "{\"id\":\"dc010625-4af6-4760-8575-f361c7de60ff\",\"fence\":2329,\"state\":\"held\",\"holder\":\"docs-verification\",\"holder_epoch\":0,\"heartbeat_seq\":1,\"expires_in_s\":900,\"reclaimable_in_s\":2700}",
+          "note": "Mesmo fence, ainda held, prazo intacto. Quatro recusas não custaram nada ao holder."
+        },
+        {
+          "label": "Contadores de falha de renovação",
+          "lang": "bash",
+          "code": "curl -s http://127.0.0.1:8420/metrics | grep '^farm_lease_renew_failures_total{'",
+          "output": "farm_lease_renew_failures_total{kind=\"fenced\"} 562\nfarm_lease_renew_failures_total{kind=\"transient\"} 0"
+        }
+      ]
+    },
+    {
+      "heading": "acquire, renew, release, revoke",
+      "source": "internal/api/leases.go, migrations/00002_lease.sql:202-327",
+      "body": "**acquire** (`leases.go:208`) é idempotente em `job_id`, e isso carrega peso. Um despejo de pod — drain de nó, preempção, retomada de instância spot, reinício por OOM — é o evento mais banal de um control plane Kubernetes e nunca pode custar um device. O processo substituto chama com o mesmo `job_id` e recebe o mesmo lease, o mesmo device e **o mesmo fence**, com `\"reattached\": true`. Incrementar o fence deixaria o job fenced para fora do próprio trabalho que ele havia deixado em andamento.\n\nO re-attach é um `UPDATE` que sobrescreve `holder`, sobrescreve `holder_instance` e incrementa `holder_epoch` (`migrations/00002_lease.sql:244-256`). Duas consequências que um operador deve guardar: as renovações do processo anterior passam a devolver 410 **com o fence inalterado**, e qualquer um que conheça um `job_id` consegue executar essa tomada. Nesta demo, o job runner faz exatamente isso com qualquer job que você criar, em cerca de um segundo.\n\n`farm.lease_acquire` também não olha para `farm.jobs.state`. Fazer acquire contra um job cancelado ou já terminado tem sucesso e entrega um device; quem percebe isso depois é o `preflight` do job runner (`internal/jobrunner/jobrunner.go:783-817`). Se você precisa de um lease que nada mais vá roubar — para testar um caminho de recusa, digamos — registre um job, cancele-o e então faça acquire.\n\nSe você omitir `holder_instance`, o servidor cunha um e o devolve com `holder_instance_minted: true`. **Você precisa renovar com exatamente esse valor** (`leases.go:227-243`).\n\n**release** passa o seu reason ao Postgres literalmente, sem nenhuma allow-list do lado do cliente (`leases.go:417-430`). É por isso que a recusa acima é um CHECK de banco de verdade, e não um `switch` em Go que alguém poderia editar. Um release que não casou com nada devolve **200 com `released:false`** — um holder fenced fazendo faxina cai aqui e não pode ser mandado tentar de novo. Um chamador tenant-scoped só pode liberar o lease do seu próprio tenant (`leases.go:441-475`); essa checagem não faz nada sob AllowAll e não separa dois clientes dentro de um mesmo tenant.\n\n`rearm_ms` só pode **alongar** a quarantine do slot, nunca encurtá-la (`leases.go:476-495`). `internal/config` verifica na inicialização que o rearm configurado excede o timeout de auto-fence do node proxy; honrar um valor menor vindo de um corpo de requisição contornaria essa verificação e entregaria o slot ao próximo job enquanto os sockets do holder anterior ainda estivessem abertos.\n\n**revoke** é o único caminho em que a decisão é de uma pessoa. É exclusivo de operator, não exige fence — um operator não tem por que conhecer o do holder, e um revoke que dependesse dele falharia exatamente quando é mais necessário —, é auditado com o nome e o reason do humano, e eleva `farm.devices.fence_floor` para além do fence revogado (`leases.go:656-661`). Tanto o corpo da API quanto o ctl dizem que o holder antigo passa então a ser \"refused at the host proxy\". **Não existe host proxy nesta build** — veja as lacunas. Hoje o piso elevado é imposto no PostgreSQL e respeitado pelos clientes cooperativos; quem de fato compra o tempo é o rearm do slot.",
+      "examples": [
+        {
+          "label": "acquire",
+          "lang": "bash",
+          "code": "curl -s -w '\\nHTTP %{http_code}\\n' -X POST http://127.0.0.1:8420/api/v1/leases/acquire \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"job_id\":\"f24a491f-9eeb-47a6-9cbb-3936981ae4da\",\"holder\":\"docs-verification\"}'",
+          "output": "{\"device_id\":\"3bc20c63-4dff-4a72-bdc0-664ced33b577\",\"expires_at\":\"2026-09-04T11:05:25.022881-03:00\",\"fence\":2329,\"holder\":\"docs-verification\",\"holder_instance\":\"4aad9588-6682-4846-b588-8be386931fd5\",\"holder_instance_minted\":true,\"job_id\":\"f24a491f-9eeb-47a6-9cbb-3936981ae4da\",\"lease_id\":\"dc010625-4af6-4760-8575-f361c7de60ff\",\"reattached\":false,\"reclaimable_at\":\"2026-09-04T11:35:25.022881-03:00\",\"slot_id\":13}\nHTTP 200",
+          "note": "Um job_id desconhecido é 404 (\"job not found\"). O corpo do 409 diz \"no healthy, enabled, unleased device in the pool matched this job; this is an ordinary scheduling outcome, re-queue and retry\" (errors.go:201-208)."
+        },
+        {
+          "label": "Renovação bem-sucedida",
+          "lang": "bash",
+          "code": "curl -s -w '\\nHTTP %{http_code}\\n' -X POST \\\n  http://127.0.0.1:8420/api/v1/leases/dc010625-4af6-4760-8575-f361c7de60ff/renew \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"fence\":2329,\"holder_instance\":\"4aad9588-6682-4846-b588-8be386931fd5\"}'",
+          "output": "{\"expires_at\":\"2026-09-04T11:05:33.547708-03:00\",\"fence\":2329,\"lease_id\":\"dc010625-4af6-4760-8575-f361c7de60ff\",\"reclaimable_at\":\"2026-09-04T11:35:33.547708-03:00\",\"was_suspect\":false}\nHTTP 200",
+          "note": "`was_suspect: true` significa que o lease havia sido marcado para alerta e que um heartbeat dentro da faixa de tolerância o curou sozinho, no mesmo fence. Nada foi perdido."
+        },
+        {
+          "label": "Release idempotente de um lease já terminal",
+          "lang": "bash",
+          "code": "curl -s -w '\\nHTTP %{http_code}\\n' -X POST \\\n  http://127.0.0.1:8420/api/v1/leases/dc010625-4af6-4760-8575-f361c7de60ff/release \\\n  -H 'Content-Type: application/json' -d '{\"fence\":2329,\"reason\":\"completed\"}'",
+          "output": "{\"lease_id\":\"dc010625-4af6-4760-8575-f361c7de60ff\",\"note\":\"nothing was released: this lease is already terminal, or the fence presented is not the one it holds. This is the idempotent case, not a failure.\",\"released\":false,\"state\":\"released\"}\nHTTP 200"
+        },
+        {
+          "label": "revoke de um lease já terminal",
+          "lang": "bash",
+          "code": "curl -s -w '\\nHTTP %{http_code}\\n' -X POST \\\n  http://127.0.0.1:8420/api/v1/leases/dc010625-4af6-4760-8575-f361c7de60ff/revoke \\\n  -H 'Content-Type: application/json' -d '{\"reason\":\"docs verification\"}'",
+          "output": "{\"error\":{\"code\":\"conflict\",\"message\":\"this lease is already terminal; there is nothing to revoke\",\"detail\":{\"lease_id\":\"dc010625-4af6-4760-8575-f361c7de60ff\",\"state\":\"released\"}}}\nHTTP 409",
+          "note": "Um revoke sem reason é 400; um id de lease desconhecido é 404. \"Already released\" é um sucesso do ponto de vista do operator e \"no such lease\" é um erro de digitação, então o handler lê o estado de volta para dizer qual dos dois é o caso."
+        }
+      ]
+    },
+    {
+      "heading": "Rotas de operator: o que recusa, e por quê",
+      "source": "internal/api/ops.go:361-700, internal/api/fleet.go:464-560",
+      "body": "**drain** muda `farm.hosts.admin_state` e mais nada. A resposta diz o que você passa a esperar: `live_leases` e `protected_leases`. Ela afirma explicitamente, no corpo, que nada foi liberado. `undrain` devolve o mesmo formato, sem a nota.\n\n**slot power** é o que surpreende as pessoas. Num hub sem chaveamento por porta, todas as portas dividem um único power domain, então \"faça power cycle deste slot\" na verdade quer dizer \"faça power cycle nestes sete devices\". O handler lê o `requires_policy` do tier em `farm.recovery_tiers` (`ops.go:566-567`, não está hard-coded), compara-o com todo lease vivo dentro do raio de dano e **recusa com 409 `disruption_refused` nomeando os infratores** — lease, job, tenant, holder, policy, posição no rack. Um `disruption_policy` desconhecido pontua 0, abaixo de `no_disruption`, e recusa: permitir um cycle que você deveria ter recusado custa a run de seis horas de alguém; recusar um que você poderia ter permitido custa minutos (`ops.go:462-476`).\n\nEm caso de sucesso ela devolve **202**, não 200. A API não chaveia o VBUS — ela grava uma linha em `farm.recovery_attempts` no tier 4, e um host agent a consome. Nenhum host agent está batendo nesta implantação, então a linha fica parada em `requested` e nada é chaveado. O corpo do 202 não diz isso; `GET /api/v1/capabilities` diz.\n\n**device exec** roda em `slots.adb_devpath`, **nunca num serial** (`fleet.go:464-471`). Seriais de fábrica duplicados existem de verdade — `/api/v1/fleet` os marca com `serial_ambiguous: true` — e um exec endereçado por serial vai parar num aparelho diferente daquele que está na tela. Ele recusa com 409 num device sob lease, a menos que você passe `\"force\": true` **e** um reason, e de todo modo não toca em lease nenhum.\n\nNuma farm que impõe o fence no socket do ADB (`FARM_FENCE_CLIENT_CERT` definido, hosts rodando o proxy) **o exec é recusado de saída**: um comando de shell arbitrário não é um serviço que o fence proxy admita numa conexão que não carrega fence de lease, então nenhuma lista exata consegue enumerá-lo e nenhum padrão consegue delimitá-lo sem entregar àquela credencial um shell em cada aparelho do rack. A rota de device único responde **501 `exec_not_admitted`** antes mesmo de discar, e diz isso. **O bulk exec é recusado da mesma forma, mas reporta a recusa por target como um 502** — o próprio texto de recusa do proxy, retransmitido — de modo que, numa farm com fence, uma bulk run volta inteira em erro sem nenhum lease afetado. Em vez disso, rode o comando como um job step sob um lease: as conexões de um job runner carregam fence e não estão sujeitas a uma whitelist de serviços.\n\n**bulk** limita a concorrência por hub (padrão 4, máximo 32). Isso não é gentileza: sessenta devices respondendo ao mesmo tempo derrubam a tensão de um power domain e fabricam uma onda de erros de transporte indistinguível de uma falha de hardware (`ops.go:1063-1068`). Devices sob lease são pulados por padrão e registrados como `skipped`.",
+      "examples": [
+        {
+          "label": "409 disruption_refused — a recusa por raio de dano",
+          "lang": "bash",
+          "code": "curl -s -w '\\nHTTP %{http_code}\\n' -X POST http://127.0.0.1:8420/api/v1/slots/16/power \\\n  -H 'Content-Type: application/json' -d '{\"reason\":\"docs verification\"}'",
+          "output": "{\"error\":{\"code\":\"disruption_refused\",\"message\":\"this power cycle would disturb 7 device(s) in power domain 3, and 1 live lease(s) there forbid it. Tier 4 (port_power) requires disruption_policy \\\"allow_port_power_cycle\\\".\",\"detail\":{\"blast_radius\":\"power_domain\",\"host_id\":\"h01\",\"hub_id\":3,\"live_leases\":1,\"offenders\":[{\"lease_id\":\"f9a404fe-9dc2-4a96-af6a-a6ea3d21c16e\",\"job_id\":\"7f3a6bac-5dd1-40b5-854c-d89381b2dd42\",\"tenant_id\":\"acme\",\"holder\":\"runner-pod-7f3a6bac\",\"disruption_policy\":\"allow_soft_reset\",\"protected\":false,\"rack_slot\":\"R1-U04-H3-P2\"}],\"power_control\":\"smarthub\",\"power_kind\":\"ganged\",\"remedy\":\"wait for the offending leases to end, or have their holders release them; an operator may also revoke a specific lease, which is audited\",\"requires_policy\":\"allow_port_power_cycle\",\"slots_in_domain\":7,\"usb_path\":\"4-1.2\"}}}\nHTTP 409",
+          "note": "`offenders` é o subconjunto que proíbe o tier; `live_leases_list` (omitido acima por questão de largura) traz todo lease vivo no domínio, para que um dashboard possa mostrar quem mais está apenas dentro do raio de dano. A recusa também é escrita em farm.recovery_attempts como outcome 'refused' e em farm.audit_log."
+        },
+        {
+          "label": "202 quando o cycle é permitido",
+          "lang": "bash",
+          "code": "curl -s -w '\\nHTTP %{http_code}\\n' -X POST http://127.0.0.1:8420/api/v1/slots/13/power \\\n  -H 'Content-Type: application/json' -d '{\"reason\":\"docs verification\"}'",
+          "output": "{\"attempt_id\":94,\"blast_radius\":\"power_domain\",\"host_id\":\"h01\",\"hub_id\":2,\"live_leases\":1,\"note\":\"the host agent performs the switch and closes recovery attempt 94 with its outcome. Any lease in this power domain keeps its device, its fence and its deadline throughout.\",\"power_control\":\"uhubctl\",\"power_domain_id\":2,\"power_kind\":\"per_port\",\"rack_slot\":\"R1-U04-H2-P6\",\"requires_policy\":\"allow_port_power_cycle\",\"slots_in_domain\":7,\"state\":\"requested\",\"tier\":4,\"tier_name\":\"port_power\",\"usb_path\":\"3-2.6\"}\nHTTP 202",
+          "note": "A tentativa 94 continuava aberta, sem finished_at nem outcome, minutos depois, porque não há nenhum node agent rodando para consumi-la. 202 significa registrado, não chaveado."
+        },
+        {
+          "label": "409 quando um hub não tem VBUS chaveável",
+          "lang": "bash",
+          "code": "curl -s -w '\\nHTTP %{http_code}\\n' -X POST http://127.0.0.1:8420/api/v1/slots/22/power \\\n  -H 'Content-Type: application/json' -d '{\"reason\":\"docs verification\"}'",
+          "output": "{\"error\":{\"code\":\"conflict\",\"message\":\"this slot has no controllable power domain, so its port power cannot be cycled from here\",\"detail\":{\"power_control\":\"none\",\"power_domain_id\":4,\"power_kind\":\"none\",\"rack_slot\":\"R1-U04-H4-P1\",\"slots_in_domain\":7,\"usb_path\":\"4-2.1\",\"vbus_switchable\":false}}}\nHTTP 409",
+          "note": "Ids de slot são inteiros: `/slots/abc/power` dá 400 \"slot id must be an integer\", `/slots/999999/power` dá 404."
+        },
+        {
+          "label": "drain diz o que ele não está fazendo",
+          "lang": "bash",
+          "code": "curl -s -w '\\nHTTP %{http_code}\\n' -X POST http://127.0.0.1:8420/api/v1/hosts/h01/drain \\\n  -H 'Content-Type: application/json' -d '{\"reason\":\"docs verification\"}'",
+          "output": "{\"admin_state\":\"draining\",\"host_id\":\"h01\",\"live_leases\":1,\"note\":\"no new leases will be placed on this host. The live leases above are untouched and will run to completion; nothing here releases them.\",\"previous_state\":\"enabled\",\"protected_leases\":0}\nHTTP 200",
+          "note": "undrain devolve os mesmos campos com admin_state \"enabled\" e previous_state \"draining\", e sem nota. Drain sem reason é 400; um host desconhecido é 404."
+        },
+        {
+          "label": "exec recusa num device sob lease",
+          "lang": "bash",
+          "code": "curl -s -w '\\nHTTP %{http_code}\\n' -X POST \\\n  http://127.0.0.1:8420/api/v1/devices/3bc20c63-4dff-4a72-bdc0-664ced33b577/exec \\\n  -H 'Content-Type: application/json' -d '{\"command\":\"getprop ro.build.version.release\"}'",
+          "output": "{\"error\":{\"code\":\"conflict\",\"message\":\"this device holds a live lease; running a command on it can corrupt that job's run. Retry with \\\"force\\\": true and a reason if you mean to do it anyway.\",\"detail\":{\"holder\":\"docs-verification\",\"job_id\":\"f24a491f-9eeb-47a6-9cbb-3936981ae4da\",\"lease_id\":\"dc010625-4af6-4760-8575-f361c7de60ff\",\"protected\":false,\"tenant_id\":\"acme\"}}}\nHTTP 409"
+        },
+        {
+          "label": "exec num device livre, endereçado por farm_uid",
+          "lang": "bash",
+          "code": "curl -s -w '\\nHTTP %{http_code}\\n' -X POST \\\n  http://127.0.0.1:8420/api/v1/devices/df-970e1a5b716350d7ed6ed7f3a05c0cde/exec \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"command\":\"getprop ro.product.model\",\"reason\":\"docs verification\"}'",
+          "output": "{\"device_id\":\"dfe76543-270a-42a8-b2d9-44b681277755\",\"adb_devpath\":\"usb:3-1.3\",\"adb_endpoint\":\"127.0.0.1:50136\",\"command\":\"getprop ro.product.model\",\"exit_code\":0,\"output\":\"\\n\",\"exited\":true,\"truncated\":false,\"duration_ms\":0}\nHTTP 200",
+          "note": "A saída vazia é o host ADB falso desta demo, não um bug do exec. A saída tem teto de 256 KiB (server.go:80) e `truncated` diz quando ela foi cortada."
+        },
+        {
+          "label": "bulk através de um hub, e depois a leitura do resultado",
+          "lang": "bash",
+          "code": "curl -s -w '\\nHTTP %{http_code}\\n' -X POST http://127.0.0.1:8420/api/v1/bulk \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"selector\":{\"host\":\"h01\",\"hub\":\"3-1\"},\"command\":\"getprop ro.build.version.sdk\",\"reason\":\"docs verification\"}'\ncurl -s http://127.0.0.1:8420/api/v1/bulk/0cbc77a7-8d23-4267-bd6a-7b94b9f76179",
+          "output": "{\"max_per_hub\":4,\"run_id\":\"0cbc77a7-8d23-4267-bd6a-7b94b9f76179\",\"skipped\":1,\"state\":\"running\",\"targets\":6,\"timeout_ms\":30000,\"truncated\":false}\nHTTP 202\n\n{\"run\":{...,\"state\":\"done\",\"targets\":7,\"ok\":5,\"errors\":1,\"skipped\":1},\"targets\":[...,{\"rack_slot\":\"R1-U04-H1-P2\",\"state\":\"skipped\",\"error\":\"device holds a live lease 2b358624-e5a2-4fa8-81ea-d8ee2df78cf0\"},...]}",
+          "note": "Um selector que não casa com nada dá 400 \"the selector matched no addressable devices\", de modo que uma run vazia nunca é reportada em silêncio como sucesso."
+        },
+        {
+          "label": "quarantine close, duas vezes",
+          "lang": "bash",
+          "code": "curl -s -w '\\nHTTP %{http_code}\\n' -X POST http://127.0.0.1:8420/api/v1/quarantines/5/close \\\n  -H 'Content-Type: application/json' -d '{\"reason\":\"docs verification\"}'",
+          "output": "{\"closed\":true,\"opened_for\":\"4 of 7 devices on hub 4-2 went unhealthy within 0s — the evidence is about the hub, not the devices\",\"quarantine_id\":5,\"scope\":\"hub\"}\nHTTP 200\n\n# second call:\n{\"error\":{\"code\":\"conflict\",\"message\":\"this quarantine is already closed\",\"detail\":{\"closed_at\":\"2026-09-04T10:51:59.852359-03:00\",\"quarantine_id\":5}}}\nHTTP 409",
+          "note": "Um id desconhecido é 404 \"no such quarantine\"."
+        }
+      ]
+    },
+    {
+      "heading": "O stream SSE",
+      "source": "internal/api/stream.go",
+      "body": "`GET /api/v1/stream` é `text/event-stream`. Um único poller lê o banco a cada 2 s (`server.go:71`) **apenas enquanto houver ao menos um cliente conectado** e distribui os diffs para todos: dez dashboards custam as mesmas queries que um. Um cliente que não consegue acompanhar é desconectado depois de 64 eventos enfileirados, e nunca esperado — travar o poller num leitor lento estagnaria todos os outros clientes enquanto segurasse uma conexão do pool.\n\nOs headers são definidos antes do primeiro flush (a ordem importa; dar flush primeiro compromete um 200 farejado e descarta em silêncio o `Content-Type`): `Cache-Control: no-cache, no-transform`, `Connection: keep-alive` e `X-Accel-Buffering: no` — o nginx bufferiza respostas intermediadas por padrão, o que transforma um stream ao vivo num download de arquivo bem lento.\n\nO primeiro frame é `: connected` mais `retry: 3000`, de modo que um navegador derrubado por ficar para trás volta em 3 s com um snapshot novo.\n\n**Cinco nomes de evento, e mais nada**: `fleet`, `lease`, `job`, `recovery`, `alert`. Cada payload é ou `{\"snapshot\":true, ...}` (na conexão, e a cada 30 s) ou `{\"changed\":[...]}` / `{\"removed\":[...]}` (deltas). Um frame de comentário `: heartbeat` a cada 15 s derrota os timeouts de ociosidade dos proxies.\n\nA **chave do diff** exclui os prazos, mas o payload não: `leaseDigest.digestKey()` zera `ExpiresUnix` antes de comparar (`stream.go:339-345`), de modo que um heartbeat rotineiro não vira evento, enquanto todo frame de lease continua carregando o `expires_at_unix` atual.\n\nOs kinds de `alert`, todos os nove derivados em vez de armazenados: `lease_suspect`, `lease_self_healed`, `lease_reclaimed`, `lease_revoked`, `hub_correlation`, `hub_recovered`, `recovery_refused`, `protected_lease_suspect`, `control_plane_gap`. Leia a mensagem de `lease_suspect` com atenção — **suspect é um alerta e nada além disso**: nenhum reset, nenhum reboot, nenhuma realocação, e um heartbeat dentro da faixa de tolerância o restaura no mesmo fence.\n\nO stream é um único snapshot compartilhado distribuído a todos os clientes, então ele não carrega filtro de tenant e não tem como receber um sem reconstruir o poller por tenant. Veja as lacunas.",
+      "examples": [
+        {
+          "label": "40 segundos do stream ao vivo",
+          "lang": "bash",
+          "code": "curl -sN --max-time 40 http://127.0.0.1:8420/api/v1/stream > sse.txt\nwc -c < sse.txt\ngrep -o '^event: .*' sse.txt | sort | uniq -c\ngrep '^: ' sse.txt | sort | uniq -c",
+          "output": "230655\n      5 event: alert\n     20 event: fleet\n     20 event: job\n     15 event: lease\n      6 event: recovery\n      1 : connected\n      2 : heartbeat"
+        },
+        {
+          "label": "Headers da resposta",
+          "lang": "bash",
+          "code": "curl -sN -D - -o /dev/null --max-time 2 http://127.0.0.1:8420/api/v1/stream",
+          "output": "HTTP/1.1 200 OK\nCache-Control: no-cache, no-transform\nConnection: keep-alive\nContent-Type: text/event-stream\nX-Accel-Buffering: no\nX-Request-Id: 1a8df110d4b0322a\nTransfer-Encoding: chunked"
+        },
+        {
+          "label": "Um alerta hub_correlation no momento em que chega",
+          "lang": "text",
+          "code": "event: alert",
+          "output": "data: {\"alerts\":[{\"kind\":\"hub_correlation\",\"hub_id\":8,\"host_id\":\"h02\",\"usb_path\":\"4-2\",\"devices\":7,\"unhealthy\":7,\"message\":\"7 of 7 devices on hub 4-2 are unhealthy; suspect the hub, its cable or its power domain before the phones\"}],\"snapshot\":true}",
+          "note": "O stream é excluído de farm_api_requests_in_flight (router.go:190-199): sem isso, um único dashboard pendurado na parede se leria como saturação permanente justamente no gauge que você usa para decidir se a API está sobrecarregada. A linha de access log dele é DEBUG pelo mesmo motivo — uma duração de várias horas em INFO parece um travamento em qualquer busca de log."
+        }
+      ]
+    },
+    {
+      "heading": "ctl — a linha de comando do operator",
+      "source": "internal/ctl/ctl.go, internal/ctl/commands.go, internal/ctl/output.go",
+      "body": "`farmd ctl <command>`. Ele não abre **nenhuma conexão de banco** — `internal/ctl` não importa nem `pgx` nem `database/sql` — e não guarda credencial alguma que o Postgres fosse aceitar. Todo comando é uma requisição HTTP contra a mesma `/api/v1` que qualquer cliente usa. Isso é uma restrição, não uma camada: uma ferramenta de operator com um caminho privado até o schema é uma ferramenta cujas recusas podem ser contornadas justamente pela pessoa com maior chance de estar com pressa às 3 da manhã. A única exceção é `ctl validate`, que faz o parse localmente com o mesmo `internal/jobspec` que o servidor executa.\n\n**Configuração**, em ordem de precedência: flag → config carregado → ambiente → padrão compilado (`ctl.go:500-520`).\n`--url` / `$FARM_API_URL` (padrão `http://127.0.0.1:8080`), `--token` / `$FARM_API_TOKEN`, `-o|--output table|json`, `--timeout` (padrão 30 s).\nO cliente HTTP em si **não** carrega timeout (`ctl.go:135-173`) — o stream de eventos e um upload de artifact seriam cortados em pleno voo. As requisições comuns recebem, em vez disso, um prazo de contexto por chamada.\n\n**Comandos destrutivos** (`job cancel`, `lease revoke`, `host drain/undrain`, `device exec`, `bulk`) exigem `--reason`, imprimem exatamente o que estão prestes a perturbar, com as posições de rack primeiro, e só então perguntam. Sem terminal em stdin — um pipe, ou `< /dev/null`, que um EOF instantâneo distingue de um terminal de verdade — não há a quem perguntar, então eles recusam a menos que `--yes` tenha sido passado.\n\n**Códigos de saída**, os quatro verificados: `0` fez o que disse, `1` falhou, `2` invocação errada, `3` o remoto **recusou** (HTTP 409). O 3 é separado do 1 porque uma recusa é uma resposta. Um script que tenta de novo no 1 e para no 3 não briga com a farm. Uma sobreposição de sentido que convém conhecer: `ctl bulk` sai com **1** quando qualquer target deu erro, ainda que a run em si tenha terminado e nenhum lease tenha sido afetado (`commands.go:2050`). Leia a própria linha `ok/errors/skipped` da run, e não o status de saída, para decidir se a fleet está em apuros.\n\nSe a resposta de uma escrita destrutiva nunca chega, o ctl diz que o desfecho é **UNKNOWN**, não tenta nada de novo e nomeia a leitura que resolve a dúvida (`ctl.go:606-627`). Reenviar uma escrita que encerra a run de alguém não é uma decisão que esta ferramenta tome diante de um erro de socket. Um `*RemoteError` passa intocado, porque ali o servidor respondeu e o estado é conhecido.\n\n`-o json` emite literalmente o próprio corpo de resposta da API, apenas reindentado — de modo que um script faz o parse do schema da API, e não de um segundo schema que o ctl tenha inventado.",
+      "examples": [
+        {
+          "label": "ctl fleet, filtrado para um único hub",
+          "lang": "bash",
+          "code": "FARM_API_URL=http://127.0.0.1:8420 farmd ctl fleet --host h02 --hub 4-2",
+          "output": "RACK SLOT     UID                                  MODEL          ANDROID      HEALTH       ADB           ADMIN    LEASE  JOB  HOLDER  BATT\n------------  -----------------------------------  -------------  -----------  -----------  ------------  -------  -----  ---  ------  ---------\nh02 / hub 4-2  (7 devices, 7 unhealthy; CORRELATED — suspect the hub, its cable or its power domain before the phones)\nR1-U10-H4-P1  df-886eee7a448c82a08e22dca48ff27a0d  Galaxy A54     14 (api 34)  quarantined  offline       enabled  free   —    —       87% 27.8C\nR1-U10-H4-P3  df-886ef07a448c86068e22daa48ff276a7  Pixel 4a       13 (api 33)  quarantined  unauthorized  enabled  free   —    —       68% 34.0C\nR1-U10-H4-P5  df-886ef27a448c896c8e22d8a48ff27341  Pixel 6a       14 (api 34)  quarantined  absent        enabled  free   —    —       64% 27.4C\n\n7 devices: 7 free, 0 leased, 7 unhealthy, 0 quarantined, 0 protected\nhealth: quarantined 7\n* on a lease state marks a protected lease: it is never reclaimed automatically. Q marks an open quarantine."
+        },
+        {
+          "label": "ctl leases — as contagens regressivas vêm do relógio do banco",
+          "lang": "bash",
+          "code": "farmd ctl leases",
+          "output": "RACK SLOT     UID                                  STATE  FENCE  HOLDER             TENANT  JOB       EXPIRES IN  RECLAIMABLE IN  LEASE\n------------  -----------------------------------  -----  -----  -----------------  ------  --------  ----------  --------------  ------------------------------------\nR1-U10-H1-P7  df-eb1b399483953b36af99f9c5f353c19f  held   2485   WIN-7S2UASNLFOP    acme    b80e05c8  9m58s       14m58s          50ebd922-45bf-43c5-b2ff-cdfd08ca6cab\nR1-U04-H2-P6  df-b0d4925b7fedc94dd4825ff3928b3828  held   2329   docs-verification  acme    f24a491f  10m06s      40m06s          dc010625-4af6-4760-8575-f361c7de60ff\n\n2 leases: held 2\ncountdowns come from the database clock, not from this machine's. A suspect lease is still LIVE: it has been marked for alerting and nothing has been released."
+        },
+        {
+          "label": "ctl lease revoke num pipe — recusa sem --yes (saída 2)",
+          "lang": "bash",
+          "code": "farmd ctl lease revoke dc010625-4af6-4760-8575-f361c7de60ff \\\n  --reason \"docs verification\" < /dev/null ; echo \"exit=$?\"",
+          "output": "About to REVOKE this lease. This ENDS SOMEBODY'S RUN NOW: the holder is fenced out at the host proxy, the device's fence floor is raised past the revoked fence, and the slot is unschedulable until its rearm window elapses. The holder gets no warning.\n\nlease:      dc010625-4af6-4760-8575-f361c7de60ff\nrack slot:  R1-U04-H2-P6\ndevice:     df-b0d4925b7fedc94dd4825ff3928b3828\nhost:       h01\nstate:      held\nfence:      2329\nholder:     docs-verification\ntenant:     acme\njob:        f24a491f-9eeb-47a6-9cbb-3936981ae4da\nheld for:   5m35s ago\nexpires in: 9m33s\nprotected:  no\n\nreason: docs verification\ntarget: http://127.0.0.1:8420\n\nType \"yes\" to proceed: ctl: usage: stdin is not a terminal, so there is nobody to confirm this with. Re-run with --yes once the list above is what you meant to disturb\nexit=2",
+          "note": "\"fenced out at the host proxy\" é a redação da ferramenta, não uma descrição desta build. Nenhum proxy desses existe ainda — veja as lacunas."
+        },
+        {
+          "label": "ctl lease revoke --yes (saída 0)",
+          "lang": "bash",
+          "code": "farmd ctl lease revoke dc010625-4af6-4760-8575-f361c7de60ff \\\n  --reason \"docs verification: proving the revoke path\" --yes ; echo \"exit=$?\"",
+          "output": "proceeding (--yes)\nlease:           dc010625-4af6-4760-8575-f361c7de60ff\nreleased:        yes\nrelease reason:  operator_revoked\ndevice:          3bc20c63-4dff-4a72-bdc0-664ced33b577\njob:             f24a491f-9eeb-47a6-9cbb-3936981ae4da\nrevoked fence:   2329\nnew fence floor: 2506\nnote:            the previous holder is now fenced: any socket still carrying fence 2329 is refused at the host proxy, and the slot is unschedulable until its rearm window elapses\nexit=0",
+          "note": "farm.audit_log passa então a conter: anonymous | lease.revoke | lease:dc010625-… | docs verification: proving the revoke path. O ator é \"anonymous\" porque o autenticador é o AllowAll — toda linha de auditoria nesta implantação nomeia a mesma não-pessoa."
+        },
+        {
+          "label": "ctl bulk através de um hub — repare no código de saída",
+          "lang": "bash",
+          "code": "farmd ctl bulk --selector host=h01 --selector hub=3-1 \\\n  --reason \"docs verification\" --yes -- getprop ro.build.version.sdk ; echo \"exit=$?\"",
+          "output": "About to run one shell command across 7 devices.\n\ncommand:         getprop ro.build.version.sdk\nselector:        host=h01,hub=3-1\nmax per hub:     4  (a hub answering all at once browns out its power domain and manufactures the incident you are investigating)\nmatches:         7 device(s)\nof which leased: 0 — these will be SKIPPED and recorded as skipped\nrack slots:      R1-U04-H1-P1, R1-U04-H1-P2, ... R1-U04-H1-P7\n\nproceeding (--yes)\nrun 7206444f-0eab-471b-a079-9e0fc04463f4 started: 7 targets, 0 skipped\nR1-U04-H1-P6  df-970e15…  error  adbwire: transport: server refused \"host:transport:usb:3-1.6\" ...\n\nrun 7206444f-… finished in state \"done\": 7 targets — 6 ok, 1 error, 0 skipped\nerrors above are transport or command failures. No lease was affected by any of them.\nctl: 1 of 7 targets failed\nexit=1"
+        },
+        {
+          "label": "ctl recovery — a ladder como está armazenada, não como está documentada",
+          "lang": "bash",
+          "code": "farmd ctl recovery",
+          "output": "the ladder — a tier runs only when the live lease's disruption policy permits it:\nTIER  NAME             BLAST RADIUS  REQUIRES POLICY         COOLDOWN  MAX/HOUR  ENABLED\n0     observe          device        no_disruption           30s       60        yes\n1     adb_reconnect    device        no_disruption           1m00s     20        yes\n2     transport_reset  device        allow_soft_reset        2m00s     10        yes\n3     usb_reset        device        allow_soft_reset        5m00s     6         yes\n4     port_power       power_domain  allow_port_power_cycle  10m00s    4         yes\n5     device_reboot    device        allow_port_power_cycle  15m00s    3         yes\n6     quarantine       device        no_disruption           1h00m     2         yes\n7     adb_restart      host          allow_port_power_cycle  1h00m     1         yes\n8     host_drain       host          no_disruption           6h00m     1         yes\n\nrecent attempts:\nR1-U04-H3-P1  h01  4  port_power  power_domain  10:55:01  refused  the live lease on this device carries disruption_policy=\"no…\nR1-U04-H4-P1  h01  4  port_power  power_domain  10:52:53  refused  this slot has no controllable power domain, so its port pow…",
+          "note": "O tier 7 (adb_restart) tem raio de dano `host` — sua descrição diz \"Restart the host adb server. SEVERS EVERY DEVICE ON THE HOST.\" Ele exige allow_port_power_cycle de todo lease vivo naquele host."
+        },
+        {
+          "label": "ctl validate — local, nunca sai da máquina",
+          "lang": "bash",
+          "code": "farmd ctl validate -f docspec.json",
+          "output": "#  STEP             KIND     TIMEOUT  ON ERROR  DETAIL\n0  wake             shell    30s      stop      input keyevent KEYCODE_WAKEUP\n1  install-harness  install  5m0s     stop      a27cf114c809\n2  check-sdk        assert   30s      stop      getprop ro.build.version.sdk ne\n\ndocspec.json is valid: version 1, 3 steps, total timeout 6m0s\nartifacts referenced: a27cf114c809bc908d5a91b112bec8b18c216a1056b554b6af22ba7755b3deca\neach must already be in the store, by sha256, before this job runs: ctl artifacts"
+        },
+        {
+          "label": "ctl submit",
+          "lang": "bash",
+          "code": "farmd ctl submit -f docspec.json --pool default --queue ci --tenant acme",
+          "output": "job:                38d07786-84c1-4031-b46a-a61ecc687d31\nstate:              queued\npool:               default\nqueue:              ci\ntenant:             acme\nsteps:              3\nspec total timeout: 6m0s\nmax runtime:        none — this lease ends when the job ends or a human revokes it\n\nnothing is scheduled yet: the scheduler turns this row into a lease.\nfollow it with: ctl job 38d07786-84c1-4031-b46a-a61ecc687d31"
+        },
+        {
+          "label": "ctl watch — o stream, renderizado",
+          "lang": "bash",
+          "code": "farmd ctl watch",
+          "output": "following http://127.0.0.1:8420/api/v1/stream — Ctrl-C to stop. Nothing here changes anything.\n10:57:11  fleet     snapshot devices 56\n10:57:11  lease     snapshot leases 81\n10:57:11  job       snapshot jobs 80\n10:57:11  recovery  snapshot attempts 51, quarantines 3\n10:57:11  ALERT     hub_correlation [h02 4-2] 7 of 7 devices on hub 4-2 are unhealthy; suspect the hub, its cable or its power domain before the phones\n10:57:11  fleet     delta    changed 2\n10:57:13  lease     delta    changed 1"
+        },
+        {
+          "label": "Códigos de saída, verificados",
+          "lang": "bash",
+          "code": "farmd ctl lease revoke <already-terminal> --reason r --yes ; echo $?\nfarmd ctl fleet --url http://127.0.0.1:1                    ; echo $?\nfarmd ctl nosuchcommand                                     ; echo $?",
+          "output": "ctl: POST /api/v1/leases/dc010625-4af6-4760-8575-f361c7de60ff/revoke: 409 conflict: this lease is already terminal; there is nothing to revoke (request 614e182a696e1ac7)\n3\nctl: GET /api/v1/fleet: Get \"http://127.0.0.1:1/api/v1/fleet?limit=1000\": dial tcp 127.0.0.1:1: connectex: No connection could be made because the target machine actively refused it.\n1\nctl: unknown command \"nosuchcommand\"\n(usage block)\nctl: usage\n2",
+          "note": "A linha do 409 carrega o request id, que é o mesmo id que aparece no access log do servidor para aquela requisição."
+        }
+      ]
+    },
+    {
+      "heading": "Artifacts: endereçamento por conteúdo, e por que isso importa com 60 devices",
+      "source": "internal/artifacts/store.go, internal/api/artifacts.go",
+      "body": "Um spec que diz \"faça push de `/builds/nightly/app.apk`\" é uma promessa sobre um sistema de arquivos que o runner não tem como cumprir. Um spec que nomeia `sha256:9f2b…` nomeia o conteúdo, e a farm passa então a conseguir responder à única pergunta que importa na hora de provisionar — *estes bytes exatos já estão naquele device?* — sem transferir nada.\n\n**A aritmética**: um APK de 200 MB enviado para 60 devices são 12 GB pelo USB. Enviado uma vez e pulado 59 vezes, são 200 MB. `farm.device_artifacts` é o ledger que permite o pulo, e `EnsureOnDevice` é a única coisa que o lê e o escreve (`store.go:12-16, 863`).\n\nO **upload** é o corpo e nada mais — sem multipart, sem base64, sem envelope JSON. Cada um deles coloca uma camada de enquadramento entre o socket e o disco, e o trabalho inteiro deste endpoint é mover várias centenas de megabytes sem jamais segurá-los. Os metadados viajam na query string: `kind` (apk, file, script, bundle), `name` e, opcionalmente, `sha256`.\n\nO `sha256` declarado **não** é o que dá nome ao artifact — o digest é calculado de todo modo. Ele é como você prova que a transferência foi fiel, e é verificado **dentro do stream**, não depois (`artifacts.go:355-395`). Depois seria tarde demais: `Store.Put` publica os bytes e escreve `farm.artifacts` antes de retornar, então uma checagem a posteriori teria de apagar uma linha e orfanar um blob que ela mesma acabou de criar. Fazer a leitura falhar, em vez disso, deixa o próprio caminho de erro do Put fazer o trabalho — bytes em staging abortados, nenhuma linha escrita, a farm exatamente como estava. Só um EOF limpo dispara a comparação, de modo que um upload truncado aparece como o erro de transporte que ele é, e não como \"o seu arquivo está errado\".\n\n**Os bytes são comitados antes da linha** (`store.go:640-668`). Um blob órfão, sem linha, é lixo inofensivo que um Put posterior de conteúdo idêntico adota; uma linha apontando para bytes que não estão lá é uma promessa que a farm não consegue cumprir. `Commit` faz fsync e depois renomeia dentro do mesmo sistema de arquivos — o staging fica sob a raiz de blobs, e não em `os.TempDir` — de modo que um crash antes do rename deixa um arquivo de staging sem nome, e depois dele deixa conteúdo completo. O estado perigoso, um arquivo truncado sob um digest que responde por ele, é inalcançável.\n\n**O DELETE é exclusivo de operator e recusa sempre que qualquer coisa ainda nomeia o conteúdo.** `farm.device_artifacts.sha256` é `ON DELETE CASCADE` (`migrations/00004_operate.sql:137`), então um delete sem proteção leva junto as linhas do ledger e a fleet esquece caladamente que sessenta aparelhos já têm esta build — e em seguida reenvia 200 MB para todos eles. A referência de um job terminal também bloqueia: apagar conteúdo que uma run já concluída instalou destrói o único registro do que ela rodou. A linha é travada primeiro com `FOR UPDATE`, o que conflita com o `FOR KEY SHARE` que um novo insert no ledger toma, de modo que nenhum device consegue começar a segurá-la no meio da checagem. A varredura de referências tem prazo de 15 s e **falha fechando** — um timeout recusa o delete, nunca permite um (`artifacts.go:599-606`).\n\nO blob **não** é removido. `artifacts.Backend` tem três métodos — Create, Open, URL (`store.go:222-235`) — e nenhum verbo para remoção, por desenho: endereçamento por conteúdo significa que um blob não referenciado é inerte, que um upload idêntico posterior o adota, e que recuperar disco é uma varredura, não um efeito colateral de uma requisição HTTP. A resposta diz isso em `blob_retained: true`, em vez de deixar subentendido. Nada do que é distribuído faz essa varredura — veja as lacunas.\n\nA raiz de blobs é `$FARM_ARTIFACT_DIR`, com padrão `<tmp>/device-farmer-artifacts`, espalhada em um nível pelos dois primeiros caracteres hexadecimais (`cmd/farmd/roles.go:383-396`, `store.go:243-276`).",
+      "examples": [
+        {
+          "label": "Upload via ctl push, que faz o hash primeiro",
+          "lang": "bash",
+          "code": "farmd ctl push harness.apk",
+          "output": "uploading harness.apk (618 B, kind apk, sha256 a27cf114c809bc908d5a91b112bec8b18c216a1056b554b6af22ba7755b3deca) to http://127.0.0.1:8420\nsha256:  a27cf114c809bc908d5a91b112bec8b18c216a1056b554b6af22ba7755b3deca\nkind:    apk\nname:    harness.apk\nsize:    618 B\npackage: com.acme.harness versionCode 40711\nnote:    the content was already in the store; this upload only refreshed its metadata\n\nreference it from a spec by that sha256.",
+          "note": "O push lê o arquivo duas vezes — uma para fazer o hash, outra para enviar — de modo que o digest possa ser declarado de antemão e uma transferência corrompida seja recusada antes que qualquer coisa seja armazenada. A linha `note` aparece apenas no caminho deduplicado."
+        },
+        {
+          "label": "400 digest_mismatch — nada foi armazenado",
+          "lang": "bash",
+          "code": "curl -s -w '\\nHTTP %{http_code}\\n' -X POST --data-binary @plain.txt \\\n  'http://127.0.0.1:8420/api/v1/artifacts?kind=file&name=liar.txt&sha256=0000000000000000000000000000000000000000000000000000000000000000'",
+          "output": "{\"error\":{\"code\":\"digest_mismatch\",\"message\":\"the upload does not match the digest it declared: 0000000000000000000000000000000000000000000000000000000000000000 was announced, but 11 bytes hashing to b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9 arrived; nothing was stored\",\"detail\":{\"declared_sha256\":\"0000…\",\"received_sha256\":\"b94d27b9…\",\"received_bytes\":11}}}\nHTTP 400"
+        },
+        {
+          "label": "Reenviar conteúdo idêntico sai de graça",
+          "lang": "bash",
+          "code": "curl -s -w '\\nHTTP %{http_code}\\n' -X POST --data-binary @harness.apk \\\n  'http://127.0.0.1:8420/api/v1/artifacts?kind=apk&name=harness.apk'",
+          "output": "{\"artifact\":{\"sha256\":\"a27cf114c809bc908d5a91b112bec8b18c216a1056b554b6af22ba7755b3deca\",\"kind\":\"apk\",\"name\":\"harness.apk\",\"size_bytes\":618,\"package\":\"com.acme.harness\",\"version_code\":40711,\"version_name\":\"4.7.11\",\"url\":\"file:///C:/Users/…/device-farmer-artifacts/a2/a27cf114…\",\"uploaded_by\":\"anonymous\",\"created_at\":\"2026-09-04T10:32:01.837269-03:00\"},\"deduplicated\":true}\nHTTP 201",
+          "note": "deduplicated:true significa que o conteúdo já estava lá e que apenas os metadados foram atualizados — e só kind e name são atualizados. package, version_code, url e uploaded_by passam por COALESCE, de modo que reenviar os mesmos bytes como kind=file não consegue apagar os metadados de package que um upload de APK anterior extraiu (store.go:684-700)."
+        },
+        {
+          "label": "O ledger, e por que DEVICES é o número que importa",
+          "lang": "bash",
+          "code": "farmd ctl artifacts",
+          "output": "SHA256                                                            KIND  NAME          SIZE   PACKAGE           VERSION  DEVICES  UPLOADED BY  CREATED\na27cf114c809bc908d5a91b112bec8b18c216a1056b554b6af22ba7755b3deca  apk   harness.apk   618 B  com.acme.harness  40711    0        anonymous    2026-09-04 10:32:01\n1245db574934abdfadc1ca847e70699f1c74e6a1322da2f480cf39660832f841  apk   notanapk.zip  146 B  —                 —        0        anonymous    2026-09-04 10:54:18\n\na spec references an artifact by its full sha256, never by name: the hash is the identity and the name is a label.\nDEVICES counts the devices already holding these exact bytes; a push step to one of those costs nothing.",
+          "note": "DEVICES conta apenas as linhas do ledger no estado 'present'. O DELETE recusa diante de QUALQUER linha do ledger, incluindo as 'failed' — que é por que harness.apk mostra DEVICES 0 e ainda assim não pode ser apagado."
+        },
+        {
+          "label": "409 — o DELETE recusa enquanto qualquer coisa o nomear",
+          "lang": "bash",
+          "code": "curl -s -w '\\nHTTP %{http_code}\\n' -X DELETE \\\n  'http://127.0.0.1:8420/api/v1/artifacts/a27cf114c809bc908d5a91b112bec8b18c216a1056b554b6af22ba7755b3deca?reason=docs%20verification'",
+          "output": "{\"error\":{\"code\":\"conflict\",\"message\":\"this artifact is still referenced by 3 device ledger row(s) and 3 job spec(s); retract it from those devices and let those jobs age out before deleting the content they name\",\"detail\":{\"device_count\":3,\"devices\":[{\"device_id\":\"9342bd98-…\",\"farm_uid\":\"df-eb1b3894…\",\"state\":\"failed\",\"error\":\"adbwire: stream_write: peer_closed … wsasend: An established connection was aborted…\"}, …],\"job_count\":3,\"jobs\":[{\"job_id\":\"7f34ac2b-…\",\"state\":\"succeeded\",\"tenant_id\":\"acme\"}, …]}}}\nHTTP 409",
+          "note": "As listas têm teto de 20 entradas; device_count e job_count são totais exatos (artifacts.go:62-64), de modo que uma página nunca diz \"2 devices\" enquanto o botão recusa por causa de mais de 900. GET /api/v1/artifacts/{sha} devolve as mesmas referências mais `deletable: false`."
+        },
+        {
+          "label": "200 — o DELETE de um digest não referenciado preserva os bytes",
+          "lang": "bash",
+          "code": "curl -s -w '\\nHTTP %{http_code}\\n' -X DELETE \\\n  'http://127.0.0.1:8420/api/v1/artifacts/b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9?reason=docs%20verification'\nls -l \"$TEMP/device-farmer-artifacts/b9/\"",
+          "output": "{\"blob_retained\":true,\"deleted\":true,\"note\":\"the row was removed; the content-addressed bytes remain in the blob backend and are adopted again by any later upload of identical content\",\"sha256\":\"b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9\"}\nHTTP 200\n\n-rw-r--r-- 1 Administrator 197121 11 Sep  4 10:54 b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9",
+          "note": "A linha sumiu (um GET seguinte dá 404, um segundo DELETE dá 404) e o blob continua no disco. Não existe varredor. Veja as lacunas."
+        },
+        {
+          "label": "O ledger do device depois de um push que falhou",
+          "lang": "bash",
+          "code": "curl -s http://127.0.0.1:8420/api/v1/devices/df-eb1b389483953983af99fac5f353c352/artifacts",
+          "output": "{\"artifacts\":[{\"sha256\":\"a27cf114c809…\",\"kind\":\"apk\",\"name\":\"harness.apk\",\"package\":\"com.acme.harness\",\"version_code\":40711,\"state\":\"failed\",\"error\":\"adbwire: stream_write: peer_closed endpoint=127.0.0.1:50138 devpath=usb:3-1.4: write tcp …: wsasend: An established connection was aborted by the software in your host machine.\"}],\"bytes_present\":0,\"counts\":{\"failed\":1},\"device_id\":\"9342bd98-8007-4321-bfdd-eef00fbbf721\",\"farm_uid\":\"df-eb1b3894…\",\"truncated\":false}",
+          "note": "Isto é o que o LEDGER acredita, nunca uma sondagem do aparelho. Uma linha dizendo 'present' cujo device foi limpo desde então é exatamente a divergência que você abre esta página para encontrar — suavizá-la sondando colocaria um socket entre um operador e uma tabela. `?state=` filtra por all|pending|present|failed|removed; qualquer outra coisa é 400."
+        }
+      ]
+    },
+    {
+      "heading": "EnsureOnDevice: o pulo, e o que um push que falha não custa a você",
+      "source": "internal/artifacts/store.go:833-915",
+      "body": "A sequência, e por que ela está nesta ordem:\n\n1. Ler a linha do artifact e a linha do ledger do device **juntas**. Um digest desconhecido ou um id de device malformado falha aqui, antes que qualquer coisa toque no device.\n2. Se a linha diz `present`, retornar `Pushed: false`. **Nada transferido, nenhuma linha escrita.** Com 60 devices, isso é uma busca indexada por chave primária em vez de uma transferência USB de quatro minutos.\n3. Abrir o blob e conferir o comprimento dele contra `farm.artifacts.size_bytes`. Um store que perdeu os próprios bytes precisa falhar antes que se diga ao ledger que um push está em andamento.\n4. Marcar `pending`. Um crash no meio do push deixa então uma linha que diz isso, em vez de nenhuma linha.\n5. Fazer o push e então registrar `present` ou `failed`.\n\n**Um push que falha não encerra nada.** Este pacote não importa nem `internal/lease` nem `internal/adbwire` — verificado, não há nenhum import de `device-farmer/internal` no pacote: a transferência chega como uma `PushFunc` fornecida por quem chama, então o store não segura socket, nem transporte, nem handle de device. Em caso de falha ele registra `failed` e devolve um erro que se declara retryable a um chamador que continua segurando o seu lease e o seu device. Um broken pipe na metade de um push de 200 MB custa uma nova tentativa, nunca um device. `recordFailure` roda num contexto **destacado** (`store.go:1014-1035`), porque o caso que mais precisa de uma linha exata é justamente aquele em que o contexto de quem chamou já morreu; se até essa escrita falhar, o log é o único lugar em que a falha sobrevive.\n\nSe o push tem sucesso mas a escrita no ledger falha, ele reporta `Pushed: true` junto com o erro de escrita. Os bytes *estão* no device; o pior custo de um `present` perdido é um push redundante na próxima vez.\n\n**O pulo confia no ledger.** Qualquer coisa que limpe um device — um reset médio ou pesado, um factory wipe, um reflash — **precisa** chamar `MarkRemoved` ou `ForgetDevice`, senão o próximo `EnsureOnDevice` vai alegremente pular um push de conteúdo que o device não tem mais.\n\nUma nota de desempenho que na verdade é uma nota sobre lease: `GET /api/v1/artifacts` conta o ledger uma vez contra uma página escolhida, em vez de usar uma subquery correlacionada. A chave primária do ledger é `(device_id, sha256)` e não existe índice apenas em `sha256`, de modo que a forma ingênua o revarre uma vez por artifact devolvido: medido com 3 000 artifacts e 36 000 linhas de ledger, isso dá **3,7 segundos** para `limit=2000`, contra 10 ms para esta forma (`internal/api/artifacts.go:426-438`). Essa é uma rota de role tenant, e o pool que ela seguraria é o mesmo pool de onde um holder toma emprestado para renovar. Um lease nunca é encerrado por uma query lenta, mas uma renovação que não consegue uma conexão é justamente o caminho pelo qual um seria."
+    },
+    {
+      "heading": "O parser de metadados do APK, e o que ele faz quando o parse falha",
+      "source": "internal/artifacts/apk.go",
+      "body": "`farm.artifacts.package` e `version_code` são o que permite a um spec dizer \"a build de `com.acme.app` com version code ≥ 4711\" em vez de nomear um caminho, e o que permite ao runner decidir se uma instalação é sequer necessária. Preenchê-los significa ler o `AndroidManifest.xml` de dentro do APK.\n\nA ferramenta óbvia é o `aapt dump badging`. **A farm não vai tê-la** — o farmd roda num contêiner ao lado de um hub USB, não numa máquina com o Android SDK, e acrescentar um SDK de 100 MB mais uma fronteira de exec para ler quatro atributos é uma troca ruim. Então o formato é lido diretamente: um APK é um zip, e o `AndroidManifest.xml` dentro dele é AXML — o XML binário em chunks do Android, com um string pool na frente. `ParseAXML` é o menor leitor que encontra `package`, `versionCode`, `versionCodeMajor` e `versionName`, e para no primeiro `<manifest>`. A busca da entrada diferencia maiúsculas de minúsculas: uma entrada de zip chamada `androidmanifest.xml` não é o manifest, e tratá-la como se fosse deixaria um arquivo forjado decidir qual package um artifact alega ser.\n\nIsto é entrada não confiável chegando por um upload HTTP e parseada **dentro do control plane**. Um panic aqui derruba o processo que segura todos os leases da farm. Portanto: toda leitura de múltiplos bytes passa por uma primitiva com checagem de limites; todo tamanho de chunk é recusado a menos que avance o cursor e permaneça dentro do documento, com a soma alargada antes para int64 para que um valor vindo da rede não dê a volta e vire um deslocamento positivo pequeno; o manifest descomprimido tem teto de 8 MiB aplicado ao *stream*, e não ao `UncompressedSize64` do próprio arquivo — que é exatamente o campo sobre o qual um zip hostil mente; a tabela de deslocamentos do string pool precisa *caber no seu chunk* antes que qualquer coisa seja alocada.\n\nOs atributos são casados **tanto** pelo resource id quanto pelo nome+namespace. Repackagers retiram os nomes de atributo, a URI do namespace android, ou ambos; um id é prova de identidade por si só, porque é a constante `android.R.attr` compilada. `versionCode` fora de `[0, 2^32-1]` e `versionCodeMajor` fora de `[0, 2^31-1]` são descartados (`apk.go:262-268`) — um major largo deslocado 32 bits à esquerda dá a volta e fica **negativo**, o que o coloca à frente de toda build legítima no índice `artifacts_pkg` e o faz vencer caladamente as consultas de \"última build\".\n\n**Em caso de falha, o artifact é armazenado mesmo assim.** `Put` reporta o problema em `PutResult.ManifestErr`, registra-o em WARN e devolve **201 Created** com um campo `manifest_error`. Só faltam `package` e `version_code`; o conteúdo está armazenado e pode ser enviado. Reportar isso como falha recusaria toda build repackaged ou ofuscada da fleet. `ctl push` imprime o aviso e sai com 0.",
+      "examples": [
+        {
+          "label": "Um manifest que faz parse",
+          "lang": "bash",
+          "code": "curl -s -X POST --data-binary @harness.apk \\\n  'http://127.0.0.1:8420/api/v1/artifacts?kind=apk&name=harness.apk'",
+          "output": "{\"artifact\":{\"sha256\":\"a27cf114c809…\",\"kind\":\"apk\",\"name\":\"harness.apk\",\"size_bytes\":618,\"package\":\"com.acme.harness\",\"version_code\":40711,\"version_name\":\"4.7.11\"},\"deduplicated\":true}\nHTTP 201",
+          "note": "version_name é devolvido, mas NÃO é persistido — farm.artifacts não tem coluna para ele (artifacts.go:143-147), então ele existe apenas na resposta à requisição que parseou o APK."
+        },
+        {
+          "label": "Um .zip / .aab enviado como kind=apk",
+          "lang": "bash",
+          "code": "curl -s -w '\\nHTTP %{http_code}\\n' -X POST --data-binary @notanapk.zip \\\n  'http://127.0.0.1:8420/api/v1/artifacts?kind=apk&name=notanapk.zip'",
+          "output": "{\"artifact\":{\"sha256\":\"1245db574934abdfadc1ca847e70699f1c74e6a1322da2f480cf39660832f841\",\"kind\":\"apk\",\"name\":\"notanapk.zip\",\"size_bytes\":146},\"deduplicated\":false,\"manifest_error\":\"artifacts: archive contains no AndroidManifest.xml; upload an .apk, not an .aab, .xapk or plain zip\"}\nHTTP 201"
+        },
+        {
+          "label": "Algo que não é sequer um zip",
+          "lang": "bash",
+          "code": "curl -s -w '\\nHTTP %{http_code}\\n' -X POST --data-binary @plain.txt \\\n  'http://127.0.0.1:8420/api/v1/artifacts?kind=apk&name=plain.txt'",
+          "output": "{\"artifact\":{\"sha256\":\"b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9\",\"kind\":\"apk\",\"name\":\"plain.txt\",\"size_bytes\":11},\"deduplicated\":false,\"manifest_error\":\"artifacts: not a readable zip: zip: not a valid zip file\"}\nHTTP 201",
+          "note": "Os dois chegam como 201, com a linha escrita. Procure por manifest_error, ou consulte por package IS NULL em kind='apk', para achar builds cujos metadados a farm nunca aprendeu. Um `kind` inválido é 400 (\"kind must be one of apk, file, script, bundle\"); um `name` ausente é 400."
+        },
+        {
+          "label": "Como o ctl mostra isso",
+          "lang": "text",
+          "code": "farmd ctl push notanapk.zip --kind apk",
+          "output": "the APK manifest did not parse (artifacts: archive contains no AndroidManifest.xml; upload an .apk, not an .aab, .xapk or plain zip); the content is stored and pushable, but package and versionCode are unknown to the store"
+        }
+      ]
+    },
+    {
+      "heading": "GET /api/v1/capabilities — o que este processo vai de fato fazer",
+      "source": "internal/api/capabilities.go",
+      "body": "Sem autenticação, pelo mesmo motivo que `/healthz` é: um operador depurando uma farm cujo auth é justamente a coisa quebrada ainda precisa enxergar o estado dela.\n\nTodo campo é **observado, não declarado**. A versão do schema vem de `goose_db_version`; a presença de cada role vem do heartbeat dela própria em `farm.component_heartbeat`; os host agents vêm de `farm.hosts`; o modo de auth vem do `Authenticator` com que este servidor foi de fato construído. Uma lista de funcionalidades num README descreve o que o projeto consegue fazer — isto descreve o que este processo, contra este banco, com esta configuração, vai fazer às 3 da manhã.\n\n**Isto é a primeira coisa a ler numa farm desconhecida**, porque é o único lugar em que as três funcionalidades não construídas aparecem nomeadas juntas: `Authentication`, `Fence enforcement at the resource` e `Helm chart`. A segunda delas é a que muda o modo como você lê todas as outras páginas: o fence é imposto no PostgreSQL e respeitado pelo cliente, e o proxy mTLS que recusaria uma conexão fenced no socket do ADB não está escrito.\n\nO array `roles` nomeia o que cada ausência custa. Nesta farm, `node` e `enroll` estão ambos com `running: false`, que é por que a funcionalidade `Recovery ladder` reporta *\"No host agent is beating: tiers 3 and 4 are REFUSED with a reason, not silently skipped\"* e `Dynamic enrollment` reporta `unavailable`.",
+      "examples": [
+        {
+          "label": "Os blocos de auth e de limites, ao vivo",
+          "lang": "bash",
+          "code": "curl -s http://127.0.0.1:8420/api/v1/capabilities | jq '.auth, .limits'",
+          "output": "{\n  \"mode\": \"allow-all\",\n  \"open\": true,\n  \"consequence\": \"every request is granted the operator role: anyone who can reach this port can revoke leases, drain hosts and power-cycle slots\",\n  \"fix\": \"set FARM_API_TOKENS to a token list, or supply an Authenticator\"\n}\n{\n  \"device_exec_max_output\": \"256 KiB\",\n  \"lease_grace\": \"30m0s\",\n  \"lease_ttl\": \"15m0s\",\n  \"reaper_gap_floor\": \"1m0s\",\n  \"renew_interval\": \"1m30s\",\n  \"slot_rearm\": \"35s\"\n}",
+          "note": "A primeira metade do `fix` que ele imprime não funciona neste binário — FARM_API_TOKENS é lido apenas por api.AuthenticatorFromEnv, que nada chama. A segunda metade funciona. Veja as lacunas."
+        },
+        {
+          "label": "As funcionalidades que não estão construídas",
+          "lang": "bash",
+          "code": "curl -s http://127.0.0.1:8420/api/v1/capabilities | jq '.features[] | select(.state==\"not_built\")'",
+          "output": "{\"name\":\"Authentication\",\"state\":\"not_built\",\"how\":\"a stub that grants every caller the operator role\",\"detail\":\"Do not expose this port to a network you do not control. The seam for OIDC is documented in internal/api/auth.go.\"}\n{\"name\":\"Fence enforcement at the resource\",\"state\":\"not_built\",\"how\":\"the fence is enforced in PostgreSQL and honoured by the client\",\"detail\":\"The mTLS proxy that would refuse a fenced connection at the ADB socket is not written, so a misbehaving client could still reach a device it has been fenced out of.\"}\n{\"name\":\"Helm chart\",\"state\":\"not_built\",\"how\":\"docker-compose only; the compose file's 'farm' profile carries the per-role services\"}"
+        },
+        {
+          "label": "Roles que não estão batendo",
+          "lang": "bash",
+          "code": "curl -s http://127.0.0.1:8420/api/v1/capabilities | jq '.roles[] | select(.running==false)'",
+          "output": "{\"component\":\"node\",\"running\":false,\"meaning\":\"host agent on a USB host; without it recovery tiers 3 and 4 are refused\"}\n{\"component\":\"enroll\",\"running\":false,\"meaning\":\"adopts newly plugged devices; without it a new handset never joins the fleet\"}"
+        }
+      ]
+    },
+    {
+      "heading": "Métricas que esta superfície emite",
+      "source": "internal/api/server.go:305-346, internal/obs/metrics.go",
+      "body": "Nove séries vêm desta camada — `farm_api_requests_total`, `farm_api_request_duration_seconds`, `farm_api_requests_in_flight`, `farm_api_stream_clients`, `farm_api_stream_clients_dropped_total`, `farm_api_stream_poll_errors_total`, `farm_api_device_execs_total`, `farm_api_operator_actions_total`, `farm_api_bulk_targets_total` — mais `farm_lease_renew_failures_total`, que o handler de renovação levanta através de `internal/obs`. Duas delas merecem uma regra de alerta.\n\n`farm_lease_renew_failures_total{kind=\"fenced\"}` subindo significa que jobs estão sendo abortados. `{kind=\"transient\"}` subindo significa que o banco não está respondendo às renovações — **os leases estão bem, o control plane não está**. Nunca alerte sobre a soma dos dois.\n\n`farm_api_operator_actions_total{action,outcome}` é a trilha de auditoria em forma de contador: `outcome=\"refused\"` em `slot.power` ou em `artifact.delete` é o sistema funcionando, não falhando. `slot.power` também tem `outcome=\"requested\"` em vez de `\"ok\"`, o que é honesto — a API registrou uma intenção, ela não chaveou nada.",
+      "examples": [
+        {
+          "label": "Ações de operator, ao vivo",
+          "lang": "bash",
+          "code": "curl -s http://127.0.0.1:8420/metrics | grep '^farm_api_operator_actions_total{'",
+          "output": "farm_api_operator_actions_total{action=\"artifact.delete\",outcome=\"ok\"} 3\nfarm_api_operator_actions_total{action=\"artifact.delete\",outcome=\"refused\"} 2\nfarm_api_operator_actions_total{action=\"bulk.create\",outcome=\"ok\"} 13\nfarm_api_operator_actions_total{action=\"host.drain\",outcome=\"ok\"} 6\nfarm_api_operator_actions_total{action=\"host.undrain\",outcome=\"ok\"} 6\nfarm_api_operator_actions_total{action=\"job.cancel\",outcome=\"ok\"} 1\nfarm_api_operator_actions_total{action=\"lease.revoke\",outcome=\"ok\"} 2\nfarm_api_operator_actions_total{action=\"quarantine.close\",outcome=\"ok\"} 5\nfarm_api_operator_actions_total{action=\"slot.power\",outcome=\"refused\"} 11\nfarm_api_operator_actions_total{action=\"slot.power\",outcome=\"requested\"} 3"
+        },
+        {
+          "label": "Os labels de rota são padrões, não caminhos",
+          "lang": "bash",
+          "code": "curl -s http://127.0.0.1:8420/metrics | grep '^farm_api_requests_total' | head -5\ncurl -s http://127.0.0.1:8420/metrics | grep '^farm_api_requests_total.*route=\"/api/v1/\"'",
+          "output": "farm_api_requests_total{code=\"200\",method=\"DELETE\",route=\"DELETE /api/v1/artifacts/{sha}\"} 3\nfarm_api_requests_total{code=\"200\",method=\"GET\",route=\"/\"} 1\nfarm_api_requests_total{code=\"200\",method=\"GET\",route=\"GET /api/v1/artifacts\"} 8\nfarm_api_requests_total{code=\"200\",method=\"GET\",route=\"GET /api/v1/artifacts/{sha}\"} 3\nfarm_api_requests_total{code=\"200\",method=\"GET\",route=\"GET /api/v1/bulk\"} 4\n\nfarm_api_requests_total{code=\"307\",method=\"GET\",route=\"/api/v1/\"} 1\nfarm_api_requests_total{code=\"307\",method=\"POST\",route=\"/api/v1/\"} 4\nfarm_api_requests_total{code=\"404\",method=\"DELETE\",route=\"/api/v1/\"} 1\nfarm_api_requests_total{code=\"404\",method=\"GET\",route=\"/api/v1/\"} 6\nfarm_api_requests_total{code=\"404\",method=\"POST\",route=\"/api/v1/\"} 5",
+          "note": "Todo erro de rota — método errado, caminho errado, barra final faltando — colapsa no único label `/api/v1/`. Isso é controle deliberado de cardinalidade, mas significa que você não consegue dizer, só pelas métricas, QUAL caminho um cliente está errando; onde isso mora é na linha de access log com o seu X-Request-Id."
+        }
+      ]
+    },
+    {
+      "heading": "Lacunas fechadas desde que esta página foi escrita",
+      "body": "A lista de lacunas abaixo foi escrita contra uma árvore anterior, e parte dela já foi corrigida desde então. Essas entradas ficam registradas aqui em vez de apagadas: quem lê e se lembra de uma lacuna precisa conseguir distinguir **corrigida** de **nunca esteve lá**, e a mudança que fechou uma delas costuma ser a descrição verdadeira mais curta do que o comportamento é hoje.\n\nA regra desta tabela é a regra da própria lista de lacunas. Uma entrada só se move para cá depois que o código foi lido e a afirmação conferida contra ele, nunca porque uma mensagem de commit disse que sim — que foi exatamente como a lista ficou desatualizada, para começar. Tudo que continua em aberto está em **O que não está construído aqui**, logo abaixo.",
+      "table": {
+        "columns": [
+          "o que estava errado",
+          "o que fechou a lacuna"
+        ],
+        "rows": [
+          [
+            "O fence não é imposto em lugar algum onde um device possa ser alcançado. `GET /api/v1/capabilities` reporta a funcionalidade \"Fence enforcement at the resource\" como `not_built`: \"The mTLS proxy that would refuse a fenced connection at the ADB socket is not written\" (`internal/api/capabilities.go:320-324`). Não existe binário de node/proxy na árvore. Mas `POST /api/v1/leases/{id}/revoke` devolve, no corpo do seu 200, \"any socket still carrying fence 2329 is refused at the host proxy\" (`internal/api/leases.go:718-722`), e `ctl lease revoke` imprime a mesma frase duas vezes — uma no aviso de pré-voo e outra no resultado. Um operador que revoga um lease e lê apenas a resposta HTTP ou a saída do ctl vai acreditar que o holder anterior foi cortado no fio. Ele não foi. O que de fato acontece é que `farm.devices.fence_floor` é elevado, `farm.leases` marca o lease como released, e o slot fica em quarantine pela janela de rearm (35 s aqui). Um holder cooperativo descobre isso na renovação seguinte, como um 410. Um holder travado, ou um que simplesmente não renova antes de escrever de novo, mantém um socket ADB aberto para um device que já foi entregue a outro — e a única coisa entre ele e o próximo job é o temporizador de rearm. Esta é a mesma forma de exposição que o desenho inteiro existe para evitar, exatamente no único ponto em que o desenho ainda é uma promessa. Trate o rearm do slot, e não o fence, como a barreira real depois de um revoke, e dimensione-o de acordo.",
+            "Construído e ligado por configuração. `GET /api/v1/capabilities` reporta \"Fence enforcement at the resource\" como `enabled` quando este processo apresenta `FARM_FENCE_CLIENT_*`, e como `unavailable`, nomeando o que falta, caso contrário — uma afirmação sobre o lado DESTE PROCESSO no fio, porque a imposição acontece por host e nada aqui consegue ver quais hosts rodam um proxy."
+          ],
+          [
+            "Um step de `install` cujo push de artifact falha continua abortando o resto do job: os steps restantes nunca são criados, e um job que outro escritor já gravou como `succeeded` permanece `succeeded`. O que mudou foi a contabilidade abandonada — `internal/janitor` agora fecha o step e a tentativa dele assim que o lease do job deixa de estar vivo, e recoloca na queue ou falha o próprio job enquanto ele ainda se lê como `running`. A API ainda vai lhe dizer que um job teve sucesso quando o APK dele nunca chegou, se algo que não o runner tiver escrito aquele estado — nesta demo, o simulador faz exatamente isso. A diferença é que a linha do step não fica mais eternamente em `running`: ela é fechada como abortada, com o sweeper nomeado no detalhe dela, de modo que a contradição fica visível no ledger em vez de parecer um step em andamento. `farm.device_artifacts` continua sendo o lugar em que a falha do push em si é registrada. O janitor não revisita um job que já saiu de `running`, então um veredito terminal errado não é corrigido.",
+            "Depois de uma falha que aborta um job, todo step restante é escrito em `farm.job_steps` como `skipped` com um reason, de modo que a lista de steps do job fica completa em vez de simplesmente se interromper. `internal/runner/steps.go` também cria primeiro o diretório-pai de um push, que era o que as falhas de `install` eram."
+          ],
+          [
+            "Nenhuma coleta de lixo de blobs roda, embora a varredura esteja escrita. `internal/api/artifacts_blob.go` implementa `BlobGC` e `POST /api/v1/artifacts/gc` — dry run por padrão, uma carência de uma hora para que não possa correr contra a janela do `Store.Put` em que os bytes são comitados antes de a linha ser escrita, uma segunda checagem de referências que falha fechando, e um relatório nomeando qualquer digest para o qual ela perdeu a corrida — e `internal/api/method_test.go` cobre tudo isso. Mas `NewBlobGC` não tem chamador fora desses testes: `runAPI` monta `a.Register(mux)` e `a.RegisterBlobRoutes(mux)` (`cmd/farmd/roles.go:167-173`) e nunca constrói um `BlobGC`, então a rota não está no binário distribuído. O DELETE continua removendo a linha de `farm.artifacts` e retendo os bytes (`blob_retained: true`), o que continua sendo a resposta certa para aquela requisição. O disco sob `$FARM_ARTIFACT_DIR` só cresce numa farm construída a partir desta árvore. Verificado duas vezes: depois de um DELETE bem-sucedido, o arquivo ainda estava presente em `<tmp>/device-farmer-artifacts/b9/b94d27b9…`, e dois blobs de uma sessão anterior estão no disco sem linha correspondente. O raciocínio de desenho é sólido — um blob endereçado por conteúdo e não referenciado é inerte e é adotado pelo próximo upload idêntico — mas recuperar espaço é um `find` manual contra `farm.artifacts` até que a varredura seja montada, o que são duas linhas em `runAPI` ao lado das que já montam a rota de conteúdo.",
+            "`cmd/farmd/roles.go` monta `api.NewBlobGC(...)` ao lado das rotas de blob, com a carência vinda de `FARM_ARTIFACT_GC_GRACE`, e `ctl artifacts gc [--apply]` e `artifacts delete <sha> --reason` o acionam. Verificado ao vivo: um dry run reportou 4 blobs, 786 B, uma entrada não arquivada como digest e nunca tocada, 0 referenciadas. Nada varre a menos que um operador peça."
+          ],
+          [
+            "O escopo por tenant para em `/events`. `GET /api/v1/events` agora é escopado (`internal/api/events_scope.go`, veja a tabela acima), mas `/fleet`, `/topology`, `/hosts`, `/recovery`, `/bulk` e `/stream` continuam abrangendo a farm inteira para qualquer chamador: `tenantScope` é chamado de `jobs.go`, `leases.go`, `artifacts.go` e `events_scope.go`, e de nenhum outro lugar. Um token tenant-scoped lê o `lease_id`, o `fence`, o `job_id` e o `tenant_id` de todo lease vivo a partir de `/fleet` e do digest `lease` do SSE — exatamente a exposição que `handleLeaseRelease` documenta como o motivo pelo qual o release precisa da sua própria checagem de tenant (`leases.go:441-458`). O stream é o mais difícil de corrigir: um único poller compartilhado produz um único snapshot compartilhado distribuído a todos os clientes, de modo que escopá-lo significa um poller por tenant.",
+            "`tenantScope` alcança toda superfície de leitura. `/fleet` e `/topology` mascaram os identificadores de lease de outro tenant em vez de esconder o device, `/hosts` conta apenas os leases de quem chamou, `/recovery` restringe as tentativas aos devices cujo lease vivo o tenant detém, `/stream` filtra por cliente a partir de um único poller, e `/bulk` passou a ser de operator. `TestEveryTenantReadableRouteIsScoped` faz a BUILD falhar diante de um GET legível por tenant cujo handler nunca chama `tenantScope`, a menos que ele esteja na allowlist com um motivo — e ele pegou uma rota que outra branch acrescentou durante o merge."
+          ],
+          [
+            "`ctl bulk` sobrecarrega o código de saída 1: `bulkOutcome` (`internal/ctl/commands.go:2056-2061`) devolve uma falha sempre que qualquer target der erro, em todos os formatos de saída, e o ctl mapeia isso no mesmo código de saída que usa quando o próprio control plane falhou. Um bulk em 7 devices com 6 ok, 1 erro de transporte e a run no estado `done` sai com 1: um script que trata o 1 como \"o control plane falhou\" vai acionar o plantão por causa de um único aparelho offline. Leia, em vez disso, as contagens `ok/errors/skipped` da run. (A metade desta lacuna que estava na API — nunca um 405, em hipótese alguma — está fechada; veja a tabela acima.)",
+            "`bulkOutcome` devolve `ErrPartial` e `ExitCode` o mapeia para **4**, distinto de 1 (o control plane ou o transporte falhou). A tabela em `ctl.go` e o `--help` o trazem."
+          ],
+          [
+            "As rotas de artifact não são tenant-scoped, e a nova rota de conteúdo torna isso consequente. `GET /api/v1/artifacts/{sha}/content` está montada atrás de `requireRole(RoleTenant)` (`internal/api/artifacts_blob.go:262`) e `contentHandler` resolve o digest apenas pelo sha — não há chamada a `tenantScope` nesse caminho. `GET /api/v1/artifacts` filtra somente por `kind` e `package` (`internal/api/artifacts.go:402-420`), de modo que os digests podem ser enumerados antes. `tenantScope` aparece exatamente uma vez no código de artifact, em `artifacts.go:518`, onde escopa a lista de REFERÊNCIAS de device dentro de `handleGet` — os metadados, não os bytes. Um token de tenant consegue listar todo digest da farm e então baixar os bytes completos de cada um: o APK de outro tenant, o harness deles, o que quer que tenham enviado. Antes de a rota de conteúdo existir, a exposição entre tenants era só de metadados — `handleGet` diz isso mesmo, escopando as referências e observando que o conteúdo em si é compartilhado — e a nova rota a escala até o artifact. `farm.artifacts` registra um `tenant_id`, então o escopo está disponível e nada o aplica. Se compartilhar conteúdo entre tenants é deliberado, isso não está deliberado em lugar nenhum por escrito, o que é o mesmo problema pelo outro lado.",
+            "Colocado na allowlist com o motivo, que o teste-guarda exige por escrito: builds endereçadas por conteúdo são conteúdo compartilhado, e as referências de job que nomeariam um tenant são servidas por `GET /api/v1/artifacts/{sha}`, que É escopada. `farm.device_artifacts` é um fato a respeito de um aparelho e não nomeia nenhum job nem nenhum tenant."
+          ],
+          [
+            "A API estava aberta e não podia ser fechada por configuração. `cmd/farmd/roles.go` acrescentava `api.WithAuthenticator(api.NewAllowAll(log, \"anonymous\"))` incondicionalmente, e `api.AuthenticatorFromEnv` — a função que lê `FARM_API_TOKENS` — não tinha chamador, de modo que o remédio que `/api/v1/capabilities` imprimia não fazia nada.",
+            "`cmd/farmd/roles.go:187` agora chama `api.AuthenticatorFor(cfg, log)`. Ele lê `FARM_API_TOKENS` e `FARM_API_AUTH`, constrói um `StaticBearer` e RECUSA subir um listener exposto sem credenciais em vez de subir aberto — uma api que não sobe é registrada como uma lacuna de control plane e reembolsada em cada lease vivo, coisa que subir aberto não é. `internal/api/auth_wiring.go`, com `internal/api/auth_test.go` por trás."
+          ],
+          [
+            "`farm.jobs.selector` era armazenado, validado, ecoado pela API e nunca usado no placement. `farm.lease_acquire` filtrava apenas por pool, admin_state, adb_state, health, estado do slot, rearm e `pin_device`, de modo que um job pedindo `{\"model\":\"Pixel 7\"}` recebia qualquer device que viesse a seguir na ordenação, com HTTP 200 onde um selector funcional teria respondido 409 no_capacity.",
+            "`migrations/00005_correctness.sql:181` acrescenta `farm.device_matches`, e a FASE 2 de `lease_acquire` a chama na linha 330. O vocabulário é pequeno e fechado, e `farm.selector_unknown_keys` transforma uma chave não reconhecida numa RECUSA em vez de numa linha ignorada — descartar uma restrição em silêncio é como um job acaba rodando em hardware que o autor dele excluiu de propósito."
+          ],
+          [
+            "Os resultados de step de job não eram expostos pela API de forma alguma. `GET /api/v1/jobs/{id}` devolvia exatamente duas chaves, `job` e `leases`; `farm.job_steps` não tinha rota, e o digest `job` do SSE carregava apenas ids e um estado.",
+            "`GET /api/v1/jobs/{id}/steps` e `GET /api/v1/jobs/{id}/attempts` (`internal/api/jobsteps.go`), tenant-scoped exatamente como `GET /api/v1/jobs/{id}` é, e sem escrever nada, mais `ctl job steps` e `ctl job attempts`."
+          ],
+          [
+            "Não havia como baixar os bytes de um artifact pela API. `ArtifactAPI.Register` montava cinco rotas de metadados; `Store.Get` e `Backend.Open` não tinham chamador HTTP, e o campo `url` era um caminho `file://` no disco do próprio host da API.",
+            "`GET /api/v1/artifacts/{sha}/content` (`internal/api/artifacts_blob.go`, montada a partir de `cmd/farmd/roles.go:172`). Ela serve através de `http.ServeContent`, então GETs com range funcionam; o digest está no caminho, então `Cache-Control: immutable` é uma promessa que uma URL endereçada por conteúdo pode fazer honestamente; um blob ausente ou corrompido é um código de erro nomeado, e não um 500."
+          ],
+          [
+            "`GET /api/v1/events` abrangia a farm inteira, sem escopo por tenant e sem filtros além de `limit`, enquanto `tenantScope` era aplicado em oito outros lugares. Qualquer token de tenant — se os tokens estivessem ligados — teria lido o histórico de jobs e de devices de todos os outros tenants, incluindo o texto de `reason` dos operators.",
+            "`internal/api/events_scope.go`. `handleEvents` constrói um `EventScope`, restringe-o a `tenantScope(r.Context())`, descarta `farm.audit_log` por completo para um chamador tenant-scoped e ecoa o escopo na resposta, de modo que uma lista escopada não possa ser lida como se fosse a farm inteira. Ele também acrescenta os filtros `kind`, `since` e `subject` que o handler nunca teve."
+          ],
+          [
+            "A API não devolvia 405 algum. Como `mux.Handle(\"/api/v1/\", …)` casava com todo caminho sob o prefixo, o tratamento de método incompatível do Go nunca disparava: um POST para uma rota GET voltava como `404 not_found`, sem header `Allow`.",
+            "`internal/api/method.go` constrói um mapa de métodos no registro e `apiFallback` responde 405 com um header `Allow`, enquanto um caminho genuinamente desconhecido continua sendo 404 — responder 405 ali diria a um chamador não autenticado quais caminhos existem. `internal/api/method_test.go` cobre os dois sentidos."
+          ],
+          [
+            "Os tiers de recovery 3 (`usb_reset`) e 4 (`port_power`) agora têm um cliente e uma coluna através da qual encontrar um agent, mas nenhum role `node` está batendo nesta implantação (`capabilities.roles[].running == false`), e o agent existe só para Linux. Os tiers 5 (`device_reboot`) e 7 (`adb_restart`) passam pelo ADB e precisam apenas de um host alcançável.",
+            "`cmd/farmd/roles.go` constrói um `node.NewClient` e o passa como o `HostRunner` do atuador, de modo que os tiers 3 e 4 alcançam `POST /node/v1/usb-reset` e `/port-power` em vez de um runner nulo que os recusa. Dois dos nove degraus deixaram de ser decorativos. O agent da outra ponta existe só para Linux e ainda nunca enfrentou hardware."
+          ]
+        ]
+      },
+      "source": "migrations/00005_correctness.sql, internal/api/{auth_wiring,jobsteps,artifacts_blob,events_scope,method}.go, cmd/farmd/roles.go"
+    }
+  ],
+  "gaps": [],
+  "verified": "All examples were run against the live system at http://127.0.0.1:8420 and postgres://farm@127.0.0.1:55432/device_farmer on 2026-09-04; every output block above is real, trimmed only for width. Roughly 118 commands.\n\nHTTP probes: all 38 routes. GETs returning 200: /healthz, /readyz, /metrics, /api/v1/capabilities, /fleet, /devices/{id}, /topology, /hosts, /jobs, /jobs/{id}, /leases, /recovery, /bulk, /bulk/{id}, /events, /stream, /specs/kinds, /specs/resets?profile=default, /artifacts, /artifacts/{sha}, /devices/{id}/artifacts, /. Corrections found here: /specs/resets without ?profile= is 400 and with an unknown profile is 404 (both correct per specs.go:725-731); POST /specs/validate with an empty or non-object body is 400, NOT the \"always 200\" the draft claimed; POST /api/v1/bulk returns 202, not 201. Method mismatches are 404 in both directions with the method named, never 405; a bare /api/v1 is 307 to /api/v1/ which then 404s.\n\nLease lifecycle end to end: the demo's scheduler and job runner take over any queued job within about a second, so I parked a job (create, cancel, then acquire — farm.lease_acquire does not read jobs.state) to get a lease nothing else would touch. On lease dc010625 at fence 2329: renewed successfully (200, was_suspect false); renewed with a wrong fence (410 fenced); renewed with a wrong holder_instance (410 fenced, identical body); renewed with no fence (400); released with reason \"device_offline\" (400 check_violation, constraint leases_release_reason_check, seven permitted words returned) and with no reason (400) — then confirmed via /api/v1/leases that the lease was still held at fence 2329 with expires_in_s 900 and heartbeat_seq 1, untouched by four refusals; revoked it through `farmd ctl lease revoke --yes` (200, revoked fence 2329, new fence floor 2506) and confirmed the farm.audit_log row; revoked again (409 conflict), released it as its holder (200, released:false idempotent), revoked with no reason (400), revoked an unknown lease id (404). Also: acquire with an unknown job (404), acquire on a cancelled job (200 — a device was handed out), acquire with an unknown JSON field (400 invalid_json), a 1.2 MB body (413), a non-uuid job_id (400).\n\nOperator routes: drained and undrained h01 and h02 (200 each; h01's drain reported live_leases 1 and the \"nothing here releases them\" note, h02's undrain carried no note), drain of an unknown host (404), drain with no reason (400); power-cycled slot 13 (202 accepted, attempt_id 94 — still open with no outcome minutes later), slot 22 (409 conflict, power_kind none), slot 16 (409 disruption_refused naming lease f9a404fe, job 7f3a6bac, tenant acme, policy allow_soft_reset, 7 slots in domain 3), slot 999999 (404), slot \"abc\" (400); exec on a free device by farm_uid (200, exit 0), on a leased device (409 naming the lease), with an empty command (400), on an unknown device (404); closed quarantine 5 (200) and closed it again (409), closed 9999 (404); ran a bulk across host=h01/hub=3-1 (202, then 7 targets, 5 ok, 1 error, 1 skipped-because-leased) and a bulk with a selector matching nothing (400).\n\nArtifacts: re-uploaded the existing harness.apk (201, deduplicated:true, package com.acme.harness versionCode 40711 versionName 4.7.11); uploaded a plain zip as kind=apk and an 11-byte text file as kind=apk (both 201 with manifest_error \"no AndroidManifest.xml\" / \"not a readable zip\"); declared-digest mismatch (400 digest_mismatch, real received hash, nothing stored); invalid kind (400); missing name (400); malformed sha in path (400); unknown sha (404). DELETE of harness.apk was refused 409 naming 3 device ledger rows and 3 job specs; DELETE of the unreferenced b94d27b9 digest returned 200 blob_retained:true and the file was still on disk afterwards, with a follow-up GET and a second DELETE both 404. Two blobs from an earlier session (3a373c43…, 1245db57…) are on disk with no farm.artifacts row — the no-GC gap, on the floor.\n\nSSE: captured 40 s of /api/v1/stream (230 655 bytes) — event names observed were exactly fleet (20), job (20), lease (15), recovery (6), alert (5), plus 1 `: connected` and 2 `: heartbeat` comment frames; verified the `retry: 3000` preamble and the Cache-Control / Connection / Content-Type / X-Accel-Buffering headers. Alert kinds seen live: hub_correlation, recovery_refused; all nine kinds confirmed against stream.go:719-894.\n\nctl (16 commands, all against the live API): help, fleet (plain and --host/--hub filtered), leases (table and -o json), hosts, recovery, artifacts, job, submit, validate, push, watch, device exec, bulk, lease revoke (pipe and --yes). Exit codes confirmed: 0 success, 1 transport failure (--url http://127.0.0.1:1), 2 usage (unknown command; revoke on a pipe without --yes), 3 remote refusal (revoke of an already-terminal lease). New finding: ctl bulk exits 1 when any target errored even though the run finished in state \"done\". ctl recovery shows all nine ladder rungs (0-8), not the five the draft printed.\n\nAuth: sent a fabricated bearer token and a garbage Authorization header to /api/v1/fleet (200 both) and hit two operator-only routes with no credential (200/200), confirming AllowAll. Cross-checked by grepping the whole tree for AuthenticatorFromEnv / NewStaticBearer / WithAuthenticator call sites — the only production wiring is cmd/farmd/roles.go:148, and FARM_API_TOKENS appears only in auth.go's dead helper and in capabilities.go's advice string.\n\nDatabase checks: farm.devices, farm.slots, farm.hubs, farm.power_domains, farm.quarantines, farm.leases, farm.jobs, farm.job_steps (which is where the succeeded-job-with-a-stuck-step gap reproduced), farm.device_artifacts, farm.artifacts, farm.audit_log, and the body of farm.lease_acquire in migrations/00002_lease.sql (to confirm the selector is never read and that re-attach overwrites holder_instance).\n\nInvariant check: I re-read every section against \"a lease ends when the job says so, when a deadline the user wrote down elapses, or when a human takes it back — nothing else.\" Nothing in the draft claimed or implied that a connectivity failure ends a lease, and nothing does now. Two passages were tightened rather than corrected: the 410 causes are now enumerated (released, reclaimed, re-attached by another acquire) so a reader cannot infer a network cause from \"the lease is gone\", and the exec, bulk and artifact-push failure paths now state explicitly what they leave untouched. The one place the invariant is weaker than it reads is the host proxy: the system's own words say a revoked holder is \"refused at the host proxy\", and no such proxy is built. That is recorded as gap 2 and flagged at every point where those words are quoted.\n\nRE-VERIFIED GAP PASS. The gap list on this page was re-checked against the tree line by line after migrations 00005, 00006 and 00007 and the Go changes that came with them. Every entry moved into \"Gaps closed since this page was written\" was confirmed by reading the code that closed it, not by trusting a commit message. Three claims turned out to be stale in the other direction and were reopened: reaper.Collectors(), jobrunner.Collectors() and the recovery/node collectors are all still unregistered, because cmd/farmd/roles.go:86 calls obs.RegisterAll(reg, log) with no variadic groups and the only Collectors() call site in the tree sits in a branch farmd never takes. One claim was simply wrong when written — farm.slots.power_domain_id has existed since migrations/00001_core.sql:91 — and was corrected in place. Two claims about test coverage were narrowed rather than closed: internal/lease and internal/api are covered now; internal/reaper, internal/scheduler, internal/runner and internal/jobrunner still have zero test files. Only the six area JSON files were edited by this pass; no Go, SQL or UI code was touched. This pass also ADDED a gap the inventory never had: GET /api/v1/artifacts/{sha}/content is not tenant-scoped, and GET /api/v1/artifacts is not either, so a tenant token can enumerate every digest in the farm and download another tenant's bytes."
+}

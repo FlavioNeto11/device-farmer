@@ -137,8 +137,12 @@
   <section id="view-leases" class="view" role="tabpanel" aria-labelledby="tab-leases" tabindex="-1" hidden>
     <div class="toolbar">
       <label><span data-i18n="filter.state">State</span>
+        <!-- The four values are farm.leases.state and are printed, never
+             translated. "live" is not one of them: it is this page's name for
+             the empty filter, so it is the one option here that is a sentence
+             and the one that carries a translated label. -->
         <select id="l-state">
-          <option value="">live (held and suspect)</option>
+          <option value="" data-i18n="leases.filter.live">live (held and suspect)</option>
           <option value="held">held</option>
           <option value="suspect">suspect</option>
           <option value="expired">expired</option>
@@ -148,139 +152,220 @@
       <span class="grow"></span>
       <span id="leases-counts" class="counts"></span>
     </div>
+    <!-- The axiom. Split across spans only so that each run of prose can carry
+         its own translation key: `data-i18n` sets textContent, which would
+         swallow the emphasis and the chip if the paragraph were one key. The
+         English is unchanged, word for word. -->
     <p class="axiom">
-      <strong>A lease ends when the job says so, when a deadline the user wrote down elapses, or when a human takes it back.</strong>
-      Nothing on this page ends one on its own. A <span class="chip chip-suspect"><span aria-hidden="true">◐</span> suspect</span>
-      lease means the control plane has not heard a heartbeat from the holder — it does <em>not</em> mean the device is broken,
-      the device has not been released, and a heartbeat that arrives later heals the lease at the same fence.
+      <strong data-i18n="leases.axiom.head">A lease ends when the job says so, when a deadline the user wrote down elapses, or when a human takes it back.</strong>
+      <span data-i18n="leases.axiom.a">Nothing on this page ends one on its own. A</span>
+      <span class="chip chip-suspect"><span aria-hidden="true">◐</span> suspect</span>
+      <span data-i18n="leases.axiom.b">lease means the control plane has not heard a heartbeat from the holder — it does</span>
+      <em data-i18n="leases.axiom.not">not</em>
+      <span data-i18n="leases.axiom.c">mean the device is broken, the device has not been released, and a heartbeat that arrives later heals the lease at the same fence.</span>
     </p>
     <div id="leases-body" class="panel-body" aria-busy="true"></div>
   </section>
 
   <!-- ================= JOBS ================= -->
   <section id="view-jobs" class="view" role="tabpanel" aria-labelledby="tab-jobs" tabindex="-1" hidden>
-    <div class="split">
-      <div class="col-main">
-        <div class="toolbar">
-          <label><span data-i18n="filter.state">State</span>
-            <select id="j-state">
-              <option value="">all states</option>
-              <option value="queued">queued</option>
-              <option value="allocating">allocating</option>
-              <option value="running">running</option>
-              <option value="succeeded">succeeded</option>
-              <option value="failed">failed</option>
-              <option value="cancelled">cancelled</option>
-            </select>
+    <!-- The form is a disclosure above the table rather than a column beside
+         it. See .formpanel in style.css for the measurement that moved it. -->
+    <section class="formpanel">
+      <h2 class="formpanel-h">
+        <button type="button" class="formpanel-toggle" data-formpanel="job-form" aria-expanded="false" aria-controls="job-form">
+          <span class="fp-glyph" aria-hidden="true">+</span>
+          <span data-i18n="jobs.form.title">Submit a job</span>
+        </button>
+      </h2>
+
+      <!-- ELEVEN FIELDS, FIVE QUESTIONS.
+           The fieldsets are the whole point: where it runs, what it runs, how
+           long it may take, what may disturb it, and who is asking. Before
+           them this was eleven labels and eleven boxes in one run, and the
+           only way to fill it in was to already know the answer.
+
+           Every VALUE is unchanged. `allow_port_power_cycle` is what the API
+           accepts and what `ctl` prints, so it is still what the option says;
+           the sentence beside it is an addition, not a replacement. -->
+      <form class="formpanel-body" id="job-form" autocomplete="off" hidden>
+
+        <fieldset>
+          <legend data-i18n="jobs.form.where">Where it runs</legend>
+          <label for="job-pool" data-i18n="jobs.form.pool">Pool</label>
+          <input id="job-pool" name="pool" required placeholder="pixel-6">
+          <p class="fhelp" data-i18n="jobs.form.poolHelp">The set of interchangeable devices the scheduler may pick from.</p>
+          <label for="job-queue" data-i18n="jobs.form.queue">Queue</label>
+          <input id="job-queue" name="queue" required placeholder="ci-main">
+          <p class="fhelp" data-i18n="jobs.form.queueHelp">Which line this job waits in. Queues are served independently, so a busy one does not hold up another.</p>
+          <label for="job-tenant" data-i18n="jobs.form.tenant">Tenant</label>
+          <input id="job-tenant" name="tenant" required placeholder="platform">
+          <p class="fhelp" data-i18n="jobs.form.tenantHelp">Who the work belongs to. It appears on the lease and in every event this job writes.</p>
+        </fieldset>
+
+        <fieldset>
+          <legend data-i18n="jobs.form.what">What it runs</legend>
+          <label for="job-spec" data-i18n="jobs.form.spec">Spec</label>
+          <textarea id="job-spec" name="spec" rows="4" spellcheck="false">{}</textarea>
+          <p class="fhelp" data-i18n="jobs.form.specHelp">JSON. The body the runner executes, passed through untouched. An empty object is a valid job.</p>
+          <label for="job-selector" data-i18n="jobs.form.selector">Selector</label>
+          <textarea id="job-selector" name="selector" rows="2" spellcheck="false">{}</textarea>
+          <p class="fhelp" data-i18n="jobs.form.selectorHelp">JSON. Narrows the pool further — a model, a host, a label. Leave it empty to accept any device in the pool.</p>
+        </fieldset>
+
+        <fieldset>
+          <legend data-i18n="jobs.form.clocks">How long it may take</legend>
+          <div class="row2">
+            <div>
+              <label for="job-expected" data-i18n="jobs.form.expected">Expected duration</label>
+              <input id="job-expected" name="expected_duration_s" type="number" min="0" step="1" placeholder="3600">
+              <p class="fhelp" data-i18n="jobs.form.expectedHelp">Seconds. Advisory: it ends nothing.</p>
+            </div>
+            <div>
+              <label for="job-maxrt" data-i18n="jobs.form.maxrt">Max runtime</label>
+              <input id="job-maxrt" name="max_runtime_s" type="number" min="0" step="1" placeholder="21600">
+              <p class="fhelp" data-i18n="jobs.form.maxrtHelp">Seconds. A real deadline.</p>
+            </div>
+          </div>
+          <p class="fhelp" data-i18n="jobs.form.maxrtNote">Max runtime is the only user-supplied clock allowed to end a lease automatically. Leave it empty and only the job or a human ends this lease.</p>
+          <div class="row2">
+            <div>
+              <label for="job-ttl" data-i18n="jobs.form.ttl">Lease TTL</label>
+              <input id="job-ttl" name="ttl_s" type="number" min="600" step="1" placeholder="900">
+              <p class="fhelp" data-i18n="jobs.form.ttlHelp">Seconds, 600 or more. How long the lease survives without a heartbeat before it turns suspect.</p>
+            </div>
+            <div>
+              <label for="job-grace" data-i18n="jobs.form.grace">Grace</label>
+              <input id="job-grace" name="grace_s" type="number" min="300" step="1" placeholder="1800">
+              <p class="fhelp" data-i18n="jobs.form.graceHelp">Seconds, 300 or more. How long a suspect lease is left alone before the reaper may reclaim it.</p>
+            </div>
+          </div>
+        </fieldset>
+
+        <fieldset>
+          <legend data-i18n="jobs.form.guards">What may disturb it</legend>
+          <label for="job-policy" data-i18n="jobs.form.policy">Disruption policy</label>
+          <select id="job-policy" name="disruption_policy">
+            <option value="allow_port_power_cycle" data-i18n="jobs.policy.portPowerCycle">allow_port_power_cycle — recovery may cut power to this device&rsquo;s USB port</option>
+            <option value="allow_soft_reset" data-i18n="jobs.policy.softReset">allow_soft_reset — recovery may restart the device&rsquo;s adb, and nothing harder</option>
+            <option value="no_disruption" data-i18n="jobs.policy.noDisruption">no_disruption — recovery may not touch this device while the lease is live</option>
+          </select>
+          <p class="fhelp" data-i18n="jobs.form.policyHelp">The value before the dash is what the API stores and what ctl prints; the rest of the line is here to explain it. A recovery rung whose blast radius exceeds this policy is refused outright, never quietly downgraded.</p>
+          <label class="chk">
+            <input id="job-protected" name="protected" type="checkbox">
+            <span data-i18n="jobs.form.protected">Protected</span>
+            <span class="chk-note" data-i18n="jobs.form.protectedNote">The reaper will never reclaim this lease. A human is paged instead.</span>
           </label>
-          <span class="grow"></span>
-          <span id="jobs-counts" class="counts"></span>
-        </div>
-        <div id="jobs-body" class="panel-body" aria-busy="true"></div>
+        </fieldset>
 
-        <h2 class="section-h">Steps of the selected job</h2>
-        <p class="hint">Which step a job is on, and what it printed. Pick a job above; the rows come from
-          <span class="mono">GET /api/v1/jobs/{id}/steps</span>, which is the same view <span class="mono">ctl job steps</span>
-          prints. A step that failed carries the exit code, the runner's message and the log it produced, so the answer to
-          &ldquo;which step failed and why&rdquo; needs neither a terminal nor a database session.</p>
-        <div id="job-steps" class="panel-body"></div>
-      </div>
+        <fieldset>
+          <legend data-i18n="jobs.form.who">Who is asking</legend>
+          <label for="job-by" data-i18n="jobs.form.by">Created by</label>
+          <input id="job-by" name="created_by" placeholder="your name"
+                 data-i18n-attr="placeholder:jobs.form.byPlaceholder">
+          <p class="fhelp" data-i18n="jobs.form.byHelp">Recorded on the job and on every event it writes. Six weeks from now it is how somebody finds out who asked.</p>
+        </fieldset>
 
-      <form class="col-side card" id="job-form" autocomplete="off">
-        <h2>Submit a job</h2>
-        <label for="job-pool">Pool</label>
-        <input id="job-pool" name="pool" required placeholder="pixel-6">
-        <label for="job-queue">Queue</label>
-        <input id="job-queue" name="queue" required placeholder="ci-main">
-        <label for="job-tenant">Tenant</label>
-        <input id="job-tenant" name="tenant" required placeholder="platform">
-        <label for="job-spec">Spec (JSON)</label>
-        <textarea id="job-spec" name="spec" rows="4" spellcheck="false">{}</textarea>
-        <label for="job-selector">Selector (JSON)</label>
-        <textarea id="job-selector" name="selector" rows="2" spellcheck="false">{}</textarea>
-        <div class="row2">
-          <div>
-            <label for="job-expected">Expected duration (s)</label>
-            <input id="job-expected" name="expected_duration_s" type="number" min="0" step="1" placeholder="3600">
-          </div>
-          <div>
-            <label for="job-maxrt">Max runtime (s)</label>
-            <input id="job-maxrt" name="max_runtime_s" type="number" min="0" step="1" placeholder="21600">
-          </div>
-        </div>
-        <p class="hint">Max runtime is the only user-supplied clock allowed to end a lease automatically. Leave it empty and only the job or a human ends this lease.</p>
-        <div class="row2">
-          <div>
-            <label for="job-ttl">TTL (s, min 600)</label>
-            <input id="job-ttl" name="ttl_s" type="number" min="600" step="1" placeholder="900">
-          </div>
-          <div>
-            <label for="job-grace">Grace (s, min 300)</label>
-            <input id="job-grace" name="grace_s" type="number" min="300" step="1" placeholder="1800">
-          </div>
-        </div>
-        <label for="job-policy">Disruption policy</label>
-        <select id="job-policy" name="disruption_policy">
-          <option value="allow_port_power_cycle">allow_port_power_cycle</option>
-          <option value="allow_soft_reset">allow_soft_reset</option>
-          <option value="no_disruption">no_disruption</option>
-        </select>
-        <label class="chk"><input id="job-protected" name="protected" type="checkbox"> Protected — the reaper will never reclaim this lease; a human is paged instead</label>
-        <label for="job-by">Created by</label>
-        <input id="job-by" name="created_by" placeholder="your name">
         <div id="job-form-error" class="form-error" hidden></div>
-        <button type="submit" class="primary">Submit job</button>
+        <button type="submit" class="primary" data-i18n="jobs.form.submit">Submit job</button>
       </form>
+    </section>
+
+    <div class="toolbar">
+      <label><span data-i18n="filter.state">State</span>
+        <select id="j-state">
+          <option value="" data-i18n="jobs.filter.all">all states</option>
+          <option value="queued">queued</option>
+          <option value="allocating">allocating</option>
+          <option value="running">running</option>
+          <option value="succeeded">succeeded</option>
+          <option value="failed">failed</option>
+          <option value="cancelled">cancelled</option>
+        </select>
+      </label>
+      <span class="grow"></span>
+      <span id="jobs-counts" class="counts"></span>
     </div>
+    <div id="jobs-body" class="panel-body" aria-busy="true"></div>
+
+    <h2 class="section-h" data-i18n="jobs.steps.title">Steps of the selected job</h2>
+    <p class="hint">
+      <span data-i18n="jobs.steps.hintA">Which step a job is on, and what it printed. Pick a job above; the rows come from</span>
+      <span class="mono">GET /api/v1/jobs/{id}/steps</span><span data-i18n="jobs.steps.hintB">, which is the same view</span>
+      <span class="mono">ctl job steps</span>
+      <span data-i18n="jobs.steps.hintC">prints. A step that failed carries the exit code, the runner&rsquo;s message and the log it produced, so the answer to &ldquo;which step failed and why&rdquo; needs neither a terminal nor a database session.</span>
+    </p>
+    <div id="job-steps" class="panel-body"></div>
   </section>
 
   <!-- ================= RECOVERY ================= -->
   <section id="view-recovery" class="view" role="tabpanel" aria-labelledby="tab-recovery" tabindex="-1" hidden>
-    <h2 class="section-h">The ladder</h2>
+    <h2 class="section-h" data-i18n="recovery.ladder">The ladder</h2>
     <p class="hint">
-      Recovery climbs from the cheapest rung upward and acts <em>on behalf of</em> the holder: the lease keeps its device,
-      the lease clock keeps ticking and the fence never moves. A rung whose blast radius exceeds the live lease's
-      disruption policy is refused, not quietly downgraded.
+      <span data-i18n="recovery.hintA">Recovery climbs from the cheapest rung upward and acts</span>
+      <em data-i18n="recovery.hintEm">on behalf of</em>
+      <span data-i18n="recovery.hintB">the holder: the lease keeps its device, the lease clock keeps ticking and the fence never moves. A rung whose blast radius exceeds the live lease&rsquo;s disruption policy is refused, not quietly downgraded.</span>
     </p>
     <div id="tiers-body" class="ladder" aria-busy="true"></div>
 
-    <h2 class="section-h">Recent attempts</h2>
+    <h2 class="section-h" data-i18n="recovery.attempts">Recent attempts</h2>
     <div id="attempts-body" class="panel-body" aria-busy="true"></div>
 
-    <h2 class="section-h">Open quarantines</h2>
+    <h2 class="section-h" data-i18n="recovery.quarantines">Open quarantines</h2>
     <div id="quarantines-body" class="panel-body" aria-busy="true"></div>
   </section>
 
   <!-- ================= BULK ================= -->
   <section id="view-bulk" class="view" role="tabpanel" aria-labelledby="tab-bulk" tabindex="-1" hidden>
-    <div class="split">
-      <div class="col-main">
-        <h2 class="section-h">Runs</h2>
-        <div id="bulk-runs" class="panel-body" aria-busy="true"></div>
-        <h2 class="section-h">Selected run</h2>
-        <div id="bulk-detail" class="panel-body"></div>
-      </div>
-      <form class="col-side card" id="bulk-form" autocomplete="off">
-        <h2>Run a command</h2>
-        <label for="bulk-selector">Selector (JSON)</label>
-        <textarea id="bulk-selector" name="selector" rows="3" spellcheck="false">{"pool":""}</textarea>
-        <label for="bulk-command">Command</label>
-        <input id="bulk-command" name="command" required placeholder="getprop ro.build.fingerprint">
-        <div class="row2">
-          <div>
-            <label for="bulk-max">Max per hub</label>
-            <input id="bulk-max" name="max_per_hub" type="number" min="1" step="1" value="4">
+    <!-- The command comes first now. It is the thing being decided; the
+         selector is where it lands, and the two limits are the guard rail
+         under both. -->
+    <section class="formpanel">
+      <h2 class="formpanel-h">
+        <button type="button" class="formpanel-toggle" data-formpanel="bulk-form" aria-expanded="false" aria-controls="bulk-form">
+          <span class="fp-glyph" aria-hidden="true">+</span>
+          <span data-i18n="bulk.form.title">Run a command</span>
+        </button>
+      </h2>
+
+      <form class="formpanel-body" id="bulk-form" autocomplete="off" hidden>
+
+        <fieldset>
+          <legend data-i18n="bulk.form.what">What to run, and where</legend>
+          <label for="bulk-command" data-i18n="bulk.form.command">Command</label>
+          <input id="bulk-command" name="command" required placeholder="getprop ro.build.fingerprint">
+          <p class="fhelp" data-i18n="bulk.form.commandHelp">Sent to every matched device exactly as typed. The handset&rsquo;s own shell does the word-splitting.</p>
+          <label for="bulk-selector" data-i18n="bulk.form.selector">Selector</label>
+          <textarea id="bulk-selector" name="selector" rows="3" spellcheck="false">{"pool":""}</textarea>
+          <p class="fhelp" data-i18n="bulk.form.selectorHelp">JSON. Which devices this reaches. An empty pool matches every pool, so read this twice before starting a run.</p>
+        </fieldset>
+
+        <fieldset>
+          <legend data-i18n="bulk.form.limits">Limits</legend>
+          <div class="row2">
+            <div>
+              <label for="bulk-max" data-i18n="bulk.form.max">Max per hub</label>
+              <input id="bulk-max" name="max_per_hub" type="number" min="1" step="1" value="4">
+              <p class="fhelp" data-i18n="bulk.form.maxHelp">Devices at once, per hub.</p>
+            </div>
+            <div>
+              <label for="bulk-timeout" data-i18n="bulk.form.timeout">Timeout</label>
+              <input id="bulk-timeout" name="timeout_ms" type="number" min="1000" step="500" value="60000">
+              <p class="fhelp" data-i18n="bulk.form.timeoutHelp">Milliseconds, per device.</p>
+            </div>
           </div>
-          <div>
-            <label for="bulk-timeout">Timeout (ms)</label>
-            <input id="bulk-timeout" name="timeout_ms" type="number" min="1000" step="500" value="60000">
-          </div>
-        </div>
-        <p class="hint">Max per hub keeps a fleet-wide command from browning out one power domain.</p>
+          <p class="fhelp" data-i18n="bulk.form.limitsNote">Max per hub keeps a fleet-wide command from browning out one power domain.</p>
+        </fieldset>
+
         <div id="bulk-form-error" class="form-error" hidden></div>
-        <button type="submit" class="primary">Start run</button>
+        <button type="submit" class="primary" data-i18n="bulk.form.submit">Start run</button>
       </form>
-    </div>
+    </section>
+
+    <h2 class="section-h" data-i18n="bulk.runs">Runs</h2>
+    <div id="bulk-runs" class="panel-body" aria-busy="true"></div>
+    <h2 class="section-h" data-i18n="bulk.selected">Selected run</h2>
+    <div id="bulk-detail" class="panel-body"></div>
   </section>
 
   <!-- ================= EVENTS ================= -->
@@ -290,14 +375,14 @@
 
   <section id="view-events" class="view" role="tabpanel" aria-labelledby="tab-events" tabindex="-1" hidden>
     <div class="toolbar">
-      <label>Show
+      <label><span data-i18n="events.show">Show</span>
         <select id="e-limit">
           <option value="100">100</option>
           <option value="250" selected>250</option>
           <option value="1000">1000</option>
         </select>
       </label>
-      <label>Kind contains
+      <label><span data-i18n="events.kind">Kind contains</span>
         <input id="e-kind" type="search" placeholder="lease_, drain, recovery" autocomplete="off">
       </label>
       <span class="grow"></span>

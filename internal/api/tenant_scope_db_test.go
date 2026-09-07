@@ -7,10 +7,12 @@ package api
 // and an operator — read every tenant-readable route, and each tenant must see
 // its own fence and never the other's, while the operator sees the farm.
 //
-// These tests need DATABASE_URL pointing at a MIGRATED database and skip
-// without one. They write rows with a per-run suffix and delete exactly those
-// rows afterwards; nothing else in the database is touched, and every query
-// they assert on is filtered to the host they created.
+// These tests run against the scratch database TestMain creates from
+// DATABASE_URL (dbtest_test.go) and skip without one. They still write rows
+// under a per-run suffix and delete exactly those rows afterwards, and every
+// query they assert on is filtered to the host they created: the scratch
+// database is shared with every other case in this package, so an unfiltered
+// count here would be a test that passes or fails on what its neighbours left.
 
 import (
 	"bufio"
@@ -51,16 +53,8 @@ type scopeFixture struct {
 
 func newScopeFixture(t *testing.T) *scopeFixture {
 	t.Helper()
-	dsn := strings.TrimSpace(os.Getenv("DATABASE_URL"))
-	if dsn == "" {
-		t.Skip("no DATABASE_URL; the tenant-scope tests need a migrated database")
-	}
+	pool := requireDB(t)
 	ctx := context.Background()
-	pool, err := pgxpool.New(ctx, dsn)
-	if err != nil {
-		t.Fatalf("connect: %v", err)
-	}
-	t.Cleanup(pool.Close)
 
 	sfx := fmt.Sprintf("%d%06d", os.Getpid()%100000, time.Now().UnixNano()%1_000_000)
 	f := &scopeFixture{

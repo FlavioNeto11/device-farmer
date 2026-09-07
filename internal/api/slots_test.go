@@ -5,11 +5,12 @@ package api
 // migration 00017 and — for rebrand — a real adbwire client talking to
 // test/fakeadb.
 //
-// These tests need DATABASE_URL to name a migrated database they may write
-// fixture rows into. They skip without one; a DATABASE_URL that is set but
-// unreachable is a failure, because somebody asked for these to run. Every
-// fixture lives under ids of its own and is deleted afterwards, so a shared
-// scratch database is left as it was found, audit rows aside.
+// These tests write fixture rows into the scratch database TestMain creates
+// from DATABASE_URL (dbtest_test.go). They skip without one; a DATABASE_URL
+// that is set but unreachable is a failure there, because somebody asked for
+// these to run. Every fixture lives under ids of its own and is deleted
+// afterwards, so the scratch database is left as the next case in this package
+// found it, audit rows aside.
 
 import (
 	"bytes"
@@ -40,23 +41,13 @@ const (
 	tenantToken   = "u13-tenant-token"
 )
 
+// slotsTestPool hands back the suite's scratch database, or skips. The ping
+// this used to do is TestMain's now (dbtest_test.go), which is also where the
+// "a DATABASE_URL that is set but unreachable is a failure, not a skip" rule
+// these tests were written under now lives.
 func slotsTestPool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
-	dsn := strings.TrimSpace(os.Getenv(config.EnvDatabaseURL))
-	if dsn == "" {
-		t.Skip("no DATABASE_URL; the slot surface needs a migrated database")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	pool, err := pgxpool.New(ctx, dsn)
-	if err != nil {
-		t.Fatalf("DATABASE_URL is set but does not parse: %v", err)
-	}
-	if err := pool.Ping(ctx); err != nil {
-		t.Fatalf("DATABASE_URL is set but unreachable: %v", err)
-	}
-	t.Cleanup(pool.Close)
-	return pool
+	return requireDB(t)
 }
 
 // slotsServer builds a server whose router is real, whose authenticator knows

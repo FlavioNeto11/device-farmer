@@ -2,7 +2,8 @@ package api
 
 // The whole screen path over real HTTP, against a real device row.
 //
-// These need DATABASE_URL pointing at a MIGRATED database and skip without one.
+// These run against the scratch database TestMain creates from DATABASE_URL
+// (dbtest_test.go) and skip without one.
 // They reuse scopeFixture from tenant_scope_db_test.go, which seeds a host, a
 // hub, three devices, and a live lease on two of them — which is exactly the
 // three cases this path branches on: a free device, a leased device, and a

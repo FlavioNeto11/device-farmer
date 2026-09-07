@@ -14,9 +14,9 @@ package api
 //   - and the ordinary reads: a job's steps, a job with none, a job that is
 //     not this caller's, and the per-device verdict on /attempts.
 //
-// The budget and the parser need no database. Everything else does, and skips
-// without DATABASE_URL pointing at a migrated one, exactly as the tenant-scope
-// tests do.
+// The budget and the parser need no database. Everything else runs against the
+// scratch database TestMain creates from DATABASE_URL (dbtest_test.go) and
+// skips without one, exactly as the tenant-scope tests do.
 
 import (
 	"context"
@@ -263,16 +263,8 @@ type stepFixture struct {
 
 func newStepFixture(t *testing.T) *stepFixture {
 	t.Helper()
-	dsn := strings.TrimSpace(os.Getenv("DATABASE_URL"))
-	if dsn == "" {
-		t.Skip("no DATABASE_URL; the job step route tests need a migrated database")
-	}
+	pool := requireDB(t)
 	ctx := context.Background()
-	pool, err := pgxpool.New(ctx, dsn)
-	if err != nil {
-		t.Fatalf("connect: %v", err)
-	}
-	t.Cleanup(pool.Close)
 
 	sfx := fmt.Sprintf("%d%06d", os.Getpid()%100000, time.Now().UnixNano()%1_000_000)
 	f := &stepFixture{

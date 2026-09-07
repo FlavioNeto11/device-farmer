@@ -10,9 +10,12 @@ package api
 // actually answered — in the ladder's own vocabulary, so the two are
 // indistinguishable to whoever reads the table — is the whole point.
 //
-// The fixture removes everything it seeded. TestSlotPowerFixtureLeavesNothing
-// is the proof, and the recipe runs this package twice against one database
-// to hold it.
+// The fixture removes everything it seeded, and TestSlotPowerFixtureLeavesNothing
+// is the proof. That proof did not become redundant when TestMain moved this
+// suite onto a scratch database of its own (dbtest_test.go): one host is seeded
+// per subtest into a database every other case in this package shares, so a
+// fixture that left rows behind would still be the next case's stray host. The
+// scratch database only stops it also being a real farm's.
 
 import (
 	"bytes"
@@ -44,21 +47,13 @@ const powerTestToken = "t0ken-for-the-slot-power-tests"
 
 var powerFixtureSeq atomic.Int64
 
-// powerDB connects to DATABASE_URL, or skips. The database is expected to be
-// migrated; nothing here is created outside the rows the fixture seeds under
-// its own host id, and the fixture removes those when the test ends.
+// powerDB hands back the suite's scratch database, or skips. The database is
+// migrated and shared with every other case in this package; nothing here is
+// created outside the rows the fixture seeds under its own host id, and the
+// fixture removes those when the test ends.
 func powerDB(t *testing.T) *pgxpool.Pool {
 	t.Helper()
-	dsn := strings.TrimSpace(os.Getenv(config.EnvDatabaseURL))
-	if dsn == "" {
-		t.Skipf("%s is not set; skipping the PostgreSQL-backed slot power tests", config.EnvDatabaseURL)
-	}
-	pool, err := pgxpool.New(context.Background(), dsn)
-	if err != nil {
-		t.Fatalf("connecting: %v", err)
-	}
-	t.Cleanup(pool.Close)
-	return pool
+	return requireDB(t)
 }
 
 // powerFixture is one GANGED power domain: a hub whose ports share a single

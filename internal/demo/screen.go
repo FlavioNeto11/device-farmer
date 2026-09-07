@@ -29,6 +29,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/flaviopadilha/device-farmer/internal/artifacts"
 	"github.com/flaviopadilha/device-farmer/test/fakeadb"
 )
@@ -136,5 +138,59 @@ func installScreenFixtures(srv *fakeadb.Server, devs []*simDevice, log *slog.Log
 			ServerLog: fmt.Sprintf("[server] INFO: device-farmer demo, %s, replaying a "+
 				"recorded clip. No handset is attached.\n", d.rackSlot),
 		}))
+	}
+}
+
+// markScreenServerPresent records the placeholder as already on every device.
+//
+// THIS IS THE ONE PLACE THE DEMO SKIPS A REAL STEP, and it is worth saying why
+// rather than leaving somebody to find it.
+//
+// A first screen session pushes the server jar with adb's sync protocol. This
+// fake ADB server does not speak sync — it is a whole second framing and it
+// lives on a separate listener (fakeadb.SyncServer), which test/fakeadb's own
+// comment calls a worthwhile merge and not that seam. So a push here fails with
+// a broken pipe, and the demo would show a 502 on every device.
+//
+// What is simulated instead is the SECOND session, which is what almost every
+// session in a real farm is: artifacts.EnsureOnDevice reads farm.device_artifacts,
+// sees 'present', and returns without a byte crossing the wire. That path is the
+// production path, unmodified, and it is the one being exercised.
+//
+// What is therefore NOT exercised anywhere in this demo is the push itself. It
+// is exercised in internal/adbwire's sync tests against fakeadb.StartSync, which
+// move 196 KB in four chunks and compare byte for byte — a better test of a
+// transfer than a demo would be. But no run of this demo is evidence that a jar
+// reaches a handset, and REQUIREMENTS.md SCREEN-01 says so in those words.
+func markScreenServerPresent(ctx context.Context, pool *pgxpool.Pool, devs []*simDevice, log *slog.Logger) {
+	if len(devs) == 0 {
+		return
+	}
+	ids := make([]string, 0, len(devs))
+	for _, d := range devs {
+		ids = append(ids, d.deviceID)
+	}
+	const q = `
+INSERT INTO farm.device_artifacts (device_id, sha256, state, installed_at, detail)
+SELECT id::uuid, $2, 'present', now(),
+       jsonb_build_object(
+         'remote_path', $3::text,
+         'note', 'seeded by internal/demo: this fake ADB server does not speak sync, ' ||
+                 'so the demo simulates the second session rather than the first')
+  FROM unnest($1::uuid[]) AS id
+    ON CONFLICT (device_id, sha256) DO UPDATE
+   SET state = 'present', installed_at = now(), detail = excluded.detail`
+
+	// The path the command line will name, so the ledger and the CLASSPATH
+	// agree. It is derived the same way internal/screen derives it — from the
+	// jar's content id — rather than typed out, because a ledger that recorded
+	// a different path than the one the server is started with is a ledger that
+	// tells an operator at 3am to look in the wrong place.
+	remote := "/data/local/tmp/scrcpy-server-" + ScreenServerSHA[:12] + ".jar"
+
+	if _, err := pool.Exec(ctx, q, ids, ScreenServerSHA, remote); err != nil {
+		log.Warn("the demo's screen server could not be marked present on its devices", "err", err,
+			"consequence", "a live screen answers 502: the push it falls back to needs a sync "+
+				"service this fake does not have")
 	}
 }

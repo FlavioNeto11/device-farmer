@@ -322,7 +322,7 @@ func (m *Manager) Open(ctx context.Context, dev Device, o Options) (*Session, er
 	// refusal: a fence that says no says no the first time, and retrying it
 	// would turn one refused connection into a burst of them in the proxy's
 	// audit log.
-	s.video, err = connectSocket(spawnCtx, dev, socket)
+	s.video, err = connectSocket(sessCtx, spawnCtx, dev, socket)
 	if err != nil {
 		cancelSession()
 		return nil, &SocketError{Socket: socket, Waited: socketRetryBudget, ServerLog: s.ServerLog(), Err: err}
@@ -364,7 +364,7 @@ func (m *Manager) Open(ctx context.Context, dev Device, o Options) (*Session, er
 	// Step 4: control. Second, always, because the server hands the first
 	// connection to the encoder and the protocol has no field that would let
 	// this be discovered rather than ordered.
-	s.control, err = connectSocket(spawnCtx, dev, socket)
+	s.control, err = connectSocket(sessCtx, spawnCtx, dev, socket)
 	if err != nil {
 		cancelSession()
 		return nil, &SocketError{Socket: socket, Waited: socketRetryBudget, ServerLog: s.ServerLog(), Err: err}
@@ -428,29 +428,41 @@ func buildSpawn(o Options) (scrcpy.Spawn, error) {
 
 // connectSocket opens the abstract socket, retrying only the gap between the
 // server being started and the socket existing.
-func connectSocket(ctx context.Context, dev Device, socket string) (io.ReadWriteCloser, error) {
+//
+// IT TAKES TWO CONTEXTS AND THE DIFFERENCE IS THE WHOLE FUNCTION. An adbwire
+// stream's lifetime IS the context it was opened with — cancelling that ctx is
+// how a caller unblocks a read on a silent device — so the socket must be opened
+// with the SESSION's context. It was opened with the spawn context once, and the
+// symptom was precise and baffling: the sixteen preamble bytes arrived, the
+// response carried a correct session header and a correct frame size, and then
+// nothing ever again, because Open's deferred cancel killed the stream the
+// instant it returned.
+//
+// try bounds the RETRYING — how long to keep knocking while the server publishes
+// its socket — and dying with it must not take the socket down with it.
+func connectSocket(sessCtx, try context.Context, dev Device, socket string) (io.ReadWriteCloser, error) {
 	deadline := time.Now().Add(socketRetryBudget)
 	var last error
 	for {
-		st, err := dev.OpenService(ctx, socket)
+		st, err := dev.OpenService(sessCtx, socket)
 		if err == nil {
 			return st, nil
 		}
 		last = err
-		if ctx.Err() != nil {
+		if try.Err() != nil {
 			// The caller's budget ran out, or the request was abandoned. Report
 			// the context's reason rather than the last connect failure: "the
 			// spawn timeout elapsed" is the true statement and the connect
 			// error is a symptom of it.
-			return nil, errors.Join(ctx.Err(), last)
+			return nil, errors.Join(try.Err(), last)
 		}
 		if !time.Now().Before(deadline) {
 			return nil, last
 		}
 		select {
 		case <-time.After(socketRetryInterval):
-		case <-ctx.Done():
-			return nil, errors.Join(ctx.Err(), last)
+		case <-try.Done():
+			return nil, errors.Join(try.Err(), last)
 		}
 	}
 }

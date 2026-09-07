@@ -516,6 +516,10 @@ func (r *Runner) startHosts(ctx context.Context) error {
 		// handset frames one. See internal/demo/screen.go for what that
 		// proves and what it does not.
 		installScreenFixtures(srv, devs, r.log)
+		// The ledger says the jar is already there, because this fake speaks no
+		// sync. See markScreenServerPresent for what that does and does not
+		// simulate.
+		markScreenServerPresent(ctx, r.pool, devs, r.log)
 		r.servers[hostID] = srv
 
 		// host_epoch increments on every adb server restart: a transport_id is

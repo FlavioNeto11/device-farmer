@@ -6,12 +6,10 @@ package screen
 // The first is the wire layout. This package reads sixteen bytes of a stream a
 // handset writes, and those sixteen bytes decide where a touch lands. The bytes
 // below are built by hand from app/src/demuxer.c in Genymobile/scrcpy rather
-// than from test/fakeadb, on purpose and for a specific reason: the fake
-// currently writes a DIFFERENT layout — its config flag is scrcpy's
-// session-header bit, its PTS mask is a bit too wide, and it writes no separate
-// codec id — so a test built on the fake would agree with the fake and prove
-// nothing about a phone. When the fake is corrected these fixtures are what it
-// should be corrected to match.
+// than borrowed from test/fakeadb, so that the two are independent statements
+// of the same protocol. They disagreed once — the fake had config on the session
+// bit — and the only reason anybody found out is that something eventually read
+// one with the other.
 //
 // The second is that nothing here ends a lease. That is not testable by
 // inspection in the usual sense — there is no lease in this package to end —
@@ -122,10 +120,16 @@ type fakeDevice struct {
 	// spawnErr, if set, is what starting the server fails with.
 	spawnErr error
 
-	opened  []string
-	pushed  map[string][]byte
-	control *recorder
-	closed  int
+	opened []string
+
+	// recordCtx keeps the context each service was opened with, so a test can
+	// assert on its lifetime. Off by default: most cases here are about bytes,
+	// and a test that held every context would hide which one it meant.
+	recordCtx bool
+	ctxs      []context.Context
+	pushed    map[string][]byte
+	control   *recorder
+	closed    int
 }
 
 func newFakeDevice(video []byte) *fakeDevice {
@@ -141,6 +145,9 @@ func (d *fakeDevice) OpenService(ctx context.Context, service string) (io.ReadWr
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.opened = append(d.opened, service)
+	if d.recordCtx {
+		d.ctxs = append(d.ctxs, ctx)
+	}
 
 	switch {
 	case strings.HasPrefix(service, "shell,v2,raw:"):
@@ -179,6 +186,12 @@ func (d *fakeDevice) services() []string {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return append([]string(nil), d.opened...)
+}
+
+func (d *fakeDevice) contexts() []context.Context {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return append([]context.Context(nil), d.ctxs...)
 }
 
 func (d *fakeDevice) closes() int {
@@ -830,5 +843,49 @@ func TestEverySessionGetsItsOwnSocketName(t *testing.T) {
 	if len(seen) < 60 {
 		t.Errorf("64 draws produced %d distinct socket names; they are meant to be "+
 			"unguessable, and this many collisions means they are not random", len(seen))
+	}
+}
+
+// TestTheVideoSocketOutlivesTheCallThatOpenedIt is the regression for the defect
+// this package's own tests could not see.
+//
+// An adbwire stream's lifetime IS the context it was opened with — that is how a
+// caller unblocks a read on a silent device — so opening the video socket with
+// the SPAWN context, which Open cancels on its way out, kills the stream the
+// instant Open returns.
+//
+// The symptom was precise and baffling, and every unit test here passed through
+// it: the sixteen preamble bytes arrive, the response carries a correct session
+// header and a correct frame size, the caller reports a healthy session, and
+// then no frame ever comes. It was found by opening the stream over HTTP against
+// the demo and counting the bytes, which is a thing no test in this package did,
+// because the fake Device ignored the context it was handed.
+//
+// So this one does not ignore it.
+//
+// Falsify: pass spawnCtx as connectSocket's first argument instead of sessCtx.
+func TestTheVideoSocketOutlivesTheCallThatOpenedIt(t *testing.T) {
+	d := newFakeDevice(videoStream(460, 1024, []byte("SPS"), []byte("IDR")))
+	d.recordCtx = true
+
+	m := NewManager(4, nil)
+	s := openOne(t, d, m)
+
+	// Open has returned. Every context a socket was opened with must still be
+	// alive, because each of them is a socket this session is about to read.
+	for i, ctx := range d.contexts() {
+		if err := ctx.Err(); err != nil {
+			t.Errorf("the context socket %d was opened with is already cancelled (%v). "+
+				"An adbwire stream dies with the context it was opened with, so this session "+
+				"has a video socket that will never produce a frame — and it will report "+
+				"itself healthy while doing it, because the session header was already read.",
+				i+1, err)
+		}
+	}
+
+	// And the stream really does still deliver.
+	got := make([]byte, 8)
+	if _, err := io.ReadFull(s.Video(), got); err != nil {
+		t.Fatalf("reading the spliced stream after Open returned: %v", err)
 	}
 }

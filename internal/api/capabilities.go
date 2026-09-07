@@ -557,7 +557,15 @@ func (s *Server) fenceEnforcement() FeatureStatus {
 		Name: "Fence enforcement at the resource", State: "enabled",
 		How: "mutual TLS to each host's fence proxy (FARM_FENCE_CLIENT_CERT/KEY/CA), every " +
 			"connection announcing its class and, for a job, its fence",
-		Detail: detail,
+		// The exec note is here because it is the one operator-visible thing this
+		// switch turns OFF, and an operator who reads "enabled" and then gets a
+		// 501 from a route that worked yesterday deserves to have been told.
+		Detail: "POST /api/v1/devices/{id}/exec is refused while this is on (501 " +
+			CodeExecNotAdmitted + "): an arbitrary shell is not a service the proxy admits to a " +
+			"connection carrying no fence. POST /api/v1/bulk is refused the same way but reports " +
+			"it per target as a 502, so a bulk run comes back all-errors. Run the command as a " +
+			"job step under a lease instead — a job runner's connections carry a fence and are " +
+			"not held to a service whitelist. " + detail,
 	}
 }
 

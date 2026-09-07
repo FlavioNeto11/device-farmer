@@ -564,6 +564,17 @@ func (a *ADBActuator) attachAfterDetach(r *rung) Result {
 	return res
 }
 
+// DeviceRebootService is the ADB device service this package opens to reboot a
+// handset, and it is the only device-side service any rung here opens.
+//
+// It is exported so that whoever builds a host's fence proxy admits THIS string
+// rather than a copy of it typed into another package. internal/fenceproxy holds
+// a connection that carries no lease fence to an exact-match whitelist, and the
+// rung below is dialled with exactly such a connection, so a whitelist naming a
+// different string would refuse tier 5 on every device of a fenced farm while
+// looking entirely correct.
+const DeviceRebootService = "reboot:"
+
 // reboot asks the device to reboot and waits for it to come back.
 //
 // reboot: is a device service, so it takes two round trips: switch a
@@ -598,8 +609,8 @@ func (a *ADBActuator) reboot(r *rung) Result {
 
 	// Past this point the request is on the wire, so a transport failure is the
 	// device going down on cue and not a fault.
-	if _, err := tr.Service(r.ctx, "reboot:"); err != nil && !adbwire.IsTransport(err) {
-		d, reason := a.classifyWire(r, "reboot:", err)
+	if _, err := tr.Service(r.ctx, DeviceRebootService); err != nil && !adbwire.IsTransport(err) {
+		d, reason := a.classifyWire(r, DeviceRebootService, err)
 		r.log.Log(r.ctx, levelFor(d), "device reboot was not issued",
 			"phase", "service", "disposition", string(d), "err", err)
 		return r.answer(d, reason, map[string]any{

@@ -105,6 +105,29 @@ type ExecutorFactory func(endpoint string, timeout time.Duration, maxOutput int)
 // defaultExecutorFactory dials the host's own ADB server — through the fence
 // proxy when cfg carries a client certificate, announcing the maintenance
 // class, since an operator's exec holds no lease and presents no fence.
+//
+// # What the maintenance class may and may not run through here
+//
+// Every Executor this factory builds announces the same class, and
+// internal/fenceproxy holds that class to an exact list of ADB service strings.
+// The two callers land on opposite sides of that list, and the difference is
+// worth stating where the factory is:
+//
+//   - POST /slots/{id}/rebrand builds an enroll.Brander over this Executor, and
+//     its commands are LITERALS internal/enroll controls — the brand read and the
+//     two brand writes whose only variable region is a farm uid. cmd/farmd's
+//     fencePolicy publishes them from internal/enroll into the maintenance
+//     whitelist, so rebrand works on a fenced farm.
+//
+//   - POST /devices/{id}/exec builds "shell,v2,raw:<whatever the operator typed>",
+//     which no exact list can enumerate and no pattern can bound without handing
+//     a stolen maintenance credential a shell on every handset. That route is
+//     refused before it dials — see refuseExecBehindTheFence in fleet.go for the
+//     argument and for what the operator is told instead.
+//
+// So this factory is not the place that decides; it just dials. A new caller
+// added here must say which of those two it is, and if it is the second the
+// answer is a refusal with a message, never a widened whitelist.
 func defaultExecutorFactory(cfg *config.Config) ExecutorFactory {
 	return func(endpoint string, timeout time.Duration, maxOutput int) Executor {
 		return adbwire.New(endpoint,
@@ -485,7 +508,9 @@ func (s *Server) registerMetrics(ownRegistry bool) error {
 		}, []string{"outcome"}),
 		execs: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: "farm", Subsystem: "api", Name: "device_execs_total",
-			Help: "Operator shell commands run against a device, by outcome.",
+			Help: "Operator shell commands attempted against a device, by outcome: ok, error, " +
+				"or not_admitted (this farm enforces the fence at the ADB socket and an " +
+				"arbitrary shell is not a service the proxy admits, so nothing was sent).",
 		}, []string{"outcome"}),
 		operatorActions: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: "farm", Subsystem: "api", Name: "operator_actions_total",

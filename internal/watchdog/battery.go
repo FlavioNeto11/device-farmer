@@ -80,6 +80,37 @@ import (
 // than a copy of it that drifts.
 const BatteryCommand = "dumpsys battery"
 
+// FenceDeviceServices returns every device-side ADB service string this package
+// can put on the wire, so whoever builds a host's fence proxy can admit exactly
+// those and nothing else.
+//
+// It exists because the alternative was a string retyped somewhere else, and
+// that string was wrong for as long as it stood: internal/fenceproxy's
+// DefaultPolicy said in a comment that "internal/watchdog uses only
+// host:track-devices-l" and admitted no shell to the maintenance class, so on
+// every farm with the proxy switched on the battery probe below was refused on
+// every device and farm.device_runtime.battery_pct simply stopped being written
+// — silently, because a device that does not answer is correctly recorded as
+// having said nothing (see "Absence of a reading is not a reading of zero"
+// above). A health loop that fails by writing nothing is the worst shape of
+// failure to leave to a comment in another package.
+//
+// Everything here is a LITERAL. Nothing in this package interpolates operator
+// input into a command, which is what makes an exact-match whitelist usable for
+// it: the caller of a fence policy needs no pattern for this package, and if a
+// probe here ever did template something, this function would have to grow a
+// pattern beside it and earn it with the extension test the proxy's
+// AllowingDeviceServices describes.
+//
+// The only host service this package opens is host:track-devices-l, which the
+// reconciler holds one of per host. It is fixed for every deployment and is
+// already on the maintenance whitelist in fenceproxy.DefaultPolicy, so it is
+// deliberately not repeated here: only the shells need publishing, because only
+// a shell is a string this package composes.
+func FenceDeviceServices() []string {
+	return []string{adbwire.ShellService(BatteryCommand)}
+}
+
 const (
 	// DefaultBatteryInterval is how often every attached device is asked.
 	//

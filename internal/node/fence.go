@@ -109,6 +109,29 @@ type FenceConfig struct {
 	// Floors overrides where the floors are read from. Nil means this host's
 	// rows in farm.devices through Config.Pool; a test supplies a value.
 	Floors fenceproxy.FenceSource
+
+	// Policy extends the shipped admission policy before the proxy serves it.
+	//
+	// It takes fenceproxy.DefaultPolicy() and returns the policy this host will
+	// enforce. It exists because the shipped policy cannot name every service
+	// string this deployment dials: a whitelist entry that is a SHELL COMMAND
+	// belongs to the package that builds the command, and internal/fenceproxy
+	// may not import those packages — it imports no database driver and no HTTP
+	// client, and they bring both. So the role that assembles the binary names
+	// them, through fenceproxy.Policy.AllowingDeviceServices, and hands the
+	// result in here. cmd/farmd's fencePolicy is that function.
+	//
+	// Nil means DefaultPolicy unchanged. An error from it is FATAL to the agent
+	// rather than logged: a proxy that served a policy which silently dropped a
+	// widening would refuse the watchdog's battery probe and the rebrand route
+	// at the ADB socket, and those failures look like broken handsets rather
+	// than like a misconfigured listener. It is applied once, where the rest of
+	// this configuration is judged, so a listener restart cannot re-run it and
+	// cannot produce a different answer than the one this process started with.
+	//
+	// MaxStaleness is applied AFTER it, so a policy function cannot move the
+	// freshness budget config.Validate keeps FARM_SLOT_REARM above.
+	Policy func(fenceproxy.Policy) (fenceproxy.Policy, error)
 }
 
 // Enabled reports whether all three PEM paths are set.
@@ -122,6 +145,13 @@ type fenceState struct {
 	cache   *fenceproxy.Cache
 	tlsConf *tls.Config
 	src     fenceproxy.FenceSource
+
+	// policy is the admission policy this host enforces, resolved once in
+	// newFenceState. It is held here rather than rebuilt per listener so that a
+	// restart after a dead accept loop serves the same policy the process
+	// started with — a proxy whose rules could change on a restart would make
+	// "the watchdog is being refused" depend on how long the host had been up.
+	policy fenceproxy.Policy
 
 	// listen is tls.Listen unless a test substitutes a listener that fails.
 	listen  func(addr string) (net.Listener, error)
@@ -185,11 +215,24 @@ func newFenceState(cfg Config, log *slog.Logger) (*fenceState, error) {
 		src = hostFloors{pool: cfg.Pool, hostID: cfg.HostID, timeout: cfg.CallTimeout}
 	}
 
+	// The policy is resolved before the listener exists, so a deployment that
+	// publishes a service string the proxy cannot accept fails the agent here
+	// with a reason instead of refusing that caller forever at the socket.
+	pol := fenceproxy.DefaultPolicy()
+	if f.Policy != nil {
+		pol, err = f.Policy(pol)
+		if err != nil {
+			return nil, fmt.Errorf("node: fence proxy policy: %w", err)
+		}
+	}
+	pol.MaxStaleness = f.MaxStaleness
+
 	st := &fenceState{
 		cfg:     f,
 		cache:   fenceproxy.NewCache(nil),
 		tlsConf: fenceproxy.ServerTLSConfig(certs.get, roots),
 		src:     src,
+		policy:  pol,
 		backoff: DefaultFenceBackoff,
 	}
 	st.listen = func(addr string) (net.Listener, error) {
@@ -413,11 +456,9 @@ func (a *Agent) fenceLoop(ctx context.Context) error {
 	}()
 	defer wg.Wait()
 
-	pol := fenceproxy.DefaultPolicy()
-	pol.MaxStaleness = f.cfg.MaxStaleness
 	srv := &fenceproxy.Server{
 		Cache:  f.cache,
-		Policy: pol,
+		Policy: f.policy,
 		DialUpstream: func(ctx context.Context) (net.Conn, error) {
 			return (&net.Dialer{Timeout: a.cfg.CallTimeout}).DialContext(ctx, "tcp", a.cfg.ADBEndpoint)
 		},

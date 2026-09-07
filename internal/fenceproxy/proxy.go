@@ -205,6 +205,23 @@ func (c Class) Valid() bool {
 	}
 }
 
+// Classes returns every class Valid accepts, in declaration order.
+//
+// It exists for the same reason [Outcomes] does: so a test can WALK the classes
+// instead of retyping them. A list retyped in a test is exactly what drifted
+// here once already — DefaultPolicy's own comment claimed internal/watchdog
+// needed only host:track-devices-l while the battery probe was opening a shell,
+// and no assertion noticed because every test that enumerated the callers
+// enumerated them by hand.
+//
+// A fresh slice per call, not a package-level var, because a var that [Valid]'s
+// callers can append to is a way to widen admission from outside this file.
+// TestClassesIsEveryClassValidAccepts parses Valid's switch and compares it to
+// this list, so a fifth class cannot be added to one and forgotten in the other.
+func Classes() []Class {
+	return []Class{ClassLease, ClassMaintenance, ClassEnroll, ClassControl}
+}
+
 // CarriesFence reports whether a connection of this class must present a
 // devpath and a fence, and is therefore subject to the fencing rules.
 //
@@ -599,15 +616,33 @@ type ServiceRules struct {
 	// Device is the set of full device service strings this class may open.
 	Device []string
 
-	// DevicePatterns admits the few device services that must be templated.
-	// internal/enroll's brandWriteCmd is the only one in this tree, and its
-	// pattern's sole variable region is a uid, so the shape of the command is
-	// fixed and the uid cannot carry a metacharacter.
+	// DevicePatterns admits the few device services that must be templated:
+	// internal/scrcpy's server spawn, whose variable regions are a
+	// content-named jar and a bounded version, and internal/enroll's brand
+	// writes, whose only variable regions are farm uids. In every case the shape
+	// of the command is fixed and the variable region's alphabet cannot hold a
+	// metacharacter.
 	//
-	// A pattern must match the WHOLE service string, and that is enforced below
-	// rather than left to whoever writes the pattern remembering \A and \z. An
-	// unanchored pattern is the prefix hole again in another costume: without
-	// the span check, `getprop ro\.x` would admit "getprop ro.x; rm -rf /sdcard".
+	// Two rules make a pattern here safe, and both are enforced below rather
+	// than left to whoever writes the pattern:
+	//
+	// WHOLE-STRING. A pattern must match the entire service string, checked by
+	// span rather than by trusting the pattern to carry \A and \z. An unanchored
+	// pattern is the prefix hole again in another costume: without the span
+	// check, `getprop ro\.x` would admit "getprop ro.x; rm -rf /sdcard".
+	//
+	// NAMED GROUPS SHARING A NAME MUST CAPTURE THE SAME TEXT. RE2 has no
+	// backreferences, so a template whose value appears twice compiles to two
+	// INDEPENDENT regions and admits a command in which they differ. That is not
+	// a theoretical gap: internal/enroll's brand write is a guard on one uid
+	// followed by an install of one uid, and with independent regions the
+	// pattern admitted "guard that the file holds A, then write B" — a command
+	// the package never builds, which walks straight through the device-side
+	// guard that exists to stop one phone being rebranded over another's
+	// identity. So a pattern may declare the correlation the regexp engine
+	// cannot: write the repeated value as (?P<uid>…) in each place it occurs and
+	// [ServiceRules.allows] refuses a match whose "uid" groups disagree. Groups
+	// with DIFFERENT names, and unnamed groups, are unconstrained.
 	DevicePatterns []*regexp.Regexp
 }
 
@@ -625,14 +660,62 @@ func (r ServiceRules) allows(s Service) bool {
 		}
 		for _, p := range r.DevicePatterns {
 			// A whole-string match, whatever the pattern's own anchoring says.
-			if loc := p.FindStringIndex(s.Raw); loc != nil && loc[0] == 0 && loc[1] == len(s.Raw) {
-				return true
+			loc := p.FindStringSubmatchIndex(s.Raw)
+			if loc == nil || loc[0] != 0 || loc[1] != len(s.Raw) {
+				continue
 			}
+			if !repeatedGroupsAgree(p, s.Raw, loc) {
+				continue
+			}
+			return true
 		}
 		return false
 	default:
 		return false
 	}
+}
+
+// repeatedGroupsAgree reports whether every set of capture groups sharing a name
+// captured identical text.
+//
+// This is the constraint RE2 cannot express, expressed here instead, and it is
+// the difference between a template and a shape. A command built by
+// interpolating ONE value into three places compiles — via regexp.QuoteMeta —
+// into a pattern with three independent regions, and such a pattern admits the
+// value being different in each. For internal/enroll's brand write those three
+// places are a guard ("the file is absent, empty, or already holds this uid")
+// and an install ("write this uid"), so independence means the pattern admits
+// "check for A, write B": the device-side guard passes and a phone carrying one
+// farm identity is rebranded to another. The guard is the only thing standing
+// between that and two device rows in farm.devices believing they are the same
+// handset, with their failure scores, quarantines and lease records fused.
+//
+// A group that did not participate in the match is skipped rather than treated
+// as empty, so an optional region stays optional.
+func repeatedGroupsAgree(p *regexp.Regexp, s string, loc []int) bool {
+	names := p.SubexpNames()
+	var seen map[string]string
+	for i, name := range names {
+		if i == 0 || name == "" {
+			continue
+		}
+		start, end := loc[2*i], loc[2*i+1]
+		if start < 0 {
+			continue
+		}
+		got := s[start:end]
+		if prev, ok := seen[name]; ok {
+			if prev != got {
+				return false
+			}
+			continue
+		}
+		if seen == nil {
+			seen = make(map[string]string, len(names))
+		}
+		seen[name] = got
+	}
+	return true
 }
 
 func contains(set []string, want string) bool {
@@ -668,11 +751,48 @@ type Policy struct {
 
 // DefaultPolicy is the shipped configuration.
 //
-// The maintenance list is derived from what the recovery ladder and the
-// watchdog actually call: internal/recovery/adbactuator.go uses the four
-// Control verbs and "reboot:", and internal/watchdog uses only
-// host:track-devices-l. Nothing wider is granted on the theory that it might be
-// needed later.
+// It holds the service strings that are FIXED FOR EVERY DEPLOYMENT: the host
+// queries, the position-addressed verbs, and the one device service —
+// "reboot:" — that is a bare protocol word with nothing templated into it.
+// Nothing wider is granted on the theory that it might be needed later.
+//
+// # What this list does NOT cover, and why that is not an omission
+//
+// A whitelist entry that is a SHELL COMMAND belongs to the package that builds
+// the command, not here. The previous version of this comment said the
+// maintenance list was "derived from what the recovery ladder and the watchdog
+// actually call: ... internal/watchdog uses only host:track-devices-l", and that
+// sentence was false for as long as it stood: internal/watchdog's battery probe
+// opens "shell,v2,raw:dumpsys battery" on every device in state 'device', so the
+// battery-health loop was refused on every farm that turned the proxy on. A
+// comment here claiming a caller needs less than it does is how that survived,
+// and retyping the caller's command here is how it would survive again — the
+// string would be in two files and only one of them would be edited.
+//
+// So those literals are published at the WIRING POINT instead, by the packages
+// that own them, through [Policy.AllowingDeviceServices]. cmd/farmd's
+// fencePolicy is the one caller; internal/node hands it every policy it serves.
+// What lands there today:
+//
+//   - internal/watchdog's battery probe, as a literal (watchdog.BatteryCommand).
+//   - internal/enroll's probe and brand commands. Two are fixed literals; the
+//     two brand writes interpolate a farm uid and are admitted by whole-string
+//     patterns enroll builds from the same command builders, so the pattern
+//     cannot drift from the command.
+//
+// # What is refused on purpose, and stays refused
+//
+//   - host:kill. internal/recovery's tier 7 restarts the host's ADB server with
+//     it, and it is on no class's list anywhere in this file: it severs every
+//     device on the host, including the ones under other people's leases. Tier 7
+//     is therefore refused behind the proxy, the ladder records the refusal as a
+//     rung disposition, and it climbs on. That is the intended trade.
+//
+//   - An operator's arbitrary shell. POST /api/v1/devices/{id}/exec builds
+//     "shell,v2,raw:<whatever the operator typed>", which no exact list can
+//     enumerate and no pattern can bound without handing a stolen maintenance
+//     credential a shell on every handset in the rack. internal/api refuses that
+//     route up front on a fenced farm and says so; see its defaultExecutorFactory.
 func DefaultPolicy() Policy {
 	maintenance := ServiceRules{
 		Host: []string{
@@ -685,18 +805,37 @@ func DefaultPolicy() Policy {
 			"reconnect", "reconnect-offline", "detach", "attach",
 		},
 		Transport: true,
-		Device:    []string{"reboot:"},
+		// "reboot:" is the only device service that is fixed for every
+		// deployment. The shells this class is dialled with — the watchdog's
+		// battery probe and, through POST /api/v1/slots/{id}/rebrand, enroll's
+		// brand commands — arrive through AllowingDeviceServices from the
+		// packages that build them. See the note on DefaultPolicy.
+		Device: []string{"reboot:"},
 	}
 	enrol := ServiceRules{
 		Host:            []string{"host:version", "host:features", "host:devices-l"},
 		HostTargetVerbs: []string{"get-state", "get-serialno", "get-devpath", "features"},
 		Transport:       true,
-		// Device and DevicePatterns are left empty on purpose. internal/enroll's
-		// probe and brand commands are the only shells this class may run, and
-		// they are literals the enroller must publish into this list at wiring
-		// time rather than strings guessed at here. An empty list refuses
-		// everything, which is the right failure for a class that would
-		// otherwise hold a shell on every handset.
+		// Device and DevicePatterns are empty HERE and filled at the wiring
+		// point, for the reason DefaultPolicy's own comment now gives: a shell
+		// command retyped in this file is a second copy of a string the owning
+		// package will edit without looking here.
+		//
+		// Two facts about this class that the previous comment did not state,
+		// and that anybody reading it should know:
+		//
+		//   - Nothing in this tree issues an enroll-class certificate yet. One
+		//     knob mints a client certificate for the classes that carry no
+		//     fence (FARM_FENCE_CLIENT_CERT/KEY/CA) and every role that uses it
+		//     announces "maintenance". So the literals below are unreachable in
+		//     production today, and the brand commands the API dials go through
+		//     as MAINTENANCE — which is why they are published to that class too.
+		//
+		//   - The host-local enroller in cmd/farmd's runNode does not traverse
+		//     the proxy at all: it dials FARM_ADB_ENDPOINT, which is the ADB
+		//     server the proxy fronts, on plain TCP and with no preamble. It is
+		//     not refused because it never arrives. This class is bounded ahead
+		//     of the credential that will reach it, not behind it.
 	}
 	return Policy{
 		MaxStaleness:  DefaultMaxStaleness,
@@ -760,6 +899,134 @@ func control() ServiceRules {
 			regexp.MustCompile(`localabstract:scrcpy_[0-9a-f]{8}`),
 		},
 	}
+}
+
+// AllowingDeviceServices returns a copy of p in which class c may also open the
+// exact service strings in literals, and anything in patterns matches as a
+// WHOLE string.
+//
+// # Why this exists
+//
+// A whitelist entry that is a shell command line is owned by the package that
+// builds the command. [DefaultPolicy] cannot import internal/watchdog or
+// internal/enroll — this package imports no database driver and no HTTP client,
+// and those packages bring both — so the only honest place to name their
+// commands is the role that builds the proxy, which already imports everything.
+// This is the seam it uses. The literals travel as values from exported
+// functions in the owning packages, so the command and the rule it is admitted
+// by cannot drift into two different strings.
+//
+// # Why it takes device services and NOTHING ELSE
+//
+// The signature is the enforcement. There is no way to reach Host,
+// HostTargetVerbs or Transport through here, because those are the entries a
+// deployment has no business widening: host:kill severs every device on a host,
+// and a transport bit is what decides whether a class can open a device service
+// at all. Widening those is a change to this file, reviewed here, next to the
+// reasons they are what they are.
+//
+// A literal that does not parse as a device service is an ERROR rather than a
+// silent no-op. "host:kill" handed to this method would land in
+// ServiceRules.Device, where [ServiceRules.allows] never looks for a KindHost
+// service, and the caller would have believed it granted something it did not.
+//
+// # What a pattern costs, and what must be proved before one is added
+//
+// A pattern is the one thing here that can be written unsafely, and
+// [ServiceRules] says at length why: a shell service string is an arbitrary
+// command line. The whole-string span check in allows stops a suffix riding
+// along, and that is necessary but not sufficient — `shell,v2,raw:.*` matches
+// the whole string too. What makes a pattern safe is that its variable regions
+// cannot hold a character that chains, substitutes or redirects. The two shapes
+// in this tree each earn it differently and both are worth copying:
+//
+//   - [control]'s spawn pattern restricts the ALPHABET: every character class in
+//     it is alphanumerics, dot, slash, underscore, hyphen, equals and space.
+//   - internal/enroll's brand patterns are LITERAL TEMPLATES: regexp.QuoteMeta
+//     of the command the package actually builds, with the uid replaced by
+//     [0-9a-f]{32}. Everything outside the uid is fixed text.
+//
+// Either way the test that earns the pattern appends ';', '&&', '||', '|', a
+// newline, '$( )', backticks, '>', '&' and '#' to a string the pattern admits
+// and proves each is refused. internal/fenceproxy's
+// TestControlSpawnPatternCannotBeExtended and cmd/farmd's
+// TestNoAdmittedDeviceServiceCanCarryASecondCommand are that test; a pattern
+// arriving here without one is a hole wearing a regexp.
+func (p Policy) AllowingDeviceServices(c Class, literals []string, patterns []*regexp.Regexp) (Policy, error) {
+	rules, ok := p.Rules[c]
+	if !ok {
+		// Creating the entry here would be inventing a class's entire bound from
+		// outside DefaultPolicy, which is the one place that decides what a class
+		// may do. ClassLease is absent on purpose — the job runner executes
+		// arbitrary step kinds and is bounded by its fence instead — and a class
+		// absent by MISTAKE is already refused everything by Admit.
+		return Policy{}, fmt.Errorf("fenceproxy: class %q has no entry in Policy.Rules, so there is "+
+			"no whitelist to widen; a class's bound is decided in DefaultPolicy, not added from "+
+			"outside it", c)
+	}
+	for _, s := range literals {
+		if k := ParseService(s).Kind; k != KindDevice {
+			return Policy{}, fmt.Errorf("fenceproxy: %q parses as a %s service, not a device "+
+				"service; only device services may be published this way, because a host service "+
+				"put here would sit in ServiceRules.Device where nothing ever matches it and the "+
+				"caller would believe it had granted something", s, k)
+		}
+	}
+	for i, re := range patterns {
+		if re == nil {
+			return Policy{}, fmt.Errorf("fenceproxy: pattern %d for class %q is nil", i, c)
+		}
+		// The same check the literals get, as far as a pattern permits it. A
+		// pattern is consulted only for a KindDevice service, so one that can
+		// only ever match a host or host-target string is stored where nothing
+		// will look for it — and the caller believes it granted something. That
+		// is the silent-refusal symptom this whole mechanism exists to prevent,
+		// arriving through the mechanism itself.
+		//
+		// LiteralPrefix is what makes this decidable without matching anything:
+		// for a pattern that is entirely literal it hands back the whole string,
+		// which ParseService can classify outright; for one with a variable
+		// region it hands back the fixed head, which is enough to see a
+		// "host:"/"host-serial:"/"host-usb:" opening. A pattern whose first
+		// character is already variable cannot be judged here at all and is
+		// accepted — a bound worth stating rather than pretending away.
+		prefix, complete := re.LiteralPrefix()
+		if complete {
+			if k := ParseService(prefix).Kind; k != KindDevice {
+				return Policy{}, fmt.Errorf("fenceproxy: pattern %d for class %q matches only %q, "+
+					"which parses as a %s service rather than a device service; it would sit in "+
+					"ServiceRules.DevicePatterns where nothing consults it", i, c, prefix, k)
+			}
+			continue
+		}
+		for _, head := range append([]string{"host:"}, hostTargetPrefixes...) {
+			// Either the prefix already opens with the marker, or it is short
+			// enough to still be growing into it. The second case errs towards
+			// REFUSING TO PUBLISH — a pattern beginning "h" and then branching
+			// could in principle describe a device service — and that is the
+			// right direction: the author sees an error naming the pattern and
+			// spells out one more character, where the alternative is a grant
+			// nobody notices was empty.
+			if strings.HasPrefix(prefix, head) || strings.HasPrefix(head, prefix) && prefix != "" {
+				return Policy{}, fmt.Errorf("fenceproxy: pattern %d for class %q begins %q, so it "+
+					"can only ever match a %s… service and never a device service; device "+
+					"patterns are consulted for device services alone", i, c, prefix, head)
+			}
+		}
+	}
+
+	// A real copy, not a shared map. The caller's Policy is a value and must
+	// stay one: a method that says it returns a copy and then mutates the map
+	// the caller still holds would widen a policy somebody else is serving.
+	next := make(map[Class]ServiceRules, len(p.Rules))
+	for k, v := range p.Rules {
+		next[k] = v
+	}
+	rules.Device = append(append([]string(nil), rules.Device...), literals...)
+	rules.DevicePatterns = append(append([]*regexp.Regexp(nil), rules.DevicePatterns...), patterns...)
+	next[c] = rules
+	p.Rules = next
+	return p, nil
 }
 
 func (p Policy) normalized() Policy {

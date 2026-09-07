@@ -273,6 +273,20 @@ const (
 	EnvFenceClientCert = "FARM_FENCE_CLIENT_CERT"
 	EnvFenceClientKey  = "FARM_FENCE_CLIENT_KEY"
 	EnvFenceClientCA   = "FARM_FENCE_CLIENT_CA"
+
+	// A SECOND client certificate, for the control class, and it is a second
+	// one rather than a replacement because the proxy reads the class from the
+	// CERTIFICATE and this process needs two.
+	//
+	// The api dials maintenance for POST /devices/{id}/exec, which runs on a
+	// device that may hold no lease at all. Control class must present a
+	// devpath and a fence or it is malformed, so promoting the process's one
+	// certificate to control would break exec on every free device. Two
+	// certificates, two adbwire clients, two classes, one process.
+	//
+	// The CA is shared: it is the same proxy on the other end.
+	EnvFenceControlCert = "FARM_FENCE_CONTROL_CERT"
+	EnvFenceControlKey  = "FARM_FENCE_CONTROL_KEY"
 )
 
 // Mirrors of CHECK constraints in migrations/00001_core.sql. Duplicated on
@@ -682,6 +696,27 @@ type FenceClient struct {
 	// Leaf is the parsed client certificate, for the startup summary. Nil
 	// when TLS was supplied in code rather than loaded from files.
 	Leaf *x509.Certificate
+
+	// certVar and keyVar name the environment variables these files came from.
+	// There are two of these in a Config now — the maintenance client and the
+	// control client — and a refusal that named the wrong pair would send an
+	// operator to edit a variable that is not the one they got wrong. Empty
+	// means the maintenance names, which is what a FenceClient built in code
+	// or in a test gets.
+	certVar, keyVar string
+}
+
+// vars names the two variables this instance was loaded from. The CA is shared
+// between both instances and is therefore always the one variable.
+func (f FenceClient) vars() (certVar, keyVar string) {
+	certVar, keyVar = f.certVar, f.keyVar
+	if certVar == "" {
+		certVar = EnvFenceClientCert
+	}
+	if keyVar == "" {
+		keyVar = EnvFenceClientKey
+	}
+	return certVar, keyVar
 }
 
 // Enabled reports whether this process dials hosts through the fence proxy.
@@ -701,10 +736,11 @@ func (f FenceClient) problems() []error {
 		return nil
 	}
 	if set != 3 {
+		certVar, keyVar := f.vars()
 		return []error{fmt.Errorf("%s, %s and %s must be set together or not at all; "+
 			"a certificate without a CA cannot verify the proxy, and a CA without a "+
 			"certificate has nothing to present to it",
-			EnvFenceClientCert, EnvFenceClientKey, EnvFenceClientCA)}
+			certVar, keyVar, EnvFenceClientCA)}
 	}
 	_, _, err := f.build()
 	if err != nil {
@@ -716,14 +752,15 @@ func (f FenceClient) problems() []error {
 // build loads the files into a TLS configuration. TLS 1.3 only: it is what
 // the proxy serves, and the choice is not the client's to negotiate down.
 func (f FenceClient) build() (*tls.Config, *x509.Certificate, error) {
+	certVar, keyVar := f.vars()
 	cert, err := tls.LoadX509KeyPair(f.CertFile, f.KeyFile)
 	if err != nil {
-		return nil, nil, fmt.Errorf("%s / %s: %w", EnvFenceClientCert, EnvFenceClientKey, err)
+		return nil, nil, fmt.Errorf("%s / %s: %w", certVar, keyVar, err)
 	}
 	leaf := cert.Leaf
 	if leaf == nil {
 		if leaf, err = x509.ParseCertificate(cert.Certificate[0]); err != nil {
-			return nil, nil, fmt.Errorf("%s: %w", EnvFenceClientCert, err)
+			return nil, nil, fmt.Errorf("%s: %w", certVar, err)
 		}
 	}
 	caPEM, err := os.ReadFile(f.CAFile)
@@ -745,8 +782,9 @@ func (f FenceClient) build() (*tls.Config, *x509.Certificate, error) {
 func (f FenceClient) describe() string {
 	switch {
 	case f.TLS == nil:
+		certVar, _ := f.vars()
 		return fmt.Sprintf("off (%s/KEY/CA unset: ADB servers are dialed in the clear, no preamble is sent, "+
-			"and a revoked fence is refused in PostgreSQL only)", EnvFenceClientCert)
+			"and a revoked fence is refused in PostgreSQL only)", certVar)
 	case f.Leaf == nil:
 		return "mTLS to each host's fence proxy (certificate supplied in code)"
 	}
@@ -760,6 +798,26 @@ func (f FenceClient) describe() string {
 	}
 	return fmt.Sprintf("mTLS to each host's fence proxy (cert %s, subject %q, san %s, expires %s)",
 		f.CertFile, f.Leaf.Subject.CommonName, san, f.Leaf.NotAfter.UTC().Format(time.RFC3339))
+}
+
+// controlFenceClient reads the control-class certificate.
+//
+// The CA is borrowed from the maintenance client, because it is the same proxy
+// being verified — but only when a control certificate was actually asked for.
+// Borrowing it unconditionally would give this instance one of its three files
+// on every farm that configured the maintenance client alone, and the
+// all-or-none rule would then refuse a configuration nobody wrote.
+func controlFenceClient(l loader) FenceClient {
+	f := FenceClient{
+		CertFile: l.str(EnvFenceControlCert, ""),
+		KeyFile:  l.str(EnvFenceControlKey, ""),
+		certVar:  EnvFenceControlCert,
+		keyVar:   EnvFenceControlKey,
+	}
+	if f.CertFile != "" || f.KeyFile != "" {
+		f.CAFile = l.str(EnvFenceClientCA, "")
+	}
+	return f
 }
 
 // Config is the whole of farmd's environment-derived configuration.
@@ -801,6 +859,13 @@ type Config struct {
 	Charge      Charge
 	Fence       Fence
 	FenceClient FenceClient
+
+	// FenceControl is the control-class client certificate, for the live screen
+	// and input path. It reuses FenceClient's type — same three files, same
+	// all-or-none rule — and shares FenceClient's CA, so setting it needs two
+	// variables rather than three. Unset, the control routes report themselves
+	// unavailable and name what is missing rather than dialling in the clear.
+	FenceControl FenceClient
 
 	WatchdogInterval time.Duration
 	MigrationsTable  string
@@ -905,6 +970,7 @@ func Load(component string, opts ...Option) (*Config, error) {
 			KeyFile:  l.str(EnvFenceClientKey, ""),
 			CAFile:   l.str(EnvFenceClientCA, ""),
 		},
+		FenceControl: controlFenceClient(l),
 
 		Battery: Battery{
 			TempRiseDCPerMin: l.num(EnvBatteryTempRise, DefaultBatteryTempRiseDCPerMin),
@@ -943,6 +1009,13 @@ func Load(component string, opts ...Option) (*Config, error) {
 			return nil, fmt.Errorf("invalid configuration:\n%w", err)
 		}
 		cfg.FenceClient.TLS, cfg.FenceClient.Leaf = tlsCfg, leaf
+	}
+	if cfg.FenceControl.CertFile != "" {
+		tlsCfg, leaf, err := cfg.FenceControl.build()
+		if err != nil {
+			return nil, fmt.Errorf("invalid configuration:\n%w", err)
+		}
+		cfg.FenceControl.TLS, cfg.FenceControl.Leaf = tlsCfg, leaf
 	}
 	return cfg, nil
 }
@@ -1562,6 +1635,7 @@ Fix by raising %s above %s + %s, or by lowering the proxy's self-fence timeout.`
 
 	// ---- fence proxy, client side ------------------------------------
 	errs = append(errs, c.FenceClient.problems()...)
+	errs = append(errs, c.FenceControl.problems()...)
 
 	return errs
 }

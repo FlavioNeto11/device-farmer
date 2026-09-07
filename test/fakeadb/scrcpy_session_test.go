@@ -553,40 +553,22 @@ func TestARespawnsGateIsNotOpenedByThePreviousSessionsVideoSocket(t *testing.T) 
 // eight bytes against a literal catches an exchange of the two flags.
 //
 // Falsify: swap scrcpyFlagConfig and scrcpyFlagKeyFrame, or write the mask as
-// scrcpyFlagConfig-1 or as scrcpySessionFlagKeyFrame-1.
+// scrcpyFlagConfig-1 or as scrcpyFlagKeyFrame-1.
 func TestTheFlagBitsSurviveATimestampThatWouldCollideWithThem(t *testing.T) {
 	t.Parallel()
 
-	// The timestamp field filled to its brim in each layout, so that a mask off
-	// by one bit either clears a bit of a real timestamp or leaves a flag bit
-	// standing in one.
-	const (
-		fullPTS        = uint64(1)<<62 - 1 // all 62 bits, the no-session-header layout
-		fullSessionPTS = uint64(1)<<61 - 1 // all 61 bits, the session-header layout
-	)
+	// The timestamp field filled to its brim, so that a mask off by one bit
+	// either clears a bit of a real timestamp or leaves a flag bit standing in
+	// one.
+	const fullSessionPTS = uint64(1)<<61 - 1 // all 61 bits
 
 	cases := []struct {
-		name     string
-		sessions bool
-		packets  []ScrcpyPacket
-		want     []uint64 // the whole top eight bytes, as a literal
+		name    string
+		packets []ScrcpyPacket
+		want    []uint64 // the whole top eight bytes, as a literal
 	}{
 		{
-			name: "flags at bits 63 and 62",
-			packets: []ScrcpyPacket{
-				{PTS: fullPTS, Config: true},
-				{PTS: fullPTS, KeyFrame: true},
-				{PTS: ^uint64(0)},
-			},
-			want: []uint64{
-				0xbfffffffffffffff, // config set, keyframe clear, 62 bits of timestamp
-				0x7fffffffffffffff, // keyframe set, config clear
-				0x3fffffffffffffff, // no flags: a timestamp with both flag bits masked off
-			},
-		},
-		{
-			name:     "flags at bits 62 and 61, under a session header",
-			sessions: true,
+			name: "flags at bits 62 and 61, under a session header",
 			packets: []ScrcpyPacket{
 				{PTS: fullSessionPTS, Config: true},
 				{PTS: fullSessionPTS, KeyFrame: true},
@@ -612,27 +594,22 @@ func TestTheFlagBitsSurviveATimestampThatWouldCollideWithThem(t *testing.T) {
 				tc.packets[j].Data = []byte{byte(j)}
 			}
 			s := Start(t, ScrcpyFixture(ScrcpyConfig{
-				Devpath:            devpath,
-				Packets:            tc.packets,
-				VideoSessionHeader: tc.sessions,
-				VideoEOF:           true,
+				Devpath:  devpath,
+				Packets:  tc.packets,
+				VideoEOF: true,
 			}))
 			scid, _ := s.ScrcpySCID(devpath)
 			video := streamWire(t, s, devpath, "localabstract:scrcpy_"+scid)
 
-			if tc.sessions {
-				id := mustRead(t, video, 4, "the codec id")
-				if got := binary.BigEndian.Uint32(id); got != wireCodecH264 {
-					t.Fatalf("codec id = %#08x, want h264", got)
-				}
-				sh := mustRead(t, video, wirePacketHeaderLen, "the session header")
-				if got := binary.BigEndian.Uint64(sh[0:8]); got>>63 != 1 {
-					t.Fatalf("the session header's top eight bytes are %#016x; the top bit is what "+
-						"says this is a geometry and not a frame, and a reader that does not see "+
-						"it resynchronises inside a picture", got)
-				}
-			} else {
-				mustRead(t, video, wireVideoHeaderLen, "the session header")
+			id := mustRead(t, video, 4, "the codec id")
+			if got := binary.BigEndian.Uint32(id); got != wireCodecH264 {
+				t.Fatalf("codec id = %#08x, want h264", got)
+			}
+			sh := mustRead(t, video, wirePacketHeaderLen, "the session header")
+			if got := binary.BigEndian.Uint64(sh[0:8]); got>>63 != 1 {
+				t.Fatalf("the session header's top eight bytes are %#016x; the top bit is what "+
+					"says this is a geometry and not a frame, and a reader that does not see "+
+					"it resynchronises inside a picture", got)
 			}
 
 			for j, want := range tc.want {

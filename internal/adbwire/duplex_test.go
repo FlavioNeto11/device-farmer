@@ -236,14 +236,23 @@ func TestAScriptedScrcpyDeviceIsReachableThroughOpenService(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reading the video socket: %v", err)
 	}
-	if len(frames) != 12+12+len(payload) {
-		t.Fatalf("the video socket carried %d bytes, want a 12-byte session header, "+
-			"a 12-byte packet header and %d of payload", len(frames), len(payload))
+	// 4 + 12 + 12: the codec id, the session header the top bit marks, and the
+	// packet header. These offsets used to be 12 + 12, from a fixture that
+	// packed the geometry in beside the codec id — a shape internal/scrcpy
+	// cannot read and no device sends. Verified against app/src/demuxer.c.
+	if len(frames) != 4+12+12+len(payload) {
+		t.Fatalf("the video socket carried %d bytes, want a 4-byte codec id, a 12-byte "+
+			"session header, a 12-byte packet header and %d of payload",
+			len(frames), len(payload))
 	}
 	if got := binary.BigEndian.Uint32(frames[0:4]); got != fakeadb.ScrcpyCodecH264 {
 		t.Fatalf("codec id = %#08x, want h264", got)
 	}
-	if !bytes.Equal(frames[24:], payload) {
+	if frames[4]&0x80 == 0 {
+		t.Fatalf("the second header does not carry the session bit (byte 4 = %#02x); "+
+			"a reader would take it for a frame and its geometry for a timestamp", frames[4])
+	}
+	if !bytes.Equal(frames[28:], payload) {
 		t.Fatalf("the packet payload did not survive the transport")
 	}
 

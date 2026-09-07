@@ -57,50 +57,29 @@ const ScrcpySocketPrefix = "localabstract:scrcpy_"
 // Video packet header flags. scrcpy packs them into the top of a big-endian
 // uint64 whose remaining bits are the presentation timestamp in microseconds.
 //
-// §3 of the design calls this "a 12-byte header (flags + 61-bit PTS) and a
-// u32 length"; the 12 bytes and the u32 are right, and the timestamp field is
-// 62 bits wide because scrcpy spends two bits on flags, not three. The
-// difference matters only for a stream running past 146,000 years, and it is
-// written down because a reader comparing this file against that sentence
-// deserves to know which one moved.
+// THIS FILE ONCE HAD A SECOND, WRONG SET OF THESE, AND THE STORY IS WORTH ONE
+// PARAGRAPH because it is how a fixture comes to certify a protocol nobody
+// speaks. An earlier version read the design document's "flags + 61-bit PTS"
+// as an error and corrected it to 62 bits — "scrcpy spends two bits on flags,
+// not three" — and moved config to bit 63 and key frame to bit 62. The design
+// document was right. Scrcpy spends three, and the third is the one that says a
+// header is a geometry rather than a frame.
+//
+// Nothing caught it, because nothing read this fixture with the real parser:
+// internal/scrcpy and test/fakeadb each had a self-consistent idea of the wire
+// and no test crossed between them. The first test that did failed with
+// "packet header declared 2147483648 bytes" — 0x80000000, the old config flag
+// being read as a payload length.
+//
+// Verified against app/src/demuxer.c in Genymobile/scrcpy: SC_PACKET_FLAG_CONFIG
+// is 1<<62, SC_PACKET_FLAG_KEY_FRAME is 1<<61, SC_PACKET_PTS_MASK is
+// KEY_FRAME-1, and sc_demuxer_is_session tests header[0] & 0x80.
 const (
-	scrcpyFlagConfig   uint64 = 1 << 63
-	scrcpyFlagKeyFrame uint64 = 1 << 62
+	scrcpyFlagSession  uint64 = 1 << 63
+	scrcpyFlagConfig   uint64 = 1 << 62
+	scrcpyFlagKeyFrame uint64 = 1 << 61
 	scrcpyPTSMask      uint64 = scrcpyFlagKeyFrame - 1
 )
-
-// The same three fields in the layout a server that sends SESSION HEADERS
-// uses, which [ScrcpyConfig.VideoSessionHeader] selects.
-//
-// The two layouts differ by one bit position and the difference is not
-// cosmetic. A server that can re-announce its video geometry mid-stream needs a
-// way to say "this twelve-byte header is a geometry, not a frame", and the only
-// unclaimed space is the top bit — so the top bit became the discriminator and
-// the flags below it each moved down one. That is the layout internal/scrcpy
-// parses, documented against app/src/demuxer.c at the top of its video.go:
-//
-//	bit 63  this header is a session header
-//	bit 62  the packet is codec configuration
-//	bit 61  the packet is a key frame
-//	bits 60..0  the presentation timestamp
-//
-// WRITING ONE LAYOUT'S FLAGS UNDER THE OTHER'S FRAMING IS NOT A NEAR MISS. A
-// config packet in the older layout sets bit 63, which a reader expecting the
-// newer one reads as a session header — so it takes the packet's payload length
-// for a video height, reports a geometry nobody announced, and resynchronises
-// somewhere inside a frame. Which is why the two sets are one choice and not
-// two, and why VideoSessionHeader moves the flags as well as adding the header.
-const (
-	scrcpyFlagSession         uint64 = 1 << 63
-	scrcpySessionFlagConfig   uint64 = 1 << 62
-	scrcpySessionFlagKeyFrame uint64 = 1 << 61
-	scrcpySessionPTSMask      uint64 = scrcpySessionFlagKeyFrame - 1
-)
-
-// scrcpyVideoHeaderLen is the preamble a server without session headers
-// writes: codec id, width, height, each a big-endian uint32, all twelve bytes
-// of it before the first packet and never repeated.
-const scrcpyVideoHeaderLen = 12
 
 // scrcpyCodecIDLen is the codec id on its own, which is what precedes a
 // SESSION header rather than being packed into it.
@@ -219,29 +198,6 @@ type ScrcpyConfig struct {
 	// that test a stream it did not ask for and let it pass or hang for reasons
 	// nowhere near the mistake.
 	VideoLoop bool
-
-	// VideoSessionHeader writes the video geometry as an in-stream session
-	// header instead of as a preamble packed in beside the codec id.
-	//
-	// WHICH ONE IS RIGHT DEPENDS ON WHICH SERVER YOU ARE PRETENDING TO BE, AND
-	// THE TWO ARE NOT INTERCHANGEABLE. Left off, the socket opens with twelve
-	// bytes — codec id, width, height — and then packets whose flags sit at
-	// bits 63 and 62. That is the shape internal/adbwire's own duplex test
-	// reads off the wire by offset, and it is the default so that test keeps
-	// describing what the fixture does. Turned on, the socket opens with the
-	// four-byte codec id and then a twelve-byte session header marked by the
-	// top bit, and the packet flags move down to bits 62 and 61 — which is the
-	// shape internal/scrcpy's Reader parses, and therefore the only shape whose
-	// frames reach a decoder at all.
-	//
-	// A fixture that could only write the first shape could not be read by this
-	// repository's own parser: internal/scrcpy would take the width for the top
-	// half of a header, find the flags where it expects a length, and fail with
-	// PacketTooLargeError before the first frame. A fake whose output the
-	// production reader rejects is not a fake of anything. Hence the knob, and
-	// hence TestTheFixturesVideoIsReadableByInternalScrcpy, which is the only
-	// test in this package that makes the two halves meet.
-	VideoSessionHeader bool
 
 	// ServerLog is written to the spawn's stdout as one shell v2 packet, the
 	// way the server jar announces itself. Nothing parses it.
@@ -571,7 +527,7 @@ func (d *scrcpyDevice) serveVideo(sess *StreamSession, gen int) error {
 				}
 			}
 			var ph [scrcpyPacketHeaderLen]byte
-			binary.BigEndian.PutUint64(ph[0:8], scrcpyMeta(p, p.PTS+pass*period, cfg.VideoSessionHeader))
+			binary.BigEndian.PutUint64(ph[0:8], scrcpyMeta(p, p.PTS+pass*period))
 			binary.BigEndian.PutUint32(ph[8:12], uint32(len(p.Data)))
 			// Header and payload go out as two writes on purpose. A client that
 			// only works when both arrive in one read is a client that works
@@ -642,20 +598,14 @@ func (d *scrcpyDevice) videoGaveUp(gen int) {
 	}
 }
 
-// writeVideoHeader opens the video socket in whichever of the two shapes
-// [ScrcpyConfig.VideoSessionHeader] asked for. The bytes are described there
-// and the layouts are described against the flag constants; what is here is
-// only the encoding.
+// writeVideoHeader opens the video socket: the four-byte codec id, then the
+// twelve-byte session header the top bit marks.
+//
+// A session header rather than a preamble packed in beside the codec id,
+// because that is what a device sends — and because a geometry that can only be
+// announced once could not describe a phone being rotated, which is the case
+// internal/scrcpy's Reader returns KindSession for.
 func (d *scrcpyDevice) writeVideoHeader(sess *StreamSession, cfg ScrcpyConfig) error {
-	if !cfg.VideoSessionHeader {
-		var hdr [scrcpyVideoHeaderLen]byte
-		binary.BigEndian.PutUint32(hdr[0:4], cfg.Codec)
-		binary.BigEndian.PutUint32(hdr[4:8], cfg.Width)
-		binary.BigEndian.PutUint32(hdr[8:12], cfg.Height)
-		_, err := sess.Write(hdr[:])
-		return err
-	}
-
 	var id [scrcpyCodecIDLen]byte
 	binary.BigEndian.PutUint32(id[:], cfg.Codec)
 	if _, err := sess.Write(id[:]); err != nil {
@@ -677,17 +627,7 @@ func (d *scrcpyDevice) writeVideoHeader(sess *StreamSession, cfg ScrcpyConfig) e
 
 // scrcpyMeta packs one packet's flags and timestamp into the top eight bytes of
 // its header, in whichever revision's bit layout the socket is speaking.
-func scrcpyMeta(p ScrcpyPacket, pts uint64, sessionHeaders bool) uint64 {
-	if sessionHeaders {
-		meta := pts & scrcpySessionPTSMask
-		if p.Config {
-			meta |= scrcpySessionFlagConfig
-		}
-		if p.KeyFrame {
-			meta |= scrcpySessionFlagKeyFrame
-		}
-		return meta
-	}
+func scrcpyMeta(p ScrcpyPacket, pts uint64) uint64 {
 	meta := pts & scrcpyPTSMask
 	if p.Config {
 		meta |= scrcpyFlagConfig

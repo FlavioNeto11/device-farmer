@@ -340,10 +340,16 @@ func TestAStreamThatIsNotUsableVideoIsNamedRatherThanGuessedAt(t *testing.T) {
 // from this reader, so a splitter and a parser that agree on every access unit's
 // bytes agree about the only thing a decoder is given.
 //
-// Falsify: unset VideoSessionHeader on the fixture below, which is the default
-// and is the framing internal/scrcpy cannot read — it takes the width for the
-// top half of a header, finds a flag where a length belongs, and fails with
-// PacketTooLargeError before the first frame.
+// THIS IS THE ONLY TEST IN THIS PACKAGE THAT MAKES THE TWO HALVES MEET, and it
+// is here because for a while they did not. test/fakeadb and internal/scrcpy
+// each had a self-consistent idea of the wire and nothing crossed between them,
+// so the fixture certified a protocol no phone speaks.
+//
+// Falsify: move scrcpyFlagConfig back to bit 63 and scrcpyFlagKeyFrame to 62,
+// which is where an earlier version of this package had them. internal/scrcpy
+// then reads every config packet as a session header, takes the payload length
+// for a video height, and fails with PacketTooLargeError before the first frame
+// — "declared 2147483648 bytes", which is 0x80000000, the old config flag.
 func TestTheFixturesVideoIsReadableByInternalScrcpy(t *testing.T) {
 	t.Parallel()
 
@@ -354,12 +360,11 @@ func TestTheFixturesVideoIsReadableByInternalScrcpy(t *testing.T) {
 	}
 
 	srv := Start(t, ScrcpyFixture(ScrcpyConfig{
-		Devpath:            devpath,
-		Width:              screenFixtureWidth,
-		Height:             screenFixtureHeight,
-		Packets:            packets,
-		VideoSessionHeader: true,
-		VideoEOF:           true,
+		Devpath:  devpath,
+		Width:    screenFixtureWidth,
+		Height:   screenFixtureHeight,
+		Packets:  packets,
+		VideoEOF: true,
 	}))
 	scid, ok := srv.ScrcpySCID(devpath)
 	if !ok {

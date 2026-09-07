@@ -30,12 +30,18 @@ const (
 // precisely how this fixture would come to disagree with internal/scrcpy
 // without anything going red.
 const (
-	wireVideoHeaderLen  = 12                    // codec id u32, width u32, height u32
-	wirePacketHeaderLen = 12                    // flags+pts u64, payload length u32
-	wireCodecH264       = uint32(0x68323634)    // "h264"
-	wireFlagConfig      = uint64(1) << 63       // top bit
-	wireFlagKeyFrame    = uint64(1) << 62       // the one below it
-	wirePTSMask         = (uint64(1) << 62) - 1 // everything under the flags
+	// The video preamble is the four-byte codec id followed by a twelve-byte
+	// session header, so the geometry sits at [8:12] and [12:16] — not at [4:8]
+	// and [8:12], which is where it was when this fixture packed all three into
+	// one twelve-byte block and could not be read by internal/scrcpy at all.
+	wireCodecIDLen      = 4
+	wireVideoHeaderLen  = wireCodecIDLen + 12 // codec id, then the session header
+	wirePacketHeaderLen = 12                  // flags+pts u64, payload length u32
+	wireCodecH264       = uint32(0x68323634)  // "h264"
+	wireFlagSession     = uint64(1) << 63     // top bit: a geometry, not a frame
+	wireFlagConfig      = uint64(1) << 62
+	wireFlagKeyFrame    = uint64(1) << 61
+	wirePTSMask         = (uint64(1) << 61) - 1 // everything under the flags
 )
 
 // Control message type bytes, likewise as numbers.
@@ -128,7 +134,11 @@ func TestScrcpyFixtureServesSpawnVideoAndControl(t *testing.T) {
 	if got := binary.BigEndian.Uint32(hdr[0:4]); got != wireCodecH264 {
 		t.Fatalf("codec id = %#08x, want %#08x (\"h264\")", got, wireCodecH264)
 	}
-	if w, h := binary.BigEndian.Uint32(hdr[4:8]), binary.BigEndian.Uint32(hdr[8:12]); w != 1080 || h != 2400 {
+	if got := binary.BigEndian.Uint64(hdr[4:12]); got&wireFlagSession == 0 {
+		t.Fatalf("the session header's top eight bytes are %#016x; without the top bit a "+
+			"reader takes this geometry for a frame and its height for a payload length", got)
+	}
+	if w, h := binary.BigEndian.Uint32(hdr[8:12]), binary.BigEndian.Uint32(hdr[12:16]); w != 1080 || h != 2400 {
 		t.Fatalf("geometry = %dx%d, want 1080x2400", w, h)
 	}
 

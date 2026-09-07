@@ -58,6 +58,37 @@ function fleetRows() {
   });
 }
 
+/* fleetNarrowedOnServer answers the one question an empty API response turns
+ * on: did we ASK for a narrower farm than the whole of it?
+ *
+ * It deliberately lists what loaders.fleet() sends — host, hub, health, pool
+ * and the search box — and deliberately omits `lease`, which is applied here in
+ * the browser and never reaches /fleet. A lease filter therefore cannot be the
+ * reason the server answered with nothing, and blaming it would tell an
+ * operator with an empty rack that filters are hiding devices that do not
+ * exist: the "Clear the filters" button would refetch, change nothing visible,
+ * and hand them the conclusion that the dashboard is broken.
+ *
+ * The search box does count. It is not in the filter bar and does not look like
+ * a filter, but it goes to the server as ?q= and empties the grid exactly as a
+ * host filter does — and a Clear button that left it set would also appear to
+ * do nothing. The client-side list is in fleetRows(); these two are different
+ * lists on purpose, and each says which. */
+function fleetNarrowedOnServer() {
+  const f = state.filters;
+  return !!(f.host || f.hub || f.health || f.pool || state.q.trim());
+}
+
+/* clearFleetFilters is what the Clear button does — literally: wire() binds
+ * #f-clear to this function, so the toolbar button and the button inside an
+ * empty grid cannot drift apart. Through setFilters() rather than five separate
+ * calls, for the reason setFilters() documents: one fleet request, not five
+ * racing ones. */
+function clearFleetFilters() {
+  state.q = '';
+  setFilters({ host: '', hub: '', health: '', pool: '', lease: '' });
+}
+
 /* healthMatches applies the ?health= filter the same way the API does.
  *
  * "unhealthy" is not a health value: the API reads it as "every state except
@@ -341,9 +372,18 @@ function renderFleet() {
   const mode = fleetMode(all);
   syncFleetModeControl(mode);
 
-  const problem = panelState('fleet', all, emptyState(
-    'No devices match.',
-    'This grid shows every device in farm.v_fleet grouped by host and then by hub — rack slot, model, health, lease and battery. Clear the filters, or check that the watchdog has registered devices.'));
+  /* A farm with no devices and a filter that hides every device read
+   * identically — "No devices match" — and they are not the same situation at
+   * all. The first is answered by a person walking to the rack; the second by
+   * one button. Telling a new operator that nothing matches, when nothing has
+   * ever been registered, sends them looking for a filter that is not set. */
+  const problem = panelState('fleet', all, fleetNarrowedOnServer()
+    ? emptyState(t('empty.fleet.filtered'),
+      [t('empty.fleet.filteredDetail'), provenance(t('empty.fleet.where'))],
+      emptyAction(t('empty.clearFilters'), () => clearFleetFilters()))
+    : emptyState(t('empty.fleet.none'),
+      [t('empty.fleet.noneDetail'), provenance(t('empty.fleet.where'))],
+      emptyAction(t('empty.openDocs'), () => setView('docs'))));
   if (problem) { body.replaceChildren(problem); alerts.replaceChildren(); return; }
 
   /* Both panes always exist; exactly one is visible, and only the visible one
@@ -358,7 +398,7 @@ function renderFleet() {
     boxes.cards.replaceChildren();
     boxes.table.replaceChildren(rows.length
       ? fleetTable(rows)
-      : emptyState(t('fleet.empty'), t('fleet.emptyDetail')));
+      : nothingToShow(all));
     /* The in-context hub-correlation box below is not drawn here, and it is
      * worth being exact about what that costs. The box belongs beside the hub
      * it accuses, and a table sorted by battery has no hub to stand beside.
@@ -490,10 +530,7 @@ function renderFleet() {
     frag.append(block);
   }
 
-  if (!rows.length) {
-    frag.append(emptyState('No devices match these filters.',
-      'The fleet has ' + (all ? all.length : 0) + ' devices. Clear the filters to see them.'));
-  }
+  if (!rows.length) frag.append(nothingToShow(all));
 
   boxes.cards.replaceChildren(frag);
 
@@ -978,6 +1015,29 @@ function fleetSorted(rows) {
  * fleetRows() has already applied every filter and the header search — and it
  * holds no reference to anything outside itself, so the caller decides where
  * it goes and when it is replaced. */
+/* nothingToShow is the panel BOTH modes draw when the filters hid everything.
+ *
+ * One function rather than one per mode, because the two answers it chooses
+ * between are the reason this exists: a farm that has no devices and a farm
+ * whose filters are hiding all of them read identically as "no devices match",
+ * and they have opposite next actions. A second copy of that decision is a
+ * second place for the two to drift back together.
+ *
+ * The empty state ABOVE this, on panelState, answers the case where the API
+ * returned nothing at all. This one answers the case where it returned devices
+ * and the client-side filters removed every one. */
+function nothingToShow(all) {
+  const n = all ? all.length : 0;
+  if (!n) {
+    return emptyState(t('empty.fleet.none'),
+      [t('empty.fleet.noneDetail'), provenance(t('empty.fleet.where'))],
+      emptyAction(t('empty.openDocs'), () => setView('docs')));
+  }
+  return emptyState(t('empty.fleet.filtered'),
+    t('empty.fleet.hiddenDetail', { n: n }),
+    emptyAction(t('empty.clearFilters'), () => clearFleetFilters()));
+}
+
 function fleetTable(rows) {
   const cols = [
     { label: t('fleet.col.slot'), sort: 'slot', cls: 'f-slot', cell: slotCell },

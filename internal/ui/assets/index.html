@@ -187,6 +187,35 @@
 
   <!-- ================= FLEET ================= -->
   <section id="view-fleet" class="view" role="tabpanel" aria-labelledby="tab-fleet" tabindex="-1">
+    <!-- The first-visit card. Three sentences and a door.
+
+         NOT a guided tour and not coach marks: this is a control plane, and the
+         person most likely to meet it for the first time is meeting it at 3
+         a.m. because something is on fire. A sequence of overlays that must be
+         clicked through is the wrong thing to put between that person and the
+         grid. Three sentences they can read in six seconds, one link to the
+         place where it is all written down properly, and a way to make it go
+         away for good.
+
+         Nothing load-bearing lives here, precisely BECAUSE it is
+         dismissed-once-never-seen-again. Everything it says is also in Docs.
+
+         Rendered `hidden` and unhidden by boot() when the localStorage flag is
+         absent, so a returning operator never sees it flash. -->
+    <div id="first-run" class="firstrun" hidden>
+      <h2 class="firstrun-h" data-i18n="firstRun.title">What this page is</h2>
+      <p data-i18n="firstRun.p1">This is the control plane for a rack of physical Android devices: what each one is
+        doing, who is holding it, and what the watchdog did about the ones that stopped answering.</p>
+      <p data-i18n="firstRun.p2">Fleet, Leases and Jobs are the present tense. Recovery, Bulk, Events and Docs are
+        the record and the tools.</p>
+      <p data-i18n="firstRun.p3">It reads the same PostgreSQL rows that ctl reads, so it is not a second source of
+        truth — and every action that changes anything asks you to confirm it and to type a reason, which is kept.</p>
+      <div class="firstrun-acts">
+        <button type="button" id="first-run-docs" class="primary" data-i18n="firstRun.docs">Open the docs</button>
+        <button type="button" id="first-run-dismiss" class="ghost"
+                data-i18n="firstRun.dismiss" data-i18n-attr="title:firstRun.dismissTitle">Dismiss</button>
+      </div>
+    </div>
     <div class="toolbar">
       <label><span data-i18n="filter.host">Host</span>
         <select id="f-host"><option value="" data-i18n="filter.allHosts">all hosts</option></select>
@@ -324,11 +353,18 @@
 
       <form class="col-side card" id="job-form" autocomplete="off">
         <h2>Submit a job</h2>
-        <label for="job-pool">Pool</label>
+        <!-- Pool, Queue and Tenant are the three required fields, and until now
+             a placeholder carried their entire meaning: `pixel-6`, `ci-main`,
+             `platform` are examples, not definitions, and a person who has not
+             been told what a pool IS cannot tell whether `pixel-6` is a model,
+             a rack or a team. The words are column names in farm.jobs and stay
+             exactly as they are; glossJobForm() in app.js attaches the
+             definition to each when terms.js is loaded. -->
+        <label for="job-pool" id="job-pool-label">Pool</label>
         <input id="job-pool" name="pool" required placeholder="pixel-6">
-        <label for="job-queue">Queue</label>
+        <label for="job-queue" id="job-queue-label">Queue</label>
         <input id="job-queue" name="queue" required placeholder="ci-main">
-        <label for="job-tenant">Tenant</label>
+        <label for="job-tenant" id="job-tenant-label">Tenant</label>
         <input id="job-tenant" name="tenant" required placeholder="platform">
         <label for="job-spec">Spec (JSON)</label>
         <textarea id="job-spec" name="spec" rows="4" spellcheck="false">{}</textarea>

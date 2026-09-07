@@ -2,4 +2,331 @@
 
    Owned by unit 6. This is where an operator answers "what is this phone and
    can I use it", so the file's job is to keep the answer above the fold and
-   the identifiers below it. */
+   the identifiers below it.
+
+   Every value here composes tokens.css. Nothing declares a raw colour, and the
+   sheet's own padding is var(--pad-row), so the header's density toggle
+   retunes it along with the rest of the page. */
+
+/* ===================================================================
+   The sheet
+
+   A right-side sheet, not a centred modal. The change is not decorative: a
+   centred dialog over a fleet grid is a page that has replaced itself, while a
+   sheet is a page with something opened beside it. The fleet stays where it
+   was, and closing the sheet puts the operator back exactly where they were
+   looking.
+
+   THE display TRAP, FIRST OCCURRENCE. A <dialog> is hidden by a user-agent
+   rule, and any author `display` beats it regardless of specificity — the same
+   mechanism as [hidden] below. `#dlg-device { display: flex }` would paint the
+   sheet permanently over the fleet, on every view, with nothing in the console.
+   So the flex column is declared under [open] and nowhere else.
+   =================================================================== */
+
+#dlg-device {
+  position: fixed;
+  inset: 0 0 0 auto;
+  margin: 0;
+  width: min(560px, 100vw);
+  max-width: min(560px, 100vw);
+  height: 100vh;
+  height: 100dvh;
+  max-height: 100vh;
+  max-height: 100dvh;
+  border: 0;
+  border-left: 1px solid var(--brd-strong);
+  border-radius: 0;
+  box-shadow: var(--elev-3);
+  background: var(--srf-raised);
+  overflow: hidden;
+}
+
+#dlg-device[open] { display: flex; flex-direction: column; }
+
+/* THE [hidden] TRAP, AND THE REASON THIS RULE IS NOT OPTIONAL.
+
+   The six panels below are shown and hidden with the hidden attribute, which is
+   a user-agent rule. An author rule that sets `display:` on the same element
+   beats it REGARDLESS OF SPECIFICITY. .sheet-panel sets display:flex a few
+   rules down, so without this every panel — Overview, Health, Lease, Screen,
+   Command and Raw — paints at once, stacked, and the tab strip appears to do
+   nothing.
+
+   The scope is the whole sheet rather than .sheet-panel alone, because the
+   screen panel, the command panel and the footer all use `hidden` too, and a
+   rule per component is three chances to forget. style.css records two prior
+   occurrences of exactly this bug, one of them inside this very screen panel. */
+#dlg-device [hidden] { display: none !important; }
+
+/* ---------------- the head: a name, then a description ---------------- */
+
+#dlg-device .dlg-head {
+  flex: 0 0 auto;
+  align-items: flex-start;
+  gap: var(--s-3);
+  padding: var(--s-4) var(--s-4) var(--s-3);
+  background: var(--srf-raised);
+  border-bottom: 0;
+}
+
+/* The rack slot, in SANS. It was monospace, which made the name of a physical
+   thing read as a log line. The slot is what an operator says out loud and
+   writes on a ticket; it is a name, and names are set in the text face. */
+#dlg-device .dlg-head h2 {
+  margin: 0;
+  font-family: var(--sans);
+  font-size: var(--fs-xl);
+  font-weight: var(--fw-semi);
+  line-height: var(--lh-tight);
+  overflow-wrap: anywhere;
+}
+
+.dev-head-text { flex: 1; min-width: 0; }
+
+.dev-sub {
+  margin: var(--s-1) 0 0;
+  color: var(--txt-2);
+  font-size: var(--fs-sm);
+  line-height: var(--lh-tight);
+  overflow-wrap: anywhere;
+}
+
+/* ---------------- the tab strip ---------------- */
+
+/* The same shape as the main view tabs — role=tab, aria-selected, one panel
+   visible — so keyboard and screen-reader behaviour is one pattern rather than
+   two. It scrolls sideways in its OWN box rather than widening the sheet;
+   see the overflow architecture note in style.css. */
+.sheet-tabs {
+  flex: 0 0 auto;
+  display: flex;
+  gap: var(--s-1);
+  min-width: 0;
+  padding: 0 var(--s-4);
+  background: var(--srf-raised);
+  border-bottom: 1px solid var(--brd-subtle);
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: thin;
+}
+
+.sheet-tab {
+  flex: 0 0 auto;
+  margin: 0;
+  padding: var(--s-2) var(--s-2);
+  background: none;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  color: var(--txt-2);
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-medium);
+  white-space: nowrap;
+  cursor: pointer;
+}
+.sheet-tab:hover { background: var(--srf-hover); color: var(--txt-1); }
+.sheet-tab[aria-selected="true"] {
+  color: var(--brand-600);
+  border-bottom-color: var(--brand-600);
+  font-weight: var(--fw-semi);
+}
+
+/* ---------------- the scrolling body ---------------- */
+
+/* The body is the only thing that scrolls. The head names the device, the tabs
+   choose the question and the footer carries the actions; all three stay put,
+   so an operator three screens into a raw API row still knows which handset
+   they are looking at and can still act on it. */
+#dlg-device #device-body {
+  flex: 1 1 auto;
+  width: auto;
+  min-width: 0;
+  min-height: 0;
+  max-height: none;
+  padding: var(--pad-row) var(--s-4) var(--s-5);
+  background: var(--srf-canvas);
+  overflow: auto;
+}
+
+.sheet-panel,
+.sheet-sec {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-3);
+  min-width: 0;
+}
+.sheet-panel:focus { outline: none; }
+
+.sheet-h {
+  margin: var(--s-2) 0 0;
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-semi);
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  color: var(--txt-3);
+}
+
+/* ---------------- the sentence ---------------- */
+
+/* The single most valuable string on this screen, and it is sized like it. */
+.dev-say {
+  margin: 0;
+  color: var(--txt-1);
+  font-size: var(--fs-lg);
+  line-height: var(--lh);
+}
+.dev-say-note,
+.dev-note {
+  margin: 0;
+  color: var(--txt-2);
+  font-size: var(--fs-sm);
+  line-height: var(--lh);
+}
+.dev-where {
+  margin: 0;
+  color: var(--txt-1);
+  font-size: var(--fs-md);
+  line-height: var(--lh);
+}
+
+#dlg-device .chips {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--s-1);
+  min-width: 0;
+}
+
+/* ---------------- the label/value rows ---------------- */
+
+/* A card rather than a bare grid, so a group of rows reads as one answer.
+
+   min-width: 0 on both columns is the load-bearing half of the overflow
+   architecture: a grid child refuses to shrink below its content, so a uuid in
+   the value column would widen the sheet instead of wrapping inside it. */
+#dlg-device .kv {
+  grid-template-columns: minmax(0, 11rem) minmax(0, 1fr);
+  gap: var(--s-2) var(--s-3);
+  align-items: baseline;
+  margin: 0;
+  padding: var(--s-3);
+  background: var(--srf-raised);
+  border: 1px solid var(--brd-subtle);
+  border-radius: var(--r);
+}
+
+#dlg-device .kv dt {
+  min-width: 0;
+  font-family: var(--sans);
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-medium);
+  color: var(--txt-2);
+  line-height: var(--lh-tight);
+}
+
+#dlg-device .kv dd {
+  min-width: 0;
+  font-size: var(--fs-sm);
+  line-height: var(--lh);
+}
+
+/* The column name, under the human label.
+
+   This is the whole compromise of this screen made visible: the reader gets
+   "Next recovery rung" and the grep gets `next_ladder_tier`, and neither had to
+   be given up for the other. */
+.kv-raw {
+  display: block;
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-normal);
+  line-height: 1.4;
+  color: var(--txt-3);
+  overflow-wrap: anywhere;
+}
+
+/* A time reads as a distance and greps as an instant. */
+.when { display: block; min-width: 0; }
+.when-abs {
+  display: block;
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
+  color: var(--txt-3);
+  overflow-wrap: anywhere;
+}
+
+/* ---------------- identifiers ---------------- */
+
+/* .ident itself is in style.css, which unit 1 owns. What is here is only
+   what the sheet adds to it: an identifier in a two-column row, beside a
+   copy button, has to be allowed to take the width the label does not. */
+.ident-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--s-2);
+  min-width: 0;
+}
+.ident-row .ident { flex: 1 1 12rem; min-width: 0; }
+.copy-btn { flex: 0 0 auto; line-height: 1; }
+
+.idents {
+  background: var(--srf-raised);
+  border: 1px solid var(--brd-subtle);
+  border-radius: var(--r);
+}
+.idents > summary {
+  padding: var(--s-2) var(--s-3);
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-medium);
+  color: var(--txt-2);
+}
+.idents[open] > summary { border-bottom: 1px solid var(--brd-subtle); }
+.idents > .dev-note { padding: var(--s-3) var(--s-3) 0; }
+
+/* Nested in a card already, so the inner grid drops its own frame. */
+#dlg-device .idents .kv {
+  background: none;
+  border: 0;
+  border-radius: 0;
+}
+
+/* farm.devices.labels, one chip per pair, instead of a line of JSON braces an
+   operator had to parse by eye to answer "is this an sdk 35 device".
+
+   .chip is `white-space: nowrap`, which is right for `healthy` and wrong for a
+   label whose value is a sentence: one long value in a nowrap flex item cannot
+   shrink and pushes the whole sheet into horizontal scroll, which is the one
+   thing the overflow architecture exists to prevent. A label chip wraps. */
+#dlg-device .lbl {
+  white-space: normal;
+  max-width: 100%;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  align-items: baseline;
+}
+.lbl-k { color: var(--txt-3); }
+.lbl-v { color: var(--txt-1); font-weight: var(--fw-semi); }
+
+/* ---------------- the action footer ---------------- */
+
+.sheet-foot {
+  flex: 0 0 auto;
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s-2);
+  padding: var(--s-3) var(--s-4);
+  background: var(--srf-raised);
+  border-top: 1px solid var(--brd-subtle);
+  box-shadow: var(--elev-2);
+}
+
+/* ---------------- narrow windows ---------------- */
+
+/* Below the sheet's own width the label column stops being a column: 11rem of
+   label against 6rem of value is a table that has stopped being one. */
+@media (max-width: 560px) {
+  #dlg-device .kv { grid-template-columns: minmax(0, 1fr); gap: 0; }
+  #dlg-device .kv dd { margin: 0 0 var(--s-2); }
+}

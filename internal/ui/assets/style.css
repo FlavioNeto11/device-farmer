@@ -354,7 +354,15 @@ td.mono, .mono { font-family: var(--mono); }
    name, a metric label — something an operator copies into a query rather than
    reads as a name. Mono is the signal that it is machine text, and the smaller
    dimmer type is the signal that it is not why you are looking at the row. */
-.ident { font-family: var(--mono); font-size: var(--fs-xs); color: var(--txt-3); }
+/* A value deliberately shown as an identifier: a uuid, a devpath, a column
+   name. overflow-wrap because a 32-character hex string has nowhere to break
+   and will otherwise push a panel sideways rather than wrap inside it. */
+.ident {
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
+  color: var(--txt-3);
+  overflow-wrap: anywhere;
+}
 td.acts { white-space: nowrap; text-align: right; }
 .trunc { display: inline-block; max-width: 22ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom; }
 

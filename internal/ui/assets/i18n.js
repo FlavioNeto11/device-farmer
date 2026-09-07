@@ -544,6 +544,101 @@ const STRINGS = {
     'state.empty': 'Nothing here',
     'state.none': '—',
 
+    /* The device sheet — unit 6.
+     *
+     * The sentences below are the ones an operator reads instead of a uuid. The
+     * `device.f.*` keys are the HUMAN half of every row; the machine half — the
+     * column name — is printed underneath by kv() and is never translated,
+     * because it is what the database, `ctl` and the log line say. */
+    'device.tab.overview': 'Overview',
+    'device.tab.health': 'Health',
+    'device.tab.lease': 'Lease',
+    'device.tab.screen': 'Screen',
+    'device.tab.command': 'Command',
+    'device.tab.raw': 'Raw',
+    'device.tabsLabel': 'Device sections',
+    'device.unnamedModel': 'No model reported by this device',
+    'device.loadingDetail': 'Fetching {path} from the API.',
+    'device.fetchFailed': 'Device detail could not be fetched ({err}); showing the fleet row instead.',
+
+    /* The status line. Health and a lease are independent, so every sentence
+     * here says which of the two it is talking about. An offline device can
+     * still be held and a healthy one can be idle. */
+    'device.say.freeHealthy': 'Healthy and free. Nobody is using this device.',
+    'device.say.freeFault': 'Free, and health says {health}. Nobody is using this device; whether it can run a job is a separate question.',
+    'device.say.freeOffService': 'Free, and out of service on purpose ({health}). Nobody is using it, and nobody is meant to.',
+    'device.say.heldBySince': 'In use by {holder} since {since}.',
+    'device.say.heldBy': 'In use by {holder}.',
+    'device.say.heldSince': 'In use since {since}; the lease records no holder.',
+    'device.say.heldByJobSince': 'In use since {since}, by job {job}; the lease records no holder.',
+    'device.say.heldByJob': 'In use by job {job}; the lease records no holder.',
+    'device.say.held': 'In use. The lease records neither a holder nor a start.',
+    'device.say.expires': 'Expires in {when}.',
+    'device.say.expiryPassed': 'Its expiry passed {when} ago.',
+    'device.say.noExpiry': 'No expiry is recorded, so only the job or a human ends this lease.',
+    'device.say.suspectNote': 'No heartbeat has arrived from the holder. The device is not released, and a heartbeat that arrives later heals the lease at the same fence.',
+    'device.say.protectedNote': 'The lease is protected: nothing reclaims it automatically, and a human is paged instead.',
+
+    'device.where': 'Where it is',
+    'device.where.full': 'Rack slot {slot}, on host {host}, behind hub {hub}.',
+    'device.where.noSlot': 'On host {host}, behind hub {hub}. No rack slot is recorded, so this handset has no physical address written down.',
+    'device.where.noHub': 'Rack slot {slot}, on host {host}. No hub is recorded.',
+    'device.where.hostOnly': 'On host {host}. Neither a rack slot nor a hub is recorded.',
+    'device.where.slotOnly': 'Rack slot {slot}. No host is recorded, which is a device this farm cannot reach.',
+    'device.where.noHost': 'Rack slot {slot}, behind hub {hub}. No host is recorded, which is a device this farm cannot reach.',
+    'device.where.hubOnly': 'Behind hub {hub}. Neither a rack slot nor a host is recorded, and with no host this farm cannot reach it.',
+    'device.where.nothing': 'Nowhere recorded: no rack slot, no host, no hub.',
+    'device.availability': 'Can it be used',
+
+    'device.identifiers': 'Identifiers',
+    'device.identifiersNote': 'The strings this device is known by — in the database, in ADB and in a log line. Nothing here changes how it behaves; they are here to be matched and copied.',
+    'device.copy': 'Copy',
+    'device.copied': 'Copied',
+    'device.copyFailed': 'This browser refused the clipboard; select the text and copy it.',
+    'device.serialAmbiguous': 'not unique',
+    'device.serialAmbiguousWhy': 'More than one device on this farm reports this ADB serial, so the serial alone does not address this handset.',
+
+    'device.healthNote': 'Health is what the last check saw. It says nothing about who holds the device: an offline device can still be held, and a healthy one can be idle.',
+    'device.leaseNote': 'A lease ends when the job says so, when a deadline the user wrote down elapses, or when a human takes it back. Nothing on this screen ends one on its own.',
+    'device.screenNote': 'A session costs three ADB transports and a hardware encoder on the handset, so it starts when you ask for it. Closing this sheet stops it.',
+    'device.rawNote': 'Exactly what the API returned for this device, before this page interpreted any of it.',
+    'device.noQuarantine': 'none',
+    'device.revoke': 'Revoke lease',
+    'device.closeQuarantine': 'Close quarantine',
+
+    /* Row labels. The column name beside each one is printed by kv() and is
+     * never translated — see the note at the top of this file. */
+    'device.f.pool': 'Pool',
+    'device.f.adminState': 'Administrative state',
+    'device.f.android': 'Android',
+    'device.f.failureScore': 'Failure score',
+    'device.f.farmUID': 'Farm UID',
+    'device.f.deviceID': 'Device ID',
+    'device.f.serial': 'ADB serial',
+    'device.f.usbPath': 'USB path',
+    'device.f.devpath': 'ADB devpath',
+    'device.f.slotID': 'Slot',
+    'device.f.slotState': 'Slot state',
+    'device.f.labels': 'Labels',
+    'device.f.health': 'Health',
+    'device.f.healthSince': 'In this state since',
+    'device.f.adbState': 'ADB state',
+    'device.f.battery': 'Battery',
+    'device.f.batteryTemp': 'Battery temperature',
+    'device.f.consecBad': 'Consecutive failed checks',
+    'device.f.nextRung': 'Next recovery rung',
+    'device.f.lastSeen': 'Last seen',
+    'device.f.quarantine': 'Quarantine',
+    'device.f.leaseState': 'Lease state',
+    'device.f.leaseID': 'Lease ID',
+    'device.f.fence': 'Fence',
+    'device.f.job': 'Job',
+    'device.f.tenant': 'Tenant',
+    'device.f.holder': 'Holder',
+    'device.f.acquired': 'Acquired',
+    'device.f.expires': 'Expires',
+    'device.f.reclaimable': 'Reclaimable',
+
     /* Errors, by the code the API returns. The server also sends a message; it
      * is shown when a code has no entry here, so a new code degrades to English
      * prose rather than to nothing. */
@@ -1132,6 +1227,101 @@ const STRINGS = {
     'state.failed': 'Não foi possível carregar',
     'state.empty': 'Nada aqui',
     'state.none': '—',
+
+    /* A folha do dispositivo — unidade 6.
+     *
+     * As frases abaixo são o que um operador lê no lugar de um uuid. As chaves
+     * `device.f.*` são a metade HUMANA de cada linha; a metade da máquina — o
+     * nome da coluna — é impressa embaixo por kv() e nunca é traduzida, porque
+     * é o que o banco, o `ctl` e a linha de log dizem. */
+    'device.tab.overview': 'Visão geral',
+    'device.tab.health': 'Saúde',
+    'device.tab.lease': 'Lease',
+    'device.tab.screen': 'Tela',
+    'device.tab.command': 'Comando',
+    'device.tab.raw': 'Cru',
+    'device.tabsLabel': 'Seções do dispositivo',
+    'device.unnamedModel': 'Nenhum modelo informado por este dispositivo',
+    'device.loadingDetail': 'Buscando {path} na API.',
+    'device.fetchFailed': 'Não foi possível buscar o detalhe do dispositivo ({err}); mostrando a linha da frota no lugar.',
+
+    /* A linha de estado. Saúde e lease são independentes, então cada frase aqui
+     * diz de qual das duas está falando. Um dispositivo offline pode continuar
+     * com lease, e um saudável pode estar ocioso. */
+    'device.say.freeHealthy': 'Saudável e livre. Ninguém está usando este dispositivo.',
+    'device.say.freeFault': 'Livre, e a saúde diz {health}. Ninguém está usando este dispositivo; se ele consegue rodar um job é outra pergunta.',
+    'device.say.freeOffService': 'Livre, e fora de serviço de propósito ({health}). Ninguém está usando, e ninguém deveria.',
+    'device.say.heldBySince': 'Em uso por {holder} desde {since}.',
+    'device.say.heldBy': 'Em uso por {holder}.',
+    'device.say.heldSince': 'Em uso desde {since}; a lease não registra quem segura.',
+    'device.say.heldByJobSince': 'Em uso desde {since}, pelo job {job}; a lease não registra quem segura.',
+    'device.say.heldByJob': 'Em uso pelo job {job}; a lease não registra quem segura.',
+    'device.say.held': 'Em uso. A lease não registra nem quem segura nem quando começou.',
+    'device.say.expires': 'Expira em {when}.',
+    'device.say.expiryPassed': 'O prazo dela passou há {when}.',
+    'device.say.noExpiry': 'Nenhum prazo registrado, então só o job ou uma pessoa encerra esta lease.',
+    'device.say.suspectNote': 'Nenhum heartbeat chegou de quem segura a lease. O dispositivo não foi liberado, e um heartbeat que chegue depois cura a lease no mesmo fence.',
+    'device.say.protectedNote': 'A lease é protegida: nada a recupera automaticamente, e uma pessoa é acionada no lugar.',
+
+    'device.where': 'Onde ele está',
+    'device.where.full': 'Slot de rack {slot}, no host {host}, atrás do hub {hub}.',
+    'device.where.noSlot': 'No host {host}, atrás do hub {hub}. Nenhum slot de rack registrado, então este aparelho não tem endereço físico anotado.',
+    'device.where.noHub': 'Slot de rack {slot}, no host {host}. Nenhum hub registrado.',
+    'device.where.hostOnly': 'No host {host}. Nem slot de rack nem hub registrados.',
+    'device.where.slotOnly': 'Slot de rack {slot}. Nenhum host registrado, o que é um dispositivo que esta fazenda não alcança.',
+    'device.where.noHost': 'Slot de rack {slot}, atrás do hub {hub}. Nenhum host registrado, o que é um dispositivo que esta fazenda não alcança.',
+    'device.where.hubOnly': 'Atrás do hub {hub}. Nem slot de rack nem host registrados, e sem host esta fazenda não alcança ele.',
+    'device.where.nothing': 'Nenhum lugar registrado: sem slot de rack, sem host, sem hub.',
+    'device.availability': 'Dá para usar',
+
+    'device.identifiers': 'Identificadores',
+    'device.identifiersNote': 'Os textos pelos quais este dispositivo é conhecido — no banco, no ADB e numa linha de log. Nada aqui muda o comportamento dele; estão aqui para serem conferidos e copiados.',
+    'device.copy': 'Copiar',
+    'device.copied': 'Copiado',
+    'device.copyFailed': 'Este navegador recusou a área de transferência; selecione o texto e copie.',
+    'device.serialAmbiguous': 'não é único',
+    'device.serialAmbiguousWhy': 'Mais de um dispositivo nesta fazenda informa este serial ADB, então o serial sozinho não endereça este aparelho.',
+
+    'device.healthNote': 'Saúde é o que a última verificação viu. Ela não diz nada sobre quem segura o dispositivo: um dispositivo offline pode continuar com lease, e um saudável pode estar ocioso.',
+    'device.leaseNote': 'Uma lease termina quando o job diz, quando um prazo que a pessoa escreveu se esgota, ou quando alguém a toma de volta. Nada nesta tela encerra uma por conta própria.',
+    'device.screenNote': 'Uma sessão custa três transportes ADB e um codificador de hardware no aparelho, então ela começa quando você pede. Fechar esta folha para a sessão.',
+    'device.rawNote': 'Exatamente o que a API devolveu para este dispositivo, antes desta página interpretar qualquer coisa.',
+    'device.noQuarantine': 'nenhuma',
+    'device.revoke': 'Revogar lease',
+    'device.closeQuarantine': 'Fechar quarentena',
+
+    /* Rótulos das linhas. O nome da coluna ao lado de cada um é impresso por
+     * kv() e nunca é traduzido — veja a nota no topo deste arquivo. */
+    'device.f.pool': 'Pool',
+    'device.f.adminState': 'Estado administrativo',
+    'device.f.android': 'Android',
+    'device.f.failureScore': 'Pontuação de falha',
+    'device.f.farmUID': 'UID da fazenda',
+    'device.f.deviceID': 'ID do dispositivo',
+    'device.f.serial': 'Serial ADB',
+    'device.f.usbPath': 'Caminho USB',
+    'device.f.devpath': 'Devpath ADB',
+    'device.f.slotID': 'Slot',
+    'device.f.slotState': 'Estado do slot',
+    'device.f.labels': 'Rótulos',
+    'device.f.health': 'Saúde',
+    'device.f.healthSince': 'Neste estado desde',
+    'device.f.adbState': 'Estado do ADB',
+    'device.f.battery': 'Bateria',
+    'device.f.batteryTemp': 'Temperatura da bateria',
+    'device.f.consecBad': 'Verificações falhas seguidas',
+    'device.f.nextRung': 'Próximo degrau de recuperação',
+    'device.f.lastSeen': 'Visto pela última vez',
+    'device.f.quarantine': 'Quarentena',
+    'device.f.leaseState': 'Estado da lease',
+    'device.f.leaseID': 'ID da lease',
+    'device.f.fence': 'Fence',
+    'device.f.job': 'Job',
+    'device.f.tenant': 'Tenant',
+    'device.f.holder': 'Quem segura',
+    'device.f.acquired': 'Adquirida',
+    'device.f.expires': 'Expira',
+    'device.f.reclaimable': 'Recuperável',
 
     /* Erros, pelo código que a API devolve. O servidor também manda uma
      * mensagem; ela aparece quando um código não tem entrada aqui, então um

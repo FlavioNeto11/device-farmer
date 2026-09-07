@@ -87,8 +87,52 @@
     return fill(s, vars);
   }
 
+  /* trOr is tr() with the server's own words as the fallback.
+   *
+   * The three places that bridge server prose to a translation — role meanings,
+   * capability names, capability details — all want the same thing: a key that
+   * may not exist, and an English sentence from the API to fall back to when it
+   * does not. Without this they each open-coded the "did t() just hand the key
+   * back" check, and the third one to be written got it subtly different.
+   *
+   * The fallback is the load-bearing half. A role or a capability added to the
+   * Go side tomorrow appears here immediately, described in English, rather
+   * than rendering a raw dictionary key or nothing at all. */
+  function trOr(key, fallback) {
+    const s = tr(key);
+    return s === key ? fallback : s;
+  }
+
   const STR = {
     en: {
+      'docs.authConsequence.allow-all': 'every request is granted the operator role: anyone who can reach this port can revoke leases, drain hosts and power-cycle slots',
+      'docs.authFix.allow-all': 'set FARM_API_TOKENS to a token list, or supply an Authenticator',
+      'docs.feat.Device leasing': 'Device leasing',
+      'docs.feat.Job execution': 'Job execution',
+      'docs.feat.Witness extensions': 'Witness extensions',
+      'docs.feat.Automatic reclamation': 'Automatic reclamation',
+      'docs.feat.Health monitoring': 'Health monitoring',
+      'docs.feat.Recovery ladder': 'Recovery ladder',
+      'docs.feat.Operator port power': 'Operator port power',
+      'docs.feat.Dynamic enrollment': 'Dynamic enrollment',
+      'docs.feat.File transfer': 'File transfer',
+      'docs.feat.Artifacts': 'Artifacts',
+      'docs.feat.Live updates': 'Live updates',
+      'docs.feat.Authentication': 'Authentication',
+      'docs.feat.Fence enforcement at the resource': 'Fence enforcement at the resource',
+      'docs.feat.Helm chart': 'Helm chart',
+      'docs.featDetail.Device leasing': 'A connectivity failure cannot end a lease: farm.leases.release_reason is CHECK-constrained to a domain with no connectivity value.',
+      'docs.featDetail.Job execution': 'Steps run against leased devices; a transport failure is retried inside the lease.',
+      'docs.featDetail.Witness extensions': 'A job that can still touch its device keeps its lease through a control-plane outage longer than ttl+grace, for up to FARM_LEASE_WITNESS_MAX_EXTENSIONS consecutive extensions. A refused witness ends nothing; only farm.lease_renew can report fencing.',
+      'docs.featDetail.Automatic reclamation': 'The only automatic release path in the system.',
+      'docs.featDetail.Health monitoring': 'Health is a separate clock and can never touch a lease.',
+      'docs.featDetail.Recovery ladder': 'No host agent is beating: tiers 3 and 4 are REFUSED with a reason, not silently skipped.',
+      'docs.featDetail.Operator port power': 'This api process has no node client (FARM_NODE_TOKEN is unset), so POST /api/v1/slots/{id}/power answers 503 and records no attempt.',
+      'docs.featDetail.Dynamic enrollment': 'No enroller is beating: a handset plugged in now will not join the fleet until one runs.',
+      'docs.featDetail.File transfer': 'push, pull and install stream in both directions; a 200MB artifact is never buffered in memory.',
+      'docs.featDetail.Authentication': 'Every caller is granted the operator role. Do not expose this port to a network you do not control; set FARM_API_TOKENS to close it. The seam for OIDC is documented in internal/api/auth.go.',
+      'docs.featDetail.Fence enforcement at the resource': 'This process dials ADB servers in the clear and sends no fence, so the fence is enforced in PostgreSQL only and honoured by the client. Enforcement is per host: a host running the proxy (FARM_FENCE_TLS_*) refuses a revoked fence at the ADB socket, and a host without one relies on the holder to honour the fence floor PostgreSQL raised. This process cannot see which hosts run the proxy.',
+      'docs.featDetail.Helm chart': 'The chart refuses DATABASE_URL, FARM_API_TOKENS and FARM_COMPONENT in config.extra: the first two are credentials, and one shared FARM_COMPONENT would make the reaper\'s gap accounting blind to the role that is down.',
       'docs.role.api': 'serves this page and the HTTP API',
       'docs.role.scheduler': 'matches queued jobs to free devices; without it nothing is ever placed',
       'docs.role.jobrunner': 'runs job specs on leased devices; without it jobs sit in running, holding a device each',
@@ -175,6 +219,34 @@
         'An area can still be translated even when this list is not.'
     },
     pt: {
+      'docs.authConsequence.allow-all': 'toda requisição recebe o papel de operador: qualquer um que alcance esta porta pode revogar leases, drenar hosts e ciclar a energia de slots',
+      'docs.authFix.allow-all': 'defina FARM_API_TOKENS com uma lista de tokens, ou forneça um Authenticator',
+      'docs.feat.Device leasing': 'Lease de dispositivos',
+      'docs.feat.Job execution': 'Execução de jobs',
+      'docs.feat.Witness extensions': 'Extensões por witness',
+      'docs.feat.Automatic reclamation': 'Retomada automática',
+      'docs.feat.Health monitoring': 'Monitoramento de saúde',
+      'docs.feat.Recovery ladder': 'Escada de recuperação',
+      'docs.feat.Operator port power': 'Energia da porta pelo operador',
+      'docs.feat.Dynamic enrollment': 'Enrollment dinâmico',
+      'docs.feat.File transfer': 'Transferência de arquivos',
+      'docs.feat.Artifacts': 'Artefatos',
+      'docs.feat.Live updates': 'Atualizações ao vivo',
+      'docs.feat.Authentication': 'Autenticação',
+      'docs.feat.Fence enforcement at the resource': 'Fence imposta no recurso',
+      'docs.feat.Helm chart': 'Chart Helm',
+      'docs.featDetail.Device leasing': 'Uma falha de conectividade não pode encerrar uma lease: farm.leases.release_reason tem uma CHECK que a restringe a um domínio sem nenhum valor sobre conectividade.',
+      'docs.featDetail.Job execution': 'Os steps rodam contra dispositivos com lease; uma falha de transporte é retentada dentro da lease.',
+      'docs.featDetail.Witness extensions': 'Um job que ainda consegue tocar seu dispositivo mantém a lease através de uma queda do control plane mais longa que ttl+grace, por até FARM_LEASE_WITNESS_MAX_EXTENSIONS extensões consecutivas. Um witness recusado não encerra nada; só farm.lease_renew pode reportar fencing.',
+      'docs.featDetail.Automatic reclamation': 'O único caminho automático de liberação no sistema.',
+      'docs.featDetail.Health monitoring': 'Saúde é um relógio separado e nunca pode tocar uma lease.',
+      'docs.featDetail.Recovery ladder': 'Nenhum agente de host está batendo: os tiers 3 e 4 são RECUSADOS com um motivo, não pulados em silêncio.',
+      'docs.featDetail.Operator port power': 'Este processo api não tem cliente de node (FARM_NODE_TOKEN não está definido), então POST /api/v1/slots/{id}/power responde 503 e não registra tentativa nenhuma.',
+      'docs.featDetail.Dynamic enrollment': 'Nenhum enroller está batendo: um aparelho plugado agora não entra na frota enquanto nenhum rodar.',
+      'docs.featDetail.File transfer': 'push, pull e install transmitem nas duas direções; um artefato de 200MB nunca é bufferizado em memória.',
+      'docs.featDetail.Authentication': 'Todo chamador recebe o papel de operador. Não exponha esta porta a uma rede que você não controla; defina FARM_API_TOKENS para fechá-la. A costura para OIDC está documentada em internal/api/auth.go.',
+      'docs.featDetail.Fence enforcement at the resource': 'Este processo disca os servidores ADB em claro e não envia nenhuma fence, então a fence é imposta apenas no PostgreSQL e honrada pelo cliente. A imposição é por host: um host rodando o proxy (FARM_FENCE_TLS_*) recusa uma fence revogada no próprio socket ADB, e um host sem ele depende do holder honrar o fence floor que o PostgreSQL levantou. Este processo não consegue ver quais hosts rodam o proxy.',
+      'docs.featDetail.Helm chart': 'O chart recusa DATABASE_URL, FARM_API_TOKENS e FARM_COMPONENT em config.extra: os dois primeiros são credenciais, e um FARM_COMPONENT compartilhado deixaria a contabilidade de gap do reaper cega para o role que está fora.',
       'docs.role.api': 'serve esta página e a API HTTP',
       'docs.role.scheduler': 'casa jobs na fila com dispositivos livres; sem ele nada é jamais alocado',
       'docs.role.jobrunner': 'roda specs de job em dispositivos com lease; sem ele os jobs ficam em running, cada um segurando um dispositivo',
@@ -571,8 +643,18 @@
         el('span', { class: 'doc-warn-glyph', 'aria-hidden': 'true' }, '▲'),
         el('div', null,
           el('div', { class: 'doc-warn-title' }, tr('docs.authOpenTitle')),
-          el('div', null, au.consequence || ''),
-          el('div', { class: 'doc-warn-fix' }, au.fix || ''))));
+          /* THE MOST IMPORTANT SENTENCE ON THIS PAGE, and it was the last thing
+           * left in English on a Portuguese one. It says that anybody who can
+           * reach this port can revoke leases, drain hosts and power-cycle
+           * slots. A security notice a reader cannot read is not a notice.
+           *
+           * Keyed on the auth mode, which is a machine token the server chooses
+           * from a closed set — the same bridge the error codes and the
+           * capability rows use — with the server's own words as the fallback,
+           * so a mode added tomorrow warns in English rather than not at all. */
+          el('div', null, trOr('docs.authConsequence.' + (au.mode || ''), au.consequence || '')),
+          el('div', { class: 'doc-warn-fix' },
+            trOr('docs.authFix.' + (au.mode || ''), au.fix || '')))));
     }
 
     // Roles. A role that is not beating is not a cosmetic gap: the reaper's own
@@ -612,11 +694,27 @@
       const st = String(f.state || '');
       return el('div', { class: 'doc-feat feat-' + st },
         el('div', { class: 'doc-feat-top' },
-          el('span', { class: 'doc-feat-name' }, f.name),
+          /* Name and detail are bridged to a translation the same way the role
+           * meanings and the API error codes are: by keying on something that is
+           * not prose. Here the key is the feature's own name, which the server
+           * treats as a stable label — capabilities.go matches on it by string
+           * to override the Authentication row — so it is an identifier in
+           * everything but appearance.
+           *
+           * `how` is NOT translated and is not meant to be. It is the mono line
+           * under the name and it is made of identifiers: SQL function names,
+           * environment variables, package paths. Translating it would be
+           * translating the thing an operator greps for.
+           *
+           * Anything with no entry keeps the server's English, so a capability
+           * added tomorrow appears described rather than blank. */
+          el('span', { class: 'doc-feat-name' }, trOr('docs.feat.' + f.name, f.name)),
           el('span', { class: 'chip ' + featChip(st) }, st.replace(/_/g, ' '))),
         el('div', { class: 'doc-feat-how mono' }, f.how || ''),
         f.detail ? (() => {
-          const d = el('div', { class: 'doc-feat-detail' }); d.append(inline(f.detail)); return d;
+          const d = el('div', { class: 'doc-feat-detail' });
+          d.append(inline(trOr('docs.featDetail.' + f.name, f.detail)));
+          return d;
         })() : null);
     })));
 

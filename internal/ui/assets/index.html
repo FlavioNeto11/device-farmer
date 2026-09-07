@@ -309,15 +309,33 @@
 </main>
 
 <!-- Confirm-with-reason. Every destructive operator action goes through here:
-     it names exactly what will be disturbed, demands a typed reason for the
-     audit log, and renders the server's own refusal in place when refused. -->
+     it names exactly what will be disturbed, asks for a reason for the audit
+     log, and renders the server's own refusal in place when refused.
+
+     THE REASON IS NOT ALWAYS REQUIRED, and this input deliberately carries no
+     `required` attribute. Five of the six routes reached from here refuse a
+     request with no reason; POST /api/v1/jobs/{id}/cancel accepts one, and the
+     dashboard used to demand a reason for it anyway. Which case this is comes
+     from openConfirm's spec.reason, and it is stated on the label — so the
+     rule the operator meets is the server's rule and not this page's.
+
+     The browser's own validation cannot express that: `required` blocks the
+     submit event before any script runs, so a guard relaxed only in JS would
+     change nothing on screen. That is why it is gone from here. -->
 <dialog id="dlg-confirm" aria-labelledby="confirm-title">
   <form id="confirm-form" method="dialog">
     <h2 id="confirm-title">Confirm</h2>
     <div id="confirm-impact" class="impact"></div>
-    <label for="confirm-reason">Reason — recorded in the audit log (required)</label>
-    <input id="confirm-reason" maxlength="240" autocomplete="off" required>
-    <div id="confirm-error" class="form-error" hidden></div>
+    <label for="confirm-reason" id="confirm-reason-label">Reason — the server refuses this action without one. It is written to farm.audit_log next to your name.</label>
+    <input id="confirm-reason" maxlength="240" autocomplete="off" aria-describedby="confirm-note">
+    <div id="confirm-suggest" class="reason-suggest" role="group" hidden
+         data-i18n-attr="aria-label:confirm.suggest.label"></div>
+    <p class="hint" id="confirm-note" data-i18n="confirm.reasonNote">Six weeks from now it is the only record of why.</p>
+    <!-- role="alert" because dropping `required` dropped the browser's own
+         spoken validation message with it. The guard that replaces it writes
+         here, and a message a screen reader never announces is the silent
+         focus jump this change exists to remove. -->
+    <div id="confirm-error" class="form-error" role="alert" hidden></div>
     <menu>
       <button type="button" id="confirm-cancel" class="ghost">Cancel</button>
       <button type="submit" id="confirm-ok" class="danger">Confirm</button>

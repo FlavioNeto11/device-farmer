@@ -556,13 +556,21 @@
       placeholder: t('exec.reasonPlaceholder'),
     });
     const impactBox = el('div', { class: 'cmd-force-impact' });
+    /* Held rather than inlined, because this label is no longer the word
+     * "Reason": it now states the server's condition — a reason is required
+     * BECAUSE this device is leased — and that sentence has to follow a
+     * language switch like every other sentence on the panel. */
+    const reasonLabel = el('span', null, t('exec.force.reason'));
     const forceWrap = el('div', { class: 'cmd-force', hidden: true },
       el('div', { class: 'cmd-force-head' },
         el('span', { 'aria-hidden': 'true' }, '▲'), ' ', t('exec.force.head')),
       impactBox,
-      el('label', { class: 'cmd-reason-wrap' },
-        el('span', null, t('exec.force.reason')), reason),
+      el('label', { class: 'cmd-reason-wrap' }, reasonLabel, reason),
       el('p', { class: 'cmd-note' }, t('exec.force.audit')));
+    window.addEventListener('languagechange', () => {
+      if (!forceWrap.isConnected) return;
+      try { reasonLabel.textContent = t('exec.force.reason'); } catch (_) { /* a stale panel must not strand the switch */ }
+    });
 
     let forcing = false;
     function revealForce(detail) {
@@ -578,6 +586,29 @@
       lines.push(t('exec.force.noSignal'));
       impactBox.replaceChildren(
         impactList(d.rackSlot || d.usbPath || shortId(d.id), lines));
+    }
+
+    /* forceReasonMissing is what a silent focus jump used to be.
+     *
+     * run() answered an empty reason by moving the caret into this field and
+     * nothing else — no message, no sound, no change on screen — which reads as
+     * a Run button that does not work. The message names the condition the
+     * server actually applies: internal/api/fleet.go asks for a reason when
+     * d.Lease != nil, so it is required BECAUSE this device is leased and not
+     * because every command needs one. */
+    function forceReasonMissing() {
+      verdict.hidden = true;
+      out.hidden = true;
+      // Announced, not just shown. The caret lands in the reason field a moment
+      // later, and a reader who cannot see the box would otherwise be moved
+      // there with no explanation at all — which is the same silence, wearing a
+      // message.
+      err.setAttribute('role', 'alert');
+      err.hidden = false;
+      err.replaceChildren(
+        el('span', { 'aria-hidden': 'true' }, '▲'), ' ',
+        el('strong', null, t('exec.force.reasonMissingHead')), ' ',
+        el('span', null, t('exec.force.reasonMissing')));
     }
     /* Revealed from the fleet row when it already shows a lease, and revealed
      * again by a 409 — which is the authority, because this row can be five
@@ -665,7 +696,7 @@
     async function run() {
       const cmd = builder.command();
       if (!cmd) { builder.input.focus(); return; }
-      if (forcing && !reason.value.trim()) { reason.focus(); return; }
+      if (forcing && !reason.value.trim()) { forceReasonMissing(); reason.focus(); return; }
 
       runBtn.disabled = true;
       verdict.hidden = true;

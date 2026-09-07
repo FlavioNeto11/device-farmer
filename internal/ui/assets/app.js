@@ -670,6 +670,12 @@ function readToken() {
 function writeToken(v) {
   try {
     if (v) sessionStorage.setItem(TOKEN_KEY, v); else sessionStorage.removeItem(TOKEN_KEY);
+    // The token IS the identity in this tab, so changing it is a handover, and
+    // the remembered reason must not cross it: the chip would otherwise offer
+    // the previous operator's sentence to be filed under the new operator's
+    // name. See REASON_LAST_KEY, which is stored per tab for the same reason
+    // this is.
+    sessionStorage.removeItem(REASON_LAST_KEY);
   } catch (_) { /* private mode: the token simply lives in memory for this page */ }
   apiToken = v;
 }
@@ -1914,12 +1920,84 @@ function impactList(subject, lines) {
     el('ul', null, lines.map((l) => el('li', null, l))));
 }
 
+/* REASON_LAST_KEY is the last reason typed in THIS TAB, offered back as a chip.
+ *
+ * sessionStorage, not localStorage, and for the same reason the API token is
+ * kept there: two operators sharing a machine must not inherit each other's
+ * audit text. A reason is written to farm.audit_log with a name beside it, and
+ * the name is whoever is signed in now — so a sentence that outlived the tab
+ * that typed it would end up attributed to somebody who never wrote it. */
+const REASON_LAST_KEY = 'device-farmer.reason-last';
+
+function readLastReason() {
+  try { return sessionStorage.getItem(REASON_LAST_KEY) || ''; } catch (_) { return ''; }
+}
+
+function writeLastReason(v) {
+  try { if (v) sessionStorage.setItem(REASON_LAST_KEY, v); } catch (_) { /* private mode: no chip, no harm */ }
+}
+
+/* reasonRequired reads spec.reason, and DEFAULTS TO REQUIRED.
+ *
+ * The default is the strict one on purpose. A seventh action added without a
+ * reason: field asks for a reason it may not need — a small annoyance, visible
+ * immediately. The other default would let an action stop recording why it was
+ * taken, silently, and nobody finds that out until six weeks later when the
+ * audit row is the only record and it is blank. */
+function reasonRequired(spec) {
+  return !spec || spec.reason !== 'optional';
+}
+
+/* reasonChip is one suggestion. Clicking it REPLACES the field and focuses it,
+ * rather than appending: a chip is a starting sentence, and half of one chip
+ * glued to half of another is not a sentence anybody meant to write. */
+function reasonChip(text, value) {
+  const input = $('#confirm-reason');
+  const full = value === undefined ? text : value;
+  return el('button', {
+    type: 'button',
+    class: 'reason-chip',
+    title: full,
+    onclick: () => { input.value = full; input.focus(); }
+  }, text);
+}
+
+/* paintReason writes the label, the suggestions and nothing into the field.
+ *
+ * THE FIELD IS NEVER PRE-FILLED, and that is a decision rather than an
+ * omission — the next reviewer will ask, so: an audit row that reads "scheduled
+ * maintenance" because nobody deleted a default is a false statement with a
+ * name attached to it, and that is worse than a blank one. A blank reason is an
+ * absence somebody can see. A wrong one is evidence. A chip is one click away,
+ * and that click is the whole difference between offering and asserting. */
+function paintReason(spec) {
+  const required = reasonRequired(spec);
+  const label = $('#confirm-reason-label');
+  label.textContent = required ? t('confirm.reason.required') : t('confirm.reason.optional');
+  const input = $('#confirm-reason');
+  input.setAttribute('aria-required', required ? 'true' : 'false');
+
+  const chips = (spec.suggest || []).map((key) => reasonChip(t(key)));
+  const last = readLastReason();
+  if (last) {
+    // Shortened for the chip, whole in the field and in the tooltip: 240
+    // characters of somebody's last sentence would push every other suggestion
+    // off the row.
+    const shown = last.length > 44 ? last.slice(0, 43) + '…' : last;
+    chips.push(reasonChip(t('confirm.suggest.last', { reason: shown }), last));
+  }
+  const row = $('#confirm-suggest');
+  row.replaceChildren(...chips);
+  row.hidden = chips.length === 0;
+}
+
 function openConfirm(spec) {
   pendingConfirm = spec;
   $('#confirm-title').textContent = spec.title;
   $('#confirm-impact').replaceChildren(spec.impact);
   const reason = $('#confirm-reason');
   reason.value = '';
+  paintReason(spec);
   const err = $('#confirm-error');
   err.hidden = true;
   err.replaceChildren();
@@ -1947,23 +2025,54 @@ function showConfirmError(e) {
   err.hidden = false;
 }
 
+/* showConfirmNotice is the page stopping itself, and it must not be dressed as
+ * the server stopping it.
+ *
+ * showConfirmError above says "the server rejected this action", which was a
+ * lie for the missing-reason guard: nothing had been sent. So this one says
+ * plainly that nothing was sent, and then names the route and the status the
+ * server WOULD answer — the operator learns which rule they have met, and that
+ * it is the server's rule rather than this page's opinion. */
+function showConfirmNotice(spec) {
+  const err = $('#confirm-error');
+  err.replaceChildren(
+    el('span', { 'aria-hidden': 'true' }, '▲'), ' ',
+    el('strong', null, t('confirm.notSent')), ' ',
+    el('span', null, t('confirm.reasonMissing', { route: spec.route || '' })));
+  err.hidden = false;
+}
+
 function wireConfirm() {
   $('#confirm-form').addEventListener('submit', async (ev) => {
     ev.preventDefault();
     if (!pendingConfirm) return;
     const reason = $('#confirm-reason').value.trim();
-    if (!reason) {
-      showConfirmError(new Error('A reason is required. It is written to farm.audit_log next to your name.'));
+    // The input carries no `required` attribute — that would block this event
+    // entirely — so the mode the server actually enforces is decided here.
+    if (!reason && reasonRequired(pendingConfirm)) {
+      showConfirmNotice(pendingConfirm);
+      $('#confirm-reason').focus();
       return;
     }
     const ok = $('#confirm-ok'), cancel = $('#confirm-cancel');
     const label = ok.textContent;
     ok.disabled = true; cancel.disabled = true;
+    // Whatever the last attempt left on screen stops being true the moment this
+    // one is sent: a request is in flight, and "Nothing was sent." next to a
+    // button that says "Cycling power — waiting for the host agent…" is the
+    // dialog contradicting itself for as long as the phone takes.
+    const err = $('#confirm-error');
+    err.hidden = true;
+    err.replaceChildren();
     // An action that blocks on hardware says so on the button while it waits,
     // rather than looking like a click that did nothing.
     if (pendingConfirm.busyLabel) ok.textContent = pendingConfirm.busyLabel;
     try {
       const res = await pendingConfirm.run(reason);
+      // Remembered only once the server has taken it, so the chip offers a
+      // sentence that is already in farm.audit_log rather than one that was
+      // refused. An empty reason is not remembered at all.
+      writeLastReason(reason);
       // done is a sentence, or a function of the server's answer for actions
       // whose outcome is only known once the server has acted.
       const done = typeof pendingConfirm.done === 'function' ? pendingConfirm.done(res) : pendingConfirm.done;
@@ -1979,6 +2088,15 @@ function wireConfirm() {
   });
   $('#confirm-cancel').addEventListener('click', () => { $('#dlg-confirm').close(); pendingConfirm = null; });
   $('#dlg-confirm').addEventListener('close', () => { pendingConfirm = null; });
+
+  /* The label and the chips are written by JS, so applyTranslations cannot
+   * reach them: a language switched with the dialog open would leave the one
+   * sentence that states the server's rule in the language the reader just
+   * left. What has already been typed is not touched. */
+  window.addEventListener('languagechange', () => {
+    if (!pendingConfirm) return;
+    try { paintReason(pendingConfirm); } catch (_) { /* a stale dialog must not strand the switch */ }
+  });
 }
 
 function openTokenDialog() {
@@ -2017,6 +2135,9 @@ function drainHost(host, devices) {
   const live = devices.filter((d) => d.leaseState === 'held' || d.leaseState === 'suspect');
   openConfirm({
     title: 'Drain host ' + host,
+    reason: 'required',
+    route: 'hosts/{id}/drain',
+    suggest: ['confirm.suggest.maintenance', 'confirm.suggest.hostUnhealthy', 'confirm.suggest.agentRollout'],
     impact: impactList(host, [
       'No new lease will be placed on this host.',
       live.length + ' live lease' + (live.length === 1 ? '' : 's') + ' on this host keep their devices and keep running. Draining never ends a lease.',
@@ -2035,6 +2156,9 @@ function undrainHost(host, devices) {
   openConfirm({
     title: 'Undrain host ' + host,
     safe: true,
+    reason: 'required',
+    route: 'hosts/{id}/undrain',
+    suggest: ['confirm.suggest.backInService', 'confirm.suggest.maintenanceDone'],
     impact: impactList(host, [
       'This host becomes schedulable again.',
       devices.length + ' device' + (devices.length === 1 ? '' : 's') + ' on it return to the allocation pool as their health allows.'
@@ -2058,6 +2182,9 @@ function revokeLease(l) {
   if (l.state === 'suspect') lines.push('This lease is suspect, which means only that we cannot see the holder. It is not evidence that the job died or that the device is broken.');
   openConfirm({
     title: 'Revoke lease ' + shortId(l.id),
+    reason: 'required',
+    route: 'leases/{id}/revoke',
+    suggest: ['confirm.suggest.holderGone', 'confirm.suggest.leaseStuck', 'confirm.suggest.deviceNeeded'],
     impact: impactList('fence ' + l.fence + ' · ' + where, lines),
     confirmLabel: 'Revoke this lease',
     done: 'Lease fence ' + l.fence + ' revoked.',
@@ -2070,6 +2197,9 @@ function powerSlot(d) {
   const liveOnHub = sameHub.filter((x) => x.leaseState === 'held' || x.leaseState === 'suspect');
   openConfirm({
     title: 'Power-cycle slot ' + (d.rackSlot || d.usbPath || d.slotID),
+    reason: 'required',
+    route: 'slots/{id}/power',
+    suggest: ['confirm.suggest.adbOffline', 'confirm.suggest.wedged'],
     impact: impactList((d.rackSlot || 'slot ' + d.slotID) + ' · ' + (d.usbPath || ''), [
       'VBUS is cut and restored for this slot’s power domain.',
       'If this hub switches power per port, only this device is disturbed. If the domain is ganged, every device in it goes down with it.',
@@ -2107,6 +2237,9 @@ function closeQuarantine(q) {
   openConfirm({
     title: 'Close quarantine ' + q.id,
     safe: true,
+    reason: 'required',
+    route: 'quarantines/{id}/close',
+    suggest: ['confirm.suggest.cableReplaced', 'confirm.suggest.healthyAgain'],
     impact: impactList(q.scope + ' ' + (q.rackSlot || q.deviceID || q.host || q.hubID || q.slotID || ''), [
       'The quarantine opened ' + fmtRel(q.openedAt) + ' is marked closed with your name on it.',
       'Scheduling resumes to this ' + q.scope + ' as soon as its health allows.',
@@ -2122,6 +2255,15 @@ function closeQuarantine(q) {
 function cancelJob(j) {
   openConfirm({
     title: 'Cancel job ' + shortId(j.id),
+    /* THE ONE THAT IS OPTIONAL. internal/api/jobs.go decodes the body into a
+     * revokeRequest it labels "optional here" and never checks the field, and
+     * auditAction stores nullif($4,'') — so a cancel with no reason is a row
+     * with a null reason, which is what the schema has always allowed. The
+     * dashboard demanded one anyway, for every action alike, and that is the
+     * complaint this answers. */
+    reason: 'optional',
+    route: 'jobs/{id}/cancel',
+    suggest: ['confirm.suggest.notNeeded', 'confirm.suggest.superseded', 'confirm.suggest.wrongTarget'],
     impact: impactList(String(j.id), [
       'The job is cancelled in state ' + j.state + '.',
       'Its lease, if it holds one, ends with release_reason job_cancelled — a deliberate ending, recorded as one.',
